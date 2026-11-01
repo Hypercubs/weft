@@ -41,6 +41,13 @@ struct TranslatedKernel {
   // The GPU form of this kernel is the warp back end — one Metal thread per
   // 32-lane warp — so the launcher dispatches a thirty-second of the grid.
   bool gpu_warp = false;
+  // How many words of threadgroup memory one warp's relay needs, and how many
+  // warps may share a threadgroup with one slice each. Both are fixed when the
+  // kernel is translated, so the array the shader declares and the group the
+  // launcher dispatches cannot disagree — a warp reading another warp's slots is
+  // a wrong answer, not a slow one.
+  uint32_t slot_words = 0;
+  uint32_t slot_per = 0;
   // The kernel uses a 64-bit atomic. There is no such instruction here, so the
   // warp back end builds one out of 32-bit atomics under a device-scope lock,
   // and the launcher has to hand the kernel a zeroed table of lock words — the

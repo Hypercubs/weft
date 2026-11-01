@@ -1,0 +1,146 @@
+; A `double` on a GPU that has no fp64.
+;
+; Metal rejects the type outright — this is not a missing lowering — so the only way
+; a kernel carrying one runs at all is software, and the runtime does it: a double is
+; its bits in a `uint64_t`, and every operation on it is exact IEEE-754 binary64,
+; round-to-nearest-even, subnormals included. That is what makes the comparison in
+; check.sh mean something: the CPU column computes the same expressions with the
+; host's own doubles, and the two are compared bit for bit, not to a tolerance.
+;
+; The input is a float, converted up, so no lane ever sees a NaN out of a buffer whose
+; bytes were filled as floats:
+;
+;   a1[8i+0]  x * 1.5 + 0.25        multiply, then add
+;   a1[8i+1]  x / 3                  divide, which is inexact on purpose
+;   a1[8i+2]  x - 1e300             subtract with a huge operand and a small one
+;   a1[8i+3]  floor(x)
+;   a1[8i+4]  ceil(x)
+;   a1[8i+5]  trunc(x)
+;   a1[8i+6]  round(x)              ties away from zero, as OpenCL's round
+;   a1[8i+7]  (double)(float)x      down to binary32 and back: to_f32 and from_f32
+;   a2[2i+0]  x > 0.75
+;   a2[2i+1]  (int)(x * 100)        converted up to 64 bits, then truncated to 32
+;
+; and the last one is the subgroup form the one-word relay could not carry:
+;
+;   a3[i]     reduce_add(lane + 1) - 528.0     zero in every lane that agrees
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Linkage
+               OpCapability Int64
+               OpCapability Float64
+        ; An import sits in its own layout section: after the capabilities and before
+        ; the memory model, not down beside the constants.
+        %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "fp64" %gid
+               OpName %main "fp64"
+               OpName %fred "sub_group_reduce_add"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %fred LinkageAttributes "sub_group_reduce_add" Import
+       %void = OpTypeVoid
+       %bool = OpTypeBool
+        ; The Kernel capability requires every integer type to be declared unsigned;
+        ; which conversion is signed is carried by the instruction, not the type.
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+        %f32 = OpTypeFloat 32
+        %f64 = OpTypeFloat 64
+       %f32p = OpTypePointer CrossWorkgroup %f32
+       %f64p = OpTypePointer CrossWorkgroup %f64
+       %u32p = OpTypePointer CrossWorkgroup %u32
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+       %fnrd = OpTypeFunction %f64 %f64
+       %fnty = OpTypeFunction %void %f32p %f64p %u32p %f64p
+        %gid = OpVariable %pin Input
+      %c1_5 = OpConstant %f64 1.5
+     %c0_25 = OpConstant %f64 0.25
+        %c3 = OpConstant %f64 3
+   %c1e300 = OpConstant %f64 1e300
+       %c100 = OpConstant %f64 100
+     %c0_75 = OpConstant %f64 0.75
+      %c528 = OpConstant %f64 528
+       %c2u = OpConstant %u64 2
+       %c8u = OpConstant %u64 8
+       %c0u = OpConstant %u64 0
+       %c1u = OpConstant %u64 1
+       %c2b = OpConstant %u64 2
+       %c3u = OpConstant %u64 3
+       %c4u = OpConstant %u64 4
+       %c5u = OpConstant %u64 5
+       %c6u = OpConstant %u64 6
+       %c7u = OpConstant %u64 7
+      %one32 = OpConstant %u32 1
+     %zero32 = OpConstant %u32 0
+    ; Declarations first: a bodyless function is an import, and SPIR-V wants every
+    ; declaration ahead of any definition.
+       %fred = OpFunction %f64 None %fnrd
+         %rp = OpFunctionParameter %f64
+                OpFunctionEnd
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f64p
+         %a2 = OpFunctionParameter %u32p
+         %a3 = OpFunctionParameter %f64p
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %pa0 = OpPtrAccessChain %f32p %a0 %gi
+         %xf = OpLoad %f32 %pa0
+          %x = OpFConvert %f64 %xf
+         %m1 = OpFMul %f64 %x %c1_5
+         %r0 = OpFAdd %f64 %m1 %c0_25
+         %r1 = OpFDiv %f64 %x %c3
+         %r2 = OpFSub %f64 %x %c1e300
+         %r3 = OpExtInst %f64 %ocl floor %x
+         %r4 = OpExtInst %f64 %ocl ceil %x
+         %r5 = OpExtInst %f64 %ocl trunc %x
+         %r6 = OpExtInst %f64 %ocl round %x
+      %narrow = OpFConvert %f32 %x
+         %r7 = OpFConvert %f64 %narrow
+       %base = OpIMul %u64 %gi %c8u
+         %p0 = OpPtrAccessChain %f64p %a1 %base
+                OpStore %p0 %r0
+        %i1 = OpIAdd %u64 %base %c1u
+         %p1 = OpPtrAccessChain %f64p %a1 %i1
+                OpStore %p1 %r1
+        %i2 = OpIAdd %u64 %base %c2b
+         %p2 = OpPtrAccessChain %f64p %a1 %i2
+                OpStore %p2 %r2
+        %i3 = OpIAdd %u64 %base %c3u
+         %p3 = OpPtrAccessChain %f64p %a1 %i3
+                OpStore %p3 %r3
+        %i4 = OpIAdd %u64 %base %c4u
+         %p4 = OpPtrAccessChain %f64p %a1 %i4
+                OpStore %p4 %r4
+        %i5 = OpIAdd %u64 %base %c5u
+         %p5 = OpPtrAccessChain %f64p %a1 %i5
+                OpStore %p5 %r5
+        %i6 = OpIAdd %u64 %base %c6u
+         %p6 = OpPtrAccessChain %f64p %a1 %i6
+                OpStore %p6 %r6
+        %i7 = OpIAdd %u64 %base %c7u
+         %p7 = OpPtrAccessChain %f64p %a1 %i7
+                OpStore %p7 %r7
+        ; ---- a comparison and a cast ----
+         %gt = OpFOrdGreaterThan %bool %x %c0_75
+       %gt32 = OpSelect %u32 %gt %one32 %zero32
+    %hundred = OpFMul %f64 %x %c100
+        %i64 = OpConvertFToS %u64 %hundred
+    %trunc32 = OpUConvert %u32 %i64
+        %b2 = OpIMul %u64 %gi %c2b
+        %q0 = OpPtrAccessChain %u32p %a2 %b2
+                OpStore %q0 %gt32
+        %b3 = OpIAdd %u64 %b2 %c1u
+        %q1 = OpPtrAccessChain %u32p %a2 %b3
+                OpStore %q1 %trunc32
+        ; ---- the same reduction, over a 64-bit float ----
+      %lane1 = OpIAdd %u64 %gi %c1u
+         %lf = OpConvertUToF %f64 %lane1
+        %red = OpFunctionCall %f64 %fred %lf
+  %redminus = OpFSub %f64 %red %c528
+        %p3b = OpPtrAccessChain %f64p %a3 %gi
+                OpStore %p3b %redminus
+                OpReturn
+                OpFunctionEnd

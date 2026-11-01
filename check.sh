@@ -349,6 +349,9 @@ gpucol kernels/triton/cvt8.ptx       128 4096
 # 128 blocks. Sizing them from the grid alone put writes out of bounds on both
 # engines, which is agreement about nothing.
 gpucol kernels/triton/wgmma.ptx      128 4096 --buffers 32768,32768,32768
+# The same instruction with bf16 operands: one 16-bit element either way, so the
+# core-matrix layout is identical and only the decode differs.
+gpucol kernels/triton/wgmma_bf16.ptx 128 4096 --buffers 32768,32768,32768
 # Hand-written samples: predication, bit tricks, a reduction barrier, two
 # threadgroup tiles, and cp.async into threadgroup memory.
 gpucol kernels/reverse.ptx           256 4096
@@ -478,6 +481,56 @@ spvgpu atomic       atomic    --grid 8 --threads 8 --buffers 8,8,8
 # counters agree with the CPU byte for byte, compared as integers: a lost increment
 # is 7.7e-43 when eight bytes of counter are read as two floats.
 spvgpu atom64k      atom64    --grid 4096 --threads 32 --buffers 1,1,1,1,1,1
+# The pair read and written as one value with nothing else in the module: a 64-bit
+# atomic load and a 64-bit atomic store. Both were refused on this host until the
+# warp target could carry them, and they take the same one-thread walk.
+spvgpu atom64rw     atom64rw  --grid 64 --threads 32 --buffers 1,1
+# A loop around the pair: an entry block, a loop block carrying two OpPhi values,
+# and an exit block. This is the shape the refusal used to name — the warp target
+# took one block only, so a loop could not reach it and the pair fell through to the
+# per-lane back end, which cannot host a contending section. Every lane adds four to
+# the counter and writes the sum of its four old values to its own slot.
+spvgpu atom64loop  atom64loop --grid 64 --threads 32 --buffers 1,64
+# A barrier between the increment and a 64-bit load, which is the shape a
+# threadgroup stage is written in. The warp target runs the lanes in step for this:
+# one program counter each, lowest first, so a lane parked on the barrier cannot be
+# passed by a lane that has not arrived. All 32 lanes of the one warp must therefore
+# read the same counter, and every slot must hold it.
+spvgpu atom64bar   atom64bar  --grid 32 --threads 32 --buffers 1,32
+# The rendezvous family in one module: a ballot of the even lanes, a 64-bit
+# broadcast from lane 0, a barrier, and the pair. One thread owns the lanes, so the
+# vote is a relay through the warp's slot array and the sweep brings the lanes back
+# in order to read it — no hardware ballot is involved and none is available. Two
+# of those votes are `all-equal`, over a 64-bit value and over a `ulong2`, each one
+# that has to be true and one that has to be false, and each is written as a residual
+# so a wrong answer is a nonzero slot.
+spvgpu atom64vote  atom64vote --grid 32 --threads 32 --buffers 1,32,32,32,32,32,32
+# The OpenCL.std imports rather than the native instructions — what LLVM's SPIR-V
+# backend actually emits: `sub_group_ballot`, `sub_group_reduce_add`, a 64-bit
+# `sub_group_broadcast`, and a reduce and a scan over 64-bit values, beside a
+# barrier and the pair. The answers are worked out by hand in the module: 0x55555555,
+# 496, 528, the prefix (l+1)(l+2)/2, and the counter in every slot.
+spvgpu atom64sub   atom64sub  --grid 32 --threads 32 --buffers 1,32,32,32,32,32,32,32
+# A `double` on a GPU with no fp64. Metal rejects the type, so the runtime carries it
+# in software — exact IEEE-754 over the 64-bit integers that do exist — and this row
+# is the proof: the cpu column computes with the host's own doubles and the two are
+# compared bit for bit, over multiply, add, divide, a catastrophic subtraction, the
+# four roundings, a trip through binary32, a comparison, a cast and a subgroup
+# reduction. The reduction's residual buffer must be zero in every lane.
+spvgpu fp64       fp64       --grid 32 --threads 32 --buffers 32,256,64,32
+# The kernel row proves the path end to end; this one proves each operation on its
+# own, over a value set per operation — every rounding, every comparison against
+# both signs and zero, subnormals, the extremes of the exponent range, and the
+# conversions in both directions, including the ones the specification leaves
+# undefined and which are therefore not compared. The reference is this machine's
+# own binary64, and the comparison is of the bits.
+if fp64_out="$(python3 tools/f64_check.py 2>&1)"; then
+  echo "ok    fp64:exact  $(printf '%s\n' "$fp64_out" | tail -1)"
+else
+  echo "FAIL  fp64:exact"
+  printf '%s\n' "$fp64_out" | tail -12 | sed 's/^/      /'
+  fail=1
+fi
 
 triton add    add_kernel    2 --grid 1024 --buffers 1024,1024,1024 --arg 0=1000
 triton matmul matmul_kernel 2 --grid 256  --buffers 2048,1024,1024
@@ -519,6 +572,20 @@ if python3 kernels/triton/wgmma_ref.py gen "$TMP/wa.bin" "$TMP/wb.bin" 2>"$TMP/w
   echo "ok    triton:wgmma  m64n8k16 f16 matches the reference exactly"
 else
   echo "FAIL  triton:wgmma"; sed 's/^/      /' "$TMP/wg.log"; fail=1
+fi
+
+# The same instruction with bf16 operands. The element is 16 bits either way, so
+# the core-matrix layout is the one above and only the decode changes — and the
+# reference can tell the two apart, because the same bits are different numbers
+# in f16 and in bf16.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wab.bin" "$TMP/wbb.bin" bf16 2>"$TMP/wgb.log" \
+   && "$WEFT" run kernels/triton/wgmma_bf16.ptx --kernel wgmma_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 512,64,512 \
+        --load 0="$TMP/wab.bin" --load 1="$TMP/wbb.bin" --dump 2="$TMP/wdb.bin" >>"$TMP/wgb.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wab.bin" "$TMP/wbb.bin" "$TMP/wdb.bin" bf16 >>"$TMP/wgb.log" 2>&1; then
+  echo "ok    triton:wgmma_bf16  m64n8k16 bf16 matches the reference exactly"
+else
+  echo "FAIL  triton:wgmma_bf16"; sed 's/^/      /' "$TMP/wgb.log"; fail=1
 fi
 
 # e5m2 is the other fp8 format and the same instruction: 5 exponent bits, 2
@@ -750,6 +817,24 @@ spvatom() {
   fi
 }
 spvatom
+
+# The same pair, but read and written as a whole value: a 64-bit atomic load and a
+# 64-bit atomic store, checked against arithmetic rather than against a twin
+# because no Metal kernel does this. Every lane reads A and writes A+1 to B, so B
+# ends at A+1 from its baseline. The module is named by path here so the inventory
+# at the end of this file can see that it is compared.
+# The answer is one, so it is checked as bytes: the dump's element width is the
+# launcher's business and a byte view does not depend on it. The module takes
+# `A - A + 1`, so the answer does not depend on what the buffer held either.
+"$WEFT" run kernels/spirv/atom64rw.spv --kernel atom64rw --cpu-only --grid 64 --threads 32 \
+    --buffers 1,1 --dump 1="$TMP/rw1.bin" >/dev/null
+rw_hex=$(od -An -tx1 -N8 "$TMP/rw1.bin" | tr -d ' \n')
+case "$rw_hex" in
+  0100000000000000|01000000)
+    echo "ok    spirv:atom64rw  64-bit atomic load and store: B = A + 1" ;;
+  *)
+    echo "FAIL  spirv:atom64rw  B reads $rw_hex, wanted the 64-bit one"; fail=1 ;;
+esac
 
 # 64-bit atomics whose old value is read back, checked against arithmetic: the
 # olds of `+= 1` are a permutation of 0..n-1, the olds of `max 1` on a counter that
@@ -1368,7 +1453,11 @@ for fx in kernels/*.ptx kernels/cuda/*.ptx kernels/triton/*.ptx kernels/spirv/*.
   case "$fx" in
     kernels/cuda/*)   if grep -qE "^nvptx +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
     kernels/triton/*) if grep -qE "^triton +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
-    kernels/spirv/*)  if grep -qE "^spvcross +[^ ]+ +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
+    kernels/spirv/*)  if grep -qE "^spvcross +[^ ]+ +$fxkey([[:space:]]|$)" "$self"; then continue; fi
+                      # An `spvgpu` line is a comparison of the module against
+                      # itself: the metal emitted from it against the C++ emitted
+                      # from the same decode. It names the fixture the same way.
+                      if grep -qE "^spvgpu +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
     *)                if grep -qE "^cross +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
   esac
   uncovered="$uncovered $fx"

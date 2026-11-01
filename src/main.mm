@@ -1041,14 +1041,41 @@ int main(int argc, char** argv) {
     // 64-bit atomic, a 64-bit float, a body only the warp back end has), which
     // the translator refuses by name, and a shader this host's compiler itself
     // fails on. Both are worth a line and neither is worth a wrong answer.
+    // Why the column is missing, when it is, and where the time went before it
+    // was. `WEFT_GPU_TRACE=1` writes one line per stage to stderr: this host's
+    // compiler service and its driver both fail in ways where only the stage names
+    // the fault, and a launch that never completes is not an answer either way.
+    const bool gpu_trace = std::getenv("WEFT_GPU_TRACE") != nullptr;
+    const double gpu_t0 = now_ms();
+    auto gpu_trace_at = [&](const char* what) {
+      if (gpu_trace) std::fprintf(stderr, "weft: gpu %8.3f ms  %s\n", now_ms() - gpu_t0, what);
+    };
+
+    // What the build check below already produced. It is the same source on the
+    // same device, so the launch reuses it rather than compiling it a second time:
+    // this host's compiler service dies on a shader now and then
+    // (XPC_ERROR_CONNECTION_INTERRUPTED), and asking it for the identical build
+    // twice per run is asking twice for the same chance to happen.
+    id<MTLDevice> probed_dev = nil;
+    id<MTLLibrary> probed_lib = nil;
+    id<MTLComputePipelineState> probed_pso = nil;
+    std::string probed_src;
     if (!o.cpu_only && !o.emit_gpu && (o.ptx || spv) && !tr.gpu_src.empty()) {
+      gpu_trace_at("build check: compiling the emitted source");
       id<MTLDevice> chk = MTLCreateSystemDefaultDevice();
       if (chk) {
         NSString* cs = [[NSString alloc] initWithBytes:tr.gpu_src.data()
                                                 length:tr.gpu_src.size()
                                               encoding:NSUTF8StringEncoding];
         MTLCompileOptions* co = [MTLCompileOptions new];
-        if (@available(macOS 15.0, *)) co.mathMode = MTLMathModeSafe;
+        if (@available(macOS 15.0, *)) {
+          co.mathMode = MTLMathModeSafe;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+          co.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+        }
         NSError* cerr = nil;
         id<MTLLibrary> clib = [chk newLibraryWithSource:cs options:co error:&cerr];
         id<MTLFunction> cfn = clib ? [clib newFunctionWithName:[NSString stringWithUTF8String:
@@ -1056,6 +1083,13 @@ int main(int argc, char** argv) {
                                    : nil;
         id<MTLComputePipelineState> cpso =
             cfn ? [chk newComputePipelineStateWithFunction:cfn error:&cerr] : nil;
+        if (cpso) {
+          probed_dev = chk;
+          probed_lib = clib;
+          probed_pso = cpso;
+          probed_src = tr.gpu_src;
+        }
+        gpu_trace_at(cpso ? "build check: the pipeline built" : "build check: the pipeline was refused");
         if (!cpso) {
           gpu_refusal = std::string("the metal backend cannot build '") + kern.name.c_str() +
                         "': " +
@@ -1128,7 +1162,19 @@ int main(int argc, char** argv) {
         copts.fastMathEnabled = NO;       // the same setting, before mathMode existed
 #pragma clang diagnostic pop
       }
-      id<MTLLibrary> mtllib = [dev newLibraryWithSource:ns options:copts error:&err];
+      // The build check above compiled this exact text on this exact device, so
+      // its library is the answer and there is nothing to ask the compiler for.
+      // Anything else — a `.metal` file, whose source is rewritten for the target,
+      // or a render pass, which appends a vertex stage — is compiled here.
+      const bool reuse_build = probed_pso != nil && probed_dev == dev && probed_src == gpu_src;
+      id<MTLLibrary> mtllib = reuse_build ? probed_lib : nil;
+      if (!mtllib) {
+        gpu_trace_at("compiling the source");
+        mtllib = [dev newLibraryWithSource:ns options:copts error:&err];
+        gpu_trace_at(mtllib ? "the library compiled" : "the library was refused");
+      } else {
+        gpu_trace_at("the library is the one the build check made");
+      }
       if (!mtllib) {
         std::fprintf(stderr, "weft: Metal could not compile the source: %s\n",
                      [[err localizedDescription] UTF8String]);
@@ -1172,9 +1218,14 @@ int main(int argc, char** argv) {
                        [[err localizedDescription] UTF8String]);
           return 1;
         }
+      } else if (reuse_build) {
+        pso = probed_pso;
+        gpu_trace_at("the pipeline is the one the build check made");
       } else {
         id<MTLFunction> fn = [mtllib newFunctionWithName:[NSString stringWithUTF8String:kern.name.c_str()]];
+        gpu_trace_at("creating the pipeline");
         pso = [dev newComputePipelineStateWithFunction:fn error:&err];
+        gpu_trace_at(pso ? "the pipeline was created" : "the pipeline was refused");
         if (!pso) {
           std::fprintf(stderr, "weft: pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
           return 1;
@@ -1270,6 +1321,14 @@ int main(int argc, char** argv) {
 
       double total = 0.0;
       for (uint32_t it = 0; it < o.bench + 1; it++) {
+        // A dispatch that never completes is asked once more, on a queue of its
+        // own: a queue runs its command buffers in submission order, so a wedged
+        // one would hold every later launch behind it. The buffers are reset from
+        // the pristine copy at the top below, so the second attempt starts from the
+        // same bytes the first one did and an accumulating kernel cannot count twice.
+        bool reissued = false;
+        int guard_ms = 120000;
+      again:
         for (size_t b = 0; b < nbind; b++)
           std::memcpy([mbuf[b] contents], pristine[b].data(), host[b].size() * sizeof(float));
         if (o.ptx || spv) {
@@ -1350,11 +1409,22 @@ int main(int argc, char** argv) {
               // run three warps the program does not have, and the CPU twin —
               // which launches `ceil(live/32)` warps — runs only the first.
               uint32_t per = std::max(1u, std::min(o.threads / 32u, warps));
+              // A kernel that relays between lanes has one slice of threadgroup
+              // memory per warp, and the translator sized that array: a wider
+              // group would put two warps in one slice, which is a wrong answer
+              // rather than a slow one. The bound is the kernel's, not a guess.
+              if (kern.slot_per) per = std::max(1u, std::min(per, kern.slot_per));
               // A wide kernel moves its atomics from one thread (see below), so its
               // group is one thread.
               if (kern.wide) per = 1u;
-              // A kernel that needs the 64-bit pair is one thread walking every
-              // warp, so it is dispatched once: one threadgroup of one thread.
+              // One warp per threadgroup was tried and is worse: at 128 warps it
+              // stops completing where four warps per group answers in 22 ms, so a
+              // group of one thread costs whatever the per-group `threadgroup`
+              // memory costs and buys nothing. The shared arena is not a reason to
+              // widen the dispatch either — it is zeroed before the body runs (see
+              // the emitter), so a warp cannot read a peer's half-written slice.
+              // A kernel that needs the 64-bit pair is walked by one thread — that
+              // is what gives the pair a single writer — so it is dispatched once.
               const bool one_walker = kern.wide && spv;
               uint64_t* cg = (uint64_t*)[geom_buf contents];
               cg[0] = o.grid;                   // lanes the kernel is written against
@@ -1372,16 +1442,47 @@ int main(int argc, char** argv) {
           [enc endEncoding];
         }
         [cb commit];
-        [cb waitUntilCompleted];
+        gpu_trace_at(reissued ? "the second launch is committed" : "the launch is committed");
+        // A dispatch the driver never finishes would block here for ever: poll, and
+        // drop the GPU column rather than hang the run.
+        // 120 s, not 30: the first dispatch of a kernel on this host compiles its
+        // pipeline lazily, and one launch of the wide 64-bit path was measured past
+        // 30 s while the same launch warm took 66 ms.
+        for (int spin = 0; spin < guard_ms; spin++) {
+          const MTLCommandBufferStatus st = cb.status;
+          if (st == MTLCommandBufferStatusCompleted || st == MTLCommandBufferStatusError)
+            break;
+          [NSThread sleepForTimeInterval:0.001];
+        }
         // A command buffer that did not complete left its work partly done, and a
         // partly-done dispatch reads as a wrong answer from the kernel rather than
         // as a failed launch. Say which it was.
         if (cb.status != MTLCommandBufferStatusCompleted) {
-          std::fprintf(stderr, "weft: the gpu did not complete this dispatch: %s\n",
-                       cb.error ? cb.error.localizedDescription.UTF8String
-                                : "no error reported");
+          if (!reissued) {
+            // The launch has been seen never to finish while the same dispatch in a
+            // second process answers in milliseconds, so this is one more question,
+            // not a longer wait: a fresh queue, a fresh command buffer, the same
+            // bindings, and a shorter guard because a real hang hangs twice.
+            gpu_trace_at("the dispatch did not complete; issuing it again on a new queue");
+            reissued = true;
+            guard_ms = 20000;
+            q = [dev newCommandQueue];
+            goto again;
+          }
+          gpu_trace_at("the dispatch did not complete a second time");
+          // A dispatch the driver never finished is not an answer: its buffers still
+          // hold whatever the last launch left there, and comparing those bytes
+          // reported the kernel as wrong. This host's first dispatch of a kernel
+          // compiles its pipeline lazily and can be far slower than the launch, so
+          // say the launch is missing rather than that the kernel disagrees.
+          gpu_refusal = std::string("the gpu did not complete the dispatch: ") +
+                        (cb.error ? cb.error.localizedDescription.UTF8String
+                                  : "no error reported");
+          std::fprintf(stderr, "weft: %s\n", gpu_refusal.c_str());
+          break;
         }
 
+        gpu_trace_at("the dispatch completed");
         double d = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         if (it > 0) {
           total += d;
@@ -1390,18 +1491,20 @@ int main(int argc, char** argv) {
       }
       gpu_avg = total / (double)o.bench;
 
-      for (size_t b = 0; b < nbind; b++) {
-        gpu_out[b].resize(host[b].size());
-        std::memcpy(gpu_out[b].data(), [mbuf[b] contents], host[b].size() * sizeof(float));
+      if (gpu_refusal.empty()) {
+        for (size_t b = 0; b < nbind; b++) {
+          gpu_out[b].resize(host[b].size());
+          std::memcpy(gpu_out[b].data(), [mbuf[b] contents], host[b].size() * sizeof(float));
+        }
+        if (o.render) {
+          gpu_out[colour_idx].assign(host[colour_idx].size(), 0.0f);
+          [target getBytes:gpu_out[colour_idx].data()
+               bytesPerRow:(NSUInteger)o.rw * 4 * sizeof(float)
+                fromRegion:MTLRegionMake2D(0, 0, o.rw, o.rh)
+               mipmapLevel:0];
+        }
       }
-      if (o.render) {
-        gpu_out[colour_idx].assign(host[colour_idx].size(), 0.0f);
-        [target getBytes:gpu_out[colour_idx].data()
-             bytesPerRow:(NSUInteger)o.rw * 4 * sizeof(float)
-              fromRegion:MTLRegionMake2D(0, 0, o.rw, o.rh)
-             mipmapLevel:0];
-      }
-      gpu_ran = true;
+      gpu_ran = gpu_refusal.empty();
     }
 #else
     if (!o.cpu_only) {

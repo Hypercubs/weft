@@ -822,15 +822,19 @@ std::string rewrite_group_ops(const std::string& body, bool& found, bool& lanes,
           err = std::string(op.name) + " takes one value";
           return body;
         }
+        // The last argument is this call site's number: every lane of a warp
+        // walks the same tree here, so the runtime computes it once and the
+        // other 31 lanes read their entry. A site number (not the pass alone)
+        // keeps two different scans in one pass from answering for each other.
         out += "(co_await weft::prefix(ctx, (" + trim(a[0]) + "), " + inc + ", " + prod + ", " +
-               width + "))";
+               width + ", " + std::to_string((unsigned long long)i + 1ull) + "u))";
       } else if (kind == "reduce") {
         if (a.size() != 1) {
           err = std::string(op.name) + " takes one value";
           return body;
         }
         out += "(co_await weft::grp_reduce(ctx, (" + trim(a[0]) + "), " + op.mode + ", " +
-               width + "))";
+               width + ", " + std::to_string((unsigned long long)i + 1ull) + "u))";
       } else {
         if (a.size() != 1) {
           err = std::string(op.name) + " takes one predicate";

@@ -15,14 +15,32 @@
 //   - a barrier is a real threadgroup barrier instead of `save pc, return`;
 //   - threadgroup memory is a `threadgroup` array instead of a shared arena;
 //   - a 64-bit atomic does not exist on this host (tools/atom64_probe.mm), so one
-//     is built from the 32-bit atomics there are: a lock over the two halves. That
-//     lock has no ordering to stand on — metal_types declares `memory_order_relaxed`
-//     and nothing else — so a payload store can escape the unlock and a peer can
-//     read a torn pair. The warp back end is exact with it (one thread owns all 32
-//     lanes, and every access is an atomic from that one thread); the per-lane back
-//     end measured wrong at 65,536 lanes in both shapes it was tried, so it refuses
-//     those by name and keeps only the shape that needs no ordering at all — a
-//     reduction, which is two 32-bit atomics.
+//     is built from the 32-bit atomics there are: a lock over the two halves.
+//     What bounds that lock is a measurement, and it is one measurement because
+//     the four before it were the harness (tools/lock_probe.mm):
+//
+//       Everything the case touches is in one buffer, so no argument can be
+//       misbound, and the kernel writes back the numbers it read so the host
+//       checks them instead of inferring them. The same kernel, the same
+//       bindings, one thread per threadgroup, 2,048 lanes of work:
+//
+//         control   no lock at all                        counter exact
+//         lone      the lock taken and dropped, 1 thread   counter exact, lock
+//                                                          left at 0
+//         locked    32 threads contending on that word     never returns
+//
+//       The only difference between `lone` and `locked` is that a second thread
+//       wants the word, so the lock word is right, the launch is right, and the
+//       wait is what does not end. It does not end with a bare
+//       compare-exchange spin either, or with a device fence in the critical
+//       section: a thread that waits for another thread's release is not
+//       scheduled again here.
+//
+//     That is why the pair has one writer rather than a lock: the warp back end
+//     is exact because one thread owns all 32 lanes and every access is an atomic
+//     from that one thread, and the per-lane back end refuses a pair it would
+//     have to lock and keeps the shape that needs no lock — a reduction, which is
+//     two 32-bit atomics.
 //
 // Everything here is `static inline` in one translation unit, so the compiler
 // inlines the helpers into the kernel and constant-folds the mode switches.
@@ -49,6 +67,407 @@ static inline uint32_t weft_bitrev32(uint32_t v) {
   return (v >> 16) | (v << 16);
 }
 static inline uint16_t weft_h16_bits(float x) { return as_type<uint16_t>((_Float16)x); }
+
+// A double on this target is its bit pattern: the type itself does not exist here,
+// so the constant spelling the emitter uses for one hands the bits back unchanged.
+static inline uint64_t weft_f64(uint64_t b) { return b; }
+
+// ---- 64-bit floating point, over the integers ----
+//
+// Apple GPUs have no fp64 and Metal rejects the type outright, so a kernel carrying a
+// `double` cannot be compiled at all — that is the language, not a missing lowering.
+// Software is how every GPU without fp64 carries one, and this is that: a double is
+// its bits in a `uint64_t` (which is the type the emitter gives it), and every
+// operation here is exact IEEE-754 binary64, round-to-nearest-even, subnormals
+// included. Exactness is the requirement rather than a nicety: the CPU column runs
+// the same kernel with the host's own doubles, and the two are compared bit for bit.
+//
+// One working form is shared by everything below:
+//
+//     value = sig * 2^(e - 55)
+//
+// `e` is the unbiased exponent and `sig` is an integer whose bit 55 is the leading
+// bit, the sign being carried separately. The low three bits of `sig` are guard,
+// round and sticky, so one rounding at the end is enough: `round_pack` does it, and
+// each operation only has to produce that form exactly.
+namespace weft_fp64 {
+
+constant uint64_t kSign = 0x8000000000000000ull;
+constant uint64_t kExpMask = 0x7FF0000000000000ull;
+constant uint64_t kFracMask = 0x000FFFFFFFFFFFFFull;
+constant uint64_t kHidden = 0x0010000000000000ull;
+// The leading bit of the working form. It is not `kHidden`: that is bit 52, the
+// significand's leading bit in the *encoding*, and the working form carries three
+// spare bits below it, so its leading bit sits at 55. Normalizing on the wrong one
+// is an infinite loop, because a value whose low bits are zero can never set bit 52
+// by shifting left.
+constant uint64_t kLead = 0x0080000000000000ull;
+constant uint64_t kInf = 0x7FF0000000000000ull;
+constant uint64_t kQNaN = 0x7FF8000000000000ull;
+// The leading-zero count of a 64-bit value, in 32-bit halves. `__builtin_clzll` is
+// what this host's compiler dies on — at pipeline creation, with
+// XPC_ERROR_CONNECTION_INTERRUPTED and nothing else — and the 32-bit builtin is
+// fine, so the wide one is spelled out of the narrow one. Measured with
+// tools/msl_bisect.py: the two helpers that used it were the only ones of sixteen
+// that failed to build.
+static inline uint32_t clz64(uint64_t v) {
+  const uint32_t hi = (uint32_t)(v >> 32);
+  if (hi != 0u) return (uint32_t)__builtin_clz(hi);
+  return 32u + (uint32_t)__builtin_clz((uint32_t)(v & 0xFFFFFFFFu));
+}
+
+constant uint64_t kOne = 0x3FF0000000000000ull;
+constant uint64_t kNegOne = 0xBFF0000000000000ull;
+constant uint64_t kHalf = 0x3FE0000000000000ull;
+
+static inline bool is_nan(uint64_t b) {
+  return (b & kExpMask) == kExpMask && (b & kFracMask) != 0ull;
+}
+static inline bool is_inf(uint64_t b) { return (b & ~kSign) == kInf; }
+static inline bool is_zero(uint64_t b) { return (b & ~kSign) == 0ull; }
+static inline uint64_t neg(uint64_t b) { return b ^ kSign; }
+static inline uint64_t abs_bits(uint64_t b) { return b & ~kSign; }
+
+// The working form. A subnormal is normalized here — it has fewer than 53
+// significant bits, so shifting it up loses nothing and every operation below can
+// then be written once.
+static inline void unpack(uint64_t b, thread int32_t& e, thread uint64_t& sig) {
+  const int32_t be = (int32_t)((b >> 52) & 0x7FF);
+  const uint64_t f = b & kFracMask;
+  if (be == 0) {
+    e = -1022;
+    sig = f << 3;
+    if (sig == 0ull) return;
+    while ((sig & kLead) == 0ull) { sig <<= 1; e -= 1; }
+  } else {
+    e = be - 1023;
+    sig = (f | kHidden) << 3;
+  }
+}
+
+// Round the working form into a pattern. A result below the normal range has a
+// quantum of 2^-1074, so the significand is shifted down before the same three-bit
+// rounding applies; that shift is the whole difference between the two cases.
+static inline uint64_t round_pack(uint32_t sign, int32_t e, uint64_t sig) {
+  const uint64_t sgn = sign ? kSign : 0ull;
+  if (sig == 0ull) return sgn;
+  const bool sub = e < -1022;
+  if (sub) {
+    const int32_t k = -1022 - e;
+    if (k >= 64) {
+      sig = 1u;  // every bit is below the last place, so the value is tiny and sticky
+    } else {
+      const uint64_t lost = sig & ((1ull << k) - 1ull);
+      sig = (sig >> k) | ((lost != 0ull) ? 1u : 0u);
+    }
+  }
+  const uint64_t s = sig & 1ull;
+  const uint64_t r = (sig >> 1) & 1ull;
+  const uint64_t g = (sig >> 2) & 1ull;
+  sig >>= 3;
+  if (g && (r || s || (sig & 1ull))) sig += 1ull;  // nearest, ties to even
+  if (sub) return sgn | sig;  // fraction only; a carry out of bit 52 is the smallest
+                              // normal, which those same bits already spell
+  int32_t be = e + 1023;
+  if (sig == (1ull << 53)) { sig >>= 1; be += 1; }
+  if (be >= 2047) return sgn | kInf;
+  return sgn | ((uint64_t)be << 52) | (sig & kFracMask);
+}
+
+static inline uint64_t add(uint64_t a, uint64_t b) {
+  if (is_nan(a) || is_nan(b)) return kQNaN;
+  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
+  const uint32_t ea = (uint32_t)((a >> 52) & 0x7FF), eb = (uint32_t)((b >> 52) & 0x7FF);
+  if (ea == 0x7FF) return (eb == 0x7FF && sa != sb) ? kQNaN : a;  // inf + -inf
+  if (eb == 0x7FF) return b;
+  if (is_zero(a) && is_zero(b)) return (sa == sb) ? a : 0ull;    // (+0) + (-0) = +0
+  if (is_zero(a)) return b;
+  if (is_zero(b)) return a;
+  int32_t ua, ub;
+  uint64_t Ma, Mb;
+  unpack(a, ua, Ma);
+  unpack(b, ub, Mb);
+  // Order by magnitude, so the only shifting is the smaller operand coming down.
+  const bool a_bigger = (ua > ub) || (ua == ub && Ma >= Mb);
+  const uint32_t sign = a_bigger ? sa : sb;
+  uint64_t big = a_bigger ? Ma : Mb;
+  uint64_t small = a_bigger ? Mb : Ma;
+  int32_t e = a_bigger ? ua : ub;
+  const int32_t d = a_bigger ? (ua - ub) : (ub - ua);
+  if (d > 0) {
+    if (d >= 64) {
+      small = 1u;  // nothing of it survives except the fact that it was not zero
+    } else {
+      const uint64_t lost = small & ((1ull << d) - 1ull);
+      small = (small >> d) | ((lost != 0ull) ? 1u : 0u);
+    }
+  }
+  uint64_t sum;
+  uint32_t out_sign = sign;
+  if (sa == sb) {
+    sum = big + small;
+  } else if (big > small) {
+    sum = big - small;
+  } else if (small > big) {
+    sum = small - big;
+    out_sign = a_bigger ? sb : sa;  // the larger magnitude was the negative one
+  } else {
+    return 0ull;  // equal magnitudes, opposite signs: +0 in round-to-nearest
+  }
+  if (sum >= (1ull << 56)) {
+    sum = (sum >> 1) | (sum & 1ull);  // keep the bit that leaves bit 0 as sticky
+    e += 1;
+  }
+  while ((sum & kLead) == 0ull) { sum <<= 1; e -= 1; }
+  return round_pack(out_sign, e, sum);
+}
+
+static inline uint64_t sub(uint64_t a, uint64_t b) { return add(a, neg(b)); }
+
+static inline uint64_t mul(uint64_t a, uint64_t b) {
+  if (is_nan(a) || is_nan(b)) return kQNaN;
+  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
+  const uint32_t sign = sa ^ sb;
+  const uint32_t ea = (uint32_t)((a >> 52) & 0x7FF), eb = (uint32_t)((b >> 52) & 0x7FF);
+  const bool za = is_zero(a), zb = is_zero(b);
+  if (ea == 0x7FF || eb == 0x7FF) {
+    if (za || zb) return kQNaN;  // an infinity times a zero
+    return (sign ? kSign : 0ull) | kInf;
+  }
+  if (za || zb) return sign ? kSign : 0ull;
+  int32_t ua, ub;
+  uint64_t ma, mb;
+  unpack(a, ua, ma);
+  unpack(b, ub, mb);
+  // The product of two 56-bit significands needs 112 bits, so it is built from
+  // 32-bit halves, and the top of it is shifted down with a sticky bit.
+  const uint64_t p0 = (ma & 0xFFFFFFFFull) * (mb & 0xFFFFFFFFull);
+  const uint64_t p1 = (ma >> 32) * (mb & 0xFFFFFFFFull);
+  const uint64_t p2 = (ma & 0xFFFFFFFFull) * (mb >> 32);
+  const uint64_t p3 = (ma >> 32) * (mb >> 32);
+  const uint64_t mid = (p0 >> 32) + (p1 & 0xFFFFFFFFull) + (p2 & 0xFFFFFFFFull);
+  const uint64_t lo = (mid << 32) | (p0 & 0xFFFFFFFFull);
+  const uint64_t hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+  const int32_t lead = hi ? (127 - (int32_t)clz64(hi)) : (63 - (int32_t)clz64(lo));
+  const int32_t sh = lead - 55;  // at most 57 for a product this wide
+  uint64_t sig = (hi << (64 - sh)) | (lo >> sh);
+  const uint64_t lost = lo & ((1ull << sh) - 1ull);
+  sig |= (lost != 0ull) ? 1ull : 0ull;
+  // value(a) = m_a * 2^(ua-52) and P = (m_a<<3) * (m_b<<3), so
+  // value(a)*value(b) = P * 2^(ua+ub-110) = sig * 2^(sh+ua+ub-110), and the working
+  // form is sig * 2^(e-55): e = sh + ua + ub - 55.
+  return round_pack(sign, sh + ua + ub - 55, sig);
+}
+
+static inline uint64_t div(uint64_t a, uint64_t b) {
+  if (is_nan(a) || is_nan(b)) return kQNaN;
+  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
+  const uint32_t sign = sa ^ sb;
+  const uint32_t ea = (uint32_t)((a >> 52) & 0x7FF), eb = (uint32_t)((b >> 52) & 0x7FF);
+  if (ea == 0x7FF) return (eb == 0x7FF) ? kQNaN : ((sign ? kSign : 0ull) | kInf);
+  if (eb == 0x7FF) return sign ? kSign : 0ull;  // a finite value over an infinity
+  if (is_zero(b)) return is_zero(a) ? kQNaN : ((sign ? kSign : 0ull) | kInf);
+  if (is_zero(a)) return sign ? kSign : 0ull;
+  int32_t ua, ub;
+  uint64_t ma, mb;
+  unpack(a, ua, ma);
+  unpack(b, ub, mb);
+  // Long division of the significands: 55 quotient bits, and whatever is left over
+  // is below the last of them, which is exactly the sticky bit.
+  uint64_t q = 0ull, r = ma;
+  if (r >= mb) { r -= mb; q = 1ull; }  // the quotient is at least one
+  for (int32_t i = 0; i < 54; i++) {
+    q <<= 1;
+    r <<= 1;
+    if (r >= mb) { r -= mb; q |= 1ull; }
+  }
+  // The quotient is in [2^54, 2^55) when the dividend's significand is the larger
+  // and [2^53, 2^54) when it is not, so the leading bit belongs at 55 — and the
+  // sticky bit goes in only after that shift, or it would move with it.
+  uint64_t sig = q << 1;
+  int32_t e = ua - ub;
+  while ((sig & kLead) == 0ull) { sig <<= 1; e -= 1; }
+  if (r != 0ull) sig |= 1ull;
+  return round_pack(sign, e, sig);
+}
+
+static inline bool eq(uint64_t a, uint64_t b) {
+  if (is_nan(a) || is_nan(b)) return false;
+  if (is_zero(a) && is_zero(b)) return true;  // +0 and -0 are equal
+  return a == b;                             // with no NaNs, equal bits are equal values
+}
+static inline bool ne(uint64_t a, uint64_t b) { return !eq(a, b); }
+static inline bool lt(uint64_t a, uint64_t b) {
+  if (is_nan(a) || is_nan(b)) return false;
+  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
+  if (is_zero(a) && is_zero(b)) return false;
+  if (sa != sb) return sa != 0u;  // a negative value is below a positive one
+  const uint64_t ma = a & ~kSign, mb = b & ~kSign;
+  return sa ? (ma > mb) : (ma < mb);
+}
+static inline bool le(uint64_t a, uint64_t b) { return lt(a, b) || eq(a, b); }
+static inline bool gt(uint64_t a, uint64_t b) { return lt(b, a); }
+static inline bool ge(uint64_t a, uint64_t b) { return le(b, a); }
+
+// minNum and maxNum: a NaN operand means the other one, and two NaNs mean a NaN.
+// Of two zeros the negative one is the smaller, which is the order IEEE gives them.
+static inline uint64_t min_bits(uint64_t a, uint64_t b) {
+  if (is_nan(a)) return is_nan(b) ? kQNaN : b;
+  if (is_nan(b)) return a;
+  if (is_zero(a) && is_zero(b)) return (a & kSign) ? a : b;
+  return lt(a, b) ? a : b;
+}
+static inline uint64_t max_bits(uint64_t a, uint64_t b) {
+  if (is_nan(a)) return is_nan(b) ? kQNaN : b;
+  if (is_nan(b)) return a;
+  if (is_zero(a) && is_zero(b)) return (a & kSign) ? b : a;
+  return gt(a, b) ? a : b;
+}
+
+static inline uint64_t from_u64(uint64_t m) {
+  if (m == 0ull) return 0ull;
+  const int32_t lead = 63 - (int32_t)clz64(m);
+  uint64_t sig;
+  if (lead <= 55) {
+    sig = m << (55 - lead);
+  } else {
+    const int32_t sh = lead - 55;
+    const uint64_t lost = m & ((1ull << sh) - 1ull);
+    sig = (m >> sh) | ((lost != 0ull) ? 1ull : 0ull);
+  }
+  return round_pack(0u, lead, sig);
+}
+static inline uint64_t from_i64(int64_t x) {
+  if (x == 0) return 0ull;
+  const uint32_t sign = x < 0 ? 1u : 0u;
+  const uint64_t m = x < 0 ? ((uint64_t)(-(x + 1)) + 1ull) : (uint64_t)x;
+  const int32_t lead = 63 - (int32_t)clz64(m);
+  uint64_t sig;
+  if (lead <= 55) {
+    sig = m << (55 - lead);
+  } else {
+    const int32_t sh = lead - 55;
+    const uint64_t lost = m & ((1ull << sh) - 1ull);
+    sig = (m >> sh) | ((lost != 0ull) ? 1ull : 0ull);
+  }
+  return round_pack(sign, lead, sig);
+}
+// Toward zero, which is what a cast does. Out-of-range and NaN are undefined in
+// SPIR-V; this saturates rather than trapping, so two targets cannot disagree by
+// accident of the host's conversion.
+static inline uint64_t to_u64(uint64_t b) {
+  if (is_nan(b)) return 0ull;
+  const uint32_t sign = (uint32_t)(b >> 63);
+  if (is_inf(b)) return sign ? 0ull : ~0ull;
+  if (is_zero(b)) return 0ull;
+  int32_t e;
+  uint64_t sig;
+  unpack(b, e, sig);
+  if (e < 0) return 0ull;
+  uint64_t m;
+  if (e >= 55) {
+    if (e >= 119) return sign ? 0ull : ~0ull;
+    m = sig << (e - 55);
+  } else {
+    m = sig >> (55 - e);
+  }
+  return sign ? (0ull - m) : m;
+}
+static inline int64_t to_i64(uint64_t b) {
+  if (is_nan(b)) return 0;
+  const bool negative = (b >> 63) != 0ull;
+  const uint64_t m = to_u64(b & ~kSign);
+  if (m > 0x8000000000000000ull) return negative ? (-0x7FFFFFFFFFFFFFFF - 1) : 0x7FFFFFFFFFFFFFFF;
+  if (m == 0x8000000000000000ull) return negative ? (-0x7FFFFFFFFFFFFFFF - 1) : 0x7FFFFFFFFFFFFFFF;
+  return negative ? -(int64_t)m : (int64_t)m;
+}
+
+static inline uint64_t from_f32(uint32_t fb) {
+  const uint32_t sign = (fb >> 31) & 1u;
+  const uint32_t be = (fb >> 23) & 0xFFu;
+  const uint32_t f = fb & 0x7FFFFFu;
+  if (be == 0xFFu) return ((uint64_t)sign << 63) | kInf | ((uint64_t)f << 29);
+  if (be == 0u) {
+    if (f == 0u) return (uint64_t)sign << 63;
+    int32_t e = -126;
+    uint32_t m = f;
+    while ((m & 0x800000u) == 0u) { m <<= 1; e -= 1; }
+    return round_pack(sign, e, (uint64_t)m << 32);
+  }
+  return round_pack(sign, (int32_t)be - 127, ((uint64_t)(f | 0x800000u)) << 32);
+}
+
+// Round into binary32: same working form, twenty-nine fewer significand bits, and
+// binary32's own bias and subnormal floor.
+static inline uint32_t round_pack32(uint32_t sign, int32_t e, uint64_t sig) {
+  const uint32_t sgn = sign << 31;
+  if (sig == 0ull) return sgn;
+  const bool sub = e < -126;
+  if (sub) {
+    const int32_t k = -126 - e;
+    if (k >= 64) {
+      sig = 1u;
+    } else {
+      const uint64_t lost = sig & ((1ull << k) - 1ull);
+      sig = (sig >> k) | ((lost != 0ull) ? 1u : 0u);
+    }
+  }
+  const uint64_t lost2 = sig & ((1ull << 29) - 1ull);
+  sig = (sig >> 29) | ((lost2 != 0ull) ? 1u : 0ull);
+  const uint64_t s = sig & 1ull, r = (sig >> 1) & 1ull, g = (sig >> 2) & 1ull;
+  sig >>= 3;
+  if (g && (r || s || (sig & 1ull))) sig += 1ull;
+  if (sub) {
+    if (sig >= (1ull << 23)) return sgn | 0x00800000u;  // the smallest normal
+    return sgn | (uint32_t)sig;
+  }
+  int32_t be = e + 127;
+  if (sig == (1ull << 24)) { sig >>= 1; be += 1; }
+  if (be >= 255) return sgn | 0x7F800000u;
+  return sgn | ((uint32_t)be << 23) | ((uint32_t)sig & 0x7FFFFFu);
+}
+
+static inline uint32_t to_f32(uint64_t b) {
+  const uint32_t sign = (uint32_t)(b >> 63);
+  if (is_nan(b)) return (sign << 31) | 0x7FC00000u;
+  if (is_inf(b)) return (sign << 31) | 0x7F800000u;
+  if (is_zero(b)) return sign << 31;
+  int32_t e;
+  uint64_t sig;
+  unpack(b, e, sig);
+  return round_pack32(sign, e, sig);
+}
+
+// Toward zero: the fraction bits below the binary point go. Everything from a value
+// already integral to an infinity is its own answer.
+static inline uint64_t trunc_bits(uint64_t b) {
+  if (is_nan(b) || is_inf(b)) return b;
+  const uint32_t be = (uint32_t)((b >> 52) & 0x7FF);
+  if (be < 1023u) return b & kSign;  // |x| < 1 has no integer part
+  const int32_t e = (int32_t)be - 1023;
+  if (e >= 52) return b;
+  return b & ~((1ull << (52 - e)) - 1ull);
+}
+static inline uint64_t floor_bits(uint64_t b) {
+  const uint64_t t = trunc_bits(b);
+  if (is_nan(b) || is_inf(b) || t == b) return t;
+  return ((b >> 63) != 0ull) ? add(t, kNegOne) : t;
+}
+static inline uint64_t ceil_bits(uint64_t b) {
+  const uint64_t t = trunc_bits(b);
+  if (is_nan(b) || is_inf(b) || t == b) return t;
+  return ((b >> 63) == 0ull) ? add(t, kOne) : t;
+}
+// GLSL's Round: to the nearest integer, ties away from zero.
+static inline uint64_t round_bits(uint64_t b) {
+  if (is_nan(b) || is_inf(b)) return b;
+  const uint64_t t = trunc_bits(b);
+  const uint64_t frac = sub(abs_bits(b), abs_bits(t));
+  if (ge(frac, kHalf)) return add(t, ((b >> 63) != 0ull) ? kNegOne : kOne);
+  return t;
+}
+
+}  // namespace weft_fp64
 static inline float weft_h16(uint32_t b, int i) {
   return (float)as_type<_Float16>((uint16_t)(b >> (16 * i)));
 }
@@ -522,15 +941,27 @@ static inline device uint32_t* lock_of(device uint32_t* locks, device const void
 // reads before trying again. Writing every time is what makes the line ping-pong
 // between thousands of waiters, and retrying in step is what let one waiter lose
 // for minutes.
+//
+// Every operation here is `memory_order_relaxed`, because this host's metal_atomic
+// constrains all of them to it. Ordering is not the obstacle — a device-scope
+// `atomic_thread_fence` exists and a relaxed store from one threadgroup is seen by
+// a waiter in another (tools/lock_probe.mm measures both). The obstacle is
+// progress: a lane that wins this section cannot run it until the other lanes in
+// its warp leave the spin loop, and they cannot leave until it releases, because a
+// warp is one program counter. A threadgroup of one thread does not dodge that
+// either — such threadgroups are co-scheduled into one warp and deadlock across
+// each other. So the lock is only taken where at most one lane per warp can ever
+// wait, which is the single-writer walk the 64-bit pair uses; a per-lane section
+// under contention cannot complete on this hardware, and the translator refuses
+// that shape by name rather than emit something that hangs.
 static inline void lock_take(device uint32_t* l) {
   device atomic_uint* a = (device atomic_uint*)l;
   uint32_t wait = 1u;
-  uint32_t expect = 0u;
   for (;;) {
+    uint32_t expect = 0u;
     if (atomic_compare_exchange_weak_explicit(a, &expect, 1u, memory_order_relaxed,
                                              memory_order_relaxed))
       return;
-    expect = 0u;
     uint32_t spins = wait + ((uint32_t)(uintptr_t)l & 7u);
     while (spins != 0u && atomic_load_explicit(a, memory_order_relaxed) != 0u) spins--;
     wait = wait < 64u ? wait * 2u : 64u;
@@ -540,22 +971,58 @@ static inline void lock_drop(device uint32_t* l) {
   atomic_store_explicit((device atomic_uint*)l, 0u, memory_order_relaxed);
 }
 
+// The pair is assembled through a `uint2` and `as_type`, not `(hi << 32) | lo`.
+// That is measured: the shift-and-or of two atomic half-reads is a construct this
+// host's pipeline compiler dies on as soon as it sits in a kernel with a barrier
+// (XPC_ERROR_CONNECTION_INTERRUPTED at pipeline creation, 3/3 runs), and the same
+// loads joined with `as_type<uint64_t>(uint2{lo, hi})` pipeline. The two are the
+// same bits, and tools/msl_bisect.py walks the variants if the compiler changes.
 static inline uint64_t load64(device uint64_t* p) {
   device atomic_uint* a = (device atomic_uint*)p;
   const uint32_t lo = atomic_load_explicit(a, memory_order_relaxed);
   const uint32_t hi = atomic_load_explicit(a + 1, memory_order_relaxed);
-  return ((uint64_t)hi << 32) | (uint64_t)lo;
+  return as_type<uint64_t>(uint2{lo, hi});
 }
 static inline int64_t load64(device int64_t* p) {
   return as_type<int64_t>(load64((device uint64_t*)p));
 }
+// The halves come out of a `uint2` for the reason load64 states: a 64-bit shift
+// feeding an atomic store is the same shape that takes the compiler down here.
 static inline void store64(device uint64_t* p, uint64_t v) {
   device atomic_uint* a = (device atomic_uint*)p;
-  atomic_store_explicit(a, (uint32_t)v, memory_order_relaxed);
-  atomic_store_explicit(a + 1, (uint32_t)(v >> 32), memory_order_relaxed);
+  const uint2 w = as_type<uint2>(v);
+  atomic_store_explicit(a, w.x, memory_order_relaxed);
+  atomic_store_explicit(a + 1, w.y, memory_order_relaxed);
 }
 static inline void store64(device int64_t* p, int64_t v) {
   store64((device uint64_t*)p, as_type<uint64_t>(v));
+}
+
+// ---- the relay a vote needs when one thread owns all 32 lanes ----
+//
+// A warp kernel's lanes are this thread's data, so a vote is a rendezvous with
+// itself: every lane publishes into the warp's slot array, the dispatch brings the
+// lanes back, and the answer is folded over the slots. `mask` is the lanes that
+// exist, because the last warp of a group is short when the lane count is not a
+// multiple of 32 and the slots of lanes that never ran hold nothing.
+//
+// The array is threadgroup memory rather than thread memory on purpose: a
+// loop-carried value over a thread array is the shape this host's compiler dies on
+// (see load64 above), and a fold over memory is not.
+static inline uint32_t slot_ballot(threadgroup const uint32_t* s, uint32_t mask) {
+  uint32_t m = 0u;
+  for (uint32_t i = 0u; i < 32u; i++)
+    if (((mask >> i) & 1u) != 0u && (s[i] & 1u) != 0u) m |= 1u << i;
+  return m;
+}
+static inline uint32_t slot_all_equal(threadgroup const uint32_t* s, uint32_t mask) {
+  uint32_t base = 0u, seen = 0u, same = 1u;
+  for (uint32_t i = 0u; i < 32u; i++) {
+    if (((mask >> i) & 1u) == 0u) continue;
+    if (seen == 0u) { base = s[i]; seen = 1u; }
+    else if (s[i] != base) same = 0u;
+  }
+  return same;
 }
 
 // A comparison and a select on the pair are written as two 32-bit words, and that
@@ -599,6 +1066,50 @@ static inline int64_t pick_s64(int64_t o, int64_t v, uint32_t take) {
     lock_drop(l);                                                           \
     return o;                                                               \
   }
+// ...and the same update for a caller that is the only writer.
+//
+// The warp body that moves a 64-bit pair is one thread for the whole launch, so
+// nothing else touches the word while it runs: a plain 64-bit load and store is
+// the whole operation, and it is one access instead of the four device-scope
+// atomics `_raw` needs. Dispatches are serial, so this is also correct across
+// them.
+#define WEFT_RMW_SOLO(name, T, expr)                    \
+  static inline T rmw_##name##_solo(device T* p, T v) { \
+    const T o = *p;                                     \
+    *p = (expr);                                        \
+    return o;                                           \
+  }
+#define WEFT_RMW_ALL_SOLO(MACRO)                  \
+  MACRO(add, uint64_t, o + v)                     \
+  MACRO(sub, uint64_t, o - v)                     \
+  MACRO(min, uint64_t, (o < v ? o : v))           \
+  MACRO(max, uint64_t, (o > v ? o : v))           \
+  MACRO(and, uint64_t, o & v)                     \
+  MACRO(or, uint64_t, o | v)                      \
+  MACRO(xor, uint64_t, o ^ v)                     \
+  MACRO(exch, uint64_t, v)                        \
+  MACRO(min, int64_t, (o < v ? o : v))            \
+  MACRO(max, int64_t, (o > v ? o : v))            \
+  MACRO(add, int64_t, o + v)                      \
+  MACRO(sub, int64_t, o - v)                      \
+  MACRO(and, int64_t, o & v)                      \
+  MACRO(or, int64_t, o | v)                       \
+  MACRO(xor, int64_t, o ^ v)                      \
+  MACRO(exch, int64_t, v)
+WEFT_RMW_ALL_SOLO(WEFT_RMW_SOLO)
+#undef WEFT_RMW_ALL_SOLO
+#undef WEFT_RMW_SOLO
+static inline uint64_t rmw_cas_solo(device uint64_t* p, uint64_t c, uint64_t v) {
+  const uint64_t o = *p;
+  if (o == c) *p = v;
+  return o;
+}
+static inline int64_t rmw_cas_solo(device int64_t* p, int64_t c, int64_t v) {
+  const int64_t o = *p;
+  if (o == c) *p = v;
+  return o;
+}
+
 // ...and the same update for a caller that already holds one.
 #define WEFT_RMW_RAW(name, T, expr)        \
   static inline T rmw_##name##_raw(device T* p, T v) { \
@@ -658,6 +1169,42 @@ static inline int64_t rmw_cas_raw(device int64_t* p, int64_t c, int64_t v) {
   if (eq_bits64(as_type<uint64_t>(o), as_type<uint64_t>(c))) store64(p, v);
   return o;
 }
+// A 64-bit read-modify-write when this thread is the only one touching the word.
+//
+// The walk that owns the launch also owns the word, so the value can live in a
+// local between the sites that use it and reach the buffer twice per launch
+// instead of twice per lane — and each of those trips is an L2 round trip. The
+// old value is still handed back in program order, so the sequence both engines
+// see is the same one; the emitter only takes this form when nothing else in the
+// kernel reads that binding, which is what makes the local a copy rather than a
+// cache.
+#define WEFT_SH64(name, T, expr)                                              \
+  static inline T sh64_##name(thread T& slot, T v) {                          \
+    const T o = slot;                                                         \
+    slot = (expr);                                                            \
+    return o;                                                                 \
+  }
+#define WEFT_SH64_ALL(MACRO)                \
+  MACRO(add, uint64_t, o + v)               \
+  MACRO(sub, uint64_t, o - v)               \
+  MACRO(and, uint64_t, o & v)               \
+  MACRO(or, uint64_t, o | v)                \
+  MACRO(xor, uint64_t, o ^ v)               \
+  MACRO(min, uint64_t, (o < v ? o : v))     \
+  MACRO(max, uint64_t, (o > v ? o : v))     \
+  MACRO(exch, uint64_t, v)                  \
+  MACRO(min, int64_t, (o < v ? o : v))      \
+  MACRO(max, int64_t, (o > v ? o : v))      \
+  MACRO(add, int64_t, o + v)                \
+  MACRO(sub, int64_t, o - v)                \
+  MACRO(and, int64_t, o & v)                \
+  MACRO(or, int64_t, o | v)                 \
+  MACRO(xor, int64_t, o ^ v)                \
+  MACRO(exch, int64_t, v)
+WEFT_SH64_ALL(WEFT_SH64)
+#undef WEFT_SH64_ALL
+#undef WEFT_SH64
+
 static inline device uint32_t* lo32(device uint64_t* p) { return (device uint32_t*)p; }
 static inline device uint32_t* hi32(device uint64_t* p) { return (device uint32_t*)p + 1; }
 static inline void red_add_u64(device uint64_t* p, uint64_t v) {

@@ -1,0 +1,38 @@
+; A 64-bit atomic load and a 64-bit atomic store.
+;
+; Both used to be refused: this host's Metal has no 64-bit atomic instruction, and
+; a plain load of eight bytes can be torn by another lane writing the other half.
+; They take the shape the pair updates already take — one thread for the whole
+; grid, which walks every warp — and there the pair has a single reader and a
+; single writer, so two 32-bit atomic loads are the 64-bit load and two 32-bit
+; atomic stores are the 64-bit store.
+;
+; The arithmetic is order-free, so the two engines agree whatever order the lanes
+; run in. Each lane loads A, takes `A - A` (which keeps the load live without
+; making the answer depend on the buffer's initial contents), adds one, and stores
+; that to B, so B ends holding 1 in both.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Int64Atomics
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "atom64rw"
+               OpName %main "atom64rw"
+      %void = OpTypeVoid
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+      %u64p = OpTypePointer CrossWorkgroup %u64
+      %fnty = OpTypeFunction %void %u64p %u64p
+       %scp = OpConstant %u32 1
+       %sem = OpConstant %u32 0
+       %one = OpConstant %u64 1
+      %main = OpFunction %void None %fnty
+        %a0 = OpFunctionParameter %u64p
+        %a1 = OpFunctionParameter %u64p
+     %entry = OpLabel
+       %old = OpAtomicLoad %u64 %a0 %scp %sem
+        %z  = OpISub %u64 %old %old
+       %inc = OpIAdd %u64 %z %one
+             OpAtomicStore %a1 %scp %sem %inc
+             OpReturn
+             OpFunctionEnd

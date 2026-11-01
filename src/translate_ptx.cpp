@@ -1800,11 +1800,16 @@ std::string Emitter::emit(const std::string& raw) {
       err = "unsupported wgmma instruction '" + opcode + "'";
       return "";
     }
-    if (has_part(parts, "bf16") || has_part(parts, "tf32") || has_part(parts, "e4m3") ||
-        has_part(parts, "e5m2") || has_part(parts, "s8") || has_part(parts, "u8") ||
-        has_part(parts, "s32") || parts.size() < 5) {
+    // f16 and bf16 are the same 16-bit element, so the core-matrix geometry below
+    // reads either one without changing a single offset: only the decode differs.
+    // tf32 and the 8-bit types are 4- and 1-byte elements, and their element
+    // stride inside a 16-byte core-matrix row is not the layout written here.
+    const bool bw = has_part(parts, "bf16");
+    if (has_part(parts, "tf32") || has_part(parts, "e4m3") || has_part(parts, "e5m2") ||
+        has_part(parts, "s8") || has_part(parts, "u8") || has_part(parts, "s32") ||
+        parts.size() < 5) {
       err = "unsupported wgmma operands in '" + opcode +
-            "': only f16 operands with an f32 accumulator are translated";
+            "': f16 and bf16 operands with an f32 accumulator are translated";
       return "";
     }
     int ncols = 0;
@@ -1853,8 +1858,9 @@ std::string Emitter::emit(const std::string& raw) {
     const std::string da = operand_as(args[1], "uint64_t");
     const std::string db = operand_as(args[2], "uint64_t");
     auto elem_at = [&](const std::string& off) {
-      return "weft_h16((uint32_t)*(" + addr_space("threadgroup", true) +
-             "uint16_t*)(sh + (" + off + ")), 0)";
+      const std::string raw = "(uint32_t)*(" + addr_space("threadgroup", true) +
+                              "uint16_t*)(sh + (" + off + "))";
+      return (bw ? "weft_bf16(" : "weft_h16(") + raw + ", 0)";
     };
     std::string out =
         "{ const uint64_t weft_da = " + da + ", weft_db = " + db + "; "
@@ -2784,6 +2790,10 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       // The same rule the CPU scheduler applies to a group the launch did not
       // fill: its missing lanes leave slots unread-by-anyone, so the arena is
       // zeroed rather than left holding whatever the last launch left there.
+      // Zeroing it unconditionally was tried and made the dispatch less reliable
+      // rather than more: with everything else equal the same fixture went from
+      // every run answering to two runs in five never completing, so the shared
+      // arena is not what the stall is made of and this stays as it was.
       body_out += "  if (weft::live_threads(ctx.tgid, ctx.tg_size, ctx.grid) < ctx.tg_size)\n";
       body_out += "    for (uint32_t weft_i = 0; weft_i < (uint32_t)sizeof(weft_sh); weft_i++)\n";
       body_out += "      weft_sh[weft_i] = 0u;\n";

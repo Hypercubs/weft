@@ -1,0 +1,64 @@
+; A loop around a 64-bit fetch-and-add.
+;
+; `atom64.spvasm` is one block: every lane does the same three pair updates and
+; returns. This is the shape a compiler actually emits — a counted loop whose
+; induction variable and running sum are OpPhi values, and whose result is written
+; to a slot per lane — and it used to be the shape the pair could not reach. The
+; per-lane back end cannot host a contending section (a warp has one program
+; counter, so lanes waiting on each other never finish), and the warp target used
+; to accept one block only, so a loop fell through to the refusal. Now the warp
+; body carries a program counter and a dispatch loop of its own, and the loop takes
+; it like any other module.
+;
+; The arithmetic makes a wrong answer visible rather than just making the two
+; engines agree. Every lane adds four to the counter, so after the launch the
+; counter has moved by exactly 4*grid from whatever it started at — the harness
+; fills its buffers with a deterministic pattern, so the starting value is not
+; zero — and no old value can be lost or repeated without moving that number. Each
+; lane's own sum is the sum of its four old values, written to a slot of its own,
+; and those slots are compared against the CPU's lane for lane.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Int64Atomics
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "atom64loop" %gid
+               OpName %main "atom64loop"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+       %bool = OpTypeBool
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+       %u64p = OpTypePointer CrossWorkgroup %u64
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %u64p %u64p
+        %gid = OpVariable %pin Input
+        %scp = OpConstant %u32 1
+        %sem = OpConstant %u32 0
+       %zero = OpConstant %u32 0
+      %one32 = OpConstant %u32 1
+       %four = OpConstant %u32 4
+        %one = OpConstant %u64 1
+     %zero64 = OpConstant %u64 0
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %u64p
+         %a1 = OpFunctionParameter %u64p
+      %entry = OpLabel
+                OpBranch %loop
+       %loop = OpLabel
+          %i = OpPhi %u32 %zero %entry %inext %loop
+        %sum = OpPhi %u64 %zero64 %entry %sum2 %loop
+        %old = OpAtomicIAdd %u64 %a0 %scp %sem %one
+       %sum2 = OpIAdd %u64 %sum %old
+      %inext = OpIAdd %u32 %i %one32
+       %cont = OpULessThan %bool %inext %four
+                OpLoopMerge %done %loop None
+                OpBranchConditional %cont %loop %done
+       %done = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pa = OpPtrAccessChain %u64p %a1 %gi
+                OpStore %pa %sum
+                OpReturn
+                OpFunctionEnd

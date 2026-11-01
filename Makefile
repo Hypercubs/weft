@@ -23,6 +23,11 @@ ROOT     := $(CURDIR)
 
 # Both tools, always: a translator change that is measured against a stale
 # weft-gen reads as "the change did nothing".
+#
+# Each link goes to a temp name and is renamed into place, so a build that is
+# interrupted mid-link cannot leave a `build/weft` whose timestamp says it is
+# current while its contents are from the previous source. That failure reads as
+# "the fix did nothing", which costs more than the rename does.
 all: build/weft build/weft-gen
 
 build/weft: src/main.mm src/translate.cpp src/translate_ptx.cpp src/translate_spirv.cpp src/translate.hpp \
@@ -30,7 +35,7 @@ build/weft: src/main.mm src/translate.cpp src/translate_ptx.cpp src/translate_sp
            runtime/weft_runtime.hpp runtime/weft_runtime.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -DWEFT_ROOT='"$(ROOT)"' $(MAIN) src/translate.cpp src/translate_ptx.cpp \
-	      src/translate_spirv.cpp $(FW) -o build/weft
+	      src/translate_spirv.cpp $(FW) -o build/weft.n && mv build/weft.n build/weft
 
 # The build-time translator: the same front ends, no Metal, no launcher. It turns a
 # kernel file into a C++ translation unit you compile into your own program, so
@@ -40,7 +45,7 @@ build/weft-gen: src/gen.cpp src/translate.cpp src/translate_ptx.cpp src/translat
                 src/weft_warp_msl.hpp
 	@mkdir -p build
 	$(CXX) -std=c++20 -O2 -I include src/gen.cpp src/translate.cpp src/translate_ptx.cpp \
-	      src/translate_spirv.cpp -o build/weft-gen
+	      src/translate_spirv.cpp -o build/weft-gen.n && mv build/weft-gen.n build/weft-gen
 
 gen: build/weft-gen
 
@@ -85,11 +90,13 @@ SPIRV_AS  ?= $(shell command -v spirv-as 2>/dev/null || echo /opt/homebrew/bin/s
 SPIRV_VAL ?= $(shell command -v spirv-val 2>/dev/null || echo /opt/homebrew/bin/spirv-val)
 
 spirv:
-	for f in kernels/spirv/*.spvasm; do $(SPIRV_AS) --target-env spv1.3 $$f -o $${f%.spvasm}.spv; done
+	# `|| exit 1` in both loops: a for loop's status is its last command, so a
+	# module that failed to assemble or validate was being reported by nothing.
+	for f in kernels/spirv/*.spvasm; do $(SPIRV_AS) --target-env spv1.3 $$f -o $${f%.spvasm}.spv || exit 1; done
 	$(LLC) -march=spirv64 -filetype=obj -O2 kernels/cuda/spvloop.ll -o kernels/spirv/llvm.spv
 	for f in kernels/spirv/*.spv; do \
 	  case $$f in *llvm.spv) e=spv1.4 ;; *) e=spv1.3 ;; esac; \
-	  $(SPIRV_VAL) --target-env $$e $$f; done
+	  $(SPIRV_VAL) --target-env $$e $$f || exit 1; done
 
 clean:
 	rm -rf build

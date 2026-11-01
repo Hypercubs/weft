@@ -1,0 +1,100 @@
+; A ballot and a 64-bit broadcast, next to a barrier and the pair.
+;
+; This is the whole rendezvous family in one module: a vote (`OpGroupNonUniformBallot`
+; of the even lanes), a shuffle (`OpGroupNonUniformBroadcast` of a 64-bit value from
+; lane 0), a threadgroup barrier, and a 64-bit atomic whose old value is dropped.
+; One thread owns all 32 lanes here, so none of those is a hardware instruction: a
+; vote is a relay through the warp's slot array, and the sweep is what brings the
+; lanes back in order to read it.
+;
+; The answers are arithmetic, not a second opinion:
+;
+;   the counter        every lane adds one, so it moves by exactly 32, and every
+;                      lane loads it after the barrier, so all 32 loads agree.
+;   the ballot         lanes are 0..31, so the even ones are 0x55555555.
+;   the broadcast      lane 0's 64-bit load goes to every lane, so every slot holds
+;                      the counter — the same number, 32 times.
+;   all-equal, 64-bit  the counter read after the barrier is the same in all 32
+;                      lanes, so this must be true; the lane index is different in
+;                      every lane, so that one must be false. Both directions are
+;                      written as a residual: 0 means the answer was the one the
+;                      arithmetic says it has to be.
+;   all-equal, 128-bit the same pair again, as a `ulong2`: the words of a value this
+;                      wide go a pass at a time, exactly like the two halves of a
+;                      long.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Int64Atomics
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformBallot
+               OpCapability GroupNonUniformShuffle
+               OpCapability GroupNonUniformVote
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "atom64vote" %gid
+               OpName %main "atom64vote"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+       %bool = OpTypeBool
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+       %u64p = OpTypePointer CrossWorkgroup %u64
+       %u32p = OpTypePointer CrossWorkgroup %u32
+      %v4u32 = OpTypeVector %u32 4
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %v2u64 = OpTypeVector %u64 2
+       %fnty = OpTypeFunction %void %u64p %u64p %u32p %u32p %u32p %u32p %u32p
+        %gid = OpVariable %pin Input
+        %scp = OpConstant %u32 1
+        %sem = OpConstant %u32 0
+        %one = OpConstant %u64 1
+      %one32 = OpConstant %u32 1
+     %zero32 = OpConstant %u32 0
+        %sub = OpConstant %u32 3
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %u64p
+         %a1 = OpFunctionParameter %u64p
+         %a2 = OpFunctionParameter %u32p
+         %a3 = OpFunctionParameter %u32p
+         %a4 = OpFunctionParameter %u32p
+         %a5 = OpFunctionParameter %u32p
+         %a6 = OpFunctionParameter %u32p
+      %entry = OpLabel
+       %bump = OpAtomicIAdd %u64 %a0 %scp %sem %one
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %gl = OpUConvert %u32 %gi
+        %bit = OpBitwiseAnd %u32 %gl %one32
+       %even = OpIEqual %bool %bit %zero32
+                OpControlBarrier %scp %scp %sem
+         %me = OpAtomicLoad %u64 %a0 %scp %sem
+     %ballot = OpGroupNonUniformBallot %v4u32 %sub %even
+         %bc = OpGroupNonUniformBroadcast %u64 %sub %me %zero32
+         %bx = OpCompositeExtract %u32 %ballot 0
+        %pa1 = OpPtrAccessChain %u64p %a1 %gi
+                OpStore %pa1 %bc
+        %pa2 = OpPtrAccessChain %u32p %a2 %gi
+                OpStore %pa2 %bx
+        ; ---- all-equal over 64 bits, both answers ----
+      %same = OpGroupNonUniformAllEqual %bool %sub %me
+      %diff = OpGroupNonUniformAllEqual %bool %sub %gi
+        %r1 = OpSelect %u32 %same %zero32 %one32
+        %r2 = OpSelect %u32 %diff %one32 %zero32
+        %pa3 = OpPtrAccessChain %u32p %a3 %gi
+                OpStore %pa3 %r1
+        %pa4 = OpPtrAccessChain %u32p %a4 %gi
+                OpStore %pa4 %r2
+        ; ---- the same two answers, over 128 bits ----
+     %vec_s = OpCompositeConstruct %v2u64 %me %me
+     %vec_d = OpCompositeConstruct %v2u64 %gi %gi
+     %samev = OpGroupNonUniformAllEqual %bool %sub %vec_s
+     %diffv = OpGroupNonUniformAllEqual %bool %sub %vec_d
+        %r3 = OpSelect %u32 %samev %zero32 %one32
+        %r4 = OpSelect %u32 %diffv %one32 %zero32
+        %pa5 = OpPtrAccessChain %u32p %a5 %gi
+                OpStore %pa5 %r3
+        %pa6 = OpPtrAccessChain %u32p %a6 %gi
+                OpStore %pa6 %r4
+                OpReturn
+                OpFunctionEnd

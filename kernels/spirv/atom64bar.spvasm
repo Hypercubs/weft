@@ -1,0 +1,47 @@
+; A barrier between a 64-bit increment and a 64-bit load.
+;
+; The increment's old value is dropped, so it takes the 64-bit reduction form that
+; already existed. The load is the pair read as one value, which needs the warp
+; target — and the barrier used to keep the module away from it, because a single
+; thread running 32 lanes has no second lane to arrive with. The warp target now
+; runs the lanes in step: one program counter each, and the lowest one is run
+; first, so a lane parked on the barrier cannot be passed by a lane that has not
+; arrived.
+;
+; That makes the barrier observable rather than decorative. Every lane of the one
+; warp adds one, waits, then loads: if the barrier holds, all 32 lanes read the
+; same number — the counter after all 32 increments — and every slot ends up with
+; that value. If it did not hold, the first lanes to arrive would read a smaller
+; counter than the last ones, and the slots would disagree with each other.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Int64Atomics
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "atom64bar" %gid
+               OpName %main "atom64bar"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+       %u64p = OpTypePointer CrossWorkgroup %u64
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %u64p %u64p
+        %gid = OpVariable %pin Input
+        %scp = OpConstant %u32 1
+        %sem = OpConstant %u32 0
+        %one = OpConstant %u64 1
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %u64p
+         %a1 = OpFunctionParameter %u64p
+      %entry = OpLabel
+       %bump = OpAtomicIAdd %u64 %a0 %scp %sem %one
+                OpControlBarrier %scp %scp %sem
+        %now = OpAtomicLoad %u64 %a0 %scp %sem
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pa = OpPtrAccessChain %u64p %a1 %gi
+                OpStore %pa %now
+                OpReturn
+                OpFunctionEnd

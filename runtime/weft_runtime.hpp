@@ -38,22 +38,33 @@ struct SlotState {
   int count;
 };
 
+// Field order is not arbitrary: the dispatcher touches `lid`, `tg_size`, `pass`,
+// `warp` and `fold` for every lane of every sweep, and those five share the first
+// cache line so a sweep reads one line per lane instead of two.
 struct Ctx {
-  uint32_t gid = 0;       // thread_position_in_grid
   uint32_t lid = 0;       // thread_position_in_threadgroup
-  uint32_t tgid = 0;      // threadgroup_position_in_grid
   uint32_t tg_size = 0;   // threads_per_threadgroup
+  uint32_t pass = 0;      // dispatcher pass number, for shuffle double-buffering
+  uint32_t* warp = nullptr;  // per-lane scratch for shfl
+  // A warp holds 32 lanes of one threadgroup on one worker thread, so the scan
+  // and fold trees those lanes run are the same tree: the first lane to reach a
+  // call site computes it and the other 31 read its answer. `fold` points at this
+  // lane's warp's slot — [0] site, [1] pass, [2] base, [3..34] the tree.
+  uint32_t* fold = nullptr;
+  unsigned char* warp16 = nullptr;  // per-lane scratch for values wider than a word
+  uint32_t* red = nullptr;   // per-threadgroup scratch for bar.red (tg + 32 slots)
+  uint32_t gid = 0;       // thread_position_in_grid
+  uint32_t tgid = 0;      // threadgroup_position_in_grid
   uint32_t grid = 0;      // threads_per_grid
   const unsigned char* shared = nullptr;
   SlotState* slots = nullptr;
   void* const* bufs = nullptr;
   WorkerState* ws = nullptr;
-  uint32_t* warp = nullptr;  // per-lane scratch for shfl
-  unsigned char* warp16 = nullptr;  // per-lane scratch for values wider than a word
-  uint32_t* red = nullptr;   // per-threadgroup scratch for bar.red (tg + 32 slots)
-  uint32_t pass = 0;         // dispatcher pass number, for shuffle double-buffering
   int slot = 0;
 };
+
+// Words in one warp's scan cache: the three key words and the 32 results.
+constexpr uint32_t kFoldWords = 35u;
 
 using Body = void (*)(Ctx&);
 
@@ -128,6 +139,9 @@ struct Task {
   void resume() {
     if (h_ && !h_.done()) h_.resume();
   }
+  // The same call for a caller that has just checked `done()` — the dispatcher
+  // does, once per lane per pass, and a 1M-lane scan runs it five million times.
+  void resume_ready() { h_.resume(); }
 
  private:
   handle_type h_;
@@ -333,6 +347,7 @@ struct PrefixAwaitable {
   bool inclusive;
   bool product = false;
   uint32_t width = 32u;
+  uint32_t site = 0u;  // the emitted call site, 0 for "do not cache"
 
   bool await_ready() const noexcept { return false; }
   void await_suspend(std::coroutine_handle<>) noexcept {
@@ -341,16 +356,33 @@ struct PrefixAwaitable {
   T await_resume() const noexcept {
     const uint32_t base = c->lid & ~(width - 1u);
     const uint32_t lane = c->lid - base;
+    uint32_t* const slot = c->fold;
+    // Every lane of a warp walks the same tree over the same published words, so
+    // one lane computes it and the rest read their entry. The key has to name the
+    // call site as well as the pass: two lanes of one warp can be at different
+    // scans in the same pass, and a cached tree must never answer for another one.
+    if (slot && site != 0u && slot[0] == site && slot[1] == c->pass && slot[2] == base) {
+      // The cache holds the whole tree, so the inclusive/exclusive choice is the
+      // caller's: exclusive reads the entry before this lane's.
+      if (inclusive) return lane < width ? from_bits<T>(slot[3 + lane]) : T(0);
+      return lane ? from_bits<T>(slot[3 + lane - 1u]) : T(product ? 1 : 0);
+    }
     const uint32_t* slots = shfl_read_buf(*c) + base;
     // The scan is run in the doubling (Kogge-Stone) order the hardware uses, not
     // as a running sum: for floats the two orders round differently, and the
     // point is to land on the same bits as the GPU. Integer addition is
     // associative, so this is exact for the integer types either way.
     T v[32];
-    for (uint32_t i = 0; i < width; i++) v[i] = from_bits<T>(slots[i]);
+    for (uint32_t i = 0; i < width && i < 32u; i++) v[i] = from_bits<T>(slots[i]);
     for (uint32_t d = 1; d < width; d <<= 1)
       for (uint32_t i = width - 1u; i >= d; i--)
         v[i] = product ? T(v[i] * v[i - d]) : T(v[i] + v[i - d]);
+    if (slot && site != 0u) {
+      for (uint32_t i = 0; i < width && i < 32u; i++) slot[3 + i] = to_bits<T>(v[i]);
+      slot[0] = site;
+      slot[1] = c->pass;
+      slot[2] = base;
+    }
     if (inclusive) return v[lane];
     return lane ? v[lane - 1u] : T(product ? 1 : 0);
   }
@@ -358,8 +390,8 @@ struct PrefixAwaitable {
 
 template <class T>
 inline PrefixAwaitable<T> prefix(Ctx& c, T value, bool inclusive, bool product = false,
-                                 uint32_t width = 32u) {
-  return PrefixAwaitable<T>{&c, value, inclusive, product, width};
+                                 uint32_t width = 32u, uint32_t site = 0u) {
+  return PrefixAwaitable<T>{&c, value, inclusive, product, width, site};
 }
 
 // ---- bar.red: a fold over the whole threadgroup ---------------------------------
@@ -500,6 +532,7 @@ struct ReduceAwaitable {
   T value;
   int mode;
   uint32_t width;
+  uint32_t site = 0u;  // the emitted call site, 0 for "do not cache"
 
   bool await_ready() const noexcept { return false; }
   void await_suspend(std::coroutine_handle<>) noexcept {
@@ -508,25 +541,39 @@ struct ReduceAwaitable {
   T await_resume() const noexcept {
     const uint32_t base = c->lid & ~(width - 1u);
     const uint32_t* slots = shfl_read_buf(*c) + base;
+    uint32_t* const slot = c->fold;
+    // Same cache as a scan: the butterfly is the same tree for all 32 lanes, and
+    // the weights it folds are the warp's published words, not this lane's.
+    if (slot && site != 0u && slot[0] == site && slot[1] == c->pass && slot[2] == base) {
+      const uint32_t at = c->lid - base;
+      return at < width && at < 32u ? from_bits<T>(slot[3 + at]) : T(0);
+    }
     // The hardware's fold is a butterfly: every lane folds its partner's
     // *running* value, step by step. Reading the published slots once and
     // folding them together would be a different tree — and for floats a
     // different answer — so the same three-step shape is kept here, one array
     // for the values and one for the step's results.
     T v[32], next[32];
-    for (uint32_t i = 0; i < width; i++) v[i] = from_bits<T>(slots[i]);
+    for (uint32_t i = 0; i < width && i < 32u; i++) v[i] = from_bits<T>(slots[i]);
     for (uint32_t d = 1; d < width; d <<= 1) {
-      for (uint32_t i = 0; i < width; i++)
+      for (uint32_t i = 0; i < width && i < 32u; i++)
         next[i] = grp_fold<T>(mode, v[i], v[i ^ d]);
-      for (uint32_t i = 0; i < width; i++) v[i] = next[i];
+      for (uint32_t i = 0; i < width && i < 32u; i++) v[i] = next[i];
+    }
+    if (slot && site != 0u) {
+      for (uint32_t i = 0; i < width && i < 32u; i++) slot[3 + i] = to_bits<T>(v[i]);
+      slot[0] = site;
+      slot[1] = c->pass;
+      slot[2] = base;
     }
     return v[c->lid - base];
   }
 };
 
 template <class T>
-inline ReduceAwaitable<T> grp_reduce(Ctx& c, T value, int mode, uint32_t width = 32u) {
-  return ReduceAwaitable<T>{&c, value, mode, width};
+inline ReduceAwaitable<T> grp_reduce(Ctx& c, T value, int mode, uint32_t width = 32u,
+                                     uint32_t site = 0u) {
+  return ReduceAwaitable<T>{&c, value, mode, width, site};
 }
 
 // simd_ballot / simd_all / simd_any: the same rendezvous, one bit wide. The

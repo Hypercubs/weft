@@ -31,7 +31,7 @@ ok    raymarch         65,536 values     ·  max |diff| 0  — agree
 ok    spirv:atom64     4,096 lanes: add/max olds sum exactly, signed compare included,
 ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 ...
-186 ok, 0 fail, 0 skip
+190 ok, 0 fail, 0 skip
 ```
 
 ## What runs
@@ -42,7 +42,7 @@ ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 | `threadgroup` / `.shared` memory, barriers | yes | yes | yes |
 | warp shuffles and votes | `simd_*` | `shfl`, `vote` | subgroup ops |
 | 32-bit atomics | yes | yes | yes |
-| 64-bit atomics, including the old value | yes | yes | yes |
+| 64-bit atomics: fetch, compare-exchange, load, store | yes | yes | yes |
 | textures and samplers | yes | `tld`, `tld4` | images and samplers |
 | render passes: fragment, `[[tile]]` stage | yes | — | — |
 | mesh and task+mesh stages | yes | — | — |
@@ -146,7 +146,9 @@ the runtime cannot pick up a stale one.
    resumes with a `goto`. Metal kernels compile to C++20 coroutines. Either way
    the dispatcher calls each thread once per barrier segment: a call and a branch,
    not a context switch. A warp shuffle uses the same mechanism — publish, return,
-   read the peer on the next pass.
+   read the peer on the next pass. A scan or a fold is cheaper than that: the 32
+   lanes of a warp walk the same tree over the same published words, so the first
+   lane to reach a call site computes it and the other 31 read their entry.
 
 3. **Flatten when possible.** A Metal kernel that only indexes by
    `thread_position_in_grid` is also emitted as a `for` loop over a contiguous
@@ -164,14 +166,14 @@ its 7-core GPU.
 
 | kernel | grid | GPU | CPU | threads | |
 |---|---|---|---|---|---|
-| `saxpy` (3 buffers) | 1M | 0.28 ms | 0.11 ms | 4 | **CPU faster** 2.4x |
-| `saxpy` (3 buffers) | 4M | 1.00 ms | 0.99 ms | 1 | tie |
-| `vec4_scale` (16-byte load/store, 4M floats) | 1M | 0.66 ms | 0.54 ms | 8 | **CPU faster** 1.2x |
-| `stencil5` | 1M | 0.13 ms | 0.20 ms | 8 | 1.6x slower |
-| `atomic_bins` (1M integer atomics) | 1M | 0.67 ms | 2.35 ms | 1 | 3.5x slower |
-| `reduce_sum` (9 barriers) | 1M | 0.42 ms | 5.76 ms | 8 | 13.8x slower |
-| `warpscan` (5 shuffles) | 1M | 0.14 ms | 6.36 ms | 8 | 46x slower |
-| `block_reduce` (shuffles + barrier) | 1M | 0.16 ms | 8.49 ms | 8 | 54x slower |
+| `saxpy` (3 buffers) | 1M | 0.25 ms | 0.11 ms | 8 | **CPU faster** 2.4x |
+| `saxpy` (3 buffers) | 4M | 0.93 ms | 0.92 ms | 1 | tie |
+| `vec4_scale` (16-byte load/store, 4M floats) | 1M | 0.65 ms | 0.53 ms | 8 | **CPU faster** 1.2x |
+| `stencil5` | 1M | 0.11 ms | 0.19 ms | 8 | 1.8x slower |
+| `atomic_bins` (1M integer atomics) | 1M | 0.67 ms | 2.29 ms | 1 | 3.4x slower |
+| `reduce_sum` (9 barriers) | 1M | 0.42 ms | 5.47 ms | 8 | 13.1x slower |
+| `warpscan` (5 shuffles) | 1M | 0.14 ms | 5.81 ms | 8 | 42.4x slower |
+| `block_reduce` (shuffles + barrier) | 1M | 0.15 ms | 7.61 ms | 8 | 49.1x slower |
 
 Best of 30 (`--bench 30`), `/usr/bin/clang++ -O2`, CPU column on the per-lane
 backend. `make numbers` regenerates the table by running the same eight launches
@@ -194,7 +196,7 @@ The CPU path is exact, and the suites compare bytes rather than tolerances
 wherever the answer is deterministic.
 
 - **Every fixture in `check.sh` is a byte comparison** between the CPU and the GPU
-  where a GPU is present, and between two front ends where it is not: 186 checks,
+  where a GPU is present, and between two front ends where it is not: 190 checks,
   none skipped on this host.
 - **The math library is one text compiled twice.** Metal's `sqrt`, `log2`,
   `exp2`, `pow` and `mix` are hardware approximations (`sqrt` is bit-for-bit
@@ -215,18 +217,72 @@ wherever the answer is deterministic.
 - **A ragged final threadgroup is defined by the launcher**, not by the GPU: the
   absent lanes' shuffle slots and threadgroup arena are zeroed before the run, so
   the same kernel at the same grid gives the same answer at 1, 2, 4 or 8 threads.
-- **64-bit atomics on the GPU are exact at 4,096, 65,536 and 262,144 lanes**,
-  compared as integers against the arithmetic rather than through a float view.
+- **64-bit atomics on the GPU are exact at 4,096, 65,536, 262,144 and 1,048,576
+  lanes**, compared as integers against the arithmetic rather than through a float
+  view.
 
 ## Limits
 
-- **Barrier- and shuffle-heavy kernels are 14–54x the GPU** — the three rows
-  above. Each barrier or shuffle costs one resume per lane.
-- **A 64-bit atomic that returns the old value is serial by construction on the
-  GPU**: it is built from two 32-bit words, so a kernel that needs it is
-  dispatched as one thread walking every warp. That is exact, and it is slower
-  than the CPU — at 1,048,576 lanes it is slow enough that macOS's watchdog ends
-  the dispatch.
+- **Barrier- and shuffle-heavy kernels are 13–49x the GPU** — the three rows
+  above. Each barrier or shuffle costs one resume per lane, and a sweep over a
+  threadgroup measures about a nanosecond per lane, so those rows are close to the
+  count of sweeps they need: `warpscan`'s five shuffles are six passes over the
+  grid. Going faster means fewer passes, not a cheaper pass — lanes held in the
+  registers of one thread (the warp back end) instead of suspended per lane.
+  A scan or a fold is the exception: it is one tree over the warp's words, so it
+  is computed once per warp rather than once per lane, and `prefixscan` costs
+  5.98 ms against 42.4 ms before that shared cache (GPU 0.20 ms).
+- **A 64-bit atomic that returns the old value is exact but serial on the GPU**,
+  and that is an exactness decision rather than a hardware one: the comparison is
+  against the order the CPU's lanes ran in, so the old values have to arrive in
+  that order, and no hardware atomic delivers a chosen order. It is built from two
+  32-bit words and dispatched as one thread walking every warp, where the words
+  it touches are kept in locals — the counters nobody reads back are folded and
+  flushed once, and a word nothing else in the kernel reads is loaded once before
+  the walk and stored once after it. Exact at 1,048,576 lanes in **61 ms**, against
+  the CPU's 10.3 ms, down from 825 ms when every lane paid two device round trips
+  per word. A parallel form would be a different answer, not a faster one, so it
+  would have to be a second row rather than a fix.
+  The pair is never *locked*, and the reason is measured rather than assumed:
+  `tools/lock_probe.mm` runs the same kernel with the lock taken and dropped by
+  one thread (exact) and with threads contending on that word (never completes,
+  in every shape tried, down to two threadgroups of 32). Ordering is not the
+  obstacle — a device-scope `atomic_thread_fence` exists and a relaxed store in
+  one threadgroup is seen by 1,024 waiters in others. Progress is: a lane that
+  wins a section cannot run it until the other lanes in its warp leave the spin
+  loop, and they cannot leave until it releases, because a warp is one program
+  counter. A threadgroup of a single thread does not dodge that either; several
+  are co-scheduled into one warp and deadlock across each other. So a per-lane
+  section is refused by name and the same kernel runs on the warp target, where
+  one thread owns all 32 lanes and there is nothing to wait for.
+  What reaches that target is any module with a 64-bit atomic: loops, `OpPhi` and
+  function-scope locals all take it, because the lane loop finishes one lane's whole
+  control flow before it starts the next, so one program counter is enough. A
+  barrier alongside the pair takes it too, and that is a second dispatch mode: one
+  program counter **per lane**, lowest run first, so a lane parked on a barrier
+  cannot be passed by a lane that has not arrived — the rendezvous the lanes need
+  when they all live in one thread. A subgroup vote or shuffle goes the same way:
+  every lane publishes its word into the warp's slot array, the sweep brings the
+  lanes back in order, and the answer is folded over the slots — a ballot, an
+  `all`/`any`, an all-equal, a broadcast or a shuffle, with a 64-bit value moved one
+  word per pass. The `OpenCL.std` subgroup *imports* — what LLVM's SPIR-V backend
+  emits — take the same relay, so `sub_group_ballot`, `sub_group_reduce_*`,
+  `sub_group_scan_*`, the shuffles and a 64-bit `sub_group_broadcast` all work on
+  the GPU now, and so do reductions and scans over 64-bit values: a word is what the
+  rendezvous carries, so those move two at a time through a pair of windows.
+- **`double`, on a GPU that has no fp64.** Metal rejects the type outright, so the
+  runtime carries one in software: a double is the `uint64_t` its bits live in, and
+  the arithmetic is exact IEEE-754 binary64 — round-to-nearest-even, subnormals
+  included — over the 64-bit integers the hardware does have. Add, subtract, multiply,
+  divide, the twelve comparisons, the conversions to and from integers and binary32,
+  `floor`/`ceil`/`trunc`/`round`, `fabs`, `min`/`max`, and the subgroup reduce, scan,
+  broadcast and vote forms all run on the GPU. Bit-exactness is checked the only way
+  that means anything: the CPU column computes the same expressions with the host's own
+  doubles and the two are compared byte for byte, and `tools/f64_check.py` sweeps each
+  operation over its own value set — both signs, zero, subnormals, the ends of the
+  exponent range, the conversions in both directions — and compares the bits. The
+  transcendental library over a double (`sqrt`, `pow`, `exp`, …) stays on the CPU, and
+  so does a vector of doubles.
 - **Translation is textual, not a compiler.** It handles the shapes it was built
   for and refuses the rest by name.
 - **Exactness is across runs of this build on this machine**, measured on the

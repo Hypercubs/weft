@@ -471,10 +471,56 @@ class Emitter {
   // The warp target: one Metal thread runs all 32 lanes, so a peer's value is this
   // thread's own data and a 64-bit pair has exactly one writer.
   bool warp_ = false;
-  void warp_target() { warp_ = true; }
+  // A warp kernel with more than one block carries a program counter: the lane
+  // loop finishes a lane before it starts the next, so one counter is enough, but
+  // a branch has to re-enter the block dispatch instead of falling through.
+  bool warp_blocks_ = false;
+  // Step mode: one program counter per lane and a dispatch that runs the lowest
+  // one first. It is what a barrier needs, because a lane that parks on the
+  // barrier's block cannot be passed by any lane that has not arrived yet.
+  bool warp_step_ = false;
+  void warp_target(bool blocks, bool step) {
+    warp_ = true;
+    warp_blocks_ = blocks;
+    warp_step_ = step;
+  }
+  bool warp_blocks() const { return warp_blocks_; }
+  bool warp_step() const { return warp_step_; }
+  // The largest case id a step-mode kernel uses: the dispatch sweeps up to it.
+  int max_case() const { return max_case_; }
+  // How many words the warp's slot array needs: one window of 32 per rendezvous
+  // site, and at least one window.
+  int slot_words() const { return slot_off_ < 32 ? 32 : slot_off_; }
+  // Why the warp target was not available, when it was not. The refusal for a pair
+  // the per-lane target cannot carry names it, so the message says which two
+  // shapes disagreed rather than just that they did.
+  void warp_reason(const std::string& why) { warp_why_ = why; }
   // The kernel takes the 64-bit lock: the launcher has to bind the table of lock
   // words for it, and the kernel declares that binding.
   bool wide_atom = false;
+  // A 64-bit counter whose address is the same for every lane is folded into a
+  // local and flushed once per kernel. A `red` is order-free, so folding in the
+  // walk and adding once is the same answer as one atomic per lane — and it is
+  // 1,048,576 pairs of device-scope atomics turned into one. Each of those is an
+  // L2 round trip, which is what made the 1M-lane 64-bit counter 825 ms.
+  struct RedAcc {
+    std::string addr;  // the pointer expression, as emitted
+    std::string op;    // add, sub, and, or, xor
+    std::string name;  // the local accumulator
+  };
+  std::vector<RedAcc> red_accs;
+  // A 64-bit word that nothing else in the kernel touches can keep its value in a
+  // local for the whole walk: the old values still come back in program order, and
+  // the buffer is read once and written once instead of twice per lane. See
+  // WEFT_SH64 in src/weft_msl.hpp.
+  struct ShadowSite {
+    std::string buf;     // the binding token, e.g. bufs[0]
+    std::string call;    // the atomic call, as emitted
+    std::string shadow;  // the local form that replaces it
+    std::string decl;    // `uint64_t weft_shN = *(...)` before the walk
+    std::string flush;   // and `*(...) = weft_shN` after it
+  };
+  std::vector<ShadowSite> shadows;
   int ntex = 0, nsamp = 0;
   std::vector<std::string> buf_type;  // one element of each binding, in bytes
 
@@ -530,6 +576,18 @@ class Emitter {
   // (src/weft_msl.hpp folds the halves with two 32-bit atomics). The definition
   // contributes one mention, so one mention means unused, and a use anywhere in
   // the function — reachable from this block or not — means live.
+  // Is this pointer used by anything but the instruction asking? Folding a
+  // counter into a local is the same program only while the word is touched by
+  // nothing else in the kernel: a later load through the same pointer, or a read
+  // after a barrier, has to see the increments, and the local is paid back only
+  // once the whole walk is over.
+  bool pointer_used_once(uint32_t id) const {
+    int seen = 0;
+    for (const Instr& in : f_.body)
+      for (uint32_t o : in.a)
+        if (o == id && ++seen > 1) return false;
+    return true;
+  }
   bool unused_anywhere(uint32_t id) const {
     int seen = 0;
     for (const Instr& in : f_.body)
@@ -570,6 +628,10 @@ class Emitter {
   // handful of places below where the two targets word the same instruction
   // differently are the only things it switches.
   bool gpu = false;
+  std::string warp_why_ = "needs something the warp target cannot provide";
+  // The largest case id a step-mode kernel uses: the dispatch sweeps up to it.
+  int max_case_ = 0;
+  int slot_off_ = 0;  // words of the slot array handed out so far
   uint32_t cur_block_ = 0;
   uint32_t wg_bytes_ = 0;
   int nbuffers_ = 0, nscalars_ = 0, ntex_ = 0, nsamp_ = 0;
@@ -602,8 +664,46 @@ class Emitter {
   // A branch: a goto on the CPU, and a program counter with a restart on the
   // GPU, where there is no goto (tools/msl_probe.mm).
   std::string jump(uint32_t label) const {
-    return gpu ? ("{ s->pc = " + std::to_string(label) + "u; continue; }")
-               : ("goto L" + std::to_string(label) + ";");
+    if (!gpu) return "goto L" + std::to_string(label) + ";";
+    if (warp_step_) return "{ s->pc[l] = " + std::to_string(label) + "u; continue; }";
+    return "{ s->pc = " + std::to_string(label) + "u; continue; }";
+  }
+  // What this host's Metal compiler will not take, measured rather than assumed
+  // (tools/msl_bisect.py over the emitted source): neither a loop-carried minimum
+  // over the lane counters nor a `switch` whose selector is read from them — both
+  // take the back end down with XPC_ERROR_CONNECTION_INTERRUPTED, which names the
+  // transport and not the construct. A selector that is the dispatch's own scalar
+  // loop counter is fine, so the sweep below is what picks a block, and a lane's
+  // counter is only ever compared against it.
+  std::string case_open(uint32_t id) const {
+    const std::string t = std::to_string(id);
+    return "      case " + t + "u: { for (uint32_t l = 0; l < 32u; l++) {\n"
+           "        if (weft_base + l >= weft_lanes) break;\n"
+           "        if (s->pc[l] != " + t + "u) continue;\n"
+           "        weft_ran = true;\n"
+           "        ctx.lid = l; ctx.gid = (uint64_t)weft_base + (uint64_t)l;\n";
+  }
+  std::string case_close() const { return "      } } break;\n"; }
+  // Park a lane on `id`: it writes its own program counter and the block it is
+  // heading for becomes a case of its own, so nothing past this point runs for
+  // that lane until the next sweep comes back to it.
+  std::string park(uint32_t id) {
+    if (id > max_case_) max_case_ = (int)id;
+    return "{ s->pc[l] = " + std::to_string(id) + "u; continue; }\n" + case_close() +
+           case_open(id);
+  }
+  // The warp's slot array is carved into windows of 32, one per rendezvous site.
+  // A window per site rather than one shared array, because lanes interleave inside
+  // a case: a lane that publishes the next word would otherwise overwrite a slot
+  // another lane has not read yet, which is exactly how the first attempt at the
+  // 64-bit broadcast came out wrong (measured: 17 distinct ballots and two
+  // different slot values where there must be one of each).
+  // Which lanes of this warp exist: the last warp of a group is short when the lane
+  // count is not a multiple of 32, and a vote over it must not count lanes that
+  // never ran.
+  std::string slot_mask() const {
+    return "((weft_lanes > weft_base) ? (((weft_lanes - weft_base) >= 32u) ? 0xFFFFFFFFu : "
+           "((1u << (weft_lanes - weft_base)) - 1u)) : 0u)";
   }
   std::string param_of(int i) const {
     const std::string n = std::to_string(i);
@@ -630,6 +730,7 @@ class Emitter {
   std::string fref(uint32_t id) const;
   bool vector_of(uint32_t tid, uint32_t& elem, uint32_t& n) const;
   std::string builtin_expr(uint32_t var, int comp) const;
+  bool f64_type(uint32_t tid) const;
   bool shfl_pub(uint32_t tid, const std::string& e, std::string& out);
   bool wide_shfl(uint32_t tid, const std::string& e, const std::string& peer, std::string& out);
   bool chain(const Instr& ins);
@@ -655,7 +756,10 @@ bool Emitter::ctype(uint32_t tid, std::string& out) const {
       return true;
     case KFloat:
       if (t.width == 32) { out = "float"; return true; }
-      if (t.width == 64) { out = "double"; return true; }
+      // Metal has no 64-bit float, so on the GPU a double is carried as the uint64_t
+      // its bits live in and every operation on it is a `weft_fp64` helper. Off the
+      // GPU it is the host's own double.
+      if (t.width == 64) { out = gpu ? "uint64_t" : "double"; return true; }
       return false;
     case KPointer:
       // An address points into a buffer, which on the GPU is the device address
@@ -682,7 +786,14 @@ bool Emitter::ctype(uint32_t tid, std::string& out) const {
       const SType& et = e->second;
       const char* pre = nullptr;
       if (et.kind == KFloat && et.width == 32) pre = "weft_f";
-      else if (et.kind == KFloat && et.width == 64) pre = "weft_d";
+      else if (et.kind == KFloat && et.width == 64) {
+        // A vector of doubles would need a helper call per component, which the
+        // component-wise path spells as an operator. Scalar doubles are carried; this
+        // shape is not, and it fails as an unsupported type rather than as integer
+        // arithmetic on two 64-bit halves.
+        if (gpu) return false;
+        pre = "weft_d";
+      }
       else if (et.kind == KInt && et.width == 32) pre = et.is_signed ? "weft_i" : "weft_u";
       else if (et.kind == KInt && et.width == 64) pre = et.is_signed ? "weft_l" : "weft_ul";
       if (!pre) return false;
@@ -782,6 +893,13 @@ uint32_t Emitter::vtype(uint32_t id) const {
   return t == vt_.end() ? 0u : t->second;
 }
 
+// A 64-bit float. On the GPU its values are carried as the uint64_t their bits live
+// in, because Metal rejects the type; the CPU target uses the host's double.
+bool Emitter::f64_type(uint32_t tid) const {
+  auto t = m_.types.find(tid);
+  return t != m_.types.end() && t->second.kind == KFloat && t->second.width == 64;
+}
+
 // A builtin variable's value, or one component of it (comp < 0 means the whole
 // thing). The launch geometry is all in Ctx, so this is a plain expression.
 std::string Emitter::builtin_expr(uint32_t var, int comp) const {
@@ -866,6 +984,21 @@ bool Emitter::wide_shfl(uint32_t tid, const std::string& e, const std::string& p
   // read the later half twice and the low word would come back as the high one.
   auto pass = [&](const std::string& payload) -> std::string {
     if (gpu) {
+      if (warp_step_) {
+        // One thread owns these lanes, so the word moves through a window of the
+        // warp's slot array: every lane publishes it, the sweep brings the lanes
+        // back, and the peer's slot is read on the way in.
+        const int off = slot_off_;
+        slot_off_ += 32;
+        const int sid = resume_next_++;
+        const std::string tmp = "weft_shfl_" + std::to_string(sid);
+        decls_ += "  uint32_t " + tmp + "[32];\n";
+        body_ += "  weft_slots[" + std::to_string(off) + " + l] = (" + payload + "); " +
+                 park((uint32_t)sid) + "\n";
+        body_ += "  s->" + tmp + "[l] = weft_slots[" + std::to_string(off) + " + ((" + peer +
+                 ") & 31u)];\n";
+        return "s->" + tmp + "[l]";
+      }
       // One instruction: the hardware moves the word between lanes, so there is
       // no second pass and nothing to save. `peer` is the absolute lane; modulo
       // the warp's width that is the index simd_shuffle takes.
@@ -915,7 +1048,7 @@ bool Emitter::wide_shfl(uint32_t tid, const std::string& e, const std::string& p
     const std::string bits =
         "((uint64_t)(" + lo + ") | ((uint64_t)(" + hi + ") << 32))";
     if (t.kind == KFloat)
-      out = "weft_bitcast<double>(" + bits + ")";
+      out = gpu ? bits : ("weft_bitcast<double>(" + bits + ")");
     else
       out = std::string("(") + (t.is_signed ? "int64_t" : "uint64_t") + ")(" + bits + ")";
     return true;
@@ -1054,6 +1187,92 @@ bool Emitter::emit_one(const Instr& ins) {
   };
   auto set = [&](const std::string& e) { body_ += "  " + fref(rd) + " = " + e + ";\n"; };
 
+  // ---- 64-bit floats ----
+  //
+  // Metal rejects `double` outright — the type does not exist on this hardware — so a
+  // kernel carrying one could not be compiled at all. Every GPU without fp64 carries
+  // one in software, and this target does the same: `ctype` hands a double the
+  // `uint64_t` its bits live in, and each operation below is an exact IEEE-754 helper
+  // from `weft_fp64`. Memory, `select`, `phi`, a copy and a shuffle need nothing: they
+  // move the bits, and the bits are the value.
+  if (gpu) {
+    const bool r64 = res && f64_type(rt);
+    const bool o64 = a.size() > 2 && f64_type(vtype(a[2]));
+    if (r64 || o64) {
+      auto bin = [&](const char* fn) {
+        set(std::string("weft_fp64::") + fn + "(" + V(2) + ", " + V(3) + ")");
+      };
+      switch (op) {
+        case OpFAdd: bin("add"); return true;
+        case OpFSub: bin("sub"); return true;
+        case OpFMul: bin("mul"); return true;
+        case OpFDiv: bin("div"); return true;
+        case OpFNegate: set("weft_fp64::neg(" + V(2) + ")"); return true;
+        case OpFOrdEqual: bin("eq"); return true;
+        case OpFOrdNotEqual: bin("ne"); return true;
+        case OpFUnordEqual: set("!weft_fp64::eq(" + V(2) + ", " + V(3) + ")"); return true;
+        case OpFUnordNotEqual:
+          set("!weft_fp64::ne(" + V(2) + ", " + V(3) + ")");
+          return true;
+        case OpFOrdLessThan: bin("lt"); return true;
+        case OpFUnordLessThan: set("!weft_fp64::ge(" + V(2) + ", " + V(3) + ")"); return true;
+        case OpFOrdGreaterThan: bin("gt"); return true;
+        case OpFUnordGreaterThan: set("!weft_fp64::le(" + V(2) + ", " + V(3) + ")"); return true;
+        case OpFOrdLessThanEqual: bin("le"); return true;
+        case OpFUnordLessThanEqual: set("!weft_fp64::gt(" + V(2) + ", " + V(3) + ")"); return true;
+        case OpFOrdGreaterThanEqual: bin("ge"); return true;
+        case OpFUnordGreaterThanEqual:
+          set("!weft_fp64::lt(" + V(2) + ", " + V(3) + ")");
+          return true;
+        case OpIsNan: set("weft_fp64::is_nan(" + V(2) + ")"); return true;
+        case OpIsInf: set("weft_fp64::is_inf(" + V(2) + ")"); return true;
+        case OpIsFinite:
+          set("(!weft_fp64::is_nan(" + V(2) + ") && !weft_fp64::is_inf(" + V(2) + "))");
+          return true;
+        case OpSignBitSet: set("((" + V(2) + ") >> 63) != 0ull"); return true;
+        case OpConvertFToS: set("weft_fp64::to_i64(" + V(2) + ")"); return true;
+        case OpConvertFToU: set("weft_fp64::to_u64(" + V(2) + ")"); return true;
+        case OpConvertSToF: set("weft_fp64::from_i64(" + V(2) + ")"); return true;
+        case OpConvertUToF: set("weft_fp64::from_u64(" + V(2) + ")"); return true;
+        case OpFConvert:
+          if (r64)
+            set("weft_fp64::from_f32(weft_bitcast<uint32_t>(" + V(2) + "))");
+          else
+            set("weft_bitcast<float>(weft_fp64::to_f32(" + V(2) + "))");
+          return true;
+        case OpExtInst: {
+          // The numbers are OpenCL.std's, which is the set this front end knows.
+          const uint32_t num = a.size() > 3 ? a[3] : 0u;
+          const std::string x = a.size() > 4 ? V(4) : "0ull";
+          switch (num) {
+            case 12: set("weft_fp64::ceil_bits(" + x + ")"); return true;
+            case 23: set("weft_fp64::abs_bits(" + x + ")"); return true;
+            case 25: set("weft_fp64::floor_bits(" + x + ")"); return true;
+            case 55: set("weft_fp64::round_bits(" + x + ")"); return true;
+            case 66: set("weft_fp64::trunc_bits(" + x + ")"); return true;
+            case 27: set("weft_fp64::max_bits(" + x + ", " + V(5) + ")"); return true;
+            case 28: set("weft_fp64::min_bits(" + x + ", " + V(5) + ")"); return true;
+            default:
+              err = "OpenCL.std instruction " + std::to_string(num) +
+                    " over a double has no GPU form: the arithmetic, the comparisons,"
+                    " the conversions, floor/ceil/trunc/round and min/max do";
+              return false;
+          }
+        }
+        // The bits move and the bits are the value, so these fall through to the
+        // ordinary translation: `break` leaves this switch, not the function.
+        case OpLoad: case OpStore: case OpSelect: case OpPhi: case OpCopyObject:
+        case OpVariable: case OpFunctionParameter: case OpCompositeExtract:
+        case OpCompositeConstruct: case OpCompositeInsert: case OpVectorShuffle:
+        case OpBitcast: case OpFunctionCall:
+          break;
+        default:
+          err = "opcode " + std::to_string(op) + " on a double has no GPU form";
+          return false;
+      }
+    }
+  }
+
   // Component-wise binary op on packed vector structs. `op` is a C++ operator.
   auto compwise = [&](const std::string& A, const std::string& B, const char* o) -> std::string {
     uint32_t en = 0, n = 0;
@@ -1091,10 +1310,18 @@ bool Emitter::emit_one(const Instr& ins) {
       uint32_t sz = 0;
       if (!tsize(t->second.elem, sz)) { err = "local variable of an unsupported type"; return false; }
       if (sz == 0) sz = 1;
-      decls_ += "  unsigned char " + field(rd) + "[" + std::to_string(sz) + "];\n";
-      base_addr_[rd] = "((" + addr_space("thread", false) + "unsigned char*)s->" + field(rd) + ")";
+      // One thread walking 32 lanes needs one copy of a local per lane: the lanes
+      // are data there, not threads, so the storage is a row each.
+      const std::string th = addr_space("thread", false);
+      decls_ += "  unsigned char " + field(rd) + (warp_ ? "[32][" : "[") +
+                std::to_string(sz) + "];\n";
+      base_addr_[rd] = "((" + th + "unsigned char*)s->" + field(rd) + (warp_ ? "[l]" : "") + ")";
       vt_[rd] = a[0];
-      if (a.size() > 3) init_ += "  std::memset(s->" + field(rd) + ", 0, " + std::to_string(sz) + ");\n";
+      if (a.size() > 3) {
+        const std::string at = "s->" + field(rd) + (warp_ ? "[l]" : "");
+        init_ += gpu ? ("  weft::zero_thread(" + at + ", " + std::to_string(sz) + ");\n")
+                     : ("  std::memset(" + at + ", 0, " + std::to_string(sz) + ");\n");
+      }
       return true;
     }
 
@@ -1362,11 +1589,27 @@ bool Emitter::emit_one(const Instr& ins) {
     case OpReturn: case OpReturnValue: case OpKill: case OpUnreachable:
       // On the warp target this ends the lane, not the thread: the lane loop
       // moves to the next lane, which is what a hardware lane does when it exits.
-      body_ += warp_ ? "  continue;\n" : "  s->pc = 0xFFFFFFFFu; return;\n";
+      // With more than one block the lane's body is a dispatch loop of its own, so
+      // the end of the lane is the sentinel that loop reads at its head — a bare
+      // `continue` there would re-enter the same case for ever.
+      if (warp_step_) body_ += "  { s->pc[l] = 0xFFFFFFFFu; continue; }\n";
+      else if (warp_)
+        body_ += warp_blocks_ ? "  { s->pc = 0xFFFFFFFFu; continue; }\n" : "  continue;\n";
+      else
+        body_ += "  s->pc = 0xFFFFFFFFu; return;\n";
       return true;
 
     case OpControlBarrier: {
       barrier_ = true;
+      if (warp_step_) {
+        // A barrier between lanes that one thread runs is a hand-off between
+        // them, not a hardware fence: park this lane and let the dispatch — which
+        // always runs the lowest program counter first — bring it back only once
+        // every lane has arrived. Nothing needs flushing, because one thread's
+        // accesses are already in program order.
+        body_ += "  " + park(resume_next_++) + "\n";
+        return true;
+      }
       if (gpu) {
         // The hardware's barrier: every thread of the group arrives, and nothing
         // is suspended, so there is no program counter to save.
@@ -1421,12 +1664,130 @@ bool Emitter::emit_one(const Instr& ins) {
           "const uint32_t weft_wl = (weft_live > weft_wb) ? (weft_live - weft_wb > 32u ? 32u : weft_live - weft_wb) : 0u; "
           "const uint32_t weft_mask = (weft_wl >= 32u) ? 0xFFFFFFFFu : ((1u << weft_wl) - 1u); ";
 
+      // One thread owns these lanes, so a vote is a relay through the warp's slot
+      // array: every lane publishes, the sweep brings them back, and the answer is
+      // folded over the slots. The park is the rendezvous — see case_open.
+      if (warp_step_) {
+        const std::string wmask = slot_mask();
+        if (op == OpGroupNonUniformAllEqual) {
+          // The value's own words, one pass each: a word that differs anywhere
+          // makes the answer false, and every word has to agree. The accumulator is
+          // per lane because the passes interleave across lanes.
+          //
+          // A word of a value is its *bits*, not its value: a float published as
+          // `(uint32_t)x` arrives as its integer part, so two different floats
+          // between 1.0 and 2.0 would compare equal. The same holds for the halves of
+          // a double, so each component is bitcast before it is split.
+          uint32_t sz = 0;
+          if (!tsize(vtype(a[3]), sz)) { err = "a vote on a value of no size"; return false; }
+          uint32_t en = 0, nn = 0;
+          const bool vec = vector_of(vtype(a[3]), en, nn);
+          const auto& et = m_.types[vec ? en : vtype(a[3])];
+          const int csize = (int)(et.width / 8);
+          if (csize != 4 && csize != 8) {
+            err = "a vote on a component that is neither 32 nor 64 bits";
+            return false;
+          }
+          const int comps = vec ? (int)nn : 1;
+          const int words = comps * csize / 4;
+          if (sz != (uint32_t)(comps * csize)) {
+            err = "a vote on a value whose size is not a whole number of components";
+            return false;
+          }
+          const bool flt = et.kind == KFloat;
+          const std::string acc = "weft_eq" + std::to_string(rd);
+          decls_ += "  uint32_t " + acc + "[32];\n";
+          // The accumulator is a member of the state, and one thread owns the
+          // lanes, so it is written through `s->` with the lane index.
+          const std::string accref = "s->" + acc + "[l]";
+          body_ += "  " + accref + " = 1u;\n";
+          for (int w = 0; w < words; w++) {
+            const int ci = w / (csize / 4);
+            const int half = w % (csize / 4);
+            std::string comp = V(3);
+            if (vec) comp = "(" + V(3) + ")." + std::string(1, "xyzw"[ci]);
+            std::string bits;
+            if (csize == 4)
+              bits = flt ? ("weft_bitcast<uint32_t>(" + comp + ")") : ("(uint32_t)(" + comp + ")");
+            else if (flt)
+              bits = half == 0
+                         ? ("(uint32_t)(weft_bitcast<uint64_t>(" + comp + ") & 0xFFFFFFFFu)")
+                         : ("(uint32_t)(weft_bitcast<uint64_t>(" + comp + ") >> 32)");
+            else
+              bits = half == 0 ? ("(uint32_t)((uint64_t)(" + comp + ") & 0xFFFFFFFFu)")
+                               : ("(uint32_t)((uint64_t)(" + comp + ") >> 32)");
+            const int off = slot_off_;
+            slot_off_ += 32;
+            body_ += "  weft_slots[" + std::to_string(off) + " + l] = " + bits + "; " +
+                     park((uint32_t)resume_next_++) + "\n";
+            body_ += "  " + accref + " &= weft::slot_all_equal(weft_slots + " +
+                     std::to_string(off) + ", " + wmask + ");\n";
+          }
+          body_ += "  " + fref(rd) + " = (" + accref + " != 0u);\n";
+          return true;
+        }
+        const int off = slot_off_;
+        slot_off_ += 32;
+        body_ += "  weft_slots[" + std::to_string(off) + " + l] = " + payload + "; " +
+                 park((uint32_t)resume_next_++) + "\n";
+        uint32_t en = 0, nn = 0;
+        const bool wide = is_ballot && vector_of(rt, en, nn) && nn == 4;
+        const std::string b = "(weft::slot_ballot(weft_slots + " + std::to_string(off) +
+                              ", " + wmask + ") & " + wmask + ")";
+        std::string e;
+        if (is_ballot) {
+          e = b;
+          if (wide) e = rty + "{" + e + ", 0u, 0u, 0u}";
+        } else if (op == OpGroupNonUniformAll) {
+          e = "(" + b + " == " + wmask + " && " + wmask + " != 0u)";
+        } else {
+          e = "(" + b + " != 0u)";
+        }
+        body_ += "  " + fref(rd) + " = " + e + ";\n";
+        return true;
+      }
+
       if (op == OpGroupNonUniformAllEqual) {
         // Every lane publishes its value's bits; the answer is whether they agree.
         // One rendezvous is enough because the published array holds all of them.
-        if (!shfl_pub(vtype(a[3]), V(3), payload)) return false;
+        //
+        // A value wider than a word goes into the eight-byte wide slot instead of
+        // the word-wide one — the same relay with a wider payload, not a second
+        // mechanism, and the shuffle path already double-buffers those slots by
+        // pass. Comparing the bytes covers every width it can hold at once: a long,
+        // a double, a `uint4`. Nothing here needs to know which of those it is,
+        // which is the point — the alternative is a refusal per type.
+        uint32_t eqsz = 0;
+        if (!tsize(vtype(a[3]), eqsz)) { err = "a vote on a value of no size"; return false; }
+        std::string eqty;
+        if (!ctype(vtype(a[3]), eqty)) { err = "a vote on a value of no type"; return false; }
+        const bool eq_wide = eqsz > 4;
+        if (eq_wide && eqsz > 16) {
+          err = "a vote on a value wider than the sixteen-byte relay slot";
+          return false;
+        }
         const int ae = resume_next_++;
         cases_ += "    case " + std::to_string(ae) + ": goto R" + std::to_string(ae) + ";\n";
+        if (eq_wide) {
+          const std::string n = std::to_string(eqsz);
+          body_ += "  { const " + eqty + " weft_v = " + V(3) +
+                   "; std::memcpy(weft::wide_pub_slot(ctx), &weft_v, " + n + "); }\n"
+                   "  s->pc = " +
+                   std::to_string(ae) + "u; return;\n  R" + std::to_string(ae) + ":;\n";
+          body_ += "  { " + live +
+                   " const unsigned char* weft_me = weft::wide_read_slot(ctx, ctx.lid);\n"
+                   "    bool weft_same = true;\n"
+                   "    for (uint32_t weft_i = 0; weft_i < 32u; weft_i++) {\n"
+                   "      if ((weft_mask & (1u << weft_i)) == 0u) continue;\n"
+                   "      if (std::memcmp(weft_me, weft::wide_read_slot(ctx, weft_wb + weft_i), " +
+                   n +
+                   ") != 0) weft_same = false;\n"
+                   "    }\n"
+                   "    s->" +
+                   field(rd) + " = weft_same; }\n";
+          return true;
+        }
+        if (!shfl_pub(vtype(a[3]), V(3), payload)) return false;
         body_ += "  ((uint32_t*)weft::shfl_pub_buf(ctx))[ctx.lid] = " + payload +
                  "; s->pc = " + std::to_string(ae) + "u; return;\n  R" +
                  std::to_string(ae) + ":;\n";
@@ -1503,9 +1864,19 @@ bool Emitter::emit_one(const Instr& ins) {
     // ---- atomics ----
     case OpAtomicLoad: {
       if (gpu && m_.types[vtype(rd)].width == 64) {
-        err = "this host's Metal has no 64-bit atomic, so a 64-bit atomic load has no "
-              "GPU form";
-        return false;
+        if (!warp_) {
+          err = "this host's Metal has no 64-bit atomic, so a 64-bit atomic load has no "
+                "GPU form";
+          return false;
+        }
+        // The warp target is one thread for the whole grid, so nothing can
+        // interleave with the pair: two 32-bit atomic loads are the 64-bit load,
+        // read through the coherent point exactly as the pair updates are.
+        wide_atom = true;
+        const bool sgn = m_.types[vtype(rd)].is_signed;
+        set("weft::load64((device " + std::string(sgn ? "int64_t" : "uint64_t") +
+            "*)(uintptr_t)(" + addr(a[2]) + "))");
+        return true;
       }
       set("weft::atomic_load<" + rty + ">((" + addr_space("device", false) + "void*)" +
           addr(a[2]) + ")");
@@ -1513,9 +1884,17 @@ bool Emitter::emit_one(const Instr& ins) {
     }
     case OpAtomicStore: {
       if (gpu && m_.types[vtype(a[3])].width == 64) {
-        err = "this host's Metal has no 64-bit atomic, so a 64-bit atomic store has no "
-              "GPU form";
-        return false;
+        if (!warp_) {
+          err = "this host's Metal has no 64-bit atomic, so a 64-bit atomic store has "
+                "no GPU form";
+          return false;
+        }
+        wide_atom = true;
+        const bool sgn = m_.types[vtype(a[3])].is_signed;
+        const std::string t64 = sgn ? "int64_t" : "uint64_t";
+        body_ += "  weft::store64((device " + t64 + "*)(uintptr_t)(" + addr(a[0]) + "), (" +
+                 t64 + ")(" + V(3) + "));\n";
+        return true;
       }
       body_ += "  weft::atomic_store((" + addr_space("device", false) + "void*)" + addr(a[0]) +
                ", " + V(3) + ");\n";
@@ -1571,8 +1950,31 @@ bool Emitter::emit_one(const Instr& ins) {
                                  : op == OpAtomicAnd  ? "and"
                                  : op == OpAtomicOr   ? "or"
                                                       : "xor";
-          body_ += "  (void)weft::red_" + rn + "_u64((device uint64_t*)(uintptr_t)(" + ptr +
-                   "), (uint64_t)(" + val_ + "));\n";
+          const std::string addr = "((device uint64_t*)(uintptr_t)(" + ptr + "))";
+          // A lane-dependent address cannot be hoisted: each lane's word is its
+          // own, and folding them together would be a different program.
+          const bool invariant = ptr.find("ctx.lid") == std::string::npos &&
+                                 ptr.find("ctx.gid") == std::string::npos &&
+                                 ptr.find("[l]") == std::string::npos;
+          if (invariant && pointer_used_once(a[2])) {
+            std::string name;
+            for (const auto& a : red_accs)
+              if (a.addr == addr && a.op == rn) name = a.name;
+            if (name.empty()) {
+              name = "weft_red_acc" + std::to_string(red_accs.size());
+              red_accs.push_back(RedAcc{addr, rn, name});
+            }
+            const char* foldop = rn == "add"   ? "+"
+                                 : rn == "sub" ? "-"
+                                 : rn == "and" ? "&"
+                                 : rn == "or"  ? "|"
+                                               : "^";
+            body_ += "  " + name + " = " + name + " " + foldop + " (uint64_t)(" + val_ +
+                     ");\n";
+            return true;
+          }
+          body_ += "  (void)weft::red_" + rn + "_u64(" + addr + ", (uint64_t)(" + val_ +
+                   "));\n";
           return true;
         }
         // Refused, and the two reasons are separate measurements.
@@ -1625,17 +2027,50 @@ bool Emitter::emit_one(const Instr& ins) {
           // one writer without a second take.
           std::string call64;
           if (name64 == "cas")
-            call64 = "weft::rmw_cas_raw(" + ptr64 + ", (" + t64 + ")(" + cmp + "), " + v64 +
+            call64 = "weft::rmw_cas_solo(" + ptr64 + ", (" + t64 + ")(" + cmp + "), " + v64 +
                       ")";
-          else call64 = "weft::rmw_" + name64 + "_raw(" + ptr64 + ", " + v64 + ")";
+          else call64 = "weft::rmw_" + name64 + "_solo(" + ptr64 + ", " + v64 + ")";
+          // The local form is recorded here and only used if the emitted body
+          // touches that binding once, which is checked once the body exists.
+          if (name64 != "cas") {
+            const size_t bat = ptr64.find("bufs[");
+            const size_t bcl = bat == std::string::npos ? std::string::npos : ptr64.find(']', bat);
+            if (bcl != std::string::npos) {
+              const std::string sh = "weft_sh" + std::to_string(shadows.size());
+              ShadowSite site;
+              site.buf = ptr64.substr(bat, bcl - bat + 1);
+              site.call = call64;
+              site.shadow = "weft::sh64_" + name64 + "(" + sh + ", " + v64 + ")";
+              site.decl = std::string(sgn ? "int64_t " : "uint64_t ") + sh + " = *((device " +
+                          t64 + "*)(uintptr_t)(" + ptr + "));";
+              site.flush = "*((device " + t64 + "*)(uintptr_t)(" + ptr + ")) = " + sh + ";";
+              shadows.push_back(site);
+            }
+          }
           if (dropped) body_ += "  (void)" + call64 + ";\n";
           else set(call64);
           return true;
         }
-        err = "a 64-bit atomic that returns or compares the pair has no Metal form on "
-              "the per-lane back end: with only relaxed atomics a lane can enter "
-              "while the holder is still writing the pair, and the values were "
-              "measured wrong at 16,384 and 65,536 lanes";
+        // Why the per-lane back end cannot have this, measured rather than
+        // assumed (tools/lock_probe.mm is the probe, and it is A/B: `control` and
+        // `handoff` are exact at every shape while `locked`, `fenced` and
+        // `exchanged` do not finish in any of them, including two threadgroups of
+        // 32 threads). Ordering is not the obstacle — a device-scope
+        // `atomic_thread_fence` exists and a relaxed store reaches a waiter in
+        // another threadgroup. Progress is: a lane that wins a section cannot run
+        // it until the other lanes in its warp leave the spin loop, and they
+        // cannot leave until it releases, because a warp is one program counter. A
+        // threadgroup of a single thread does not escape that either — such
+        // threadgroups are co-scheduled into one warp and deadlock across each
+        // other instead of within each. So this shape is refused by name rather
+        // than emitted as a launch that hangs; the same kernel runs on the warp
+        // target above, where one thread owns all 32 lanes and there is no section
+        // to wait on at all.
+        err = "a 64-bit atomic that reads the old pair back moves both words as one "
+              "value, and only one writer can do that here: lanes in a warp cannot "
+              "wait for each other (a warp has one program counter), so the per-lane "
+              "back end cannot host the section. The warp target can, by walking "
+              "every warp in one thread, but this kernel " + warp_why_;
         return false;      }
       // sub is only defined for unsigned in the runtime; signed subtraction is
       // an add of the negation.
@@ -1848,16 +2283,22 @@ bool Emitter::emit_one(const Instr& ins) {
       std::string f;
       int arity = 1;
       switch (num) {
-        case 12: f = "cbrt"; break;
-        case 13: f = "ceil"; break;
-        case 14: f = "copysign"; arity = 2; break;
-        case 15: f = "cos"; break;
-        case 16: f = "cosh"; break;
-        case 18: f = "erfc"; break;
-        case 19: f = "erf"; break;
-        case 20: f = "exp"; break;
-        case 21: f = "exp2"; break;
-        case 22: f = "exp10"; break;
+        // The numbers are OpenCL.std's own — what an assembler encodes and what a
+        // compiler emits. This window used to be off by one: `cbrt` is 11 and `ceil`
+        // is 12, because `cospi` and `expm1` are in the list between `cosh` and
+        // `erfc`. As it stood, a kernel calling `ceil` was translated into a cube
+        // root, silently. `cospi` and `expm1` have no name on both targets, so they
+        // are refused by number instead of being mapped to something else.
+        case 11: f = "cbrt"; break;
+        case 12: f = "ceil"; break;
+        case 13: f = "copysign"; arity = 2; break;
+        case 14: f = "cos"; break;
+        case 15: f = "cosh"; break;
+        case 17: f = "erfc"; break;
+        case 18: f = "erf"; break;
+        case 19: f = "exp"; break;
+        case 20: f = "exp2"; break;
+        case 21: f = "exp10"; break;
         case 23: f = "fabs"; break;
         case 24: f = "fdim"; arity = 2; break;
         case 25: f = "floor"; break;
@@ -1990,19 +2431,30 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
   auto arg = [&](size_t k) { return V(3 + k); };
   auto result = [&](const std::string& e) {
     if (!has_result) return;
-    body_ += "  s->" + field(a[1]) + " = " + e + ";\n";
+    // `fref` is `s->v<id>` on the C++ target and `s->v<id>[l]` where one thread owns
+    // the lanes, which is what the warp target's imports write into.
+    body_ += "  " + fref(a[1]) + " = " + e + ";\n";
   };
 
   // Every rendezvous below is the same shape: publish this lane's value, give
   // the worker back, and read the warp's published array on the next pass.
+  int last_off = -1;  // the window this call published into, for the fold that reads it
   auto rendezvous = [&](const std::string& payload) -> std::string {
+    if (warp_step_) {
+      // One thread owns these lanes, so the rendezvous is a window of the warp's
+      // slot array and a park: the sweep brings the lanes back in order, and the
+      // fold reads the window. Same relay as the native subgroup instructions.
+      subgroup_ = true;
+      last_off = slot_off_;
+      slot_off_ += 32;
+      body_ += "  weft_slots[" + std::to_string(last_off) + " + l] = (uint32_t)(" + payload +
+               "); " + park((uint32_t)resume_next_++) + "\n";
+      return "";
+    }
     if (gpu) {
-      // The import path is the one place a rendezvous would have to become a
-      // separate simd instruction per call, and there is no shape here that says
-      // which one. The native OpGroupNonUniform forms do have a GPU form; this
-      // is refused by name rather than guessed at.
       err = "the OpenCL.std subgroup call '" + name +
-            "' has no GPU form: the native subgroup instructions do";
+            "' has no GPU form on the per-lane target: the relay it needs is the "
+            "warp target's; the native subgroup instructions say which one it is";
       return "";
     }
     subgroup_ = true;
@@ -2026,6 +2478,11 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
     // A sub-group barrier is weaker than a work-group one, but a threadgroup
     // rendezvous is the only kind this runtime has, and it is sound to over-wait.
     barrier_ = true;
+    if (warp_step_) {
+      body_ += "  " + park(resume_next_++) + "\n";
+      result("0");
+      return true;
+    }
     if (gpu) {
       body_ += "  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n";
       result("0");
@@ -2049,13 +2506,24 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
   if (name == "sub_group_ballot" || name == "sub_group_all" || name == "sub_group_any") {
     const std::string lab = rendezvous("(" + arg(0) + ") ? 1u : 0u");
     body_ += lab;
+    if (warp_step_) {
+      // Folded out of the window this call published into, over the lanes that exist.
+      const std::string mask = slot_mask();
+      const std::string b = "(weft::slot_ballot(weft_slots + " + std::to_string(last_off) +
+                            ", " + mask + ") & " + mask + ")";
+      std::string e;
+      if (name == "sub_group_ballot") e = b;
+      else if (name == "sub_group_all") e = "(" + b + " == " + mask + " && " + mask + " != 0u)";
+      else e = "(" + b + " != 0u)";
+      body_ += "  " + fref(a[1]) + " = (" + rty + ")(" + e + ");\n";
+      return true;
+    }
     std::string e;
     if (name == "sub_group_ballot") e = "(weft::vote_ballot(ctx) & weft_mask)";
     else if (name == "sub_group_all")
       e = "(((weft::vote_ballot(ctx) & weft_mask) == weft_mask) && weft_mask != 0u)";
     else e = "((weft::vote_ballot(ctx) & weft_mask) != 0u)";
-    body_ += "  { " + std::string(kLive) + "s->" + field(a[1]) + " = (" + rty + ")(" + e +
-             "); }\n";
+    body_ += "  { " + std::string(kLive) + fref(a[1]) + " = (" + rty + ")(" + e + "); }\n";
     return true;
   }
 
@@ -2085,25 +2553,163 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
     const std::string kind = name.substr(name.find_last_of('_') + 1);
     std::string ety;
     if (!ctype(vtype(a[3]), ety)) { err = "reduction over an unsupported type"; return false; }
+    // A double on the GPU is the uint64_t its bits live in, so its identity and its
+    // combine are the helpers rather than the operators: `weft_a + weft_v` over two
+    // bit patterns would be integer addition.
+    const auto& vtel = m_.types[vtype(a[3])];
+    const bool f64_el = gpu && vtel.kind == KFloat && vtel.width == 64;
     std::string seed, comb;
-    if (kind == "add") { seed = "0"; comb = "weft_a + weft_v"; }
+    if (f64_el) {
+      if (kind == "add") {
+        seed = "0ull";
+        comb = "weft_fp64::add(weft_a, weft_v)";
+      } else if (kind == "min") {
+        seed = "0x7FF0000000000000ull";
+        comb = "weft_fp64::min_bits(weft_a, weft_v)";
+      } else if (kind == "max") {
+        seed = "0xFFF0000000000000ull";
+        comb = "weft_fp64::max_bits(weft_a, weft_v)";
+      } else {
+        err = "a subgroup " + kind + " over a double has no GPU form";
+        return false;
+      }
+    } else if (kind == "add") { seed = "0"; comb = "weft_a + weft_v"; }
     else if (kind == "and") { seed = "~(" + ety + ")0"; comb = "weft_a & weft_v"; }
     else if (kind == "or") { seed = "0"; comb = "weft_a | weft_v"; }
-    else if (kind == "xor") { seed = "0"; comb = "weft_a ^ weft_v"; }
-    else if (kind == "min") {
-      seed = inf_expr(ety, false);
-      comb = "weft_a < weft_v ? weft_a : weft_v";
-    } else if (kind == "max") {
-      seed = inf_expr(ety, true);
-      comb = "weft_a > weft_v ? weft_a : weft_v";
+    else if (kind == "xor") { seed = "0"; comb = "weft_a ^ weft_v"; }    else if (kind == "min" || kind == "max") {
+      // The identity a fold starts from: `INFINITY` on the GPU, which has no
+      // numeric_limits, and the type's own extreme for an integer — casting a float
+      // infinity to an int is not the integer's largest value.
+      const auto& vt = m_.types[vtype(a[3])];
+      const bool ints = vt.kind == KInt && vt.width <= 32;
+      const bool mn = kind == "min";
+      if (!gpu) seed = inf_expr(ety, !mn);
+      else if (!ints) seed = mn ? "INFINITY" : "-INFINITY";
+      else if (mn) seed = vt.is_signed ? "((" + ety + ")0x7FFFFFFF)" : "(~(" + ety + ")0)";
+      else seed = vt.is_signed ? "((" + ety + ")0x80000000)" : "((" + ety + ")0)";
+      comb = mn ? "weft_a < weft_v ? weft_a : weft_v" : "weft_a > weft_v ? weft_a : weft_v";
     } else {
       err = "subgroup operation '" + name + "' is not supported";
       return false;
+    }
+    // ---- a value wider than the rendezvous ----
+    //
+    // A window of the slot array is one word, and so is the publication buffer, so
+    // a 64-bit payload has nowhere to go. It does not need a third mechanism: the
+    // region that carries a 16-byte shuffle payload is already eight bytes per lane
+    // on the C++ target, and on the warp target two windows side by side are the
+    // same eight bytes. Publish low word then high, park once, and the fold
+    // reassembles each lane's value from the two.
+    const bool wide64 = m_.types[vtype(a[3])].width == 64;
+    const std::string nth = scan ? (incl ? "((ctx.lid & 31u) + 1u)" : "(ctx.lid & 31u)")
+                                 : std::string("32u");
+    if (wide64) {
+      // An integer is already its own bits; a double's have to be carried as the
+      // bits they are, which `weft_bitcast` does on both targets.
+      const std::string bits = ety == "double"
+                                   ? ("weft_bitcast<uint64_t>(" + arg(0) + ")")
+                                   : ("(uint64_t)(" + arg(0) + ")");
+      const std::string unpack = "weft_bitcast<" + ety + ">";
+      if (warp_step_) {
+        subgroup_ = true;
+        const int lo = slot_off_;
+        slot_off_ += 64;
+        body_ += "  { const uint64_t weft_b = " + bits +
+                 ";\n"
+                 "    weft_slots[" +
+                 std::to_string(lo) +
+                 " + l] = (uint32_t)(weft_b & 0xFFFFFFFFu);\n"
+                 "    weft_slots[" +
+                 std::to_string(lo + 32) + " + l] = (uint32_t)(weft_b >> 32); }\n  " +
+                 park((uint32_t)resume_next_++) + "\n";
+        const std::string mask = slot_mask();
+        body_ += "  { const uint32_t weft_mask = " + mask + ";\n"
+                 "    threadgroup const uint32_t* weft_wl = weft_slots + " +
+                 std::to_string(lo) +
+                 ";\n"
+                 "    threadgroup const uint32_t* weft_wh = weft_slots + " +
+                 std::to_string(lo + 32) +
+                 ";\n"
+                 "    const uint32_t weft_n = " +
+                 nth +
+                 ";\n"
+                 "    " +
+                 ety + " weft_a = (" + ety + ")(" + seed + ");\n"
+                 "    for (uint32_t weft_i = 0; weft_i < weft_n; weft_i++) {\n"
+                 "      if (!(weft_mask & (1u << weft_i))) continue;\n"
+                 "      const uint64_t weft_w = ((uint64_t)weft_wh[weft_i] << 32) | "
+                 "(uint64_t)weft_wl[weft_i];\n"
+                 "      const " +
+                 ety + " weft_v = " + unpack + "(weft_w);\n"
+                 "      weft_a = (" +
+                 ety + ")(" + comb +
+                 ");\n"
+                 "    }\n"
+                 "    " +
+                 fref(a[1]) + " = weft_a; }\n";
+        return true;
+      }
+      if (gpu) {
+        err = "a 64-bit subgroup " + std::string(scan ? "scan" : "reduce") +
+              " on the per-lane GPU target: the eight-byte relay is the warp target's";
+        return false;
+      }
+      // The C++ target publishes the eight bytes into its wide slot, which the
+      // shuffle path already double-buffers by pass.
+      subgroup_ = true;
+      const int id = resume_next_++;
+      cases_ += "    case " + std::to_string(id) + ": goto R" + std::to_string(id) + ";\n";
+      body_ += "  { const uint64_t weft_b = " + bits +
+               "; std::memcpy(weft::wide_pub_slot(ctx), &weft_b, 8); }\n"
+               "  s->pc = " +
+               std::to_string(id) + "u; return;\n  R" + std::to_string(id) + ":;\n";
+      body_ += "  { " + std::string(kLive) + " const uint32_t weft_n = " + nth +
+               ";\n"
+               "    " +
+               ety + " weft_a = (" + ety + ")(" + seed + ");\n"
+               "    for (uint32_t weft_i = 0; weft_i < weft_n; weft_i++) {\n"
+               "      if (!(weft_mask & (1u << weft_i))) continue;\n"
+               "      uint64_t weft_w = 0u;\n"
+               "      std::memcpy(&weft_w, weft::wide_read_slot(ctx, weft_i), 8);\n"
+               "      const " +
+               ety + " weft_v = " + unpack + "(weft_w);\n"
+               "      weft_a = (" +
+               ety + ")(" + comb +
+               ");\n"
+               "    }\n"
+               "    " +
+               fref(a[1]) + " = weft_a; }\n";
+      return true;
     }
     std::string payload;
     if (!shfl_pub(vtype(a[3]), arg(0), payload)) return false;
     const std::string lab = rendezvous(payload);
     body_ += lab;
+    if (warp_step_) {
+      // The same fold the C++ target does, over the window this call published into
+      // instead of the shared publication buffer.
+      const std::string mask = slot_mask();
+      body_ += "  { const uint32_t weft_mask = " + mask + ";\n"
+               "    threadgroup const uint32_t* weft_rb = weft_slots + " +
+               std::to_string(last_off) +
+               ";\n"
+               "    const uint32_t weft_n = " +
+               nth +
+               ";\n"
+               "    " +
+               ety + " weft_a = (" + ety + ")(" + seed + ");\n"
+               "    for (uint32_t weft_i = 0; weft_i < weft_n; weft_i++) {\n"
+               "      if (!(weft_mask & (1u << weft_i))) continue;\n"
+               "      const " +
+               ety + " weft_v = weft_bitcast<" + ety + ">(weft_rb[weft_i]);\n"
+               "      weft_a = (" +
+               ety + ")(" + comb +
+               ");\n"
+               "    }\n"
+               "    " +
+               fref(a[1]) + " = weft_a; }\n";
+      return true;
+    }
     body_ += "  { " + std::string(kLive) +
              " const uint32_t* weft_rb = (const uint32_t*)weft::shfl_read_buf(ctx) + (ctx.lid & ~31u);\n"
              "    const uint32_t weft_n = " + (scan ? (incl ? "((ctx.lid & 31u) + 1u)" : "(ctx.lid & 31u)") : std::string("32u")) + ";\n"
@@ -2113,7 +2719,7 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
              "      const " + ety + " weft_v = weft_bitcast<" + ety + ">(weft_rb[weft_i]);\n"
              "      weft_a = (" + ety + ")(" + comb + ");\n"
              "    }\n"
-             "    s->" + field(a[1]) + " = weft_a; }\n";
+             "    " + fref(a[1]) + " = weft_a; }\n";
     return true;
   }
 
@@ -2305,12 +2911,21 @@ bool Emitter::run() {
 
   // ---- the body ----
   for (size_t bi = 0; bi < blocks_.size(); bi++) {
-    body_ += gpu ? ("  case " + std::to_string(bi) + "u:;\n") : ("L" + std::to_string(bi) + ":;\n");
+    // In step mode a block is a case whose body is run for every lane sitting at
+    // that program counter, one lane at a time; the lane loop is opened and closed
+    // here, and a barrier splits the case in two where it stands.
+    if (warp_step_) {
+      body_ += case_open((uint32_t)bi);
+      if ((int)bi > max_case_) max_case_ = (int)bi;
+    } else
+      body_ += gpu ? ("  case " + std::to_string(bi) + "u:;\n")
+                   : ("L" + std::to_string(bi) + ":;\n");
     cur_block_ = blocks_[bi].label;
     for (size_t k = blocks_[bi].begin; k < blocks_[bi].end; k++) {
       if (B[k].op == OpPhi) continue;  // written by the incoming edges
       if (!emit_one(B[k])) return false;
     }
+    if (warp_step_) body_ += case_close();
   }
   for (uint32_t id : deferred_ptr_) {
     std::string ty;
@@ -2350,37 +2965,86 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       r.error = "entry point " + e.name + " has no function body";
       return r;
     }
-    // The warp target, chosen from the module rather than from the attempt: one
-    // block (there is no per-lane program counter to arbitrate), no barrier or
-    // subgroup rendezvous, no image binding, no variable storage and no
-    // threadgroup memory — and a 64-bit atomic, which is the reason it exists.
+    // The warp target, chosen from the module rather than from the attempt: a
+    // 64-bit atomic, which is the reason it exists, and nothing the lanes have to do
+    // together — no barrier and no subgroup vote or shuffle, because a single
+    // thread runs the lanes one after another and they are never in flight at the
+    // same time. Loops, phis and function-scope storage are all fine: one program
+    // counter per lane is enough when the lane loop finishes a lane before it
+    // starts the next, and a phi is then a per-lane value like any other.
+    bool warp_pc = false;
+    bool warp_step = false;
+    std::string warp_why = "needs something the warp target cannot provide";
     auto warp_shape = [&]() -> bool {
       const auto& B = f->second.body;
       int blocks = 0;
       bool wide = false;
+      // A subgroup relay needs this target however the module got here: a vote, a
+      // reduce, a shuffle or a `sub_group_*` import is a hand-off between lanes, and
+      // the per-lane target has nowhere to put it. A barrier on its own is not that —
+      // a real threadgroup barrier does the job there — so the two are told apart.
+      bool vote = false;
       for (const Instr& ins : B) {
         switch (ins.op) {
           case OpLabel: blocks++; break;
-          case OpPhi: case OpControlBarrier: case OpMemoryBarrier: case OpVariable:
+          case OpControlBarrier:
+            // A barrier is a hand-off between lanes, which step mode provides.
+            warp_step = true;
+            break;
           case OpImageWrite: case OpImageRead: case OpImageFetch:
           case OpImageSampleImplicitLod: case OpImageSampleExplicitLod:
+            warp_why = "reads or writes an image, which is a per-lane binding";
             return false;
-          default: break;
+          default:
+            // A vote or a shuffle is a relay through the warp's slot array, which is
+            // step mode's own machinery: publish, let the sweep bring the lanes
+            // back, fold the slots. The OpenCL.std subgroup builtins arrive as calls
+            // to imported functions and need exactly the same relay.
+            if (ins.op >= OpGroupNonUniformElect && ins.op <= OpGroupNonUniformShuffleDown) {
+              warp_step = true;
+              vote = true;
+            } else if (ins.op == OpFunctionCall && ins.a.size() > 2) {
+              auto nm = m.names.find(ins.a[2]);
+              if (nm != m.names.end() && nm->second.find("sub_group_") != std::string::npos) {
+                warp_step = true;
+                vote = true;
+              }
+            }
+            break;
         }
         if (ins.op > OpAtomicLoad && ins.op <= OpAtomicXor && ins.a.size() >= 2) {
           auto t = m.types.find(ins.a[0]);
           if (t != m.types.end() && t->second.kind != KPointer && t->second.width == 64)
             wide = true;
         }
+        // A 64-bit atomic load or store is a pair read or written as one value, so
+        // it needs the same single writer the pair updates need.
+        if (ins.op == OpAtomicLoad && !ins.a.empty()) {
+          auto t = m.types.find(ins.a[0]);
+          if (t != m.types.end() && t->second.width == 64) wide = true;
+        }
+        if (ins.op == OpAtomicStore && !ins.a.empty()) {
+          auto t = m.types.find(ins.a[0]);
+          if (t != m.types.end() && t->second.kind == KPointer) {
+            auto e = m.types.find(t->second.elem);
+            if (e != m.types.end() && e->second.width == 64) wide = true;
+          }
+        }
       }
       for (const auto& g : m.globals)
-        if (g.second.storage == 3 || g.second.storage == 4) return false;
-      return blocks == 1 && wide;
+        if (g.second.storage == 3 || g.second.storage == 4) {
+          warp_why = "declares threadgroup memory, which belongs to a group of lanes "
+                     "rather than to one lane";
+          return false;
+        }
+      warp_pc = blocks > 1 || warp_step;
+      return wide || vote;
     };
     Emitter em(m, f->second);
     em.gpu_target(gpu);
     const bool warp_kernel = gpu && warp_shape();
-    if (warp_kernel) em.warp_target();
+    em.warp_reason(warp_why);
+    if (warp_kernel) em.warp_target(warp_pc, warp_step);
     if (!em.run()) {
       r.error = "kernel " + e.name + ": " + em.err;
       return r;
@@ -2389,13 +3053,21 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
     // The body is generated before the signature, because the signature has to
     // declare the lock table when a 64-bit atomic needs one.
     const std::string code = em.code();
+    // The relay area, when the kernel has one: one slice of threadgroup memory per
+    // warp, sized here so the launcher and the shader agree on both the width of a
+    // slice and how many warps a threadgroup may hold.
+    uint32_t slot_words = 0, slot_per = 0;
     if (gpu && warp_kernel) {
       // One Metal thread runs a whole 32-lane warp. Every SSA value is an array of
       // 32, the lane loop sets the context per lane so the emitted code — which
       // reads `ctx.lid` and `ctx.gid` — is unchanged, and the block body is the
       // same text the per-lane target emits.
       const int nbufs = em.nargs;
-      kernels += "struct " + st + " {\n" + em.decls() + "};\n";
+      // The warp body's program counter, when the kernel has more than one block.
+      kernels += "struct " + st + " {\n";
+      if (em.warp_step()) kernels += "  uint32_t pc[32];\n";
+      else if (em.warp_blocks()) kernels += "  uint32_t pc;\n";
+      kernels += em.decls() + "};\n";
       kernels += "kernel void " + e.name + "(";
       for (int i = 0; i < nbufs; i++)
         kernels += "device uint8_t* weft_b" + std::to_string(i) + " [[buffer(" +
@@ -2426,11 +3098,54 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       // the group's position times the threads in it, plus the thread's own index.
       kernels += "  ctx.tgid = weft_tgid.x * weft_tgsz.x + weft_tid;\n";
       kernels += "  const uint32_t weft_lanes = (uint32_t)weft_geom[0];\n";
+      if (em.warp_step()) {
+        // The warp's slot array, declared at kernel scope: a vote or a shuffle among
+        // lanes that one thread owns is a relay through it, in one window per site.
+        //
+        // A threadgroup holds several metal threads, and every one of them needs
+        // its own relay: the windows are indexed by site and lane, not by thread,
+        // so two warps sharing an array publish into the same slot and a shuffle
+        // reads a lane of a warp that has nothing to do with it. Measured on the
+        // warp scan below at eight warps per group: a max |diff| of 9.7, and 0
+        // once each warp had its own slice. So the array is one slice per warp and
+        // the slice budget fixes how many warps may share a threadgroup.
+        slot_words = (uint32_t)em.slot_words();
+        slot_per = 6144u / slot_words;  // 24 KiB of threadgroup memory, at most
+        if (slot_per > 8u) slot_per = 8u;
+        if (slot_per == 0u) slot_per = 1u;
+        kernels += "  threadgroup uint32_t weft_slots_all[" +
+                   std::to_string((uint64_t)slot_words * slot_per) + "];\n";
+        kernels += "  threadgroup uint32_t* weft_slots = weft_slots_all + weft_tid * " +
+                   std::to_string(slot_words) + "u;\n";
+      }
       // A 64-bit pair over two 32-bit words has one writer at a time, so a kernel
       // that needs it is dispatched as one thread walking every warp: the lanes
       // arrive at the atomics in program order, and nothing spins or contends.
       // A lock per warp was measured and is slower than the work it guards.
+      // A word nothing else in the kernel touches becomes a local: one read before
+      // the walk and one write after it, instead of two device round trips for
+      // every lane. The gate is the binding's use count in the emitted body — if
+      // anything else reads it, the local would be a stale copy.
+      std::string body = code;
+      std::vector<const Emitter::ShadowSite*> live_shadows;
       if (em.wide_atom) {
+        for (const auto& s : em.shadows) {
+          size_t uses = 0;
+          for (size_t at = body.find(s.buf); at != std::string::npos;
+               at = body.find(s.buf, at + s.buf.size()))
+            uses++;
+          if (uses != 1) continue;
+          for (size_t at = body.find(s.call); at != std::string::npos;
+               at = body.find(s.call, at + s.shadow.size()))
+            body.replace(at, s.call.size(), s.shadow);
+          live_shadows.push_back(&s);
+        }
+      }
+      for (const auto* s : live_shadows) kernels += "  " + s->decl + "\n";
+      if (em.wide_atom) {
+        for (const auto& a : em.red_accs)
+          kernels += "  uint64_t " + a.name + " = " +
+                     (a.op == "and" ? "~0ull" : "0ull") + ";\n";
         kernels += "  const uint32_t weft_wn = (uint32_t)weft_geom[2];\n";
         kernels += "  for (uint32_t weft_w = 0; weft_w < weft_wn; weft_w++) {\n";
         kernels += "    ctx.tgid = weft_w;\n";
@@ -2438,15 +3153,84 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       } else {
         kernels += "  const uint32_t weft_base = ctx.tgid * 32u;\n";
       }
+      const bool wpc = em.warp_blocks();
+      const bool wstep = em.warp_step();
+      if (wstep) {
+        // Step mode: every lane starts at block 0, the locals are zeroed once per
+        // lane before any block runs, and the dispatch below runs whichever block
+        // the lowest program counter names. A barrier parks a lane on a case of
+        // its own, so no lane can run past one until every lane has arrived.
+        kernels += "  for (uint32_t i = 0; i < " + std::to_string(em.slot_words()) +
+                   "u; i++) weft_slots[i] = 0u;\n";
+        kernels += "  for (uint32_t l = 0; l < 32u; l++)\n";
+        kernels += "    s->pc[l] = (weft_base + l < weft_lanes) ? 0u : 0xFFFFFFFFu;\n";
+        kernels += "  for (uint32_t l = 0; l < 32u; l++) {\n";
+        kernels += "    if (weft_base + l >= weft_lanes) break;\n";
+        kernels += "    ctx.lid = l; ctx.gid = (uint64_t)weft_base + (uint64_t)l;\n";
+        kernels += em.init();
+        kernels += "  }\n";
+        // Sweep after sweep, every lane runs at most one block, and the block
+        // after a barrier is just another block. So a lane that parks on a barrier
+        // waits out the rest of the sweep and every lane has arrived by the next
+        // one: the rendezvous is the sweep itself. The selector is this loop's own
+        // counter, never a lane's, for the compiler reason in case_open.
+        kernels += "  for (;;) {\n";
+        kernels += "    bool weft_ran = false;\n";
+        kernels += "    for (uint32_t weft_id = 0; weft_id <= " +
+                   std::to_string(em.max_case()) + "u; weft_id++) {\n";
+        kernels += "      switch (weft_id) {\n";
+      } else {
       kernels += "  for (uint32_t l = 0; l < 32u; l++) {\n";
       kernels += "    if (weft_base + l >= weft_lanes) break;\n";
       kernels += "    ctx.lid = l; ctx.gid = (uint64_t)weft_base + (uint64_t)l;\n";
+      if (wpc) kernels += "    s->pc = 0u;\n";
       kernels += em.init();
       // The block text starts with its own `case 0u:;`, so the switch starts here.
-      kernels += "    switch (0u) {\n";
-      kernels += code;
-      kernels += "    }\n  }\n";
+      // A kernel with more than one block needs a dispatch loop around it: a branch
+      // writes `s->pc` and continues, the lane walks its own control flow to the
+      // end, and the sentinel ends the lane. One counter is enough because the lane
+      // loop finishes a lane before it starts the next.
+      if (wpc) {
+        kernels += "    for (;;) {\n";
+        kernels += "      if (s->pc == 0xFFFFFFFFu) break;\n";
+        kernels += "      switch (s->pc) {\n";
+      } else {
+        kernels += "    switch (0u) {\n";
+      }
+      }  // the per-lane half of `if (wstep)`; the block text is shared below
+      // The folds above are paid back into the buffers here, once each, and with
+      // the pair forms. That is measured rather than assumed. A one-walker launch
+      // is one Metal thread for the whole grid, so its 64-bit counters have a
+      // single writer and a *plain* load and store looks like it must be
+      // equivalent — it was 825 ms down to 70 ms at 1,048,576 lanes, and it read
+      // counters a previous dispatch of the same buffer had left in the device
+      // cache: 4,096 and 1,048,576 lanes disagreed while 8 lanes agreed. So the
+      // access that reaches the buffer is an atomic, and the fold that saves the
+      // 1M round trips is the local above.
+      kernels += body;
+      if (wstep) {
+        // An id with no case is one no lane is waiting on; nothing to do.
+        kernels += "        default: break;\n";
+        // A sweep in which no lane ran is a sweep with every lane retired — the
+        // module never defines an id that no case answers, so a live lane always
+        // runs exactly once per sweep.
+        kernels += "      }\n    }\n    if (!weft_ran) break;\n  }\n";
+      } else {
+        if (wpc) {
+          kernels += "        default: { s->pc = 0xFFFFFFFFu; break; }\n      }\n    }\n";
+        } else {
+          kernels += "    }\n";
+        }
+        kernels += "  }\n";
+      }
       if (em.wide_atom) kernels += "  }\n";  // the warp walk
+      for (const auto* s : live_shadows) kernels += "  " + s->flush + "\n";
+      // One coherent access per counter for the whole launch, which is where the
+      // folded local is paid back into the buffer.
+      for (const auto& a : em.red_accs)
+        kernels += "  (void)weft::red_" + a.op + "_u64(" + a.addr + ", " + a.name + ");\n";
+      em.red_accs.clear();
+      em.shadows.clear();
       kernels += "}\n\n";
     } else if (gpu) {
       // A kernel: a thread-local register file, the runtime's context, one bound
@@ -2523,6 +3307,8 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
     tk.ntex = em.ntex;
     tk.wide = gpu && em.wide_atom;
     tk.gpu_warp = warp_kernel;
+    tk.slot_words = slot_words;
+    tk.slot_per = slot_per;
     tk.nsamp = em.nsamp;
     tk.sync = em.sync;
     tk.flat = false;

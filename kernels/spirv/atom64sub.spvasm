@@ -1,0 +1,135 @@
+; The OpenCL.std subgroup builtins, next to a barrier and the pair.
+;
+; LLVM's SPIR-V backend leaves the subgroup builtins as calls to imported
+; functions (`sub_group_ballot` and friends) rather than instructions, so a module
+; out of a real compiler reaches this runtime through the import path. One thread
+; owns all 32 lanes here, so a vote is a relay through the warp's slot array —
+; publish, let the sweep bring the lanes back, fold the window.
+;
+; Every answer below can be worked out by hand, and the last three buffers carry
+; what is left over when the hand-worked number is taken away, so a wrong bit
+; anywhere is a nonzero slot rather than a rounded float in a dump.
+;
+;   ballot(gid even)        lanes are 0..31, so the mask is 0x55555555 in every lane.
+;   reduce_add(gid & 31)    0 + 1 + ... + 31 = 496, in every lane.
+;   broadcast(counter, 0)   lane 0's 64-bit load, in every lane — and because every
+;                           lane loads after the barrier, that is the counter itself,
+;                           which has moved by exactly 32.
+;   reduce_add(gid + 1, 64) 1 + 2 + ... + 32 = 528.
+;   scan_inclusive_add      lane l gets 1 + ... + (l+1) = (l+1)(l+2)/2.
+;
+; The last three are what the one-word rendezvous could not carry: a 64-bit value
+; goes through two words at a time, which is a pair of windows on the warp target
+; and the eight-byte wide slot on the C++ target.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Linkage
+               OpCapability Int64
+               OpCapability Int64Atomics
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "atom64sub" %gid
+               OpName %main "atom64sub"
+               OpName %fballot "sub_group_ballot"
+               OpName %fred "sub_group_reduce_add"
+               OpName %fred32 "sub_group_reduce_add"
+               OpName %fscan "sub_group_scan_inclusive_add"
+               OpName %fbcast "sub_group_broadcast"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               ; A bodyless function is an import, which spirv-val spells out.
+               OpDecorate %fballot LinkageAttributes "sub_group_ballot" Import
+               OpDecorate %fred LinkageAttributes "sub_group_reduce_add" Import
+               OpDecorate %fred32 LinkageAttributes "sub_group_reduce_add" Import
+               OpDecorate %fscan LinkageAttributes "sub_group_scan_inclusive_add" Import
+               OpDecorate %fbcast LinkageAttributes "sub_group_broadcast" Import
+       %void = OpTypeVoid
+       %bool = OpTypeBool
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+       %u64p = OpTypePointer CrossWorkgroup %u64
+       %u32p = OpTypePointer CrossWorkgroup %u32
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+        %fnb = OpTypeFunction %u32 %u32
+        %fnc = OpTypeFunction %u64 %u64 %u32
+        %fn1 = OpTypeFunction %u64 %u64
+       %fnty = OpTypeFunction %void %u64p %u64p %u32p %u32p %u32p %u32p %u64p %u64p
+        %gid = OpVariable %pin Input
+        %scp = OpConstant %u32 1
+        %sem = OpConstant %u32 0
+        %one = OpConstant %u64 1
+      %one32 = OpConstant %u32 1
+     %zero32 = OpConstant %u32 0
+    %mask31 = OpConstant %u32 31
+ %want_ballot = OpConstant %u32 1431655765
+  %want_sum = OpConstant %u32 496
+   %want_red = OpConstant %u64 528
+        %two = OpConstant %u64 2
+    ; Declarations first: SPIR-V wants every function declaration ahead of any
+    ; definition, and these are imports with no body.
+    %fballot = OpFunction %u32 None %fnb
+         %bp = OpFunctionParameter %u32
+                OpFunctionEnd
+       %fred = OpFunction %u64 None %fn1
+         %rp = OpFunctionParameter %u64
+                OpFunctionEnd
+     %fred32 = OpFunction %u32 None %fnb
+         %rq = OpFunctionParameter %u32
+                OpFunctionEnd
+      %fscan = OpFunction %u64 None %fn1
+         %sp = OpFunctionParameter %u64
+                OpFunctionEnd
+     %fbcast = OpFunction %u64 None %fnc
+         %cp = OpFunctionParameter %u64
+         %lp = OpFunctionParameter %u32
+                OpFunctionEnd
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %u64p
+         %a1 = OpFunctionParameter %u64p
+         %a2 = OpFunctionParameter %u32p
+         %a3 = OpFunctionParameter %u32p
+         %a4 = OpFunctionParameter %u32p
+         %a5 = OpFunctionParameter %u32p
+         %a6 = OpFunctionParameter %u64p
+         %a7 = OpFunctionParameter %u64p
+      %entry = OpLabel
+       %bump = OpAtomicIAdd %u64 %a0 %scp %sem %one
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %gl = OpUConvert %u32 %gi
+        %bit = OpBitwiseAnd %u32 %gl %one32
+       %even = OpIEqual %bool %bit %zero32
+                OpControlBarrier %scp %scp %sem
+         %me = OpAtomicLoad %u64 %a0 %scp %sem
+       %pred = OpSelect %u32 %even %one32 %zero32
+     %ballot = OpFunctionCall %u32 %fballot %pred
+        %low = OpBitwiseAnd %u32 %gl %mask31
+        %sum = OpFunctionCall %u32 %fred32 %low
+         %bc = OpFunctionCall %u64 %fbcast %me %zero32
+        %pa1 = OpPtrAccessChain %u64p %a1 %gi
+                OpStore %pa1 %bc
+        %pa2 = OpPtrAccessChain %u32p %a2 %gi
+                OpStore %pa2 %ballot
+        %pa3 = OpPtrAccessChain %u32p %a3 %gi
+                OpStore %pa3 %sum
+        %xb = OpBitwiseXor %u32 %ballot %want_ballot
+        %xs = OpISub %u32 %sum %want_sum
+        %pa4 = OpPtrAccessChain %u32p %a4 %gi
+                OpStore %pa4 %xb
+        %pa5 = OpPtrAccessChain %u32p %a5 %gi
+                OpStore %pa5 %xs
+        ; ---- the same reductions, in 64 bits ----
+      %lane1 = OpIAdd %u64 %gi %one
+       %rd64 = OpFunctionCall %u64 %fred %lane1
+      %sc64 = OpFunctionCall %u64 %fscan %lane1
+      %xd = OpISub %u64 %rd64 %want_red
+        %pa6 = OpPtrAccessChain %u64p %a6 %gi
+                OpStore %pa6 %xd
+        ; 1 + ... + (l+1), and the product is even, so the halving is exact.
+      %lane2 = OpIAdd %u64 %lane1 %one
+       %prod = OpIMul %u64 %lane1 %lane2
+     %prefix = OpUDiv %u64 %prod %two
+       %xsc = OpISub %u64 %sc64 %prefix
+        %pa7 = OpPtrAccessChain %u64p %a7 %gi
+                OpStore %pa7 %xsc
+                OpReturn
+                OpFunctionEnd

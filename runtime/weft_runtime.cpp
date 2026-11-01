@@ -26,6 +26,7 @@ struct Pool {
 
   uint32_t* warp = nullptr;  // one slot per lane, for shuffles
   uint32_t* red = nullptr;   // one slot per thread, plus one per warp, for bar.red
+  uint32_t* fold = nullptr;  // one scan/fold cache per warp, for the warp library
 
   unsigned char* ensure_shared() {
     if (!shared) shared = (unsigned char*)std::aligned_alloc(64, kSharedBytes);
@@ -44,6 +45,20 @@ struct Pool {
       }
     }
     return red;
+  }
+
+  // A warp's scan and fold trees are the same for its 32 lanes, so one cache
+  // slot per warp is enough: three key words and the 32 results.
+  uint32_t* ensure_fold() {
+    if (!fold) {
+      const size_t n = (size_t)(kMaxThreadgroup / 32u) * weft::kFoldWords * sizeof(uint32_t);
+      fold = (uint32_t*)std::calloc(n, 1);
+      if (!fold) {
+        std::fprintf(stderr, "weft: out of memory for warp scan cache\n");
+        std::abort();
+      }
+    }
+    return fold;
   }
 
   uint32_t* ensure_warp() {
@@ -113,13 +128,15 @@ namespace {
 // was most of the per-lane cost.
 struct StepGroup {
   std::vector<weft::Ctx> ctxs;
+  uint32_t built = 0;  // lanes whose launch-invariant fields are already written
 };
 
 // Resumable kernels: one call per thread per barrier segment. No stacks, no
 // switches — the thread's registers are already in the state blob.
 void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32_t grid,
                     WorkerState& ws, void* const* bufs, unsigned char* shared,
-                    unsigned char* states, uint32_t* warp, uint32_t* red, StepGroup& g) {
+                    unsigned char* states, uint32_t* warp, uint32_t* red, uint32_t* fold,
+                    StepGroup& g) {
   const uint32_t base = tgid * tg;
   const uint32_t live = (base + tg <= grid) ? tg : (grid > base ? grid - base : 0);
   const size_t stride = k.state_size;
@@ -129,29 +146,50 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   }
 
   g.ctxs.resize(live);
+  // A new group's scan caches start empty: the pass number counts from zero in
+  // every group, so a key left by the previous group could match this one's.
+  for (uint32_t w = 0; w < (live + 31u) / 32u; w++) fold[(size_t)w * weft::kFoldWords] = 0u;
+  // Nine of the twelve fields depend on the launch, not on the group, so they are
+  // written once per lane instead of once per lane per group: a barrier-heavy
+  // kernel sets this up 4,096 times for a 1M-lane grid, and every write past the
+  // first group is the same value again.
+  if (g.built < live) {
+    unsigned char* w16 = (unsigned char*)warp + (size_t)2 * kMaxThreadgroup * sizeof(uint32_t);
+    for (uint32_t i = g.built; i < live; i++) {
+      weft::Ctx& c = g.ctxs[i];
+      c.lid = i;
+      c.tg_size = tg;
+      c.grid = grid;
+      c.slots = nullptr;
+      c.bufs = bufs;
+      c.ws = &ws;
+      c.warp = warp;
+      c.warp16 = w16;
+      c.red = red;
+      c.fold = fold + (size_t)(i / 32u) * weft::kFoldWords;
+    }
+    g.built = live;
+  }
   for (uint32_t i = 0; i < live; i++) {
     *reinterpret_cast<uint32_t*>(states + i * stride) = 0;
     weft::Ctx& c = g.ctxs[i];
     c.gid = base + i;
-    c.lid = i;
     c.tgid = tgid;
-    c.tg_size = tg;
-    c.grid = grid;
     c.shared = shared;
-    c.slots = nullptr;
-    c.bufs = bufs;
-    c.ws = &ws;
-    c.warp = warp;
-    c.warp16 = (unsigned char*)warp + (size_t)2 * kMaxThreadgroup * sizeof(uint32_t);
-    c.red = red;
     c.pass = 0;
+    // The shared-memory cursor is per group: a lane that allocated a slot in the
+    // previous group must not carry its index into this one.
     c.slot = 0;
   }
 
   uint32_t remaining = live;
   uint32_t pass = 1;
   while (remaining > 0) {
-    for (uint32_t i = 0; i < live; i++) g.ctxs[i].pass = pass;  // shuffles key on this
+    // A whole-group call needs every pass number written first; the per-lane call
+    // writes its own just before it runs, which keeps the store on a line the
+    // call is about to touch anyway.
+    if (k.group_step)
+      for (uint32_t i = 0; i < live; i++) g.ctxs[i].pass = pass;  // shuffles key on this
     if (k.group_step) {
       // Whole group, one call: the lane loop is in the module's own function.
       k.group_step(g.ctxs.data(), states, stride, live, bufs, shared);
@@ -165,6 +203,7 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
         uint32_t* pc = reinterpret_cast<uint32_t*>(st);
         if (*pc == weft::kThreadDone) continue;
         weft::Ctx& c = g.ctxs[i];
+        c.pass = pass;
         k.step(c, st, bufs, shared);
         if (*pc == weft::kThreadDone) remaining--;
       }
@@ -228,11 +267,12 @@ struct CoroGroup {
   std::vector<weft::Ctx> ctxs;
   std::vector<weft::Task> tasks;
   weft::SlotState slots{};
+  uint32_t built = 0;  // lanes whose launch-invariant fields are already written
 };
 
 void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32_t grid,
                     WorkerState& ws, void* const* bufs, unsigned char* shared, CoroGroup& g,
-                    uint32_t* warp) {
+                    uint32_t* warp, uint32_t* fold) {
   const uint32_t base = tgid * tg;
   const uint32_t live = (base + tg <= grid) ? tg : (grid > base ? grid - base : 0);
   if (live < tg) {
@@ -245,22 +285,38 @@ void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   g.slots.bump = 0;
   g.slots.count = 0;
   for (int k = 0; k < 64; k++) g.slots.off[k] = 0;
+  // The scan caches are per warp and keyed on the pass number, which counts from
+  // zero in every group: clear the keys so the previous group's cannot match.
+  for (uint32_t w = 0; w < (live + 31u) / 32u; w++) fold[(size_t)w * weft::kFoldWords] = 0u;
 
+  // Same split as the step path: the launch-invariant fields once per lane, the
+  // per-group ones every group. `shared` is here because each group's arena is
+  // its own window and it is the one value that changes group to group.
+  if (g.built < live) {
+    unsigned char* w16 = (unsigned char*)warp + (size_t)2 * kMaxThreadgroup * sizeof(uint32_t);
+    for (uint32_t i = g.built; i < live; i++) {
+      weft::Ctx& c = g.ctxs[i];
+      c.lid = i;
+      c.tg_size = tg;
+      c.grid = grid;
+      c.slots = &g.slots;
+      c.bufs = bufs;
+      c.ws = &ws;
+      c.warp = warp;
+      c.warp16 = w16;
+      c.fold = fold + (size_t)(i / 32u) * weft::kFoldWords;
+    }
+    g.built = live;
+  }
   for (uint32_t i = 0; i < live; i++) {
     weft::Ctx& c = g.ctxs[i];
     c.gid = base + i;
-    c.lid = i;
     c.tgid = tgid;
-    c.tg_size = tg;
-    c.grid = grid;
     c.shared = shared;
-    c.slots = &g.slots;
-    c.bufs = bufs;
-    c.ws = &ws;
-    c.warp = warp;
-    c.warp16 = (unsigned char*)warp + (size_t)2 * kMaxThreadgroup * sizeof(uint32_t);
-    c.pass = 0;  // the run up to the first yield is pass 0
+    // Per group, like the pass: a stale cursor would point a lane's shared array
+    // into the previous group's offsets.
     c.slot = 0;
+    c.pass = 0;  // the run up to the first yield is pass 0
     g.tasks.emplace_back(k.coro(c));  // runs up to the first barrier
   }
 
@@ -276,7 +332,9 @@ void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
     for (uint32_t i = 0; i < live; i++) {
       if (g.tasks[i].done()) continue;
       g.ctxs[i].pass = pass;
-      g.tasks[i].resume();
+      // `resume()` re-checks what the loop just checked; this is the one call
+      // that runs 5M times in a 1M-lane scan.
+      g.tasks[i].resume_ready();
       if (g.tasks[i].done()) remaining--;
     }
     pass++;
@@ -286,7 +344,7 @@ void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
 
 void run_flat(const weft::KernelDef& k, uint32_t first, uint32_t stride, uint32_t ngroups,
               uint32_t tg, uint32_t grid, WorkerState& ws, void* const* bufs,
-              uint32_t* warp) {
+              uint32_t* warp, uint32_t* fold) {
   weft::SlotState dummy;
   dummy.bump = 0;
   dummy.count = 0;
@@ -303,11 +361,13 @@ void run_flat(const weft::KernelDef& k, uint32_t first, uint32_t stride, uint32_
   for (uint32_t g = first; g < ngroups; g += stride) {
     const uint32_t base = g * tg;
     const uint32_t live = (base + tg <= grid) ? tg : (grid > base ? grid - base : 0);
+    for (uint32_t w = 0; w < (live + 31u) / 32u; w++) fold[(size_t)w * weft::kFoldWords] = 0u;
     for (uint32_t i = 0; i < live; i++) {
       c.gid = base + i;
       c.lid = i;
       c.tgid = g;
       c.slot = 0;
+      c.fold = fold + (size_t)(i / 32u) * weft::kFoldWords;
       dummy.bump = 0;
       dummy.count = 0;
       k.body(c);
@@ -682,23 +742,25 @@ void dispatch(const KernelDef& k, void* const* bufs, uint32_t grid, uint32_t tg)
       uint32_t* red = pool.ensure_red();
       StepGroup g;
       g.ctxs.reserve(tg);
+      uint32_t* const fold = pool.ensure_fold();
       if (workers == 1) {
         for (uint32_t grp = 0; grp < ngroups; grp++)
-          run_group_step(k, grp, tg, grid, ws, bufs, shared, states, warp, red, g);
+          run_group_step(k, grp, tg, grid, ws, bufs, shared, states, warp, red, fold, g);
       } else {
         for (uint32_t grp = id; grp < ngroups; grp += workers)
-          run_group_step(k, grp, tg, grid, ws, bufs, shared, states, warp, red, g);
+          run_group_step(k, grp, tg, grid, ws, bufs, shared, states, warp, red, fold, g);
       }
     } else if (k.coro) {
       unsigned char* shared = pool.ensure_shared();
       CoroGroup g;
       g.tasks.reserve(tg);
+      uint32_t* const fold = pool.ensure_fold();
       if (workers == 1) {
         for (uint32_t grp = 0; grp < ngroups; grp++)
-          run_group_coro(k, grp, tg, grid, ws, bufs, shared, g, pool.ensure_warp());
+          run_group_coro(k, grp, tg, grid, ws, bufs, shared, g, pool.ensure_warp(), fold);
       } else {
         for (uint32_t grp = id; grp < ngroups; grp += workers)
-          run_group_coro(k, grp, tg, grid, ws, bufs, shared, g, pool.ensure_warp());
+          run_group_coro(k, grp, tg, grid, ws, bufs, shared, g, pool.ensure_warp(), fold);
       }
     } else if (k.flat) {
       // Contiguous slices: one loop per worker, no per-thread call.
@@ -718,7 +780,7 @@ void dispatch(const KernelDef& k, void* const* bufs, uint32_t grid, uint32_t tg)
       const uint32_t e = (b + per < grid) ? b + per : grid;
       if (b < e) k.flat(c, b, e);
     } else {
-      run_flat(k, id, workers, ngroups, tg, grid, ws, bufs, pool.ensure_warp());
+      run_flat(k, id, workers, ngroups, tg, grid, ws, bufs, pool.ensure_warp(), pool.ensure_fold());
     }
   };
 
