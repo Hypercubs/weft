@@ -2765,15 +2765,9 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       body_out += "    ((thread uint8_t*)&st)[weft_i] = 0u;\n";
       body_out += "  for (uint32_t l = 0; l < weft::kWarpLanes; l++) s->pc[l] = 0u;\n";
       body_out += "  weft::WCtx ctx;\n";
-      // One thread is one warp, and a lane's index is its position *inside the
-      // threadgroup* — that is what `%tid.x` means on the hardware, so a kernel
-      // that derives its fragment from `tid` has to see 0..tg-1 in every group
-      // rather than 0..grid-1 across the launch. `%ctaid.x` is the group.
-
-      // `%ctaid.x` is the hardware block index and `%tid.x` picks the warp inside
-      // it, which is what the kernels emitted for this back end already index by —
-      // so this stays as it was. Chunked dispatch belongs to the SPIR-V warp body,
-      // whose `weft_geom[3]` this does not read.
+      // One thread is one warp. `%ctaid.x` is the block and `%tid.x` picks the warp
+      // inside it — a lane's index is its position inside the threadgroup, so a
+      // kernel that derives its fragment from `tid` sees 0..tg-1 in every group.
       body_out += "  ctx.lid0 = weft_lid * weft::kWarpLanes;\n";
       body_out += "  ctx.tgid = weft_tgid.x;\n";
       body_out += "  ctx.tg_size = (uint32_t)weft_geom[1];\n";
@@ -2781,12 +2775,8 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       for (int i = 0; i < wnbufs; i++)
         body_out += "  ctx.b[" + std::to_string(i) + "] = weft_b" + std::to_string(i) + ";\n";
       body_out += "  ctx.params = weft_params;\n";
-      // The lock words a 64-bit read-modify-write spins on. It is a bound buffer
-      // rather than an address read out of the geometry: a pointer cast back from
-      // another buffer's contents names memory the kernel never declared, and a
-      // spinlock on it was measured to lose increments under load. The launcher
-      // zeroes it before the dispatch, so a launch that ended with one held does
-      // not hand the next one a lock nobody will release.
+      // The lock words a 64-bit read-modify-write spins on: a bound buffer, zeroed
+      // by the launcher before each dispatch.
       body_out += "  ctx.locks = weft_locks;\n";
       body_out += "  threadgroup uint8_t weft_sh[" +
                    std::to_string(arena > 0 ? arena : 1) + "];\n";

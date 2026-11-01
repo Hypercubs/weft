@@ -2404,9 +2404,6 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
                  ")]],\n                 ";
       kernels += "device uint64_t* weft_geom [[buffer(" + std::to_string(nbufs + 1) +
                  ")]],\n                 ";
-      if (em.wide_atom)
-        kernels += "device uint32_t* weft_locks [[buffer(" + std::to_string(nbufs + 2) +
-                   ")]],\n                 ";
       kernels += "uint weft_tid [[thread_index_in_threadgroup]],\n                 ";
       kernels += "uint3 weft_tgid [[threadgroup_position_in_grid]],\n                 ";
       kernels += "uint3 weft_tgsz [[threads_per_threadgroup]]) {\n";
@@ -2425,26 +2422,17 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
           kernels += (i ? ", weft_b" : "weft_b") + std::to_string(i);
         kernels += "};\n  (void)bufs;\n";
       }
-      // The lock table is a bound resource, not an address read out of the
-      // geometry: Metal promises a bound resource's writes are visible to another
-      // thread, and says nothing about a pointer cast back from buffer contents.
-      if (em.wide_atom) kernels += "  ctx.locks = weft_locks;\n";
-      else kernels += "  ctx.locks = nullptr;\n";
-      // Which warp this thread owns: groups of `threads_per_threadgroup` threads,
-      // each thread one warp, and `weft_geom[3]` the warp the chunk starts at (see
-      // main.mm). `threadgroup_position_in_grid` alone is not it — a group can hold
-      // more than one warp.
-      kernels += "  ctx.tgid = (uint32_t)weft_geom[3] + weft_tgid.x * weft_tgsz.x +";
-      kernels += " weft_tid;\n";
+      // Which warp this thread owns: a group can hold more than one warp, so it is
+      // the group's position times the threads in it, plus the thread's own index.
+      kernels += "  ctx.tgid = weft_tgid.x * weft_tgsz.x + weft_tid;\n";
       kernels += "  const uint32_t weft_lanes = (uint32_t)weft_geom[0];\n";
       // A 64-bit pair over two 32-bit words has one writer at a time, so a kernel
       // that needs it is dispatched as one thread walking every warp: the lanes
       // arrive at the atomics in program order, and nothing spins or contends.
       // A lock per warp was measured and is slower than the work it guards.
       if (em.wide_atom) {
-        kernels += "  const uint32_t weft_w0 = (uint32_t)weft_geom[3];\n";
-        kernels += "  const uint32_t weft_wn = (uint32_t)weft_geom[4];\n";
-        kernels += "  for (uint32_t weft_w = weft_w0; weft_w < weft_w0 + weft_wn; weft_w++) {\n";
+        kernels += "  const uint32_t weft_wn = (uint32_t)weft_geom[2];\n";
+        kernels += "  for (uint32_t weft_w = 0; weft_w < weft_wn; weft_w++) {\n";
         kernels += "    ctx.tgid = weft_w;\n";
         kernels += "    const uint32_t weft_base = weft_w * 32u;\n";
       } else {
@@ -2476,9 +2464,6 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
                  ")]],\n                 ";
       // One binding per resource, so the lock table takes the index after the
       // scalars — the same one a warp kernel uses for its geometry.
-      if (em.wide_atom)
-        kernels += "device uint32_t* weft_locks [[buffer(" + std::to_string(nbufs + 1) +
-                   ")]],\n                 ";
 
       for (int i = 0; i < em.ntex; i++)
         kernels += "texture2d<float, access::" + em.textures()[i] + "> weft_t" +
@@ -2500,7 +2485,6 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       for (int i = 0; i < nbufs; i++)
         kernels += "  ctx.b[" + std::to_string(i) + "] = weft_b" + std::to_string(i) + ";\n";
       kernels += "  ctx.params = weft_params;\n";
-      if (em.wide_atom) kernels += "  ctx.locks = weft_locks;\n";
       kernels += "  (void)ctx;\n";
       if (nbufs > 0) {
         kernels += "  device uint8_t* bufs[" + std::to_string(nbufs) + "] = {";

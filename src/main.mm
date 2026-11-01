@@ -1206,7 +1206,7 @@ int main(int argc, char** argv) {
       // one extra binding after the scalar parameters.
       id<MTLBuffer> geom_buf = nil;
       if (kern.gpu_warp)
-        geom_buf = [dev newBufferWithLength:8 * sizeof(uint64_t)
+        geom_buf = [dev newBufferWithLength:4 * sizeof(uint64_t)
                                    options:MTLResourceStorageModeShared];
       // The words a 64-bit atomic locks on. The shape is `kLockWords` in
       // src/weft_warp_msl.hpp — one word per slot, hashed from the address — so
@@ -1350,29 +1350,16 @@ int main(int argc, char** argv) {
               // run three warps the program does not have, and the CPU twin —
               // which launches `ceil(live/32)` warps — runs only the first.
               uint32_t per = std::max(1u, std::min(o.threads / 32u, warps));
-              // A kernel that holds a 64-bit atomic spins on a lock, and two
-              // threads that spin while a third holds one have to make progress
-              // independently for that to end. Threads in one threadgroup share
-              // a SIMD group, which runs one program counter for all of them, so
-              // a waiting thread there freezes the holder's critical section and
-              // the launch never finishes. One thread per threadgroup puts every
-              // thread in a SIMD group of its own, which costs issue slots and
-              // keeps the launch parallel.
+              // A wide kernel moves its atomics from one thread (see below), so its
+              // group is one thread.
               if (kern.wide) per = 1u;
-              const uint64_t lock_word = (uint64_t)(uintptr_t)(lock_buf ? [lock_buf contents]
-                                                                        : nullptr);
               // A kernel that needs the 64-bit pair is one thread walking every
-              // warp (see src/translate_spirv.cpp), so it is dispatched once.
-              uint64_t* cg = (uint64_t*)[geom_buf contents];
-              cg[0] = o.grid;  // lanes the program is written against
-              cg[1] = 32u;     // lanes in one threadgroup, which is one warp
-              cg[2] = lock_word;
-              cg[3] = 0;       // the warp the walk starts at
-              // A wide kernel's walk covers every warp, so it is dispatched once: one
-              // threadgroup of one thread. Anything more runs the whole walk per
-              // thread — the same warp `warps` times over.
+              // warp, so it is dispatched once: one threadgroup of one thread.
               const bool one_walker = kern.wide && spv;
-              cg[4] = one_walker ? warps : 0;
+              uint64_t* cg = (uint64_t*)[geom_buf contents];
+              cg[0] = o.grid;                   // lanes the kernel is written against
+              cg[1] = 32u;                      // lanes in one threadgroup, which is one warp
+              cg[2] = one_walker ? warps : 0u;  // warps the walk covers
               const uint32_t groups = one_walker ? 1u : (warps + per - 1u) / per;
               const uint32_t threads = one_walker ? 1u : per;
               [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
