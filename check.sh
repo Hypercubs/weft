@@ -1,0 +1,1382 @@
+#!/usr/bin/env bash
+# Runs each example kernel twice — once on the GPU, once on the CPU — and fails
+# if the two disagree. Then checks the PTX front end against the Metal front end
+# by comparing their byte-for-byte output.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+WEFT=./build/weft
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+fail=0
+
+# A build with no GPU column — anywhere that is not macOS — still runs every
+# kernel here: translation, launch and the byte comparisons between front ends.
+# What it has no hardware for is the diff against the GPU, so that line says so
+# instead of reporting an agreement nobody checked.
+NOSHADOW=""
+if "$WEFT" run kernels/basic.metal --kernel saxpy --grid 16 --buffers 16,16,16 \
+     --bench 1 2>/dev/null | grep -q '^gpu *unavailable'; then
+  CPUMODE="--cpu-only"
+  NOSHADOW="  (no gpu on this host, ran on the cpu)"
+else
+  CPUMODE=""
+fi
+
+# The `compare` line exists only when there was a GPU run to compare against.
+summary() {
+  local out="$1" line
+  line="$(echo "$out" | grep '^compare' | sed 's/compare  *//' || true)"
+  echo "${line:-${NOSHADOW#  }}"
+}
+
+run() {
+  local name="$1"; shift
+  local out
+  out="$("$WEFT" run kernels/basic.metal --kernel "$name" "$@" --bench 5 $CPUMODE)"
+  if echo "$out" | grep -q DISAGREE; then
+    echo "FAIL  $name"
+    echo "$out" | sed 's/^/      /'
+    fail=1
+  else
+    echo "ok    $name  $(summary "$out")"
+  fi
+}
+
+# The same check for a kernel that lives outside basic.metal.
+runf() {
+  local file="$1" name="$2"; shift 2
+  local out
+  out="$("$WEFT" run "$file" --kernel "$name" "$@" --bench 5 $CPUMODE)"
+  if echo "$out" | grep -q DISAGREE; then
+    echo "FAIL  $name"
+    echo "$out" | sed 's/^/      /'
+    fail=1
+  else
+    echo "ok    $name  $(summary "$out")"
+  fi
+}
+
+run saxpy      --grid 1048576 --buffers 1048576,1048576,1048576
+run texmix     --grid 65536   --buffers 65536 --textures 64x64   # texture read + nearest sample
+
+# Bilinear filtering: the weights are quantised the way the hardware quantises
+# them (round(f * 256) / 256, measured from the GPU) and blended with the fma the
+# hardware uses, which reproduces a one-axis sample exactly. Across both axes one
+# ulp of the final blend remains — 1.2e-07, where the unquantised weights were
+# 1.4e-03. The run's `agree` is that bound; a regression shows up as DISAGREE.
+run texlin     --grid 65536   --buffers 65536 --textures 64x64   # bilinear, 8-bit weights + fma
+run stencil5   --grid 1048576 --buffers 1048576,1048576
+run stencil5   --grid 1000    --buffers 1000,1000          # ragged final group
+run reverse    --grid 1048576 --threads 256 --buffers 1048576,1048576
+run reduce_sum --grid 1048576 --threads 256 --buffers 1048576,4096
+run reduce_sum --grid 1536    --threads 96  --buffers 1536,16
+run vec4_scale --grid 262144  --buffers 1048576,1048576     # 16-byte vector load/store
+run vec3_mix   --grid 262144  --buffers 1048576,1048576     # float3: 16-byte stride, 4 bytes padding
+run half_cvt   --grid 1048576 --buffers 1048576,1048576     # half + half2 layout and conversion
+run halfarith  --grid 65536   --buffers 9961472,524320     # fp16 arithmetic, library, half2/3/4
+run half_tg    --grid 65536   --threads 64 --buffers 65536,1048576  # fp16 in threadgroup memory
+run tg_vec3    --grid 65536   --threads 64 --buffers 1048576,1048576  # float3 in threadgroup memory
+run int_pack   --grid 262144  --buffers 1048576,1048576     # int3/uint3/uchar4/short2/char4
+run vecmath    --grid 4096    --buffers 12288,16384         # dot/cross/normalize/mix/clamp/smoothstep
+run atomic_bins --grid 1048576 --buffers 1048576,8          # integer atomics
+run warpscan   --grid 1048576 --threads 256 --buffers 1048576,1048576   # 5 shuffles
+run fillscan   --grid 1048576 --threads 256 --buffers 1048576,1048576   # shuffle_and_fill
+run prefixscan --grid 1048576 --threads 256 --buffers 1048576,1048576   # simd_prefix sums
+# A float prefix sum cannot be bit-identical: the hardware folds the warp in its
+# own tree and this folds it the doubling way, so the two differ by a few ulp of
+# the running sum. What must hold is that the gap stays that small — a wrong scan
+# would be off by the whole warp, not by 1e-7 relative.
+if [ -n "$CPUMODE" ]; then
+  # The gap being measured is between this engine and the hardware's own fold
+  # tree. With no GPU run there is no second answer, so there is nothing to
+  # measure, and saying so is better than failing a check that cannot run.
+  echo "skip  pfxscan    float prefix sums need the gpu column to measure the gap"
+else
+pfx_md=$("$WEFT" run kernels/basic.metal --kernel pfxscan --grid 1048576 --threads 256 \
+    --buffers 1048576,1048576 --bench 3 | grep '^compare' | sed 's/.*max |diff| //; s/ .*//')
+if [ "$pfx_md" = "0" ]; then
+  echo "ok    pfxscan    float prefix sums are bit-identical: one fold tree, both engines"
+else
+  echo "FAIL  pfxscan    float prefix sums differ by $pfx_md absolute"; fail=1
+fi
+fi
+run logic      --grid 1048576 --buffers 1048576,1048576   # lop3 + the class tests
+run block_reduce --grid 1048576 --threads 256 --buffers 1048576,4096
+run block_reduce --grid 3072  --threads 96  --buffers 3072,32          # 3 warps/group
+run votek      --grid 1048576 --threads 256 --buffers 1048576,1048576  # simd_ballot/_all/_any
+run bits       --grid 1048576 --buffers 1048576,1048576   # funnel shift, mulhi, prmt, cvt
+run roundk     --grid 1048576 --buffers 1048576,1048576   # the four rounding converts
+run grpops     --grid 1048576 --threads 256 --buffers 1048576,1048576  # the rest of the warp/quad library
+run grpsf      --grid 1048576 --threads 256 --buffers 1048576,1048576  # float sum/max/product, bit-exact
+run widevec    --grid 1048576 --buffers 1048576,1048576   # bool/long/ulong/double vectors
+run sgmat      --grid 1048576 --threads 256 --buffers 1048576,1048576  # simdgroup 8x8 multiply
+run sgmatT     --grid 1048576 --threads 256 --buffers 1048576,1048576  # ... with a transposed load
+run wide_shfl  --grid 1048576 --threads 256 --buffers 1048576,1048576  # shuffles of a float2 and a long
+run veccmp     --grid 1048576 --buffers 1048576,1048576   # vector comparisons -> bool vectors
+# packed_* is a layout, and the kernel checks the layouts by printing sizeof into
+# the arithmetic: 12+3+6+4 bytes, and 32 for the struct of three of them. The
+# result also sums a large constant, so fast-math reassociation shows up as a
+# 1e-7 relative difference and nothing more.
+run packedk    --grid 1048576 --buffers 1048576,1048576
+# 8- and 16-bit vectors wrap in their own width: 200*2 as uchar is 144, and
+# 30000*2 as short is -5536. A wider intermediate would give a different sum.
+run narrowv    --grid 1048576 --buffers 1048576,1048576
+# A file-scope struct and two helpers: one that only computes is compiled as
+# written, one that waits on the threadgroup is expanded into the kernel.
+run helperk    --grid 1048576 --threads 256 --buffers 1048576,1048576
+# A storage image: each lane writes a texel and reads its neighbour's after a
+# mem_texture barrier, so a write that never reached the texture answers wrong.
+run texrw      --grid 4096 --threads 256 --buffers 4096,4096 --textures 64x64
+# threadgroups_per_grid rounds up for a short last group: 1000 threads at 96 a
+# group is 11 groups, not 10.
+run counts     --grid 1000 --threads 96 --buffers 1000
+run counts     --grid 3072 --threads 96 --buffers 3072
+
+# The two hard fixtures. A raymarcher is nothing but `length`, `normalize`, `dot`,
+# `reflect` and `smoothstep` in a 64-step loop, so a single bit of difference in
+# the portable library walks the ray somewhere else; the FFT is a permuted tree
+# with a `sin`/`cos` at every node and nine barriers per threadgroup.
+runf kernels/hard.metal raymarch --grid 65536 --buffers 65536,65536     # SDF raymarch, 64 steps
+runf kernels/hard.metal fft --grid 2048 --threads 256 --buffers 4096,4096  # 256-point radix-2, 9 barriers
+
+# `double` is rejected by Metal on Apple GPUs, so the double vectors are only
+# checkable on the CPU: the kernel compares the vector operators against the same
+# arithmetic written out scalar by scalar, and every output must be 1.0f.
+"$WEFT" run kernels/dblvec.metal --kernel dblvec --cpu-only --grid 4096 --buffers 4096,4096 \
+    --dump 1="$TMP/dbl.bin" >/dev/null
+ones=$(od -An -tu4 -v "$TMP/dbl.bin" | tr -s ' ' '\n' | grep -c 1065353216)
+if [ "$ones" = "4096" ]; then
+  echo "ok    dblvec   double2/3/4 match the scalar arithmetic (4096/4096)"
+else
+  echo "FAIL  dblvec   $ones of 4096 components matched"; fail=1
+fi
+
+# Both sides of a twin comparison, with one extra rule: neither dump may be empty.
+# `cmp` treats two missing files as equal, so a comparison that silently produced
+# nothing would otherwise read as agreement. Defined before its first caller — a
+# function called before its definition is just a missing command.
+same_dumps() {
+  local tag="$1" a="$2" b="$3"
+  if [ -s "$a" ] && [ -s "$b" ] && cmp -s "$a" "$b"; then return 0; fi
+  if [ ! -s "$a" ] || [ ! -s "$b" ]; then
+    local sa sb
+    sa=$(wc -c <"$a" 2>/dev/null || echo 0)
+    sb=$(wc -c <"$b" 2>/dev/null || echo 0)
+    echo "      $tag: a dump is empty or missing ($sa / $sb bytes)"
+  fi
+  return 1
+}
+
+# PTX front end vs the Metal front end: same math, two source languages.
+cross() {
+  local kernel="$1" idx="$2"; shift 2
+  "$WEFT" run kernels/basic.metal --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/msl.bin" "$@" >/dev/null
+  "$WEFT" run "kernels/$kernel.ptx"        --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/ptx.bin" "$@" >/dev/null
+  if same_dumps "ptx:$kernel" "$TMP/msl.bin" "$TMP/ptx.bin"; then
+    echo "ok    ptx:$kernel  matches the metal front end byte for byte"
+  else
+    echo "FAIL  ptx:$kernel  differs from the metal front end"
+    fail=1
+  fi
+}
+
+cross saxpy   2 --grid 1048576 --buffers 1048576,1048576,1048576
+cross reverse 1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+# Dynamic threadgroup memory (`extern .shared`) and cp.async.
+cross async_copy 1 --grid 1024 --threads 64 --buffers 1024,1024
+# Two threadgroup arrays in one kernel: the second must not alias the first.
+cross twotile 1 --grid 1024 --threads 64 --buffers 1024,1024
+
+# The same, but the PTX was emitted by LLVM's NVPTX backend (llc), not written
+# by hand — so the input is real compiler output, register allocation and all.
+nvptx() {
+  local kernel="$1" idx="$2"; shift 2
+  "$WEFT" run kernels/basic.metal      --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/msl.bin" "$@" >/dev/null
+  "$WEFT" run "kernels/cuda/$kernel.ptx" --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/nv.bin" "$@" >/dev/null
+  if same_dumps "nvptx:$kernel" "$TMP/msl.bin" "$TMP/nv.bin"; then
+    echo "ok    nvptx:$kernel  llc-emitted ptx matches the metal kernel byte for byte"
+  else
+    echo "FAIL  nvptx:$kernel  differs from the metal kernel"
+    fail=1
+  fi
+  # The warp backend is a second execution mode for the same PTX: a kernel with a
+  # warp body runs 32 lanes wide there instead of as a per-lane state machine. Both
+  # modes have to land on the same bytes as the twin, or which backend a kernel
+  # picks would change its answer.
+  env WEFT_WARP=1 "$WEFT" run "kernels/cuda/$kernel.ptx" --kernel "$kernel" --cpu-only \
+      --dump "$idx"="$TMP/nvw.bin" "$@" >/dev/null
+  if same_dumps "nvptx:$kernel warp" "$TMP/msl.bin" "$TMP/nvw.bin"; then
+    echo "ok    nvptx:$kernel:warp  the warp backend lands on the same bytes"
+  else
+    echo "FAIL  nvptx:$kernel:warp  the warp backend differs from the per-lane one"
+    fail=1
+  fi
+}
+
+nvptx saxpy   2 --grid 1048576 --buffers 1048576,1048576,1048576
+nvptx reverse 1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+# Real compiler shuffles: shfl.sync.up in a scan, shfl.down + shared memory +
+# a barrier in a CUB-shaped block reduction.
+nvptx warpscan     1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+# Four samples that sat in kernels/cuda/ with nothing diffing them: a shuffle-down
+# fold, the same fold with twelve multiplies a step, a predicated store, and an
+# indexed rotate. The coverage check at the end of this file is what found them.
+nvptx bsum         1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+nvptx hsum         1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+nvptx pred         1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+nvptx rotate       1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+nvptx block_reduce 1 --grid 1048576 --threads 256 --buffers 1048576,4096
+
+# Triton goes through LLVM's NVPTX backend too, so its output is PTX in a
+# particular shape: `.maxntid` from `num_warps`, the pointers then
+# `global_scratch` (declared, never read, so not bound) then the scalars, and for
+# `tl.dot` tensor-core instructions. The Metal twin is written from the fragment
+# layout the PTX instruction defines — each lane owns rows g and g+8, columns 2t
+# and 2t+1 — so a mismatch means the layout translation is wrong, not that the
+# two disagree about rounding: the PTX rounds its inputs to integers first, so
+# every product and every sum of sixteen is exact.
+triton() {
+  local twin="$1" kernel="$2" idx="$3"; shift 3
+  "$WEFT" run kernels/basic.metal         --kernel "triton_$twin" --cpu-only --dump "$idx"="$TMP/msl.bin" "$@" >/dev/null
+  "$WEFT" run "kernels/triton/$twin.ptx"  --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/tr.bin"  "$@" >/dev/null
+  if same_dumps "triton:$twin" "$TMP/msl.bin" "$TMP/tr.bin"; then
+    echo "ok    triton:$twin  matches the metal twin byte for byte"
+  else
+    echo "FAIL  triton:$twin  differs from the metal twin"; fail=1
+  fi
+  # The warp backend runs the same PTX 32 lanes wide; the tensor-core shapes are
+  # already warp-only, so this is the comparison that would notice if a kernel
+  # with both bodies answered differently depending on which one ran.
+  env WEFT_WARP=1 "$WEFT" run "kernels/triton/$twin.ptx" --kernel "$kernel" --cpu-only \
+      --dump "$idx"="$TMP/trw.bin" "$@" >/dev/null
+  if same_dumps "triton:$twin warp" "$TMP/msl.bin" "$TMP/trw.bin"; then
+    echo "ok    triton:$twin:warp  the warp backend lands on the same bytes"
+  else
+    echo "FAIL  triton:$twin:warp  the warp backend differs"; fail=1
+  fi
+}
+
+# The GPU column, for a front end that used to have none.
+#
+# PTX has a second back end: the same decode emitted as Metal (src/weft_msl.hpp is
+# the runtime behind it). This runs that module on the GPU and compares it with
+# the module the C++ target produced from the same input — so the two sides are
+# the same generated code, and a disagreement points at a back end rather than at
+# two implementations that were written to agree.
+#
+# A kernel whose GPU form does not exist on this host keeps its CPU column and
+# says which instruction or which compiler failure stopped it, rather than
+# passing a hand-written twin off as a GPU run of this translation.
+gpucol() {
+  local file="$1" threads="$2" grid="$3"; shift 3
+  local key out
+  # The path under kernels/, not the basename: two fixtures are both named
+  # `reduce.ptx`, and one line of output should not stand for two runs.
+  key="${file#kernels/}"
+  if [ -n "$CPUMODE" ]; then
+    echo "skip  gpu:$key  no gpu on this host"
+    return
+  fi
+  local st=0
+  # `tr -d '\000'`: a NUL byte ends a shell variable, so a driver that leaves one
+  # in the stream would make a whole report look like silence.
+  local retried="" attempt=1 tries=""
+  # A run that printed nothing did not compare anything, and saying so is better
+  # than reporting a disagreement that never happened: this host's Metal compiler
+  # occasionally takes the process down on a shader it builds (the same driver
+  # that reports XPC_ERROR_CONNECTION_INTERRUPTED), which loses the whole report
+  # with the stdout buffer. That is once in a few hundred runs, so the report is
+  # worth asking for three times before calling it a gap — a fault that is really
+  # there fails every attempt and is still named, with every exit status it gave.
+  while [ "$attempt" -le 3 ]; do
+    st=0
+    if out=$("$WEFT" run "$file" --grid "$grid" --threads "$threads" --bench 2 "$@" 2>&1 |
+             LC_ALL=C tr -d '\000'); then :; else st=$?; fi
+    if [ -n "$out" ]; then break; fi
+    tries="$tries $st"
+    attempt=$((attempt + 1))
+  done
+  if [ -z "$out" ]; then
+    echo "skip  gpu:$key  three attempts printed nothing, exiting$tries, so nothing was compared"
+    return
+  fi
+  if [ "$attempt" -gt 1 ]; then
+    retried=" (retried after exiting$tries)"
+  fi
+  # The reason is read off the line itself rather than judged by a search: a
+  # driver that writes its own bytes to the same stream must not be able to make
+  # a named gap look like an unnamed one.
+  local why
+  # `LC_ALL=C`: the driver can leave bytes in the stream that are not text, and a
+  # UTF-8-aware sed refuses them — which would lose the reason rather than the
+  # noise.
+  why="$(printf '%s\n' "$out" | LC_ALL=C sed -n 's/.*no column for this kernel *//p' | head -1)"
+  if [ -n "$why" ]; then
+    echo "skip  gpu:$key  $why"
+    return
+  fi
+  if printf '%s\n' "$out" | grep -aq '^compare .*agree'; then
+    echo "ok    gpu:$key  the emitted metal matches the cpu byte for byte$retried"
+  else
+    echo "FAIL  gpu:$key"
+    printf '%s\n' "$out" | tail -4 | LC_ALL=C sed 's/^/      /'
+    fail=1
+  fi
+}
+
+# llc-emitted samples: the input is real compiler output, register allocation
+# and all, and every one of them now runs on both engines from one decode.
+gpucol kernels/cuda/saxpy.ptx        256 4096
+gpucol kernels/cuda/reverse.ptx    256 4096
+gpucol kernels/cuda/warpscan.ptx     256 4096
+gpucol kernels/cuda/block_reduce.ptx 256 4096
+gpucol kernels/cuda/bsum.ptx         256 4096
+gpucol kernels/cuda/hsum.ptx         256 4096
+gpucol kernels/cuda/pred.ptx         256 4096
+gpucol kernels/cuda/rotate.ptx       256 4096
+gpucol kernels/cuda/scale.ptx        256 4096
+gpucol kernels/cuda/vecscale.ptx     256 4096
+# A tree reduction over the whole group: eight barriers, and every thread reads
+# slots another thread wrote, so the barrier has to be the hardware's.
+gpucol kernels/cuda/reduce.ptx       256 4096
+# Triton's shapes, which arrive as PTX: elementwise, a saturating fp16 convert,
+# and the wgmma tensor-core form.
+gpucol kernels/triton/add.ptx        128 4096
+gpucol kernels/triton/cvt8.ptx       128 4096
+# The tensor-core kernels tile their buffers by block, so the buffers have to
+# hold every block's tile: a tile is 8 KiB of A and B at most, and this grid is
+# 128 blocks. Sizing them from the grid alone put writes out of bounds on both
+# engines, which is agreement about nothing.
+gpucol kernels/triton/wgmma.ptx      128 4096 --buffers 32768,32768,32768
+# Hand-written samples: predication, bit tricks, a reduction barrier, two
+# threadgroup tiles, and cp.async into threadgroup memory.
+gpucol kernels/reverse.ptx           256 4096
+gpucol kernels/saxpy.ptx             256 4096
+gpucol kernels/logic.ptx           256 4096
+gpucol kernels/round.ptx             256 4096
+gpucol kernels/bred.ptx              256 4096
+gpucol kernels/twotile.ptx            64 4096
+gpucol kernels/async_copy.ptx         64 4096
+# PTX textures: a sample through the bound sampler state, and a surface written,
+# barriered, then read back through a neighbour's texel. The binding order is the
+# order the `.tex`/`.surf` declarations appear in.
+gpucol kernels/ptxtex.ptx             64 4096 --textures 64x64 --samplers nearest/clamp
+gpucol kernels/ptxsrf.ptx             64 4096 --textures 64x64
+# `tld4` keeps the four texels apart instead of blending them, which is the one
+# thing a filter cannot stand in for.
+gpucol kernels/ptxgather.ptx          64 4096 --textures 64x64
+# The bit tricks: funnel shifts, `prmt`, `mul.hi` at 32 and 64 bits, and the
+# float-integer conversions. This one used to be a skip — the emitted source
+# compiled and the pipeline step then killed the compiler, because a `mul.hi.u64`
+# was a `__int128` multiply and this host's back end cannot lower one in a kernel
+# this size. The high word is four 32x32 products now, so it has a GPU column of
+# its own like any other kernel.
+gpucol kernels/cuda/bits.ptx         256 4096
+# `mul.hi` at 64 bits with the sign bits forced: the carry chain of the limb
+# product, unsigned and signed, and a negative times a negative. Ten words per
+# lane out of four words in.
+gpucol kernels/mulhi.ptx            256 4096 --buffers 16384,40960
+# `redux.sync` is one group instruction on the GPU (`simd_sum` and the other
+# folds), so a warp-wide integer fold has both columns; a lane outside the member
+# mask stands in with the fold's identity, which keeps a partial mask exact.
+gpucol kernels/triton/reduce.ptx     128 4096 --buffers 4096,32768
+# A 64-bit `red` has no result, so an order-free operation is two 32-bit atomics
+# on the halves — the low half's carry into the high one for add/sub, a fold per
+# half for and/or/xor. Nothing is read back, so nothing needs the pair as one
+# value, and the answer is order-free either way.
+gpucol kernels/red64.ptx             256 4096 --buffers 8,8,8,8
+# A 64-bit atomic, which this host has no instruction for: `atomic_ulong` is in
+# the header, but every entry point that could read, write, exchange or compare one
+# is constrained to 32-bit types, and the two that are not (`atomic_max_explicit` /
+# `atomic_min_explicit`) compile and are then refused by the device at pipeline
+# creation — tools/atom64_probe.mm asks for each answer separately. So the emission
+# builds one out of the 32-bit atomics the hardware does have: a lock on the word,
+# held while the pair is read and written as two 32-bit atomics. Its 32-bit
+# counters are `red`s by the dead-result rewrite, which is what ptxas emits for a
+# dropped result. The launch stays parallel — one warp per threadgroup, because a
+# thread that spins needs a SIMD group of its own — at 10 ms for 4,096 lanes and
+# 150 ms for 262,144, against the CPU's 0.4 ms and 23 ms.
+gpucol kernels/atom.ptx              256 4096
+# The kernels whose GPU form this host has no answer for. Each is a named skip
+# with the reason the translator gave, so the gap has a name on it; the CPU
+# column above still runs every one of them.
+gpucol kernels/triton/dot32.ptx      128 4096 --buffers 32768,32768,32768
+gpucol kernels/triton/dotbf16.ptx    128 4096 --buffers 32768,32768,32768
+gpucol kernels/triton/dotfp8.ptx     128 4096 --buffers 32768,32768,32768
+gpucol kernels/triton/dote5m2.ptx    128 4096 --buffers 32768,32768,32768
+gpucol kernels/triton/matmul.ptx     128 4096 --buffers 32768,32768,32768
+
+# The SPIR-V front end got the same second back end, so its fixtures get the same
+# column: the metal emitted from the module against the C++ module from the same
+# decode. An image and a sampler are bindings a Metal kernel declares, so those
+# two kernels cover the binding side as well.
+spvgpu() {
+  local kernel="$1" file="$2"; shift 2
+  local out
+  if [ -n "$CPUMODE" ]; then
+    echo "skip  spvgpu:$kernel  no gpu on this host"
+    return
+  fi
+  local st=0 retried="" attempt=1 tries=""
+  # Same retry as the PTX column: silence is the compiler service dying, not an
+  # answer, and it is rare enough to be worth asking three times before naming a
+  # gap.
+  while [ "$attempt" -le 3 ]; do
+    st=0
+    if out=$("$WEFT" run "kernels/spirv/$file.spv" --kernel "$kernel" --bench 2 "$@" 2>&1 |
+             LC_ALL=C tr -d '\000'); then :; else st=$?; fi
+    if [ -n "$out" ]; then break; fi
+    tries="$tries $st"
+    attempt=$((attempt + 1))
+  done
+  if [ -z "$out" ]; then
+    echo "skip  spvgpu:$kernel  three attempts printed nothing, exiting$tries, so nothing was compared"
+    return
+  fi
+  if [ "$attempt" -gt 1 ]; then
+    retried=" (retried after exiting$tries)"
+  fi
+  local why
+  why="$(printf '%s\n' "$out" | LC_ALL=C sed -n 's/.*no column for this kernel *//p' | head -1)"
+  if [ -n "$why" ]; then
+    echo "skip  spvgpu:$kernel  $why"
+    return
+  fi
+  if printf '%s\n' "$out" | grep -aq '^compare .*agree'; then
+    echo "ok    spvgpu:$kernel  the emitted metal matches the cpu byte for byte$retried"
+  else
+    echo "FAIL  spvgpu:$kernel"
+    printf '%s\n' "$out" | tail -4 | LC_ALL=C sed 's/^/      /'
+    fail=1
+  fi
+}
+spvgpu saxpy        saxpy     --grid 1048576 --buffers 1048576,1048576,1048576
+spvgpu warpscan     warpscan  --grid 1048576 --threads 256 --buffers 1048576,1048576
+spvgpu block_reduce blockreduce --grid 1048576 --threads 256 --buffers 1048576,4096
+spvgpu votek        vote      --grid 1048576 --threads 256 --buffers 1048576,1048576
+spvgpu wide_shfl    wide      --grid 1048576 --threads 256 --buffers 1048576,1048576
+spvgpu serial_sum   llvm      --grid 1 --threads 1 --buffers 1000,1 --arg 0=1000
+spvgpu globk        global    --grid 1048576 --buffers 1048576,1048576
+# An image read and a filtered sample; then a storage image written, barriered,
+# and read back through the neighbour's texel.
+spvgpu texmix       texture   --grid 65536 --buffers 65536 --textures 64x64 \
+  --samplers nearest/clamp
+spvgpu texrw        texturerg --grid 4096 --threads 256 --buffers 4096,4096 \
+  --textures 64x64
+# `OpImageGather` has no column here, and not because it was skipped: the validator
+# refuses it outside a Shader module (`requires one of these capabilities: Shader`),
+# and this front end decodes OpenCL/Kernel modules. The PTX front end's `tld4` is the
+# only gather there is to translate, and it has a column above.
+# The 64-bit counter here reads nothing back — `%old64` is written and never used —
+# and an atomic nobody reads the result of is a reduction, so it takes the form
+# that exists at 64 bits: two 32-bit atomics on the halves. That is what makes
+# this a column rather than a refusal.
+spvgpu atomic       atomic    --grid 8 --threads 8 --buffers 8,8,8
+# A 64-bit atomic whose old value *is* read back has one writer at a time, so the
+# module takes the warp target, which walks every warp in one thread. All six
+# counters agree with the CPU byte for byte, compared as integers: a lost increment
+# is 7.7e-43 when eight bytes of counter are read as two floats.
+spvgpu atom64k      atom64    --grid 4096 --threads 32 --buffers 1,1,1,1,1,1
+
+triton add    add_kernel    2 --grid 1024 --buffers 1024,1024,1024 --arg 0=1000
+triton matmul matmul_kernel 2 --grid 256  --buffers 2048,1024,1024
+# fp32 `tl.dot` is the tf32 instruction: the operands are reduced to 10 mantissa
+# bits, and the twin reduces them the same way rather than computing in f32.
+triton dot32  dot32_kernel  2 --grid 256  --buffers 1024,512,1024
+# bf16 `tl.dot`: the same fragments, 8 mantissa bits, and the twin does the
+# rounding itself rather than being handed the converted values.
+triton dotbf16 dotbf16_kernel 2 --grid 256 --buffers 2048,1024,1024
+# `redux.sync`, the warp fold Triton emits for a `tl.sum`/`tl.max` over integers:
+# six folds, each checked against a shuffle tree of the same shape.
+triton reduce reduce_kernel 1 --grid 1024 --buffers 1024,8192
+# fp8 `tl.dot` is `mma.sync.m16n8k32`: four bytes a register and twice the K of
+# the half form. Its reference is not a Metal twin but `kernels/triton/fp8_ref.py`,
+# an e4m3 written from the format's definition (1-4-3, saturated at 448,
+# ties-to-even in exact integer arithmetic), and the tile holds exact binary
+# fractions, so every product and every sum of 32 is exact: a difference is a
+# fragment-layout or conversion bug, never a rounding one.
+if python3 kernels/triton/fp8_ref.py gen 512 256 "$TMP/f8a.bin" "$TMP/f8b.bin" 2>"$TMP/f8.log" \
+   && "$WEFT" run kernels/triton/dotfp8.ptx --kernel dotfp8_kernel --cpu-only \
+        --grid 1 --threads 32 --buffers 128,64,128 \
+        --load 0="$TMP/f8a.bin" --load 1="$TMP/f8b.bin" --dump 2="$TMP/f8d.bin" >>"$TMP/f8.log" 2>&1 \
+   && python3 kernels/triton/fp8_ref.py matmul "$TMP/f8a.bin" "$TMP/f8b.bin" "$TMP/f8d.bin" >>"$TMP/f8.log" 2>&1; then
+  echo "ok    triton:dotfp8  m16n8k32 e4m3 matches the e4m3 reference exactly"
+else
+  echo "FAIL  triton:dotfp8"; sed 's/^/      /' "$TMP/f8.log"; fail=1
+fi
+
+# wgmma is a warpgroup (128-lane) instruction whose operands come from shared
+# memory through a descriptor — so no lane reads another lane's register, and it
+# lowers on the per-lane backend where the threadgroup is the warpgroup. The
+# reference multiplies the input tiles directly, which is independent of both the
+# descriptor decode and the core-matrix walk the kernel itself uses.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wa.bin" "$TMP/wb.bin" 2>"$TMP/wg.log" \
+   && "$WEFT" run kernels/triton/wgmma.ptx --kernel wgmma_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 512,64,512 \
+        --load 0="$TMP/wa.bin" --load 1="$TMP/wb.bin" --dump 2="$TMP/wd.bin" >>"$TMP/wg.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wa.bin" "$TMP/wb.bin" "$TMP/wd.bin" >>"$TMP/wg.log" 2>&1; then
+  echo "ok    triton:wgmma  m64n8k16 f16 matches the reference exactly"
+else
+  echo "FAIL  triton:wgmma"; sed 's/^/      /' "$TMP/wg.log"; fail=1
+fi
+
+# e5m2 is the other fp8 format and the same instruction: 5 exponent bits, 2
+# mantissa bits, infinities and NaN at the top exponent. Same layout, different
+# decode — so this catches a decoder wired to the wrong format.
+if python3 kernels/triton/fp8_ref.py gen 512 256 "$TMP/e5a.bin" "$TMP/e5b.bin" e5m2 2>"$TMP/e5.log" \
+   && "$WEFT" run kernels/triton/dote5m2.ptx --kernel dote5m2_kernel --cpu-only \
+        --grid 1 --threads 32 --buffers 128,64,128 \
+        --load 0="$TMP/e5a.bin" --load 1="$TMP/e5b.bin" --dump 2="$TMP/e5d.bin" >>"$TMP/e5.log" 2>&1 \
+   && python3 kernels/triton/fp8_ref.py matmul "$TMP/e5a.bin" "$TMP/e5b.bin" "$TMP/e5d.bin" e5m2 >>"$TMP/e5.log" 2>&1; then
+  echo "ok    triton:dote5m2  m16n8k32 e5m2 matches the e5m2 reference exactly"
+else
+  echo "FAIL  triton:dote5m2"; sed 's/^/      /' "$TMP/e5.log"; fail=1
+fi
+
+# `cvt.rn.satfinite.e4m3x2.f32` + `prmt`, the sequence that builds an fp8 operand:
+# checked byte for byte on values that exercise saturation, subnormals and both
+# kinds of rounding tie.
+if python3 kernels/triton/fp8_ref.py gen-cvt "$TMP/f8in.bin" 2>"$TMP/f8c.log" \
+   && "$WEFT" run kernels/triton/cvt8.ptx --kernel cvt8_kernel --cpu-only \
+        --grid 32 --threads 32 --buffers 128,32 \
+        --load 0="$TMP/f8in.bin" --dump 1="$TMP/f8out.bin" >>"$TMP/f8c.log" 2>&1 \
+   && python3 kernels/triton/fp8_ref.py cvt "$TMP/f8in.bin" "$TMP/f8out.bin" >>"$TMP/f8c.log" 2>&1; then
+  echo "ok    triton:cvt8  packing to e4m3 matches the reference on every branch"
+else
+  echo "FAIL  triton:cvt8"; sed 's/^/      /' "$TMP/f8c.log"; fail=1
+fi
+
+# The geometry Triton compiled for is in the module, not in the caller's head:
+# `.maxntid 128` is the launch size, and the `global_scratch` pointer the kernel
+# never reads is not one of the buffers it is launched with.
+meta=$("$WEFT" run kernels/triton/add.ptx --kernel add_kernel --grid 1024 \
+    --buffers 1024,1024,1024 --arg 0=1000 --cpu-only)
+if echo "$meta" | grep -q 'threadgroup 128' && echo "$meta" | grep -q '1 declared parameter is not bound'; then
+  echo "ok    triton:abi  threads default to .maxntid (128), unread scratch not bound"
+else
+  echo "FAIL  triton:abi"; echo "$meta" | sed 's/^/      /'; fail=1
+fi
+
+# A barrier inside a loop, from real codegen — this is the resumable path.
+"$WEFT" run kernels/basic.metal --kernel reduce_sum --cpu-only --grid 1048576 --threads 256 --buffers 1048576,4096 --dump 1="$TMP/red_ref.bin" >/dev/null
+"$WEFT" run kernels/cuda/reduce.ptx --kernel reduce --cpu-only --grid 1048576 --threads 256 --buffers 1048576,4096 --dump 1="$TMP/red_ptx.bin" >/dev/null
+if cmp -s "$TMP/red_ref.bin" "$TMP/red_ptx.bin"; then
+  echo "ok    nvptx:reduce   barrier inside a loop matches the metal reduction"
+else
+  echo "FAIL  nvptx:reduce"; fail=1
+fi
+
+# Scalar kernel parameters and a v4 vector load, both from real codegen.
+"$WEFT" run kernels/basic.metal --kernel scale --cpu-only --grid 1048576 --buffers 1048576,1048576 --dump 1="$TMP/scale_ref.bin" >/dev/null
+"$WEFT" run kernels/cuda/scale.ptx --kernel scale --cpu-only --grid 1048576 --buffers 1048576,1048576 --arg 0=1.5 --arg 1=1048576 --dump 1="$TMP/scale_ptx.bin" >/dev/null
+if cmp -s "$TMP/scale_ref.bin" "$TMP/scale_ptx.bin"; then
+  echo "ok    nvptx:scale   scalar parameters and a guarded body match"
+else
+  echo "FAIL  nvptx:scale"; fail=1
+fi
+
+"$WEFT" run kernels/cuda/vecscale.ptx --kernel vecscale --cpu-only --grid 262144 --buffers 1048576,1048576 --arg 0=1.5 --dump 1="$TMP/vec.bin" >/dev/null
+if cmp -s "$TMP/scale_ref.bin" "$TMP/vec.bin"; then
+  echo "ok    nvptx:vecscale  v4 loads and stores match"
+else
+  echo "FAIL  nvptx:vecscale"; fail=1
+fi
+
+# Bit manipulation: funnel shifts, high-word multiplies, a byte permute, a NaN
+# test and the rounding converts. The PTX side is LLVM's own output; the Metal
+# side computes the same numbers from the definitions. Neither is the oracle for
+# the other, so a match means both are right.
+nvptx bits 1 --grid 1048576 --buffers 1048576,1048576
+
+"$WEFT" run kernels/basic.metal --kernel roundk --cpu-only --grid 1048576 \
+    --buffers 1048576,1048576 --dump 1="$TMP/round_msl.bin" >/dev/null
+"$WEFT" run kernels/round.ptx --kernel roundk --cpu-only --grid 1048576 \
+    --buffers 1048576,1048576 --dump 1="$TMP/round_ptx.bin" >/dev/null
+if cmp -s "$TMP/round_msl.bin" "$TMP/round_ptx.bin"; then
+  echo "ok    ptx:roundk    cvt.rn/.rz/.rm/.rp agree with rint/trunc/floor/ceil"
+else
+  echo "FAIL  ptx:roundk    rounding modes differ from the metal kernel"; fail=1
+fi
+
+# lop3's truth tables and the eight testp classes, against a bit-pattern oracle
+# written in the Metal front end. Metal's own isnan/isfinite are unusable here:
+# it compiles with fast-math, which is free to fold them away.
+"$WEFT" run kernels/basic.metal --kernel logic --cpu-only --grid 1048576 \
+    --buffers 1048576,1048576 --dump 1="$TMP/logic_msl.bin" >/dev/null
+"$WEFT" run kernels/logic.ptx --kernel logic --cpu-only --grid 1048576 \
+    --buffers 1048576,1048576 --dump 1="$TMP/logic_ptx.bin" >/dev/null
+if cmp -s "$TMP/logic_msl.bin" "$TMP/logic_ptx.bin"; then
+  echo "ok    ptx:logic     lop3 tables and all eight testp classes agree"
+else
+  echo "FAIL  ptx:logic     differs from the metal kernel"; fail=1
+fi
+
+# Atomics, checked against arithmetic rather than against each other: both
+# counters rise by exactly the grid, and the two maxes are set to a constant
+# larger than anything already in the buffer. A zero grid gives the starting
+# value, since the buffers are not zero-filled.
+atomcheck() {
+  local backend="$1" prefix=""
+  [ "$backend" = warp ] && prefix="WEFT_WARP=1"
+  local n=262144
+  env $prefix "$WEFT" run kernels/atom.ptx --kernel atomk --cpu-only --grid 0 \
+      --buffers 8,8,8,8 --dump 0="$TMP/at_base0.bin" --dump 2="$TMP/at_base2.bin" >/dev/null
+  env $prefix "$WEFT" run kernels/atom.ptx --kernel atomk --cpu-only --grid "$n" \
+      --buffers 8,8,8,8 --bench 1 --dump 0="$TMP/at_out0.bin" --dump 1="$TMP/at_out1.bin" \
+      --dump 2="$TMP/at_out2.bin" --dump 3="$TMP/at_out3.bin" >/dev/null
+  local b32 o32 b64 o64 m32 m64l m64h
+  b32=$(od -An -tu4 -N4 "$TMP/at_base0.bin" | tr -d ' ')
+  o32=$(od -An -tu4 -N4 "$TMP/at_out0.bin"  | tr -d ' ')
+  b64=$(od -An -tu4 -N4 "$TMP/at_base2.bin" | tr -d ' ')
+  o64=$(od -An -tu4 -N4 "$TMP/at_out2.bin"  | tr -d ' ')
+  m32=$(od -An -tx4 -N4 "$TMP/at_out1.bin"  | tr -d ' ')
+  m64l=$(od -An -tx4 -j0 -N4 "$TMP/at_out3.bin" | tr -d ' ')
+  m64h=$(od -An -tx4 -j4 -N4 "$TMP/at_out3.bin" | tr -d ' ')
+  if [ "$o32" -eq "$((b32 + n))" ] && [ "$o64" -eq "$((b64 + n))" ] \
+     && [ "$m32" = "7fffffff" ] && [ "$m64l" = "ffffffff" ] && [ "$m64h" = "7fffffff" ]; then
+    echo "ok    atom:$backend  u32/u64 counters +262144, both maxes exact"
+  else
+    echo "FAIL  atom:$backend  counters $b32->$o32 $b64->$o64, maxes $m32 $m64h$m64l"; fail=1
+  fi
+}
+
+atomcheck lanes
+atomcheck warp
+
+# bar.red — a threadgroup-wide fold, checked against arithmetic. Each group's
+# record depends only on how many threads it actually has, so a grid whose last
+# group is short must record a different answer, and no group may see another
+# group's slots.
+bredcheck() {
+  local backend="$1" prefix="" bad=""
+  [ "$backend" = warp ] && prefix="WEFT_WARP=1"
+  for cfg in "256 256" "100 256" "1024 256" "300 96" "1000 96" "512 128"; do
+    local grid="${cfg% *}" tg="${cfg#* }"
+    env $prefix "$WEFT" run kernels/bred.ptx --kernel bred --cpu-only --grid "$grid" \
+        --threads "$tg" --buffers 4,64 --dump 1="$TMP/bred.bin" >/dev/null
+    local ngroups=$(((grid + tg - 1) / tg)) g=0
+    while [ "$g" -lt "$ngroups" ]; do
+      local live=$((grid - g * tg))
+      [ "$live" -gt "$tg" ] && live="$tg"
+      local pop=$((live < 100 ? live : 100))
+      local and=$((live <= 200 ? 1 : 0))
+      local loop=$(((live < 32 ? live : 32) + (live < 16 ? live : 16)))
+      local got
+      got=$(od -An -tu4 -j $((16 * g)) -N16 "$TMP/bred.bin" | tr -s ' ' | sed 's/^ //; s/ $//')
+      [ "$got" = "$pop $and 1 $loop" ] || bad="$bad  $grid/$tg group $g got '$got' want '$pop $and 1 $loop'"
+      g=$((g + 1))
+    done
+  done
+  if [ -z "$bad" ]; then
+    echo "ok    bred:$backend  bar.red popc/and/or exact, incl. short threadgroups"
+  else
+    echo "FAIL  bred:$backend $bad"; fail=1
+  fi
+}
+
+bredcheck lanes
+bredcheck warp
+
+# Warp votes, checked against the answer rather than against each other: the
+# ballot of the even lanes is 0x55555555, and all(lane<32) + uni(lane<32) +
+# any(lane==7) is 3. Both backends, since they compute it completely differently.
+for backend in lanes warp; do
+  if [ "$backend" = warp ]; then export WEFT_WARP=1; else unset WEFT_WARP; fi
+  "$WEFT" run kernels/cuda/vote.ptx --kernel vote --cpu-only --grid 4096 --threads 256 \
+      --buffers 4096,4096 --dump 0="$TMP/vb.bin" --dump 1="$TMP/vc.bin" >/dev/null
+  bal="$(od -An -tx4 -v "$TMP/vb.bin" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr -d '\n')"
+  cnt="$(od -An -tu4 -v "$TMP/vc.bin" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr -d '\n')"
+  if [ "$bal" = "55555555" ] && [ "$cnt" = "3" ]; then
+    echo "ok    vote:$backend  ballot 0x55555555, all/uni/any all hold"
+  else
+    echo "FAIL  vote:$backend  ballot=$bal count=$cnt"; fail=1
+  fi
+done
+unset WEFT_WARP
+
+# SPIR-V front end vs the Metal front end, byte for byte. The modules are
+# assembled from text by spirv-as and validated, so a mistake in the module
+# cannot be mistaken for a mistake in the translator.
+spvcross() {
+  local kernel="$1" file="$2" idx="$3"; shift 3
+  "$WEFT" run kernels/basic.metal --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/msl.bin" "$@" >/dev/null
+  "$WEFT" run "kernels/spirv/$file.spv" --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/spv.bin" "$@" >/dev/null
+  if same_dumps "spirv:$kernel" "$TMP/msl.bin" "$TMP/spv.bin"; then
+    echo "ok    spirv:$kernel  matches the metal front end byte for byte"
+  else
+    echo "FAIL  spirv:$kernel  differs from the metal front end"; fail=1
+  fi
+}
+
+spvcross saxpy        saxpy       2 --grid 1048576 --buffers 1048576,1048576,1048576
+spvcross warpscan     warpscan    1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+# Loops with OpPhi, threadgroup memory and a barrier.
+spvcross block_reduce blockreduce 1 --grid 1048576 --threads 256 --buffers 1048576,4096
+spvcross block_reduce blockreduce 1 --grid 1000    --threads 96  --buffers 1000,11
+spvcross votek        vote        1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+# Values wider than the 32-bit rendezvous: a float2 and a 64-bit integer.
+spvcross wide_shfl    wide        1 --grid 1048576 --threads 256 --buffers 1048576,1048576
+# The one module LLVM's own SPIR-V backend emitted, not written by hand.
+spvcross serial_sum   llvm        1 --grid 1 --threads 1 --buffers 1000,1 --arg 0=1000
+# Images and samplers. In SPIR-V the sampler is host state (--samplers), while the
+# Metal twin bakes a constexpr sampler into the kernel; both must land on the same
+# texel, so every one of the 65536 outputs has to match.
+spvcross texmix       texture     0 --grid 65536 --buffers 65536 --textures 64x64 --samplers nearest/clamp
+# A module-scope `__global` buffer, which is bound as the parameter after the
+# explicit arguments rather than passed as a pointer.
+spvcross globk        global      1 --grid 1048576 --buffers 1048576,1048576
+# A storage image, written and read back across lanes: `OpImageWrite` in SPIR-V,
+# `texture2d<..., access::read_write>` in Metal.
+spvcross texrw        texturerg   1 --grid 4096 --threads 256 --buffers 4096,4096 --textures 64x64
+
+# SPIR-V atomics, checked against arithmetic: each counter rises by exactly the
+# grid, from a zero-thread baseline.
+spvatom() {
+  local n=262144
+  "$WEFT" run kernels/spirv/atomic.spv --kernel atomic --cpu-only --grid 0 --buffers 8,8,8 \
+      --dump 1="$TMP/sa_b1.bin" --dump 2="$TMP/sa_b2.bin" >/dev/null
+  "$WEFT" run kernels/spirv/atomic.spv --kernel atomic --cpu-only --grid "$n" --buffers 8,8,8 \
+      --bench 1 --dump 1="$TMP/sa_o1.bin" --dump 2="$TMP/sa_o2.bin" >/dev/null
+  local b32 o32 b64 o64
+  b32=$(od -An -tu4 -N4 "$TMP/sa_b1.bin" | tr -d ' ')
+  o32=$(od -An -tu4 -N4 "$TMP/sa_o1.bin" | tr -d ' ')
+  b64=$(od -An -tu4 -N4 "$TMP/sa_b2.bin" | tr -d ' ')
+  o64=$(od -An -tu4 -N4 "$TMP/sa_o2.bin" | tr -d ' ')
+  if [ "$o32" -eq "$((b32 + n))" ] && [ "$o64" -eq "$((b64 + n))" ]; then
+    echo "ok    spirv:atomic  u32 and u64 counters +$n exactly"
+  else
+    echo "FAIL  spirv:atomic  counters $b32->$o32 $b64->$o64"; fail=1
+  fi
+}
+spvatom
+
+# 64-bit atomics whose old value is read back, checked against arithmetic: the
+# olds of `+= 1` are a permutation of 0..n-1, the olds of `max 1` on a counter that
+# starts at 0 are one 0 and n-1 ones, and the signed `min -1` takes the counter to
+# -1 with the olds summing to -(n-1) — unsigned ordering would leave both at 0,
+# which is what makes it the signed check.
+spvatom64() {
+  local n=4096 f=kernels/spirv/atom64.spv b
+  # The counters have to start at zero for the arithmetic below to mean anything,
+  # and the launcher's generator fills a buffer with float patterns — so the eight
+  # bytes of each counter are supplied from a file instead.
+  printf '\0\0\0\0\0\0\0\0' > "$TMP/a64_zero.bin"
+  local io=()
+  for b in 0 1 2 3 4 5; do
+    io+=(--load "$b=$TMP/a64_zero.bin" --dump "$b=$TMP/a64_$b.bin")
+  done
+  "$WEFT" run "$f" --kernel atom64k --cpu-only --grid "$n" --threads 32 \
+      --buffers 1,1,1,1,1,1 "${io[@]}" >/dev/null
+  # Two 32-bit words, little-endian, joined into one number. macOS od has no 64-bit
+  # unsigned format, and bash arithmetic is 64-bit, so this is exact either way.
+  u64of() {
+    local w lo hi
+    w=$(od -An -tu4 -N8 "$1" | tr -s ' ' '\n' | sed '/^$/d')
+    lo=$(printf '%s\n' "$w" | sed -n 1p); hi=$(printf '%s\n' "$w" | sed -n 2p)
+    echo $(( (hi << 32) | lo ))
+  }
+  local c b1 b2 b3 b4 b5 bad=""
+  c=$(u64of "$TMP/a64_0.bin"); b1=$(u64of "$TMP/a64_1.bin")
+  b2=$(u64of "$TMP/a64_2.bin"); b3=$(u64of "$TMP/a64_3.bin")
+  b4=$(u64of "$TMP/a64_4.bin"); b5=$(u64of "$TMP/a64_5.bin")
+  [ "$c" -eq "$n" ] || bad="$bad counter=$c"
+  [ "$b1" -eq "$(( n * (n - 1) / 2 ))" ] || bad="$bad add_olds=$b1"
+  [ "$b2" -eq 1 ] || bad="$bad umax=$b2"
+  [ "$b3" -eq "$(( n - 1 ))" ] || bad="$bad umax_olds=$b3"
+  [ "$b4" -eq -1 ] || bad="$bad smin=$b4"
+  [ "$b5" -eq "$(( 1 - n ))" ] || bad="$bad smin_olds=$b5"
+  # The same six counters on the GPU, against the same arithmetic. The launcher's
+  # own compare reads these buffers as floats, and a u64 counter that lost 548
+  # increments is a 7.7e-43 difference in that view — so it said "agree" about a
+  # wrong answer. This one compares integers, and compares them because the answer
+  # is known, not because two engines were asked the same question.
+  local gbad=""
+  if [ -n "$CPUMODE" ]; then
+    gbad="no gpu on this host"
+  else
+    # Both sizes are exact, byte for byte, on every run measured: a wide kernel is
+    # one thread walking every warp, so the pair has one writer and nothing spins.
+    local gn gc gb1 gb2 gb3 gb4 gb5 go gio
+    for gn in 4096 65536; do
+      go=""
+      gio=()
+      for b in 0 1 2 3 4 5; do
+        gio+=(--load "$b=$TMP/a64_zero.bin" --dump-gpu "$b=$TMP/a64g_$b.bin")
+      done
+      "$WEFT" run "$f" --kernel atom64k --grid "$gn" --threads 32 \
+          --buffers 1,1,1,1,1,1 "${gio[@]}" >/dev/null 2>&1
+      gc=$(u64of "$TMP/a64g_0.bin"); gb1=$(u64of "$TMP/a64g_1.bin")
+      gb2=$(u64of "$TMP/a64g_2.bin"); gb3=$(u64of "$TMP/a64g_3.bin")
+      gb4=$(u64of "$TMP/a64g_4.bin"); gb5=$(u64of "$TMP/a64g_5.bin")
+      [ "$gc" -eq "$gn" ] || go="$go counter=$gc"
+      [ "$gb1" -eq "$(( gn * (gn - 1) / 2 ))" ] || go="$go add_olds=$gb1"
+      [ "$gb2" -eq 1 ] || go="$go umax=$gb2"
+      [ "$gb3" -eq "$(( gn - 1 ))" ] || go="$go umax_olds=$gb3"
+      [ "$gb4" -eq -1 ] || go="$go smin=$gb4"
+      [ "$gb5" -eq "$(( 1 - gn ))" ] || go="$go smin_olds=$gb5"
+      [ -z "$go" ] || gbad="$gbad ${gn}lanes:$go"
+    done
+  fi
+  if [ -z "$bad" ] && [ -z "$gbad" ]; then
+    echo "ok    spirv:atom64  $n lanes: add/max olds sum exactly, signed compare included,"
+    echo "      and the gpu's six counters are the same integers at 4,096 and 65,536"
+  else
+    [ -z "$bad" ] || { echo "FAIL  spirv:atom64 $bad"; fail=1; }
+    [ -z "$gbad" ] || { echo "FAIL  spirv:atom64 gpu:$gbad"; fail=1; }
+    [ -z "$gbad" ] || [ -z "$bad" ] || true
+  fi
+}
+spvatom64
+
+# Every SPIR-V sample has to be a valid module before any of the above means
+# anything: spirv-val is the reference the front end is being checked against.
+if command -v spirv-val >/dev/null 2>&1; then
+  bad=""
+  for f in kernels/spirv/*.spv; do
+    env=spv1.3
+    case "$f" in *llvm.spv) env=spv1.4 ;; esac
+    spirv-val --target-env "$env" "$f" >/dev/null 2>&1 || bad="$bad $f"
+  done
+  if [ -z "$bad" ]; then
+    echo "ok    spirv       every module validates with spirv-val"
+  else
+    echo "FAIL  spirv       invalid modules:$bad"; fail=1
+  fi
+fi
+
+# Both execution backends, same input, byte for byte: the per-lane state machine
+# and the warp-vector backend (WEFT_WARP=1) must agree on every kernel.
+# Same kernel twice — once per execution backend — into $3. Kernels differ in how
+# many buffers they take, so try the common shapes rather than hard-coding one.
+backend_run() {
+  local prefix="$1" file="$2" k="$3" dst="$4" n
+  for n in 2 3 1; do
+    local bufs
+    bufs="$(printf '1048576,%.0s' $(seq 1 "$n"))"
+    # shellcheck disable=SC2086
+    if env $prefix "$WEFT" run "$file" --kernel "$k" --cpu-only --grid 1048576 \
+        --threads 256 --buffers "${bufs%,}" --arg 0=1.5 --arg 1=1048576 \
+        --dump 1="$dst" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+backends_cmp() {
+  local f="$1" k="$2"
+  backend_run "" "$f" "$k" "$TMP/lanes.bin" || return 0
+  backend_run "WEFT_WARP=1" "$f" "$k" "$TMP/warp.bin" || return 0
+  if cmp -s "$TMP/lanes.bin" "$TMP/warp.bin"; then
+    echo "ok    backends:$k  per-lane and warp-vector agree byte for byte"
+  else
+    echo "FAIL  backends:$k  the two backends disagree"; fail=1
+  fi
+}
+
+for f in kernels/cuda/*.ptx; do
+  backends_cmp "$f" "$(basename "$f" .ptx)"
+done
+
+# The hand-written kernels too, whose file names do not always match the entry.
+backends_cmp kernels/round.ptx roundk
+backends_cmp kernels/logic.ptx logic
+backends_cmp kernels/bred.ptx  bred
+
+# A render pass. The target is 64x64 pixels and every stage is one invocation per
+# pixel, so the CPU's pixel loop and the GPU's rasteriser have to land on the same
+# pixel for every pixel — the buffer is `in[y * 64 + x]`, so an off-by-one in the
+# position mapping moves the input rather than hiding.
+rendertest() {
+  local file="$1" name="$2" target="$3"; shift 3
+  local out
+  out="$("$WEFT" run "$file" --kernel "$name" --render "$target" "$@" --bench 5 $CPUMODE)"
+  if echo "$out" | grep -q DISAGREE; then
+    echo "FAIL  render:$name"
+    echo "$out" | sed 's/^/      /'
+    fail=1
+  else
+    echo "ok    render:$name  $(summary "$out")"
+  fi
+}
+
+rendertest kernels/basic.metal fragshade 64x64 --buffers 4096 --textures 64x64
+# A target that is neither square nor a round number: 100x40, where the row
+# stride is the target's width and not the square of anything.
+rendertest kernels/basic.metal fragwide  100x40 --buffers 4000
+# The tile stage fills tile memory for every pixel before any fragment reads it.
+# Both sides lower tile memory to one element per pixel, and the tile buffer is
+# compared like any other, so a stage that writes the wrong pixel - or a fragment
+# that reads memory the stage never filled - is a difference, not a coincidence.
+rendertest kernels/basic.metal fragtile 64x64 --buffers 4096
+# The same, with the tile stage filling its group's block and waiting on it: the
+# barrier is inside the stage, so this is the tile stage through the coroutine
+# path, and the slot it leaves depends on the lane next door.
+rendertest kernels/tilegroup.metal fraggroup 64x64 --buffers 4096 --textures 64x64
+
+# Two tile stages in one pass is ambiguous, and a fragment that reads tile memory
+# with no stage to fill it would compare two numbers neither side computed.
+cat > "$TMP/twotile.metal" <<'EOF'
+struct TileVal { float4 c; };
+[[tile]] void t1(imageblock<TileVal> blk [[imageblock_data]],
+                 device const float* in [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    blk.c = float4(in[gid], 0.0f, 0.0f, 1.0f);
+}
+[[tile]] void t2(imageblock<TileVal> blk [[imageblock_data]],
+                 device const float* in [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    blk.c = float4(in[gid], 1.0f, 0.0f, 1.0f);
+}
+fragment float4 f(float4 pos [[position]], device const float* in [[buffer(0)]],
+                  imageblock<TileVal> blk [[imageblock_data]]) {
+    return float4(blk.c.x, 0.0f, 0.0f, 1.0f);
+}
+EOF
+two_msg="$("$WEFT" run "$TMP/twotile.metal" --kernel f --render 64x64 --buffers 4096 2>&1 || true)"
+if echo "$two_msg" | grep -q "has one .\[\[tile\]\]. stage"; then
+  echo "ok    render:twotile  two tile stages are refused, not picked between"
+else
+  echo "FAIL  render:twotile  two tile stages were not refused"; fail=1
+fi
+cat > "$TMP/notile.metal" <<'EOF'
+struct TileVal { float4 c; };
+fragment float4 f(float4 pos [[position]], device const float* in [[buffer(0)]],
+                  imageblock<TileVal> blk [[imageblock_data]]) {
+    return float4(blk.c.x, 0.0f, 0.0f, 1.0f);
+}
+EOF
+no_msg="$("$WEFT" run "$TMP/notile.metal" --kernel f --render 64x64 --buffers 4096 2>&1 || true)"
+if echo "$no_msg" | grep -q "no .\[\[tile\]\]. stage"; then
+  echo "ok    render:notile  a fragment reading tile memory needs a stage to fill it"
+else
+  echo "FAIL  render:notile  a fragment read tile memory with no tile stage"; fail=1
+fi
+
+# A fragment that reads the tile next door. The GPU leaves that read undefined -
+# it is another tile's memory, which may not have been written yet - so there is
+# no answer to compare and the run is refused. The legal case, a neighbour inside
+# your own tile, is fraggroup above, whose slot comes from the lane next door.
+hop_msg="$("$WEFT" run kernels/tilegroup.metal --kernel fragtilehop --render 64x64 --textures 64x64 2>&1 || true)"
+
+# A mesh object stage. A mesh pipeline needs MTLGPUFamilyApple9 (M3 or later), but
+# a mesh stage's output is only buffers, and the translation of it to plain compute
+# is what runs on any Metal device — so this is checked twice: the kernel's two
+# blocks against a reference model recomputed independently in Python, and the GPU
+# run against the CPU one, on the same machine, bit for bit. One mesh per 32-lane
+# threadgroup is the rule both use to find each mesh's block.
+rm -f "$TMP/mesh_in.bin" "$TMP/mesh_v.bin" "$TMP/mesh_p.bin"
+if "$WEFT" run kernels/mesh.metal --kernel meshmaker --grid 256 --buffers 256 \
+     --bench 1 --dump 0="$TMP/mesh_in.bin" --dump 1="$TMP/mesh_v.bin" \
+     --dump 2="$TMP/mesh_p.bin" > "$TMP/mesh.log" 2>&1 \
+   && python3 - "$TMP/mesh_in.bin" "$TMP/mesh_v.bin" "$TMP/mesh_p.bin" "$TMP/mesh.log" <<'MESHPY'
+import struct, sys
+# The GPU ran this too: a mesh stage is lowered to plain compute, so there is a
+# Metal answer to diff against on a device with no mesh pipeline at all. A host
+# with no Metal backend has no GPU column, and says so instead — that is the one
+# case where the model alone is the check.
+log = open(sys.argv[4], encoding='utf-8').read()
+if 'unavailable' not in log and '— agree' not in log:
+    sys.exit(1)
+inp = open(sys.argv[1], 'rb').read()
+v = open(sys.argv[2], 'rb').read()
+p = open(sys.argv[3], 'rb').read()
+grid, lanes, nv, np_ = 256, 32, 16, 16
+groups = grid // lanes
+
+def f(i):
+    return struct.unpack_from('<f', inp, 4 * i)[0]
+
+if len(p) != groups * np_ * 16:   # a triangle is a uint3: Metal pads it to 16 bytes
+    sys.exit(1)
+if len(v) % (groups * nv):
+    sys.exit(1)
+vs = len(v) // (groups * nv)   # sizeof(Vtx): the compiler's answer, not a guess
+bad = 0
+for g in range(groups):
+    for i in range(nv):
+        o = (g * nv + i) * vs
+        px, py, pz, pw = struct.unpack_from('<4f', v, o)
+        ux, uy = struct.unpack_from('<2f', v, o + 16)
+        if i == 4:
+            # lane 16 rewrote this slot from vertex 3, after the barrier
+            want, ux_w, uy_w = (3.0 + 3.5, f(g * lanes + 3), 6.0, 1.0), 3.0, 3.5
+        else:
+            want = (float(i), f(g * lanes + i), float(i) * 2.0, 1.0)
+            ux_w, uy_w = float(i), float(i) + 0.5
+        if (px, py, pz, pw) != want or (ux, uy) != (ux_w, uy_w):
+            bad += 1
+    for k in range(np_):
+        a, b, c = struct.unpack_from('<3I', p, (g * np_ + k) * 16)
+        if (a, b, c) != (k, (k + 1) % nv, (k + 2) % nv):
+            bad += 1
+sys.exit(1 if bad else 0)
+MESHPY
+then
+  echo "ok    mesh        16 vertices and 16 triangles per mesh, matched against a model"
+else
+  echo "FAIL  mesh         a mesh object stage did not match the reference model"
+  tail -4 "$TMP/mesh.log" 2>/dev/null | sed 's/^/      /'; fail=1
+fi
+
+# A task stage ahead of a mesh stage. The task stage runs first over --grid (96
+# threads = three groups of 32), sets the meshgrid to four meshes and fills one
+# payload element per task group. The launcher cuts the meshgrid into contiguous
+# blocks, one per task group, and copies each group's payload to the meshes of its
+# block: meshes 0 and 1 read group 0, mesh 2 group 1, mesh 3 group 2. The
+# partition is the launcher's, written down here and nowhere left to guesswork.
+rm -f "$TMP/tm_res.bin" "$TMP/tm_v.bin" "$TMP/tm_p.bin" "$TMP/tm_pl.bin"
+if "$WEFT" run kernels/taskmesh.metal --kernel meshuse --grid 96 --buffers 8 \
+     --bench 1 --dump 0="$TMP/tm_res.bin" --dump 1="$TMP/tm_v.bin" \
+     --dump 2="$TMP/tm_p.bin" --dump 3="$TMP/tm_pl.bin" > "$TMP/tm.log" 2>&1 \
+   && python3 - "$TMP/tm_res.bin" "$TMP/tm_v.bin" "$TMP/tm_p.bin" "$TMP/tm_pl.bin" \
+              "$TMP/tm.log" <<'TASKPY'
+import struct, sys
+tlog = open(sys.argv[5], encoding='utf-8').read()
+if 'unavailable' not in tlog and '— agree' not in tlog:
+    sys.exit(1)
+res = open(sys.argv[1], 'rb').read()
+v = open(sys.argv[2], 'rb').read()
+p = open(sys.argv[3], 'rb').read()
+pl = open(sys.argv[4], 'rb').read()
+meshes, nv = 4, 8
+# struct Payload { uint base; float scale; }, one element per mesh: the launcher
+# has already copied each task group's payload into the block of meshes it owns.
+if len(pl) != meshes * 8:
+    sys.exit(1)
+base = [struct.unpack_from('<I', pl, 8 * m)[0] for m in range(meshes)]
+scale = [struct.unpack_from('<f', pl, 8 * m + 4)[0] for m in range(meshes)]
+# Three task groups (base 0, 4, 8) over four meshes: meshes 0 and 1 are group 0's.
+if (base, scale) != ([0, 0, 4, 8], [0.5, 0.5, 1.5, 2.5]):
+    sys.exit(1)
+vs = len(v) // (meshes * nv)
+out = struct.unpack('<%df' % (meshes * 2), res)
+bad = 0
+for m in range(meshes):
+    t = m
+    for i in range(nv):
+        q = struct.unpack_from('<4f', v, (m * nv + i) * vs)
+        if q != (float(base[t] + i), scale[t], float(m), 1.0):
+            bad += 1
+    if struct.unpack_from('<3I', p, m * nv * 16) != (0, 1, 2):
+        bad += 1
+    if out[2 * m] != float(base[t]) + scale[t] or out[2 * m + 1] != float(m):
+        bad += 1
+sys.exit(1 if bad else 0)
+TASKPY
+then
+  echo "ok    task:mesh   a task stage set the meshgrid (4 meshes) and its payload reached them"
+else
+  echo "FAIL  task:mesh   the task and mesh stages did not match the reference model"
+  tail -5 "$TMP/tm.log" 2>/dev/null | sed 's/^/      /'; fail=1
+fi
+
+# The translation cache is keyed by the generated code, so a second run of the
+# same kernel must not compile again: that is what makes the CLI usable in a loop.
+cached_run="$("$WEFT" run kernels/basic.metal --kernel saxpy --grid 4096 --buffers 4096,4096,4096 --cpu-only 2>&1)"
+if echo "$cached_run" | grep -q "cached"; then
+  echo "ok    cache       a repeated translation is reused, not recompiled"
+else
+  echo "FAIL  cache       the second run compiled again"
+  echo "$cached_run" | grep translate | sed 's/^/      /'; fail=1
+fi
+if echo "$hop_msg" | grep -q "outside its own 32x32 tile"; then
+  echo "ok    render:tilehop  a read of another tile is refused, not compared"
+else
+  echo "FAIL  render:tilehop  an out-of-tile tile-memory read was not refused"; fail=1
+fi
+
+# A launch that cannot fill the block a module declares leaves lanes the program
+# is written against, and their staging slots would be read unfilled. The run
+# names the launch instead of answering with those bits.
+short_block="$("$WEFT" run kernels/triton/wgmma.ptx --kernel wgmma_kernel --grid 32 \
+  --threads 128 --buffers 32768,32768,32768 2>&1 || true)"
+if echo "$short_block" | grep -q "at least one full block"; then
+  echo "ok    launch:shortblock  a grid under one block is refused, not compared"
+else
+  echo "FAIL  launch:shortblock  a under-filled block launch was compared anyway"; fail=1
+fi
+
+# The linked path: build/embed links the translated kernel into one binary and
+# calls it through include/weft/weft.h. It writes its two inputs and its result,
+# and the CLI is then fed those same inputs, so the two paths have to produce the
+# same bytes - a drift between the library and the tool is a difference here.
+if make -s build/embed >/dev/null 2>&1 && ./build/embed "$TMP/embed" >/dev/null 2>&1; then
+  "$WEFT" run kernels/basic.metal --kernel saxpy --grid 4096 --buffers 4096,4096,4096 \
+      --cpu-only --load 0="$TMP/embed_a.bin" --load 1="$TMP/embed_b.bin" \
+      --dump 2="$TMP/cli_out.bin" >/dev/null
+  if cmp -s "$TMP/embed_out.bin" "$TMP/cli_out.bin"; then
+    echo "ok    embed       the linked kernel and the CLI agree byte for byte"
+  else
+    echo "FAIL  embed       the linked kernel and the CLI differ"; fail=1
+  fi
+else
+  echo "FAIL  embed       could not build or run examples/embed"; fail=1
+fi
+
+# A buffer's width comes from the kernel's declaration: `--buffers 262144` for a
+# float4 kernel is a million floats, not a quarter of a million.
+typed=$("$WEFT" run kernels/basic.metal --kernel vec4_scale --grid 262144 \
+    --buffers 262144,262144 --bench 1 | grep '^kernel')
+if echo "$typed" | grep -q "float4 16B"; then
+  echo "ok    typed       buffers are elements of the declared type (float4 16B)"
+else
+  echo "FAIL  typed       the float4 buffer was not reported as 16 bytes"
+  echo "$typed" | sed 's/^/      /'; fail=1
+fi
+
+# SPIR-V states its own layout (ArrayStride, Offset), so weft-gen can report each
+# binding's element width from the module — the pointer's pointee, or one element
+# of the array it names. PTX binds addresses, so it reports none, and a stated
+# width is how that gap gets filled instead of a silent 4 bytes.
+spv_types=$(./build/weft-gen kernels/spirv/global.spv --describe)
+if echo "$spv_types" | grep -q "types=4,4"; then
+  echo "ok    spirv:types  element widths come from the module's own pointer types"
+else
+  echo "FAIL  spirv:types  SPIR-V widths were not reported"; echo "$spv_types" | sed 's/^/      /'; fail=1
+fi
+ptx_none=$(./build/weft-gen kernels/reverse.ptx --describe)
+ptx_stated=$(./build/weft-gen kernels/reverse.ptx --describe --buffer-bytes 0=4,1=16)
+if echo "$ptx_none" | grep -q "types=0,0" && echo "$ptx_stated" | grep -q "types=4,16"; then
+  echo "ok    ptx:types    an address-only front end reports no width; --buffer-bytes states one"
+else
+  echo "FAIL  ptx:types    the PTX width fallback drifted"; fail=1
+fi
+
+# weft-gen is what a build system calls, so its manifest has to name the arguments.
+desc=$(./build/weft-gen kernels/basic.metal --describe)
+if echo "$desc" | grep -q '^kernel 0 saxpy kernel buffers=3 textures=0 sync=0 threads=0 types=float,float,float$'; then
+  echo "ok    weft-gen    --describe names each kernel, its buffers and their types"
+else
+  echo "FAIL  weft-gen    --describe did not describe saxpy"
+  echo "$desc" | head -3 | sed 's/^/      /'; fail=1
+fi
+
+# ... including the launch size a module states, which is the one thing a caller
+# of a Triton kernel cannot infer from the arguments (threads=32 is `.maxntid`).
+tdesc=$(./build/weft-gen kernels/triton/matmul.ptx --describe)
+if echo "$tdesc" | grep -q '^kernel 0 matmul_kernel kernel buffers=3 textures=0 sync=1 threads=32 types=0,0,0$'; then
+  echo "ok    triton:gen  --describe carries the launch size the module declares"
+else
+  echo "FAIL  triton:gen"; echo "$tdesc" | sed 's/^/      /'; fail=1
+fi
+
+# A render pass is a frame, and the colour target is RGBA rather than one
+# channel. --out saves it, so both engines write the same image: the files are
+# compared byte for byte, which is the `compare` line in a form a viewer opens.
+rm -f /tmp/weft_render_cpu.png /tmp/weft_render_gpu.png
+# The PNG header and the IHDR width/height, as bytes: 100 x 40 is 00000064
+# 00000028. That is readable without an image library, on any host.
+png_ok() {
+  head -c 8 "$1" | od -An -tx1 | tr -d ' \n' | grep -q '^89504e470d0a1a0a$' \
+    && [ "$(od -An -tx1 -j16 -N8 "$1" | tr -d ' \n')" = "0000006400000028" ]
+}
+if [ -n "$CPUMODE" ]; then
+  # No GPU frame to diff, so the claim is the part that is still checkable: the
+  # render pass produced a 100x40 RGBA PNG rather than a file that merely exists.
+  if "$WEFT" run kernels/basic.metal --kernel fragwide --render 100x40 --buffers 4000 \
+       --bench 1 --out /tmp/weft_render_cpu.png > /tmp/weft_render.log 2>&1 \
+     && png_ok /tmp/weft_render_cpu.png; then
+    echo "ok    render:image  the frame is a PNG, 100x40  (no gpu on this host to diff)"
+  else
+    echo "FAIL  render:image"; tail -5 /tmp/weft_render.log 2>/dev/null | sed 's/^/      /'; fail=1
+  fi
+elif "$WEFT" run kernels/basic.metal --kernel fragwide --render 100x40 --buffers 4000 \
+     --bench 1 --out /tmp/weft_render_cpu.png --out-gpu /tmp/weft_render_gpu.png \
+     > /tmp/weft_render.log 2>&1 \
+   && cmp -s /tmp/weft_render_cpu.png /tmp/weft_render_gpu.png \
+   && png_ok /tmp/weft_render_cpu.png; then
+  echo "ok    render:image  the frame is a PNG, and the cpu and gpu files are identical"
+else
+  echo "FAIL  render:image"; tail -5 /tmp/weft_render.log 2>/dev/null | sed 's/^/      /'; fail=1
+fi
+
+# Portable math: 54 functions over 65,536 lanes, dumped from both engines and
+# compared as bytes. Identical is the whole claim — sqrt, rsqrt, log2, exp2, pow,
+# mix, dot, length, distance and normalize are the same code on both sides, so a
+# single differing bit is a failure rather than a tolerance.
+rm -f /tmp/weft_math_cpu.bin /tmp/weft_math_gpu.bin /tmp/weft_math_in.bin
+if [ -n "$CPUMODE" ]; then
+  # The libm comparison below still runs on this dump, which is the check that
+  # catches two engines sharing one wrong function. What is missing here is the
+  # second engine, and the line says so.
+  if "$WEFT" run kernels/mathfit.metal --kernel fnprobe --grid 65536 \
+       --buffers 393216,3538944 --bench 1 --dump 0=/tmp/weft_math_in.bin \
+       --dump 1=/tmp/weft_math_cpu.bin > /tmp/weft_math.log 2>&1 \
+     && [ -s /tmp/weft_math_cpu.bin ]; then
+    echo "ok    math:portable  54 functions x 65,536 lanes ran on the cpu  (no gpu on this host)"
+  else
+    echo "FAIL  math:portable"; tail -4 /tmp/weft_math.log 2>/dev/null | sed 's/^/      /'; fail=1
+  fi
+elif "$WEFT" run kernels/mathfit.metal --kernel fnprobe --grid 65536 \
+     --buffers 393216,3538944 --bench 1 --dump 0=/tmp/weft_math_in.bin \
+     --dump 1=/tmp/weft_math_cpu.bin --dump-gpu 1=/tmp/weft_math_gpu.bin \
+     > /tmp/weft_math.log 2>&1 \
+   && cmp -s /tmp/weft_math_cpu.bin /tmp/weft_math_gpu.bin; then
+  echo "ok    math:portable  54 functions x 65,536 lanes are byte-identical on cpu and gpu"
+else
+  echo "FAIL  math:portable"; tail -4 /tmp/weft_math.log 2>/dev/null | sed 's/^/      /'; fail=1
+fi
+
+
+# Agreement is not accuracy: two engines running the same wrong code pass the
+# byte comparison, which is what the portable sqrt did before this check
+# existed. So all 48 computed columns on all 65,536 lanes are also compared
+# against libm, each with its own limit; a failure names the column.
+if command -v python3 >/dev/null 2>&1; then
+  if acc=$(python3 - /tmp/weft_math_in.bin /tmp/weft_math_cpu.bin <<'ACCPY'
+import struct, math, sys
+inp = open(sys.argv[1], 'rb').read()
+cpu = open(sys.argv[2], 'rb').read()
+lanes = len(inp) // 24
+rows = len(cpu) // 4 // lanes
+def at(i):
+    return struct.unpack_from('<f', cpu, 4 * i)[0]
+def given(i):
+    return struct.unpack_from('<f', inp, 4 * i)[0]
+def dot3(x, y):
+    return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]
+def dot4(x, y):
+    return dot3(x, y) + x[3] * y[3]
+def norm3(x):
+    l = math.sqrt(dot3(x, x))
+    return [float('nan')] * 3 if l == 0.0 else [c / l for c in x]
+def cl(x):
+    return -1.0 if x < -1.0 else (1.0 if x > 1.0 else x)
+# column -> (name, reference of (a, b, u, a3, b3, a4, b4), limit)
+# The metric is |got-ref| / max(1, |ref|): absolute for small answers, relative
+# for large ones, so one number works for a value of 1e-3 and one of 1e4.
+def refs(a, b, u, a3, b3, a4, b4):
+    n, nb = norm3(a3), norm3(b3)
+    n2 = norm3([a[0], a[1], 0.0])
+    d = dot3(nb, n)
+    k = 1.0 - 0.5625 * (1.0 - d * d)
+    # refract(I, N, eta) = eta*I - (eta*dot(N,I) + sqrt(k))*N, and zero when the
+    # angle is past the critical one — the same text Metal's documentation gives.
+    rf = [0.0, 0.0, 0.0] if k < 0 else [0.75 * n[i] - (0.75 * d + math.sqrt(k)) * nb[i]
+                                        for i in range(3)]
+    return {
+        0: ('sqrt', math.sqrt(u)),
+        1: ('divide', 1.0 / u),
+        2: ('rsqrt', 1.0 / math.sqrt(u)),
+        3: ('divide2', u / (u + 1.0)),
+        4: ('exp2', 2.0 ** u),
+        5: ('log2', math.log2(u)),
+        6: ('length2', math.sqrt(a[0] ** 2 + a[1] ** 2)),
+        7: ('dot2', a[0] * b[0] + a[1] * b[1]),
+        8: ('length4', math.sqrt(dot4(a4, a4))),
+        9: ('dot4', dot4(a4, b4)),
+        10: ('mix', a[0] + (b[0] - a[0]) * a[1]),
+        11: ('mix_form1', a[0] + (b[0] - a[0]) * a[1]),
+        12: ('mix_form2', a[1] * (b[0] - a[0]) + a[0]),
+        13: ('mix_form3', a[0] * (1.0 - a[1]) + b[0] * a[1]),
+        14: ('pow3', u ** 3),
+        15: ('pow_half', math.sqrt(u)),
+        16: ('sqrt_sq', u),
+        17: ('fma', u * u + 1.0),
+        18: ('recip_sqrt', 1.0 / math.sqrt(u)),
+        19: ('u_rsqrt', u / math.sqrt(u)),
+        20: ('normalize', n2[0]),
+        21: ('distance', math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)),
+        22: ('length3', math.sqrt(dot3(a3, a3))),
+        23: ('dot3', dot3(a3, a3)),
+        24: ('sqrt_chain', math.sqrt(a[0] ** 2 + a[1] ** 2)),
+        25: ('fma_chain', a[0] ** 2 + a[1] ** 2),
+        26: ('recip_chain', 1.0 / math.sqrt(a[0] ** 2 + 1.0)),
+        27: ('log2_scaled', 1.5 * math.log2(u)),
+        28: ('exp2_log2', u ** 1.5),   # exp2(1.5*log2(u))
+        29: ('mix_vs_fma', 0.0),
+        30: ('sqrt_vs_rsqrt', 0.0),
+        31: ('fma_exact', 0.0),
+        32: ('sin', math.sin(a[0])),
+        33: ('cos', math.cos(a[1])),
+        34: ('tan', math.tan(a[0] * 0.5)),
+        35: ('asin', math.asin(cl(a[0]))),
+        36: ('acos', math.acos(cl(a[1]))),
+        37: ('atan', math.atan(a[2])),
+        38: ('atan2', math.atan2(a[1], a[0])),
+        39: ('sinh', math.sinh(a[0])),
+        40: ('cosh', math.cosh(a[1])),
+        41: ('tanh', math.tanh(a[0])),
+        42: ('asinh', math.asinh(a[2])),
+        43: ('acosh', math.acosh(abs(a[0]) + 1.0)),
+        44: ('atanh', math.atanh(a[0] * 0.5)),
+        45: ('exp10', 10.0 ** a[1]),
+        46: ('log10', math.log10(abs(a[0]) + 0.5)),
+        47: ('powr', (abs(a[0]) + 0.5) ** a[1]),
+        48: ('cross', a[1] * b[2] - a[2] * b[1]),
+        49: ('reflect', n[0] - 2.0 * dot3(nb, n) * nb[0]),
+        50: ('refract', rf[0]),
+        51: ('faceforward', a[2] if dot3(a3, b3) < 0 else -a[2]),
+    }
+# exp10/powr answer on a coarser grid by construction; everything else is within
+# a few ulp, so 1e-6 is a tight bound rather than a generous one.
+limited = {'exp10': 2e-5, 'powr': 2e-5}
+worst = {}
+for i in range(lanes):   # every lane: a subsample would miss the lane with the bug
+    a = [given(6 * i + t) for t in range(3)]
+    b = [given(6 * i + t) for t in range(3, 6)]
+    u = abs(a[0]) + 0.5
+    try:
+        table = refs(a, b, u, a, b, a + [1.0], b + [1.0])
+    except (ValueError, OverflowError):
+        continue  # an argument outside a function's domain, on this lane
+    for col, (name, ref) in table.items():
+        if ref != ref:
+            continue  # the lane itself is degenerate (normalize of zero)
+        got = at(i * rows + col)
+        e = 1e9 if got != got else abs(got - ref) / max(1.0, abs(ref))
+        if e > worst.get(name, (-1.0, 0))[0]:
+            worst[name] = (e, col)
+bad = [(n, e, c) for n, (e, c) in worst.items() if e > limited.get(n, 1e-6)]
+if bad:
+    print('%d column(s) over limit: %s' % (len(bad), ', '.join(
+        '%s %.0e' % (n, e) for n, e, c in sorted(bad, key=lambda t: -t[1])[:5])))
+    sys.exit(1)
+if len(worst) < 48:
+    print('only %d of 48 columns compared' % len(worst))
+    sys.exit(1)
+top = max(worst.items(), key=lambda kv: kv[1][0])
+print('%.1e (%s, 48 columns)' % (top[1][0], top[0]))
+sys.exit(0)
+ACCPY
+  ); then
+    echo "ok    math:accuracy  worst $acc against libm"
+  else
+    echo "FAIL  math:accuracy  worst $acc against libm"; fail=1
+  fi
+else
+  echo "FAIL  math:accuracy  no python3 to compare against libm"; fail=1
+fi
+
+# ---- every ptx/spv fixture is compared by a check that names it ----
+# A `.ptx` or `.spv` sample that nothing diffs is a translation nobody checked, and
+# a hand-written twin that no call invokes can drift away from the kernel it
+# mirrors with nothing to notice. The inventory is the directory, the coverage is
+# the calls above, and both have to agree.
+#
+# Four llc-emitted samples predate these comparisons and no twin was written for
+# them, so they are named here as known-uncompared instead of being skipped in
+# silence: that is a gap with a name on it, not one hiding behind a passing run.
+known_uncompared=""   # empty: every fixture has a comparison now
+self="${BASH_SOURCE[0]}"
+uncovered=""
+for fx in kernels/*.ptx kernels/cuda/*.ptx kernels/triton/*.ptx kernels/spirv/*.spv; do
+  [ -e "$fx" ] || continue
+  fxbase="$(basename "$fx")"; fxkey="${fxbase%.*}"
+  case "$known_uncompared" in *" $fx "*) continue ;; esac
+  if grep -qF "$fx" "$self"; then continue; fi
+  case "$fx" in
+    kernels/cuda/*)   if grep -qE "^nvptx +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
+    kernels/triton/*) if grep -qE "^triton +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
+    kernels/spirv/*)  if grep -qE "^spvcross +[^ ]+ +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
+    *)                if grep -qE "^cross +$fxkey([[:space:]]|$)" "$self"; then continue; fi ;;
+  esac
+  uncovered="$uncovered $fx"
+done
+if [ -z "$uncovered" ]; then
+  echo "ok    twins        every ptx/spv fixture is named by a comparison in this file"
+else
+  echo "FAIL  twins        fixtures no comparison names:$uncovered"; fail=1
+fi
+
+exit "$fail"
