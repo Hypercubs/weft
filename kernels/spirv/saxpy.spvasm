@@ -1,0 +1,37 @@
+; out[i] = 2*a[i] + 0.5*b[i] — the same math as basic.metal's saxpy, so the two
+; front ends must produce byte-identical output.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "saxpy" %gid
+               OpName %main "saxpy"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+     %f32 = OpTypeFloat 32
+      %u64 = OpTypeInt 64 0
+     %ptr = OpTypePointer CrossWorkgroup %f32
+    %v3u64 = OpTypeVector %u64 3
+      %pin = OpTypePointer Input %v3u64
+    %fnty = OpTypeFunction %void %ptr %ptr %ptr
+      %gid = OpVariable %pin Input
+       %two = OpConstant %f32 2
+      %half = OpConstant %f32 0.5
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %ptr
+         %b = OpFunctionParameter %ptr
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+        %pa = OpPtrAccessChain %ptr %a %gi
+        %va = OpLoad %f32 %pa
+        %pb = OpPtrAccessChain %ptr %b %gi
+        %vb = OpLoad %f32 %pb
+        %m1 = OpFMul %f32 %va %two
+        %m2 = OpFMul %f32 %vb %half
+         %r = OpFAdd %f32 %m1 %m2
+        %po = OpPtrAccessChain %ptr %o %gi
+                OpStore %po %r
+                OpReturn
+                OpFunctionEnd

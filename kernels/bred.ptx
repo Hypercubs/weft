@@ -1,0 +1,83 @@
+// Hand-written PTX for bar.red — the barrier whose result is a fold over the
+// whole threadgroup (`__syncthreads_count` and friends). Every answer here is a
+// constant that depends only on the thread's index, so check.sh compares them
+// against arithmetic rather than against another implementation:
+//
+//   out[0] = 100   popc of tid < 100
+//   out[1] = 0     and of tid < 200   (not every thread passes)
+//   out[2] = 1     or  of tid == 7
+//   out[3] = 48    popc written twice inside a loop: 32 then 16
+//
+// The loop is the point of the fourth one: the per-thread slots have to be safe
+// to reuse, since the group runs the reduction again before everyone has read
+// the first answer.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry bred(
+    .param .u64 bred_param_0,
+    .param .u64 bred_param_1
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [bred_param_0];
+    ld.param.u64 %rd2, [bred_param_1];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.lo.s32 %r4, %r2, %r3;
+    add.s32 %r5, %r4, %r1;          // gid
+    mov.u32 %r6, %nctaid.x;
+    mul.lo.s32 %r7, %r6, %r3;
+    setp.ge.s32 %p1, %r5, %r7;
+    @%p1 bra.uni DONE;
+
+    setp.lt.s32 %p2, %r1, 100;
+    bar.red.popc.u32 %r8, 0, %p2;
+
+    setp.lt.s32 %p3, %r1, 200;
+    bar.red.and.pred %r9, 0, %p3;
+
+    setp.eq.s32 %p4, %r1, 7;
+    bar.red.or.pred %r10, 0, %p4;
+
+    // two passes over the reduction inside one loop body
+    mov.u32 %r11, 0;                // sum
+    mov.u32 %r12, 32;               // limit, halved each pass
+LOOP:
+    setp.lt.s32 %p5, %r1, %r12;
+    bar.red.popc.u32 %r13, 0, %p5;
+    add.s32 %r11, %r11, %r13;
+    shr.u32 %r12, %r12, 1;
+    setp.gt.s32 %p6, %r12, 8;
+    @%p6 bra.uni LOOP;
+
+    // One record per threadgroup, written by that group's thread 0. Each group's
+    // answer depends only on how many threads it actually has, so a grid whose
+    // last group is short records a different — and checkable — value.
+    setp.eq.s32 %p7, %r1, 0;
+    @!%p7 bra.uni DONE;
+
+    mul.lo.s32 %r15, %r2, 16;
+    cvt.u64.u32 %rd3, %r15;
+    add.u64 %rd4, %rd2, %rd3;
+
+    st.global.b32 [%rd4], %r8;
+
+    add.u64 %rd5, %rd4, 4;
+    st.global.b32 [%rd5], %r9;
+
+    add.u64 %rd5, %rd4, 8;
+    st.global.b32 [%rd5], %r10;
+
+    add.u64 %rd5, %rd4, 12;
+    st.global.b32 [%rd5], %r11;
+
+DONE:
+    ret;
+}

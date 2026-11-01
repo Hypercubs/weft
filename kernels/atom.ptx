@@ -1,0 +1,50 @@
+// Hand-written PTX for the atomic paths: a 32-bit counter, a 64-bit counter, and
+// two maxes whose answer is a constant because every value already in the buffer
+// is smaller. Buffers 0 and 2 are read-and-add so their answer depends on what
+// the buffer held before — check.sh runs the kernel with a zero grid first to
+// learn that, and compares against base + grid.
+//
+// Real codegen writes the scope and the memory semantics out in full
+// (`atom.acquire.sys.global.max.s64`), so both spellings are exercised here.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry atomk(
+    .param .u64 atomk_param_0,
+    .param .u64 atomk_param_1,
+    .param .u64 atomk_param_2,
+    .param .u64 atomk_param_3
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<10>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [atomk_param_0];
+    ld.param.u64 %rd2, [atomk_param_1];
+    ld.param.u64 %rd3, [atomk_param_2];
+    ld.param.u64 %rd4, [atomk_param_3];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.lo.s32 %r4, %r2, %r3;
+    add.s32 %r5, %r4, %r1;
+    mov.u32 %r6, %nctaid.x;
+    mul.lo.s32 %r7, %r6, %r3;
+    setp.ge.s32 %p1, %r5, %r7;
+    @%p1 bra.uni DONE;
+
+    // one 32-bit counter
+    atom.global.add.u32 %r1, [%rd1], 1;
+    // a 32-bit max against a constant larger than anything in the buffer
+    red.global.max.u32 [%rd2], 2147483647;
+    // one 64-bit counter, and a 64-bit max against INT64_MAX — larger than any
+    // two floats read as one 64-bit value, so the answer is that constant
+    atom.global.add.u64 %rd5, [%rd3], 1;
+    atom.acquire.sys.global.max.s64 %rd6, [%rd4], 9223372036854775807;
+
+DONE:
+    ret;
+}

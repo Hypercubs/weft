@@ -1,0 +1,56 @@
+// A texture read from PTX, the twin of basic.metal's `texmix`:
+//
+//     w = txq.width(tex), h = txq.height(tex)
+//     x = gid & 63, y = (gid >> 6) & 63          // a 64x64 binding
+//     t = tex2D(tex, (x + 0.5) / 64, (y + 0.5) / 64)   // nearest, clamped
+//     out[gid] = t * 2
+//
+// Every sample lands on a texel centre, so the answer is the texel itself: a
+// filter, an address mode, or a size that is off by one all show up as a wrong
+// number instead of hiding in a register. `.tex` declares the binding, and the
+// declarations are numbered in order — the order `--textures` fills.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.tex .u32 tex, 1, 1, 1, 1;
+
+.visible .entry ptxtex(
+    .param .u64 ptxtex_param_0
+)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<16>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxtex_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    // The size the binding reports, not a number written into the kernel.
+    txq.width.b32 %r5, [tex];
+    txq.height.b32 %r6, [tex];
+
+    and.b32 %r7, %r4, 63;               // x = gid & 63
+    shr.u32 %r8, %r4, 6;
+    and.b32 %r9, %r8, 63;               // y = (gid >> 6) & 63
+
+    cvt.rn.f32.u32 %f1, %r7;
+    cvt.rn.f32.u32 %f2, %r9;
+    add.f32 %f3, %f1, 0f3F000000;       // x + 0.5
+    add.f32 %f4, %f2, 0f3F000000;       // y + 0.5
+    cvt.rn.f32.u32 %f5, %r5;
+    cvt.rn.f32.u32 %f6, %r6;
+    div.rn.f32 %f7, %f3, %f5;           // u
+    div.rn.f32 %f8, %f4, %f6;           // v
+
+    tex.2d.v4.f32.f32 {%f9,%f10,%f11,%f12}, [tex, {%f7,%f8}];
+
+    mul.f32 %f13, %f9, 0f40000000;
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f13;
+    ret;
+}

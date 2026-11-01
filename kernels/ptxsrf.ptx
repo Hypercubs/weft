@@ -1,0 +1,53 @@
+// A surface: one lane writes a texel, the next lane reads it back.
+//
+//     sust.2d [s, {x, y}], {in[gid]}
+//     bar.sync
+//     out[gid] = suld.2d [s, {x ^ 1, y}]
+//
+// `x ^ 1` stays inside the same 64-lane group and the same row, so the value that
+// comes out is the neighbour's and a write that never reached the image answers
+// with the wrong number instead of hiding in a register. `.surf` declares the
+// binding; it shares the numbering `.tex` uses, so the launcher fills both with
+// `--textures`.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.surf .u64 srf, 1, 1, 1, 1;
+
+.visible .entry ptxsrf(
+    .param .u64 ptxsrf_param_0,
+    .param .u64 ptxsrf_param_1
+)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxsrf_param_0];
+    ld.param.u64 %rd2, [ptxsrf_param_1];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];          // in[gid]
+
+    and.b32 %r5, %r1, 63;               // x
+    shr.u32 %r6, %r4, 6;
+    and.b32 %r6, %r6, 63;               // y
+
+    sust.b.2d.b32 [srf, {%r5,%r6}], {%f1};
+
+    bar.sync 0;
+
+    xor.b32 %r7, %r5, 1;                // the neighbour inside this group
+    suld.b.2d.b32 %r8, [srf, {%r7,%r6}];
+
+    add.s64 %rd5, %rd2, %rd3;
+    st.global.b32 [%rd5], %r8;          // the texel's bits, as they were stored
+    ret;
+}

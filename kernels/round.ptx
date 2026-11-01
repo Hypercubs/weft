@@ -1,0 +1,76 @@
+// Hand-written PTX for the four rounding converts CUDA's __f2i_rn/_rz/_rm/_rp
+// compile to, plus a narrowing f64->f32 that rounds to zero and two exact
+// ties-to-even cases. LLVM's NVPTX backend only emits .rzi/.rni/.rmi for its own
+// idioms, so the .rn and .rp integer forms have to be written out to be tested.
+// The Metal kernel `roundk` computes the same numbers with rint/trunc/floor/ceil.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry roundk(
+    .param .u64 roundk_param_0,
+    .param .u64 roundk_param_1
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [roundk_param_0];
+    ld.param.u64 %rd2, [roundk_param_1];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.lo.s32 %r4, %r2, %r3;
+    add.s32 %r5, %r4, %r1;
+    mov.u32 %r6, %nctaid.x;
+    mul.lo.s32 %r7, %r6, %r3;
+    setp.ge.s32 %p1, %r5, %r7;
+    @%p1 bra.uni DONE;
+
+    mul.lo.s32 %r8, %r5, 4;
+    cvt.u64.u32 %rd3, %r8;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+
+    // f = (v - 1) * 1000 + 0.25 — signed, fractional, and never a tie
+    add.f32 %f2, %f1, 0fBF800000;
+    mul.f32 %f3, %f2, 0f447A0000;
+    add.f32 %f4, %f3, 0f3E800000;
+
+    cvt.rn.s32.f32 %r9, %f4;
+    cvt.rz.s32.f32 %r10, %f4;
+    cvt.rm.s32.f32 %r11, %f4;
+    cvt.rp.s32.f32 %r12, %f4;
+
+    mul.lo.s32 %r9, %r9, 3;
+    mul.lo.s32 %r10, %r10, 5;
+    mul.lo.s32 %r11, %r11, 7;
+    mul.lo.s32 %r12, %r12, 11;
+
+    // rint(0.5) is 0 and rint(1.5) is 2: ties round to even, not away from zero
+    cvt.rn.s32.f32 %r13, 0f3F000000;
+    cvt.rn.s32.f32 %r14, 0f3FC00000;
+    mul.lo.s32 %r13, %r13, 17;
+    mul.lo.s32 %r14, %r14, 19;
+
+    // the same value through the plain truncating convert, which is what a C
+    // cast to int compiles to
+    cvt.rzi.s32.f32 %r15, %f4;
+    mul.lo.s32 %r15, %r15, 13;
+
+    add.s32 %r9, %r9, %r10;
+    add.s32 %r9, %r9, %r11;
+    add.s32 %r9, %r9, %r12;
+    add.s32 %r9, %r9, %r13;
+    add.s32 %r9, %r9, %r14;
+    add.s32 %r9, %r9, %r15;
+
+    add.u64 %rd5, %rd2, %rd3;
+    st.global.b32 [%rd5], %r9;
+
+DONE:
+    ret;
+}

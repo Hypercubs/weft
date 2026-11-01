@@ -1,0 +1,54 @@
+// Dynamic threadgroup memory and an asynchronous copy.
+//
+//     extern __shared__ float tile[];          // sized by the launch
+//     cp.async.ca.shared.global [&tile[lid&63]], [&in[gid]], 4;
+//     cp.async.commit_group; cp.async.wait_group 0;
+//     __syncthreads();
+//     out[gid] = tile[(lid + 1) & 63];
+//
+// `extern .shared` has no extent in the module: the size comes from the launch,
+// and goc's launch gives every threadgroup the whole 48 KiB arena.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry async_copy(
+    .param .u64 async_copy_param_0,
+    .param .u64 async_copy_param_1
+)
+{
+    .reg .b32 %r<14>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+    .extern .shared .align 4 .b8 tile[];
+
+    ld.param.u64 %rd1, [async_copy_param_0];
+    ld.param.u64 %rd2, [async_copy_param_1];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+
+    mul.lo.s32 %r4, %r2, %r3;
+    add.s32 %r5, %r4, %r1;      // gid
+    mul.lo.s32 %r6, %r5, 4;     // byte offset of gid
+    cvt.u64.u32 %rd3, %r6;
+    add.u64 %rd4, %rd1, %rd3;   // &in[gid]
+
+    and.b32 %r7, %r1, 63;
+    mul.lo.s32 %r8, %r7, 4;     // byte offset of lid & 63
+
+    cp.async.ca.shared.global [%r8], [%rd4], 4;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+
+    add.s32 %r9, %r1, 1;
+    and.b32 %r10, %r9, 63;
+    mul.lo.s32 %r11, %r10, 4;
+    ld.shared.f32 %f1, [%r11];
+
+    add.u64 %rd5, %rd2, %rd3;
+    st.global.f32 [%rd5], %f1;
+    ret;
+}

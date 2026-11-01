@@ -1,0 +1,53 @@
+// Hand-written PTX, the shape nvcc emits for:
+//     out[gid] = 2.0f * a[gid] + 0.5f * b[gid];
+// Run it with:  goc run kernels/saxpy.ptx --kernel saxpy --grid N
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry saxpy(
+    .param .u64 saxpy_param_0,
+    .param .u64 saxpy_param_1,
+    .param .u64 saxpy_param_2
+)
+{
+    .reg .b32 %r<9>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<6>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [saxpy_param_0];
+    ld.param.u64 %rd2, [saxpy_param_1];
+    ld.param.u64 %rd3, [saxpy_param_2];
+
+    // gid = ctaid.x * ntid.x + tid.x
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.lo.s32 %r4, %r2, %r3;
+    add.s32 %r5, %r4, %r1;
+    // if (gid >= grid) return;
+    mov.u32 %r7, %nctaid.x;
+    mul.lo.s32 %r8, %r7, %r3;
+    setp.ge.s32 %p1, %r5, %r8;
+    @%p1 bra.uni DONE;
+
+    mul.lo.s32 %r6, %r5, 4;
+    cvt.u64.u32 %rd4, %r6;
+
+    add.u64 %rd5, %rd1, %rd4;
+    ld.global.f32 %f1, [%rd5];
+
+    add.u64 %rd6, %rd2, %rd4;
+    ld.global.f32 %f2, [%rd6];
+
+    mul.f32 %f3, %f1, 0f40000000;
+    mul.f32 %f4, %f2, 0f3F000000;
+    add.f32 %f5, %f3, %f4;
+
+    add.u64 %rd7, %rd3, %rd4;
+    st.global.f32 [%rd7], %f5;
+
+DONE:
+    ret;
+}

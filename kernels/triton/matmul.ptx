@@ -1,0 +1,156 @@
+//
+// Triton: `tl.dot` on one 16x8x16 tile, in the shape Triton emits it.
+//
+// A program is one warp (`num_warps = 1`, so `.maxntid 32, 1, 1`) and owns a
+// 16x8 output tile. The steps are the ones a Triton matmul kernel has after
+// lowering to Blackwell-era PTX:
+//
+//   1. the block of A (16x16) and B (16x8) is copied to shared memory, eight
+//      floats per lane in one vector load and one vector store;
+//   2. `ldmatrix` loads the four 8x8 tiles of A and the two of B, the latter
+//      through `.trans` because `mma` wants B in column layout;
+//   3. `mma.sync.m16n8k16` multiplies them into an f32 accumulator;
+//   4. each lane stores the four outputs it owns.
+//
+// The floats are rounded to integers before they become halves, so every product
+// is an exact integer and every sum of sixteen is exact in f32: the result is the
+// same bits however the additions are scheduled, which is what makes it a test of
+// the *layouts* — ldmatrix's address→register map and mma's fragment map — rather
+// than of floating point.
+.version 8.1
+.target sm_80
+.address_size 64
+
+.maxntid 32, 1, 1
+
+.visible .entry matmul_kernel(
+	.param .u64 matmul_kernel_param_0,
+	.param .u64 matmul_kernel_param_1,
+	.param .u64 matmul_kernel_param_2,
+	.param .u64 matmul_kernel_param_3
+)
+{
+	.reg .f32 	%f<32>;
+	.reg .b32 	%r<40>;
+	.reg .b64 	%rd<24>;
+
+	// A tile at 0 (16x16 halves = 512 bytes), B tile at 512 (16x8 = 256 bytes).
+	.shared .align 16 .b8 weft_tile[768];
+
+	ld.param.u64 	%rd1, [matmul_kernel_param_0];
+	ld.param.u64 	%rd2, [matmul_kernel_param_1];
+	ld.param.u64 	%rd3, [matmul_kernel_param_2];
+
+	mov.u32 	%r1, %ctaid.x;
+	mov.u32 	%r2, %tid.x;
+
+	// ---- the tiles this program owns ----
+	shl.b32 	%r3, %r1, 8;              // program * 256 (A)
+	mul.wide.u32 	%rd4, %r3, 4;
+	add.s64 	%rd5, %rd1, %rd4;
+	shl.b32 	%r4, %r1, 7;              // program * 128 (B and D)
+	mul.wide.u32 	%rd6, %r4, 4;
+	add.s64 	%rd7, %rd2, %rd6;
+	add.s64 	%rd8, %rd3, %rd6;
+
+	// ---- A -> shared, eight contiguous floats a lane ----
+	shl.b32 	%r5, %r2, 5;
+	cvt.u64.u32 	%rd9, %r5;
+	add.s64 	%rd10, %rd5, %rd9;
+	ld.global.v4.b32 	{%f1, %f2, %f3, %f4}, [%rd10];
+	ld.global.v4.b32 	{%f5, %f6, %f7, %f8}, [%rd10+16];
+	mul.f32 	%f1, %f1, 0f41000000;
+	mul.f32 	%f2, %f2, 0f41000000;
+	mul.f32 	%f3, %f3, 0f41000000;
+	mul.f32 	%f4, %f4, 0f41000000;
+	mul.f32 	%f5, %f5, 0f41000000;
+	mul.f32 	%f6, %f6, 0f41000000;
+	mul.f32 	%f7, %f7, 0f41000000;
+	mul.f32 	%f8, %f8, 0f41000000;
+	cvt.rni.f32.f32 %f1, %f1;
+	cvt.rni.f32.f32 %f2, %f2;
+	cvt.rni.f32.f32 %f3, %f3;
+	cvt.rni.f32.f32 %f4, %f4;
+	cvt.rni.f32.f32 %f5, %f5;
+	cvt.rni.f32.f32 %f6, %f6;
+	cvt.rni.f32.f32 %f7, %f7;
+	cvt.rni.f32.f32 %f8, %f8;
+	cvt.rn.f16x2.f32 %r10, %f2, %f1;
+	cvt.rn.f16x2.f32 %r11, %f4, %f3;
+	cvt.rn.f16x2.f32 %r12, %f6, %f5;
+	cvt.rn.f16x2.f32 %r13, %f8, %f7;
+	mov.u64 	%rd11, weft_tile;
+	shl.b32 	%r6, %r2, 4;
+	cvt.u64.u32 	%rd12, %r6;
+	add.s64 	%rd13, %rd11, %rd12;
+	st.shared.v4.b32 	[%rd13], {%r10, %r11, %r12, %r13};
+
+	// ---- B -> shared, four contiguous floats a lane ----
+	shl.b32 	%r7, %r2, 4;
+	cvt.u64.u32 	%rd14, %r7;
+	add.s64 	%rd15, %rd7, %rd14;
+	ld.global.v4.b32 	{%f9, %f10, %f11, %f12}, [%rd15];
+	mul.f32 	%f9, %f9, 0f41000000;
+	mul.f32 	%f10, %f10, 0f41000000;
+	mul.f32 	%f11, %f11, 0f41000000;
+	mul.f32 	%f12, %f12, 0f41000000;
+	cvt.rni.f32.f32 %f9, %f9;
+	cvt.rni.f32.f32 %f10, %f10;
+	cvt.rni.f32.f32 %f11, %f11;
+	cvt.rni.f32.f32 %f12, %f12;
+	cvt.rn.f16x2.f32 %r14, %f10, %f9;
+	cvt.rn.f16x2.f32 %r15, %f12, %f11;
+	shl.b32 	%r8, %r2, 3;
+	cvt.u64.u32 	%rd16, %r8;
+	add.s64 	%rd17, %rd11, %rd16;
+	add.s64 	%rd17, %rd17, 512;
+	st.shared.v2.b32 	[%rd17], {%r14, %r15};
+
+	bar.sync 	0;
+
+	// ---- four 8x8 tiles of A: lane l addresses row (k&1)*8 + (l&7) at the
+	// column block the tile starts in ----
+	shr.u32 	%r16, %r2, 3;
+	and.b32 	%r17, %r2, 7;
+	and.b32 	%r18, %r16, 1;
+	shl.b32 	%r18, %r18, 3;
+	add.s32 	%r17, %r17, %r18;
+	shl.b32 	%r17, %r17, 5;
+	shr.u32 	%r18, %r16, 1;
+	shl.b32 	%r18, %r18, 4;
+	add.s32 	%r17, %r17, %r18;
+	cvt.u64.u32 	%rd18, %r17;
+	add.s64 	%rd18, %rd11, %rd18;
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r20, %r21, %r22, %r23}, [%rd18];
+
+	// ---- two 8x8 tiles of B, transposed on the way out ----
+	shl.b32 	%r19, %r16, 3;
+	and.b32 	%r24, %r2, 7;
+	add.s32 	%r24, %r24, %r19;
+	shl.b32 	%r24, %r24, 4;
+	cvt.u64.u32 	%rd19, %r24;
+	add.s64 	%rd19, %rd11, %rd19;
+	add.s64 	%rd19, %rd19, 512;
+	ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r26, %r27}, [%rd19];
+
+	// ---- D = A * B, accumulated from zero ----
+	mov.f32 	%f13, 0f00000000;
+	mov.f32 	%f14, 0f00000000;
+	mov.f32 	%f15, 0f00000000;
+	mov.f32 	%f16, 0f00000000;
+	mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f17, %f18, %f19, %f20}, {%r20, %r21, %r22, %r23}, {%r26, %r27}, {%f13, %f14, %f15, %f16};
+
+	// ---- the four outputs this lane owns: rows g and g+8, columns 2t and 2t+1 ----
+	and.b32 	%r28, %r2, 3;
+	shr.u32 	%r29, %r2, 2;
+	shl.b32 	%r29, %r29, 5;
+	shl.b32 	%r28, %r28, 3;
+	add.s32 	%r28, %r28, %r29;
+	cvt.u64.u32 	%rd20, %r28;
+	add.s64 	%rd20, %rd8, %rd20;
+	st.global.b32 	[%rd20], %f17;
+	st.global.b32 	[%rd20+4], %f18;
+	st.global.b32 	[%rd20+256], %f19;
+	st.global.b32 	[%rd20+260], %f20;
+	ret;
+}

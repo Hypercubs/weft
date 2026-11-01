@@ -1,0 +1,36 @@
+// Predicated arithmetic: the value written under @%p must leave the lanes that
+// fail the predicate alone. The predicate alternates with the lane id so both
+// sides of it are live in every warp. Hand-written, because llc rarely emits
+// this shape.
+.version 6.0
+.target sm_70
+.address_size 64
+
+.visible .entry pred(
+	.param .u64 .ptr .global .align 1 pred_param_0,
+	.param .u64 .ptr .global .align 1 pred_param_1
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<12>;
+	.reg .b64 	%rd<6>;
+
+	ld.param.b64 	%rd1, [pred_param_0];
+	ld.param.b64 	%rd2, [pred_param_1];
+	mov.u32 	%r1, %tid.x;
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mad.lo.s32 	%r4, %r2, %r3, %r1;
+	mul.wide.s32 	%rd3, %r4, 4;
+	add.s64 	%rd4, %rd1, %rd3;
+	ld.global.b32 	%r5, [%rd4];
+	and.b32 	%r7, %r1, 1;
+	setp.eq.s32 	%p1, %r7, 0;
+	// d = r5 * 3 + 1 + 2 where the lane is even; odd lanes keep r5.
+	mov.b32 	%r6, %r5;
+	@%p1 mad.lo.s32 %r6, %r5, 3, 1;
+	@%p1 add.s32 	%r6, %r6, 2;
+	add.s64 	%rd5, %rd2, %rd3;
+	st.global.b32 	[%rd5], %r6;
+	ret;
+}

@@ -1,0 +1,81 @@
+// mul.hi at 64 bits: the high word of a 64x64 product, and the carry chain that
+// builds it out of four 32x32 multiplies.
+//
+// The interesting operands are the ones where the high word is not just the low
+// word shifted: a product whose operands both have the top bit set, a negative
+// times a negative, and a mixed pair. Two input words per lane are packed into a
+// 64-bit register and the sign bits are forced, so every lane exercises those
+// paths rather than the small numbers a ramp of floats would produce.
+//
+//   a = {in[gid*4+0], in[gid*4+1] | 0x80000000}     // negative as a signed word
+//   b = {in[gid*4+2], in[gid*4+3] | 0xFF000000}     // large, and negative too
+//
+//   out[gid*10+0..1] = mul.hi.u64 a, b
+//   out[gid*10+2..3] = mul.hi.s64 a, b
+//   out[gid*10+4..5] = mul.hi.s64 -a, -b
+//   out[gid*10+6]    = mul.hi.u32 of the low words
+//   out[gid*10+7]    = mul.hi.s32 of the low words
+//   out[gid*10+8..9] = mul.wide.u32 of the low words
+//
+// The Metal twin is the same translation, and both engines have to agree on all
+// 40960 words.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry mulhi(
+    .param .u64 mulhi_param_0,
+    .param .u64 mulhi_param_1
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [mulhi_param_0];
+    ld.param.u64 %rd2, [mulhi_param_1];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;          // gid
+
+    mul.wide.u32 %rd3, %r4, 16;             // four words in
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b32 %r5, [%rd4];              // a lo
+    ld.global.b32 %r6, [%rd4+4];            // a hi
+    ld.global.b32 %r7, [%rd4+8];            // b lo
+    ld.global.b32 %r8, [%rd4+12];           // b hi
+    or.b32 %r6, %r6, 0x80000000;            // a's top bit
+    or.b32 %r8, %r8, 0xFF000000;            // b's top byte
+
+    mov.b64 %rd5, {%r5, %r6};               // a
+    mov.b64 %rd6, {%r7, %r8};               // b
+
+    mul.hi.u64 %rd7, %rd5, %rd6;            // unsigned high word
+    mul.hi.s64 %rd8, %rd5, %rd6;            // the same bits, read signed
+    neg.s64 %rd9, %rd5;
+    neg.s64 %rd10, %rd6;
+    mul.hi.s64 %rd11, %rd9, %rd10;          // negative x negative
+    mul.hi.u32 %r9, %r5, %r7;
+    mul.hi.s32 %r10, %r5, %r7;
+    mul.wide.u32 %rd12, %r5, %r7;           // the full product of the two low words
+
+    mul.wide.u32 %rd13, %r4, 40;            // ten words out
+    add.u64 %rd14, %rd2, %rd13;
+
+    mov.b64 {%r11, %r12}, %rd7;
+    st.global.b32 [%rd14], %r11;
+    st.global.b32 [%rd14+4], %r12;
+    mov.b64 {%r13, %r14}, %rd8;
+    st.global.b32 [%rd14+8], %r13;
+    st.global.b32 [%rd14+12], %r14;
+    mov.b64 {%r15, %r16}, %rd11;
+    st.global.b32 [%rd14+16], %r15;
+    st.global.b32 [%rd14+20], %r16;
+    st.global.b32 [%rd14+24], %r9;
+    st.global.b32 [%rd14+28], %r10;
+    mov.b64 {%r17, %r18}, %rd12;
+    st.global.b32 [%rd14+32], %r17;
+    st.global.b32 [%rd14+36], %r18;
+    ret;
+}

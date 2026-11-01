@@ -1,0 +1,61 @@
+; 64-bit atomics whose old value is read back.
+;
+; `kernels/spirv/atomic.spvasm` covers the case where nobody reads the pair: an
+; order-free operation whose result is dropped is a reduction, and a reduction is
+; two 32-bit atomics. Here every old value is used, so the pair has to be read,
+; changed and written back as one value — which this host builds out of a lock
+; over the two halves, taken in lane order.
+;
+; The checks are arithmetic rather than a reference implementation, because the
+; old values of an atomic are order-free as a set:
+;
+;   b0 += 1, summing the olds    the olds are a permutation of 0..n-1, so their
+;                               sum is n(n-1)/2 exactly. A lost or duplicated
+;                               update moves that number.
+;   b2 = max(b2, 1), summing     the counter starts at 0 and 1 is the only value
+;     the olds                 ever offered, so exactly one thread sees 0 and the
+;                               rest see 1: the final counter is 1 and the olds
+;                               sum to n-1. This is the 64-bit compare.
+;   b4 = min(b4, -1), summing    the signed form, and the one that tells signed
+;     the olds                 ordering from unsigned: signed, the counter ends at
+;                               -1 and the olds sum to -(n-1) after one thread
+;                               sees 0; read as unsigned, -1 is the largest value
+;                               there is, so both stay 0.
+;
+; The sums go through `OpAtomicIAdd` with the result unused, which is the
+; reduction that already existed at 64 bits — so this fixture exercises the new
+; path and the old one in the same kernel.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Int64Atomics
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "atom64k"
+               OpName %main "atom64k"
+      %void = OpTypeVoid
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+       %i64 = OpTypeInt 64 1
+      %u64p = OpTypePointer CrossWorkgroup %u64
+      %i64p = OpTypePointer CrossWorkgroup %i64
+      %fnty = OpTypeFunction %void %u64p %u64p %u64p %u64p %i64p %i64p
+      %scp = OpConstant %u32 1
+      %sem = OpConstant %u32 0
+      %one = OpConstant %u64 1
+      %cm1 = OpConstant %i64 -1
+      %main = OpFunction %void None %fnty
+        %a0 = OpFunctionParameter %u64p
+        %a1 = OpFunctionParameter %u64p
+        %a2 = OpFunctionParameter %u64p
+        %a3 = OpFunctionParameter %u64p
+        %a4 = OpFunctionParameter %i64p
+        %a5 = OpFunctionParameter %i64p
+     %entry = OpLabel
+      %old0 = OpAtomicIAdd %u64 %a0 %scp %sem %one
+     %keep0 = OpAtomicIAdd %u64 %a1 %scp %sem %old0
+      %old2 = OpAtomicUMax %u64 %a2 %scp %sem %one
+     %keep2 = OpAtomicIAdd %u64 %a3 %scp %sem %old2
+      %old4 = OpAtomicSMin %i64 %a4 %scp %sem %cm1
+     %keep4 = OpAtomicIAdd %i64 %a5 %scp %sem %old4
+                OpReturn
+                OpFunctionEnd

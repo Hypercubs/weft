@@ -1,0 +1,58 @@
+//
+// Triton: elementwise add, in the shape Triton emits it.
+//
+// A @triton.jit kernel goes TritonPythonAST -> TritonGPU -> LLVM IR -> this PTX,
+// with LLVM's NVPTX backend. The shape below is that output for a
+// one-dimensional kernel over `tl.arange(0, BLOCK)`:
+//
+//   * `.maxntid` is the launch size Triton derives from `num_warps`, and it is
+//     the only place the geometry the kernel was compiled for is recorded;
+//   * the parameters are the raw pointers, then `global_scratch` — a pointer the
+//     kernel here never touches, so it is declared and not bound — then the
+//     scalar arguments;
+//   * the thread's element is `%ctaid.x * %ntid.x + %tid.x`, and both accesses
+//     are predicated on it being below `n_elements`.
+//
+// Written by hand in that shape rather than pasted from a dump: a dump carries
+// one Triton build's register allocation, and this file is checked against the
+// same kernel written in Metal, not against a binary.
+.version 8.1
+.target sm_80
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry add_kernel(
+	.param .u64 add_kernel_param_0,
+	.param .u64 add_kernel_param_1,
+	.param .u64 add_kernel_param_2,
+	.param .u64 add_kernel_param_3,
+	.param .u32 add_kernel_param_4
+)
+{
+	.reg .pred 	%p<3>;
+	.reg .f32 	%f<6>;
+	.reg .b32 	%r<8>;
+	.reg .b64 	%rd<10>;
+
+	ld.param.u64 	%rd1, [add_kernel_param_0];
+	ld.param.u64 	%rd2, [add_kernel_param_1];
+	ld.param.u64 	%rd3, [add_kernel_param_2];
+	ld.param.u32 	%r1, [add_kernel_param_4];
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r4, %tid.x;
+	mad.lo.s32 	%r5, %r2, %r3, %r4;
+	setp.lt.u32 	%p1, %r5, %r1;
+	mul.wide.u32 	%rd4, %r5, 4;
+	add.s64 	%rd5, %rd1, %rd4;
+	add.s64 	%rd6, %rd2, %rd4;
+	add.s64 	%rd7, %rd3, %rd4;
+	mov.f32 	%f1, 0f00000000;
+	@%p1 ld.global.b32 	%f1, [%rd5];
+	mov.f32 	%f2, 0f00000000;
+	@%p1 ld.global.b32 	%f2, [%rd6];
+	add.f32 	%f3, %f1, %f2;
+	@%p1 st.global.b32 	[%rd7], %f3;
+	ret;
+}

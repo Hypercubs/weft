@@ -1,0 +1,57 @@
+; The same three votes as basic.metal's votek, in SPIR-V: a ballot of the even
+; lanes plus all() and any(). The answer does not depend on the order the lanes
+; run in, so the two front ends must produce the same bytes.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformBallot
+               OpCapability GroupNonUniformVote
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "votek" %gid %lid
+               OpName %main "votek"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+      %u32 = OpTypeInt 32 0
+      %u64 = OpTypeInt 64 0
+    %bool = OpTypeBool
+     %u32p = OpTypePointer CrossWorkgroup %u32
+   %v3u64 = OpTypeVector %u64 3
+  %v4u32 = OpTypeVector %u32 4
+      %pin = OpTypePointer Input %v3u64
+    %fnty = OpTypeFunction %void %u32p %u32p
+       %c0 = OpConstant %u32 0
+       %c1 = OpConstant %u32 1
+       %c7 = OpConstant %u32 7
+      %c31 = OpConstant %u32 31
+      %c32 = OpConstant %u32 32
+      %sub = OpConstant %u32 3
+      %gid = OpVariable %pin Input
+      %lid = OpVariable %pin Input
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %u32p
+         %o = OpFunctionParameter %u32p
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+      %lane = OpBitwiseAnd %u32 %li %c31
+       %odd = OpBitwiseAnd %u32 %lane %c1
+      %even = OpIEqual %bool %odd %c0
+      %bal4 = OpGroupNonUniformBallot %v4u32 %sub %even
+       %bal = OpCompositeExtract %u32 %bal4 0
+       %lt = OpULessThan %bool %lane %c32
+      %alll = OpGroupNonUniformAll %bool %sub %lt
+       %is7 = OpIEqual %bool %lane %c7
+      %anyl = OpGroupNonUniformAny %bool %sub %is7
+        %b1 = OpSelect %u32 %alll %c1 %c0
+        %b2 = OpSelect %u32 %anyl %c1 %c0
+        %t1 = OpIAdd %u32 %bal %b1
+        %t2 = OpIAdd %u32 %t1 %b2
+        %po = OpPtrAccessChain %u32p %o %gi
+                OpStore %po %t2
+                OpReturn
+                OpFunctionEnd

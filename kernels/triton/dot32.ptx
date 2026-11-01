@@ -1,0 +1,84 @@
+//
+// Triton: `tl.dot` on fp32 inputs, which is the tf32 form of `mma`.
+//
+// With fp32 tensors Triton does not round-trip through halves: it emits
+// `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`, which reads 32-bit
+// operands and reduces each to tf32 (10 mantissa bits) inside the instruction.
+// There is no `ldmatrix` for 32-bit elements, so each lane loads the six fragment
+// values it owns straight from global memory:
+//
+//   a0 = A[g][t]   a1 = A[g+8][t]   a2 = A[g][t+4]   a3 = A[g+8][t+4]
+//   b0 = B[t][g]   b1 = B[t+4][g]
+//
+// and writes the four outputs it owns (rows g and g+8, columns 2t and 2t+1).
+// The Metal twin rounds each operand to tf32 the same way, so what this checks is
+// the operand rounding and the fragment map together.
+.version 8.1
+.target sm_80
+.address_size 64
+
+.maxntid 32, 1, 1
+
+.visible .entry dot32_kernel(
+	.param .u64 dot32_kernel_param_0,
+	.param .u64 dot32_kernel_param_1,
+	.param .u64 dot32_kernel_param_2,
+	.param .u64 dot32_kernel_param_3
+)
+{
+	.reg .f32 	%f<20>;
+	.reg .b32 	%r<24>;
+	.reg .b64 	%rd<20>;
+
+	ld.param.u64 	%rd1, [dot32_kernel_param_0];
+	ld.param.u64 	%rd2, [dot32_kernel_param_1];
+	ld.param.u64 	%rd3, [dot32_kernel_param_2];
+
+	mov.u32 	%r1, %ctaid.x;
+	mov.u32 	%r2, %tid.x;
+
+	// &A[tile] (16x8), &B[tile] (8x8), &D[tile] (16x8)
+	shl.b32 	%r3, %r1, 7;
+	mul.wide.u32 	%rd4, %r3, 4;
+	add.s64 	%rd5, %rd1, %rd4;
+	shl.b32 	%r4, %r1, 6;
+	mul.wide.u32 	%rd6, %r4, 4;
+	add.s64 	%rd7, %rd2, %rd6;
+	add.s64 	%rd8, %rd3, %rd4;
+
+	shr.u32 	%r5, %r2, 2;              // g
+	and.b32 	%r6, %r2, 3;              // t
+
+	// ---- the A fragment: rows g and g+8, columns t and t+4 ----
+	mad.lo.s32 	%r7, %r5, 8, %r6;
+	mul.wide.u32 	%rd9, %r7, 4;
+	add.s64 	%rd10, %rd5, %rd9;
+	ld.global.b32 	%f1, [%rd10];
+	ld.global.b32 	%f2, [%rd10+256];
+	ld.global.b32 	%f3, [%rd10+16];
+	ld.global.b32 	%f4, [%rd10+272];
+
+	// ---- the B fragment (column layout): rows t and t+4, column g ----
+	mad.lo.s32 	%r8, %r6, 8, %r5;
+	mul.wide.u32 	%rd11, %r8, 4;
+	add.s64 	%rd12, %rd7, %rd11;
+	ld.global.b32 	%f5, [%rd12];
+	ld.global.b32 	%f6, [%rd12+128];
+
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	mov.f32 	%f9, 0f00000000;
+	mov.f32 	%f10, 0f00000000;
+	mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%f11, %f12, %f13, %f14}, {%f1, %f2, %f3, %f4}, {%f5, %f6}, {%f7, %f8, %f9, %f10};
+
+	// ---- rows g and g+8, columns 2t and 2t+1 ----
+	shl.b32 	%r10, %r6, 1;
+	mad.lo.s32 	%r9, %r5, 8, %r10;
+	mul.wide.u32 	%rd13, %r9, 4;
+	add.s64 	%rd14, %rd8, %rd13;
+	st.global.b32 	[%rd14], %f11;
+	st.global.b32 	[%rd14+4], %f12;
+	st.global.b32 	[%rd14+256], %f13;
+	st.global.b32 	[%rd14+260], %f14;
+	ret;
+}

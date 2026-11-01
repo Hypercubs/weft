@@ -1,0 +1,62 @@
+// 64-bit reductions: `red.global.{add,or,sub,xor}.u64`.
+//
+// A `red` has no result, which is what lets these run on the GPU at all: the
+// answer does not need the pair read as one value, only to end up holding the
+// fold of everything applied to it. `add`/`sub` are a 32-bit atomic on each half
+// with the low half's carry (or borrow) carried into the high one; `or`/`xor`
+// fold each half on its own. All four are order-free, so the GPU and the CPU
+// agree without either side imposing an order.
+//
+// One buffer per operation, each sensitive in its own way: the count catches a
+// lost carry, the or-mask a lost bit, the sub counter catches a borrow applied
+// the wrong way round (it wraps, and the CPU wraps the same way), and the xor
+// mask catches a bit cancelled twice.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry red64k(
+    .param .u64 red64k_param_0,
+    .param .u64 red64k_param_1,
+    .param .u64 red64k_param_2,
+    .param .u64 red64k_param_3
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<10>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [red64k_param_0];
+    ld.param.u64 %rd2, [red64k_param_1];
+    ld.param.u64 %rd3, [red64k_param_2];
+    ld.param.u64 %rd4, [red64k_param_3];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;
+    mov.u32 %r5, %nctaid.x;
+    mul.lo.s32 %r6, %r5, %r3;
+    setp.ge.s32 %p1, %r4, %r6;
+    @%p1 bra.uni DONE;
+
+    // one, into the 64-bit counter
+    red.global.add.u64 [%rd1], 1;
+
+    // and a bit of this thread's own, into the 64-bit mask
+    and.b32 %r7, %r4, 63;
+    mov.u64 %rd5, 1;
+    shl.b64 %rd6, %rd5, %r7;
+    red.global.or.u64 [%rd2], %rd6;
+
+    // the same count downwards, so a borrow has to land in the high half
+    red.global.sub.u64 [%rd3], 1;
+
+    // and an xor of the thread's index, where the bit has to cancel exactly once
+    cvt.u64.u32 %rd7, %r4;
+    add.s64 %rd8, %rd7, 1;
+    red.global.xor.u64 [%rd4], %rd8;
+
+DONE:
+    ret;
+}

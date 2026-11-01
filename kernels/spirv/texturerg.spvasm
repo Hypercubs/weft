@@ -1,0 +1,63 @@
+; A storage image: one lane writes a texel, the next lane reads it back — the
+; SPIR-V twin of basic.metal's texrw:
+;     img.write(float4(in[gid], 0, 0, 0), uint2(x, y));
+;     barrier(mem_texture);
+;     out[gid] = img.read(uint2(x ^ 1, y)).x
+; `Sampled = 2` is a storage image rather than a sampled one, and the value that
+; comes out is the neighbour's, so a write that never reached the image answers
+; with the wrong number instead of hiding in a register.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability ImageBasic
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "texrw" %gid
+               OpName %main "texrw"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+       %v2u = OpTypeVector %u32 2
+       %v4f = OpTypeVector %f32 4
+     %v3u64 = OpTypeVector %u64 3
+       %img = OpTypeImage %f32 2D 0 0 0 2 Unknown
+ %ptr_uc_img = OpTypePointer UniformConstant %img
+    %ptr_cw_f = OpTypePointer CrossWorkgroup %f32
+        %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %ptr_cw_f %ptr_cw_f %ptr_uc_img
+        %gid = OpVariable %pin Input
+       %zerou = OpConstant %u32 0
+         %one = OpConstant %u32 1
+          %z0 = OpConstant %f32 0
+        %scop = OpConstant %u32 2
+         %sem = OpConstant %u32 256
+       %main = OpFunction %void None %fnty
+          %i = OpFunctionParameter %ptr_cw_f
+          %o = OpFunctionParameter %ptr_cw_f
+        %tex = OpFunctionParameter %ptr_uc_img
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %g32 = OpUConvert %u32 %gi
+      %vimg = OpLoad %img %tex
+       %wsz = OpImageQuerySizeLod %v2u %vimg %zerou
+         %w = OpCompositeExtract %u32 %wsz 0
+         %h = OpCompositeExtract %u32 %wsz 1
+         %x = OpUMod %u32 %g32 %w
+        %dy = OpUDiv %u32 %g32 %w
+         %y = OpUMod %u32 %dy %h
+       %xyu = OpCompositeConstruct %v2u %x %y
+         %pi = OpPtrAccessChain %ptr_cw_f %i %gi
+         %vi = OpLoad %f32 %pi
+      %texel = OpCompositeConstruct %v4f %vi %z0 %z0 %z0
+               OpImageWrite %vimg %xyu %texel
+               OpControlBarrier %scop %scop %sem
+       %nx = OpBitwiseXor %u32 %x %one
+       %nxy = OpCompositeConstruct %v2u %nx %y
+         %r = OpImageRead %v4f %vimg %nxy
+        %rx = OpCompositeExtract %f32 %r 0
+        %po = OpPtrAccessChain %ptr_cw_f %o %gi
+               OpStore %po %rx
+               OpReturn
+               OpFunctionEnd

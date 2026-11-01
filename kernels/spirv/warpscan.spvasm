@@ -1,0 +1,67 @@
+; The same warp scan as basic.metal's warpscan, written in SPIR-V: five
+; subgroup shuffles, each guarded by "lane >= d". Unrolled rather than looped
+; because the d sequence is 1,2,4,8,16 — five steps, not a loop.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformShuffleRelative
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "warpscan" %gid %lid
+               OpName %main "warpscan"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+     %f32 = OpTypeFloat 32
+      %u32 = OpTypeInt 32 0
+      %u64 = OpTypeInt 64 0
+    %bool = OpTypeBool
+     %ptr = OpTypePointer CrossWorkgroup %f32
+    %v3u64 = OpTypeVector %u64 3
+      %pin = OpTypePointer Input %v3u64
+    %fnty = OpTypeFunction %void %ptr %ptr
+      %gid = OpVariable %pin Input
+      %lid = OpVariable %pin Input
+      %sub = OpConstant %u32 3
+       %c1 = OpConstant %u32 1
+       %c2 = OpConstant %u32 2
+       %c4 = OpConstant %u32 4
+       %c8 = OpConstant %u32 8
+      %c16 = OpConstant %u32 16
+      %c31 = OpConstant %u32 31
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %ptr
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+        %li = OpCompositeExtract %u64 %l 0
+     %lane0 = OpUConvert %u32 %li
+      %lane = OpBitwiseAnd %u32 %lane0 %c31
+        %pa = OpPtrAccessChain %ptr %a %gi
+        %v0 = OpLoad %f32 %pa
+        %t1 = OpGroupNonUniformShuffleUp %f32 %sub %v0 %c1
+        %g1 = OpUGreaterThanEqual %bool %lane %c1
+        %p1 = OpFAdd %f32 %v0 %t1
+        %v1 = OpSelect %f32 %g1 %p1 %v0
+        %t2 = OpGroupNonUniformShuffleUp %f32 %sub %v1 %c2
+        %g2 = OpUGreaterThanEqual %bool %lane %c2
+        %p2 = OpFAdd %f32 %v1 %t2
+        %v2 = OpSelect %f32 %g2 %p2 %v1
+        %t3 = OpGroupNonUniformShuffleUp %f32 %sub %v2 %c4
+        %g3 = OpUGreaterThanEqual %bool %lane %c4
+        %p3 = OpFAdd %f32 %v2 %t3
+        %v3 = OpSelect %f32 %g3 %p3 %v2
+        %t4 = OpGroupNonUniformShuffleUp %f32 %sub %v3 %c8
+        %g4 = OpUGreaterThanEqual %bool %lane %c8
+        %p4 = OpFAdd %f32 %v3 %t4
+        %v4 = OpSelect %f32 %g4 %p4 %v3
+        %t5 = OpGroupNonUniformShuffleUp %f32 %sub %v4 %c16
+        %g5 = OpUGreaterThanEqual %bool %lane %c16
+        %p5 = OpFAdd %f32 %v4 %t5
+        %v5 = OpSelect %f32 %g5 %p5 %v4
+        %po = OpPtrAccessChain %ptr %o %gi
+                OpStore %po %v5
+                OpReturn
+                OpFunctionEnd

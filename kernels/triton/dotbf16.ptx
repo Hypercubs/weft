@@ -1,0 +1,118 @@
+//
+// Triton: `tl.dot` over bfloat16, which is what a Triton matmul over bf16
+// tensors is after lowering: `cvt.rn.bf16x2.f32` to pack the pairs, `ldmatrix`
+// to get them into fragment registers, `mma.sync.m16n8k16...bf16` to multiply.
+//
+// bf16 keeps 8 mantissa bits, so a product of two of them needs 16 and is exact
+// in the f32 accumulator; the sixteen additions are formed in the same order
+// here and in the Metal twin, so the two must agree bit for bit. What the twin
+// does *not* share with this side is the rounding to bf16 — it performs that
+// itself, from the definition — so a wrong conversion shows up as a difference.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 32, 1, 1
+
+.visible .entry dotbf16_kernel(
+	.param .u64 dotbf16_kernel_param_0,
+	.param .u64 dotbf16_kernel_param_1,
+	.param .u64 dotbf16_kernel_param_2,
+	.param .u64 dotbf16_kernel_param_3
+)
+{
+	.reg .f32 	%f<24>;
+	.reg .b32 	%r<40>;
+	.reg .b64 	%rd<24>;
+
+	.shared .align 16 .b8 weft_tile[768];
+
+	ld.param.u64 	%rd1, [dotbf16_kernel_param_0];
+	ld.param.u64 	%rd2, [dotbf16_kernel_param_1];
+	ld.param.u64 	%rd3, [dotbf16_kernel_param_2];
+
+	mov.u32 	%r1, %ctaid.x;
+	mov.u32 	%r2, %tid.x;
+
+	shl.b32 	%r3, %r1, 8;
+	mul.wide.u32 	%rd4, %r3, 4;
+	add.s64 	%rd5, %rd1, %rd4;
+	shl.b32 	%r4, %r1, 7;
+	mul.wide.u32 	%rd6, %r4, 4;
+	add.s64 	%rd7, %rd2, %rd6;
+	add.s64 	%rd8, %rd3, %rd6;
+
+	// ---- A -> shared as bf16, eight contiguous floats a lane ----
+	shl.b32 	%r5, %r2, 5;
+	cvt.u64.u32 	%rd9, %r5;
+	add.s64 	%rd10, %rd5, %rd9;
+	ld.global.v4.b32 	{%f1, %f2, %f3, %f4}, [%rd10];
+	ld.global.v4.b32 	{%f5, %f6, %f7, %f8}, [%rd10+16];
+	cvt.rn.bf16x2.f32 %r10, %f2, %f1;
+	cvt.rn.bf16x2.f32 %r11, %f4, %f3;
+	cvt.rn.bf16x2.f32 %r12, %f6, %f5;
+	cvt.rn.bf16x2.f32 %r13, %f8, %f7;
+	mov.u64 	%rd11, weft_tile;
+	shl.b32 	%r6, %r2, 4;
+	cvt.u64.u32 	%rd12, %r6;
+	add.s64 	%rd13, %rd11, %rd12;
+	st.shared.v4.b32 	[%rd13], {%r10, %r11, %r12, %r13};
+
+	// ---- B -> shared, four contiguous floats a lane ----
+	shl.b32 	%r7, %r2, 4;
+	cvt.u64.u32 	%rd14, %r7;
+	add.s64 	%rd15, %rd7, %rd14;
+	ld.global.v4.b32 	{%f9, %f10, %f11, %f12}, [%rd15];
+	cvt.rn.bf16x2.f32 %r14, %f10, %f9;
+	cvt.rn.bf16x2.f32 %r15, %f12, %f11;
+	shl.b32 	%r8, %r2, 3;
+	cvt.u64.u32 	%rd16, %r8;
+	add.s64 	%rd17, %rd11, %rd16;
+	add.s64 	%rd17, %rd17, 512;
+	st.shared.v2.b32 	[%rd17], {%r14, %r15};
+
+	bar.sync 	0;
+
+	// ---- the four 8x8 tiles of A ----
+	shr.u32 	%r16, %r2, 3;
+	and.b32 	%r17, %r2, 7;
+	and.b32 	%r18, %r16, 1;
+	shl.b32 	%r18, %r18, 3;
+	add.s32 	%r17, %r17, %r18;
+	shl.b32 	%r17, %r17, 5;
+	shr.u32 	%r18, %r16, 1;
+	shl.b32 	%r18, %r18, 4;
+	add.s32 	%r17, %r17, %r18;
+	cvt.u64.u32 	%rd18, %r17;
+	add.s64 	%rd18, %rd11, %rd18;
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r20, %r21, %r22, %r23}, [%rd18];
+
+	// ---- the two 8x8 tiles of B, transposed ----
+	shl.b32 	%r19, %r16, 3;
+	and.b32 	%r24, %r2, 7;
+	add.s32 	%r24, %r24, %r19;
+	shl.b32 	%r24, %r24, 4;
+	cvt.u64.u32 	%rd19, %r24;
+	add.s64 	%rd19, %rd11, %rd19;
+	add.s64 	%rd19, %rd19, 512;
+	ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r26, %r27}, [%rd19];
+
+	mov.f32 	%f13, 0f00000000;
+	mov.f32 	%f14, 0f00000000;
+	mov.f32 	%f15, 0f00000000;
+	mov.f32 	%f16, 0f00000000;
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f17, %f18, %f19, %f20}, {%r20, %r21, %r22, %r23}, {%r26, %r27}, {%f13, %f14, %f15, %f16};
+
+	and.b32 	%r28, %r2, 3;
+	shr.u32 	%r29, %r2, 2;
+	shl.b32 	%r29, %r29, 5;
+	shl.b32 	%r28, %r28, 3;
+	add.s32 	%r28, %r28, %r29;
+	cvt.u64.u32 	%rd20, %r28;
+	add.s64 	%rd20, %rd8, %rd20;
+	st.global.b32 	[%rd20], %f17;
+	st.global.b32 	[%rd20+4], %f18;
+	st.global.b32 	[%rd20+256], %f19;
+	st.global.b32 	[%rd20+260], %f20;
+	ret;
+}

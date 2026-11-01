@@ -1,0 +1,39 @@
+; A module-scope `__global` buffer (OpenCL 2.0 program scope) — the one kind of
+; global a kernel can name without it being a parameter. The host still has to
+; supply the storage, so it takes the buffer index after the explicit arguments:
+; bufs[0] is `in`, bufs[1] is `out`.
+;
+; The twins are basic.metal's globk, which spells both as parameters.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "globk" %gid
+               OpName %main "globk"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u64 = OpTypeInt 64 0
+     %v3u64 = OpTypeVector %u64 3
+%ptr_cw_f32 = OpTypePointer CrossWorkgroup %f32
+%ptr_cw_ptr = OpTypePointer CrossWorkgroup %ptr_cw_f32
+        %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %ptr_cw_f32
+       %gout = OpVariable %ptr_cw_ptr CrossWorkgroup
+        %gid = OpVariable %pin Input
+       %three = OpConstant %f32 3
+        %one = OpConstant %f32 1
+       %main = OpFunction %void None %fnty
+          %a = OpFunctionParameter %ptr_cw_f32
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pa = OpPtrAccessChain %ptr_cw_f32 %a %gi
+         %va = OpLoad %f32 %pa
+         %m1 = OpFMul %f32 %va %three
+          %r = OpFAdd %f32 %m1 %one
+        %out = OpLoad %ptr_cw_f32 %gout
+         %po = OpPtrAccessChain %ptr_cw_f32 %out %gi
+               OpStore %po %r
+               OpReturn
+               OpFunctionEnd

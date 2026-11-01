@@ -1,0 +1,70 @@
+//
+// Triton: `tl.sum` / `tl.max` / `tl.and` over an integer block, which Triton
+// emits as `redux.sync` — the warp-wide fold PTX added for `__reduce_add_sync`
+// and its cousins.
+//
+// One program is one warp of 32 values (`.maxntid 32`), each lane holds one, and
+// every lane ends with the answer, so each lane writes its own copy. The float
+// input is rounded to an integer first: an integer fold has one right answer
+// whatever order it is formed in, which is what lets it be checked against a
+// reference rather than against itself.
+//
+// `redux.sync` is an integer fold. A float reduction is the shuffle form — PTX
+// has no `redux.sync.add.f32` — and that is what a `tl.sum` of a float block
+// compiles to, so the shuffle path already handles it.
+.version 8.1
+.target sm_80
+.address_size 64
+
+.maxntid 32, 1, 1
+
+.visible .entry reduce_kernel(
+	.param .u64 reduce_kernel_param_0,
+	.param .u64 reduce_kernel_param_1,
+	.param .u64 reduce_kernel_param_2
+)
+{
+	.reg .f32 	%f<12>;
+	.reg .b32 	%r<20>;
+	.reg .b64 	%rd<10>;
+
+	ld.param.u64 	%rd1, [reduce_kernel_param_0];
+	ld.param.u64 	%rd2, [reduce_kernel_param_1];
+
+	mov.u32 	%r1, %ctaid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %tid.x;
+	mad.lo.s32 	%r4, %r1, %r2, %r3;
+	mul.wide.u32 	%rd3, %r4, 4;
+	add.s64 	%rd4, %rd1, %rd3;
+	ld.global.b32 	%f1, [%rd4];
+
+	// the integer this lane contributes
+	mul.f32 	%f2, %f1, 0f41000000;
+	cvt.rni.s32.f32 %r5, %f2;
+
+	redux.sync.add.u32 	%r6, %r5, 0xffffffff;
+	redux.sync.max.u32 	%r7, %r5, 0xffffffff;
+	redux.sync.min.u32 	%r8, %r5, 0xffffffff;
+	redux.sync.and.u32 	%r9, %r5, 0xffffffff;
+	redux.sync.or.u32 	%r10, %r5, 0xffffffff;
+	redux.sync.xor.u32 	%r11, %r5, 0xffffffff;
+
+	cvt.rn.f32.s32 %f3, %r6;
+	cvt.rn.f32.s32 %f4, %r7;
+	cvt.rn.f32.s32 %f5, %r8;
+	cvt.rn.f32.s32 %f6, %r9;
+	cvt.rn.f32.s32 %f7, %r10;
+	cvt.rn.f32.s32 %f8, %r11;
+
+	shl.b32 	%r12, %r4, 3;
+	mul.wide.u32 	%rd5, %r12, 4;
+	add.s64 	%rd6, %rd2, %rd5;
+	st.global.b32 	[%rd6], %f3;
+	st.global.b32 	[%rd6+4], %f4;
+	st.global.b32 	[%rd6+8], %f5;
+	st.global.b32 	[%rd6+12], %f6;
+	st.global.b32 	[%rd6+16], %f7;
+	st.global.b32 	[%rd6+20], %f8;
+	ret;
+}

@@ -1,0 +1,129 @@
+; The same block reduction as basic.metal's block_reduce: a warp fold with
+; shuffles, one threadgroup array, a barrier, then a second fold over the warp
+; totals. Written as real structured SPIR-V: two loops with OpPhi, a
+; threadgroup variable, an OpControlBarrier, and nested selections.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformShuffleRelative
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "block_reduce" %gid %lid %tgid %tgs
+               OpName %main "block_reduce"
+               OpName %wg "warp_sums"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+               OpDecorate %tgid BuiltIn WorkgroupId
+               OpDecorate %tgs BuiltIn WorkgroupSize
+      %void = OpTypeVoid
+     %f32 = OpTypeFloat 32
+      %u32 = OpTypeInt 32 0
+      %u64 = OpTypeInt 64 0
+    %bool = OpTypeBool
+     %fptr = OpTypePointer CrossWorkgroup %f32
+     %c32u = OpConstant %u32 32
+      %arr = OpTypeArray %f32 %c32u
+     %warr = OpTypePointer Workgroup %arr
+     %wf32 = OpTypePointer Workgroup %f32
+   %v3u64 = OpTypeVector %u64 3
+      %pin = OpTypePointer Input %v3u64
+    %fnty = OpTypeFunction %void %fptr %fptr
+       %c0 = OpConstant %u32 0
+       %c1 = OpConstant %u32 1
+      %c16 = OpConstant %u32 16
+      %c31 = OpConstant %u32 31
+       %c5 = OpConstant %u32 5
+      %c32 = OpConstant %u32 32
+       %c2 = OpConstant %u32 2
+     %c256 = OpConstant %u32 256
+      %sub = OpConstant %u32 3
+     %zero = OpConstant %f32 0
+      %gid = OpVariable %pin Input
+      %lid = OpVariable %pin Input
+     %tgid = OpVariable %pin Input
+      %tgs = OpVariable %pin Input
+       %wg = OpVariable %warr Workgroup
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %fptr
+         %o = OpFunctionParameter %fptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+         %t = OpLoad %v3u64 %tgid
+       %ti0 = OpCompositeExtract %u64 %t 0
+        %ti = OpUConvert %u32 %ti0
+         %s = OpLoad %v3u64 %tgs
+       %si0 = OpCompositeExtract %u64 %s 0
+        %si = OpUConvert %u32 %si0
+        %pa = OpPtrAccessChain %fptr %a %gi
+        %v0 = OpLoad %f32 %pa
+               OpBranch %loop1
+     %loop1 = OpLabel
+         %v = OpPhi %f32 %v0 %entry %vn %cont1
+         %d = OpPhi %u32 %c16 %entry %dn %cont1
+               OpLoopMerge %merge1 %cont1 None
+               OpBranch %test1
+     %test1 = OpLabel
+       %more = OpINotEqual %bool %d %c0
+               OpBranchConditional %more %body1 %merge1
+     %body1 = OpLabel
+        %sh = OpGroupNonUniformShuffleDown %f32 %sub %v %d
+       %vn = OpFAdd %f32 %v %sh
+               OpBranch %cont1
+     %cont1 = OpLabel
+        %dn = OpShiftRightLogical %u32 %d %c1
+               OpBranch %loop1
+    %merge1 = OpLabel
+      %lane = OpBitwiseAnd %u32 %li %c31
+      %islo = OpIEqual %bool %lane %c0
+               OpSelectionMerge %smerg None
+               OpBranchConditional %islo %sthen %smerg
+     %sthen = OpLabel
+       %wid = OpShiftRightLogical %u32 %li %c5
+        %wp = OpAccessChain %wf32 %wg %wid
+               OpStore %wp %v
+               OpBranch %smerg
+     %smerg = OpLabel
+               OpControlBarrier %c2 %c2 %c256
+      %nw0 = OpIAdd %u32 %si %c31
+       %nw = OpShiftRightLogical %u32 %nw0 %c5
+     %lt32 = OpULessThan %bool %li %c32
+               OpSelectionMerge %m2 None
+               OpBranchConditional %lt32 %then2 %m2
+     %then2 = OpLabel
+        %lp = OpAccessChain %wf32 %wg %li
+       %lv0 = OpLoad %f32 %lp
+      %inrg = OpULessThan %bool %li %nw
+       %t0 = OpSelect %f32 %inrg %lv0 %zero
+               OpBranch %loop2
+     %loop2 = OpLabel
+         %w = OpPhi %f32 %t0 %then2 %wn %cont2
+         %e = OpPhi %u32 %c16 %then2 %en %cont2
+               OpLoopMerge %merge2 %cont2 None
+               OpBranch %test2
+     %test2 = OpLabel
+       %more2 = OpINotEqual %bool %e %c0
+               OpBranchConditional %more2 %body2 %merge2
+     %body2 = OpLabel
+       %sh2 = OpGroupNonUniformShuffleDown %f32 %sub %w %e
+       %wn = OpFAdd %f32 %w %sh2
+               OpBranch %cont2
+     %cont2 = OpLabel
+        %en = OpShiftRightLogical %u32 %e %c1
+               OpBranch %loop2
+    %merge2 = OpLabel
+      %first = OpIEqual %bool %li %c0
+               OpSelectionMerge %m3 None
+               OpBranchConditional %first %emit %m3
+      %emit = OpLabel
+      %pout = OpPtrAccessChain %fptr %o %ti0
+               OpStore %pout %w
+               OpBranch %m3
+        %m3 = OpLabel
+               OpBranch %m2
+        %m2 = OpLabel
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,72 @@
+; Subgroup shuffles of values wider than one 32-bit word: a float2 and a 64-bit
+; integer. The Metal twin is `wide_shfl` in basic.metal — `simd_shuffle` of a
+; float2 and of a long — so the two front ends have to agree bit for bit.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformShuffle
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "wide_shfl" %gid %lid
+               OpName %main "wide_shfl"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+        %f2 = OpTypeVector %f32 2
+    %v3u64 = OpTypeVector %u64 3
+       %ptr = OpTypePointer CrossWorkgroup %f32
+       %inp = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr %ptr
+       %gid = OpVariable %inp Input
+       %lid = OpVariable %inp Input
+       %sub = OpConstant %u32 3
+        %c5 = OpConstant %u32 5
+        %c9 = OpConstant %u32 9
+       %c31 = OpConstant %u32 31
+        %c1 = OpConstant %f32 1
+        %c3 = OpConstant %u64 2654435761
+        %c7 = OpConstant %u64 7
+        %c32 = OpConstant %u64 32
+        %m16 = OpConstant %u32 65535
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %ptr
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+      %lane = OpBitwiseAnd %u32 %li %c31
+        %pa = OpPtrAccessChain %ptr %a %gi
+         %v = OpLoad %f32 %pa
+        %v1 = OpFAdd %f32 %v %c1
+        %vv = OpCompositeConstruct %f2 %v %v1
+        %l5 = OpIAdd %u32 %lane %c5
+       %l5m = OpBitwiseAnd %u32 %l5 %c31
+        %pv = OpGroupNonUniformShuffle %f2 %sub %vv %l5m
+        %px = OpCompositeExtract %f32 %pv 0
+        %py = OpCompositeExtract %f32 %pv 1
+       %sum = OpFAdd %f32 %px %py
+        %g3 = OpIMul %u64 %gi %c3
+        %lv = OpIAdd %u64 %g3 %c7
+        %l9 = OpIAdd %u32 %lane %c9
+       %l9m = OpBitwiseAnd %u32 %l9 %c31
+        %lp = OpGroupNonUniformShuffle %u64 %sub %lv %l9m
+       %llo = OpUConvert %u32 %lp
+       %lhi0 = OpShiftRightLogical %u64 %lp %c32
+       %lhi = OpUConvert %u32 %lhi0
+       %llo16 = OpBitwiseAnd %u32 %llo %m16
+       %lhi16 = OpBitwiseAnd %u32 %lhi %m16
+       %flo = OpConvertUToF %f32 %llo16
+       %fhi = OpConvertUToF %f32 %lhi16
+       %s1 = OpFAdd %f32 %px %py
+       %s2 = OpFAdd %f32 %s1 %flo
+       %res = OpFAdd %f32 %s2 %fhi
+        %po = OpPtrAccessChain %ptr %o %gi
+               OpStore %po %res
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,51 @@
+// Hand-written PTX with threadgroup memory and a barrier — the PTX counterpart
+// of the `reverse` kernel in basic.metal:
+//     threadgroup float tile[256];
+//     tile[lid] = in[gid];
+//     threadgroup_barrier(mem_threadgroup);
+//     out[gid] = tile[tgsize - 1 - lid];
+//
+// Run it with: goc run kernels/reverse.ptx --kernel reverse --grid N --threads 256
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry reverse(
+    .param .u64 reverse_param_0,
+    .param .u64 reverse_param_1
+)
+{
+    .reg .b32 %r<12>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+    .shared .align 4 .b8 tile[1024];
+
+    ld.param.u64 %rd1, [reverse_param_0];
+    ld.param.u64 %rd2, [reverse_param_1];
+
+    mov.u32 %r1, %tid.x;       // lid  within the threadgroup
+    mov.u32 %r2, %ctaid.x;     // tgid
+    mov.u32 %r3, %ntid.x;      // threads per threadgroup
+
+    mul.lo.s32 %r4, %r2, %r3;
+    add.s32 %r5, %r4, %r1;     // gid
+    mul.lo.s32 %r6, %r5, 4;    // byte offset of gid
+    cvt.u64.u32 %rd3, %r6;
+
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+
+    mul.lo.s32 %r7, %r1, 4;    // byte offset of lid
+    st.shared.f32 [%r7], %f1;
+
+    bar.sync 0;
+
+    sub.s32 %r8, %r3, 1;
+    sub.s32 %r9, %r8, %r1;
+    mul.lo.s32 %r10, %r9, 4;
+    ld.shared.f32 %f2, [%r10];
+
+    add.u64 %rd5, %rd2, %rd3;
+    st.global.f32 [%rd5], %f2;
+    ret;
+}
