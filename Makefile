@@ -28,7 +28,10 @@ ROOT     := $(CURDIR)
 # interrupted mid-link cannot leave a `build/weft` whose timestamp says it is
 # current while its contents are from the previous source. That failure reads as
 # "the fix did nothing", which costs more than the rename does.
-all: build/weft build/weft-gen
+# The SPIR-V fixtures are assembled from the text beside them, so the built files
+# are not in the repository. `spirv` is best effort — see the target — and so is
+# safe here on a machine without the tools.
+all: build/weft build/weft-gen spirv
 
 build/weft: src/main.mm src/translate.cpp src/translate_ptx.cpp src/translate_spirv.cpp src/translate.hpp \
            src/translate_ptx.hpp src/translate_spirv.hpp src/weft_msl.hpp src/weft_warp_msl.hpp \
@@ -90,13 +93,27 @@ SPIRV_AS  ?= $(shell command -v spirv-as 2>/dev/null || echo /opt/homebrew/bin/s
 SPIRV_VAL ?= $(shell command -v spirv-val 2>/dev/null || echo /opt/homebrew/bin/spirv-val)
 
 spirv:
-	# `|| exit 1` in both loops: a for loop's status is its last command, so a
-	# module that failed to assemble or validate was being reported by nothing.
-	for f in kernels/spirv/*.spvasm; do $(SPIRV_AS) --target-env spv1.3 $$f -o $${f%.spvasm}.spv || exit 1; done
-	$(LLC) -march=spirv64 -filetype=obj -O2 kernels/cuda/spvloop.ll -o kernels/spirv/llvm.spv
-	for f in kernels/spirv/*.spv; do \
-	  case $$f in *llvm.spv) e=spv1.4 ;; *) e=spv1.3 ;; esac; \
-	  $(SPIRV_VAL) --target-env $$e $$f || exit 1; done
+	# Both tools are external, so this is best effort: with them, every module is
+	# rebuilt and validated; without, the files already on disk stand and the
+	# message says which one was missing. `|| exit 1` inside the loops because a
+	# for loop's status is its last command, so a module that failed to assemble
+	# was being reported by nothing.
+	@if ! command -v $(SPIRV_AS) >/dev/null 2>&1 && [ ! -x "$(SPIRV_AS)" ]; then \
+	  echo "spirv: no spirv-as, so the modules already here are the ones used"; \
+	elif ! command -v $(LLC) >/dev/null 2>&1 && [ ! -x "$(LLC)" ]; then \
+	  echo "spirv: no llc, so the modules already here are the ones used"; \
+	else \
+	  for f in kernels/spirv/*.spvasm; do \
+	    $(SPIRV_AS) --target-env spv1.3 $$f -o $${f%.spvasm}.spv || exit 1; \
+	  done && \
+	  $(LLC) -march=spirv64 -filetype=obj -O2 kernels/cuda/spvloop.ll -o kernels/spirv/llvm.spv && \
+	  if command -v $(SPIRV_VAL) >/dev/null 2>&1 || [ -x "$(SPIRV_VAL)" ]; then \
+	    for f in kernels/spirv/*.spv; do \
+	      case $$f in *llvm.spv) e=spv1.4 ;; *) e=spv1.3 ;; esac; \
+	      $(SPIRV_VAL) --target-env $$e $$f || exit 1; \
+	    done; \
+	  fi; \
+	fi
 
 clean:
 	rm -rf build
