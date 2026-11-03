@@ -552,6 +552,31 @@ PY
 else
   echo "FAIL  spvgpu:quads  the fixture did not run"; fail=1
 fi
+
+# A double is 64 bits, so the relay carries it as two words. `(uint64_t)1.0` is 1 and
+# its pattern is 1, so a relay that packed the value instead of the bits wrote zero
+# here while both columns compiled — the sum is checked against the lane id instead.
+if "$WEFT" run kernels/spirv/dblshfl.spv --kernel dblshfl --cpu-only --grid 32 --threads 32 --buffers 32 --dump 0="$TMP/dblshfl.bin" >/dev/null 2>&1; then
+  if python3 - "$TMP/dblshfl.bin" <<'PY'
+import struct, sys
+v = struct.unpack("<32f", open(sys.argv[1], "rb").read(128))
+bad = []
+for i in range(32):
+    want = 5 + (i ^ 3) + (i - 1 if i >= 1 else i) + (i + 2 if i + 2 < 32 else i)
+    if v[i] != float(want):
+        bad.append((i, v[i], want))
+for i, got, want in bad[:4]:
+    print("  lane %d wrote %g, wanted %d" % (i, got, want))
+sys.exit(0 if not bad else 1)
+PY
+  then
+    echo "ok    spvgpu:dblshfl  a double through broadcast, xor, up and down"
+  else
+    echo "FAIL  spvgpu:dblshfl  the 64-bit relay moved the value instead of the bits"; fail=1
+  fi
+else
+  echo "FAIL  spvgpu:dblshfl  the fixture did not run"; fail=1
+fi
 # `.a2d`: a layered sample whose third coordinate is the slice, and `txq.depth`
 # answering with the slice count both readings are folded into the output.
 gpucol kernels/ptxarray.ptx           64 4096 --textures '64x64*4' --samplers nearest/clamp
@@ -664,6 +689,9 @@ spvgpu wide_shfl    wide      --grid 1048576 --threads 256 --buffers 1048576,104
 # A quad broadcast at each of the four lane indices, and the three quad swaps. The
 # fixture writes a weighted sum that check.sh recomputes below.
 spvgpu quads       quads      --grid 32 --threads 32 --buffers 32,32
+# A double through all four shuffle modes, which the relay moves two words at a
+# time: the fixture's sum is recomputed by hand below.
+spvgpu dblshfl     dblshfl    --grid 32 --threads 32 --buffers 32
 spvgpu serial_sum   llvm      --grid 1 --threads 1 --buffers 1000,1 --arg 0=1000
 spvgpu globk        global    --grid 1048576 --buffers 1048576,1048576
 # An image read and a filtered sample; then a storage image written, barriered,

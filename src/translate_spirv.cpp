@@ -1199,9 +1199,18 @@ bool Emitter::wide_shfl(uint32_t tid, const std::string& e, const std::string& p
   }
 
   // A 64-bit scalar goes out as two 32-bit halves, low first.
+  //
+  // A double has to go out as its *bits*: `(uint64_t)1.0` is 1, whose pattern is
+  // five thousand times smaller than the smallest subnormal, so a cast here would
+  // deliver zero for every value that is not already an integer pattern. The GPU
+  // target already holds the bits in a `uint64_t`, which is why this is the CPU
+  // side of the same expression.
   if (t.kind == KFloat ? t.width == 64 : (t.kind == KInt && t.width == 64)) {
-    const std::string lo = pass("(uint32_t)((uint64_t)(" + e + ") & 0xFFFFFFFFu)");
-    const std::string hi = pass("(uint32_t)((uint64_t)(" + e + ") >> 32)");
+    const std::string word =
+        (t.kind == KFloat && !gpu) ? ("weft_bitcast<uint64_t>(" + e + ")") :
+                                     ("(uint64_t)(" + e + ")");
+    const std::string lo = pass("(uint32_t)(" + word + " & 0xFFFFFFFFu)");
+    const std::string hi = pass("(uint32_t)(" + word + " >> 32)");
     const std::string bits =
         "((uint64_t)(" + lo + ") | ((uint64_t)(" + hi + ") << 32))";
     if (t.kind == KFloat)
@@ -1445,6 +1454,14 @@ bool Emitter::emit_one(const Instr& ins) {
         case OpLoad: case OpStore: case OpSelect: case OpPhi: case OpCopyObject:
         case OpVariable: case OpFunctionParameter: case OpCompositeExtract:
         case OpCompositeConstruct: case OpCompositeInsert: case OpVectorShuffle:
+        // A subgroup shuffle of a double is the same instruction as a shuffle of a
+        // `long`: it takes the value apart into words and moves them, which is what
+        // the shuffle path already does for every 64-bit type. On the GPU the value
+        // is the `uint64_t` its bits live in, so there is nothing to convert.
+        case OpGroupNonUniformBroadcast: case OpGroupNonUniformBroadcastFirst:
+        case OpGroupNonUniformShuffle: case OpGroupNonUniformShuffleXor:
+        case OpGroupNonUniformShuffleUp: case OpGroupNonUniformShuffleDown:
+        case OpGroupNonUniformQuadBroadcast: case OpGroupNonUniformQuadSwap:
         case OpBitcast: case OpFunctionCall:
           break;
         default:

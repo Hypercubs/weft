@@ -1,0 +1,62 @@
+; Shuffles of a double: 64 bits, which the relay moves two 32-bit words at a time.
+;
+;     x = (double)lane
+;     out[gid] = broadcast(x, 5) + shuffleXor(x, 3) + shuffleUp(x, 1) + shuffleDown(x, 2)
+;
+; With x = lane every term is an integer, so the sum is exact in a float and check.sh
+; recomputes it from the lane id: 5 + (i ^ 3) + (i >= 1 ? i - 1 : i) + (i + 2 < 32 ? i
+; + 2 : i). The four modes reach four different lanes, so a relay that takes the value
+; apart arithmetically instead of the bits — `(uint64_t)1.0` is 1, not the mantissa —
+; collapses every term and writes zero, which is what this fixture was written after
+; seeing.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Float64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformBallot
+               OpCapability GroupNonUniformShuffle
+               OpCapability GroupNonUniformShuffleRelative
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "dblshfl" %gid %lid
+               OpName %main "dblshfl"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %f64 = OpTypeFloat 64
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+    %v3u64 = OpTypeVector %u64 3
+       %ptr = OpTypePointer CrossWorkgroup %f32
+       %inp = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr
+       %gid = OpVariable %inp Input
+       %lid = OpVariable %inp Input
+       %sub = OpConstant %u32 3
+        %c1 = OpConstant %u32 1
+        %c2 = OpConstant %u32 2
+        %c3 = OpConstant %u32 3
+        %c5 = OpConstant %u32 5
+      %main = OpFunction %void None %fnty
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+        %vf = OpConvertUToF %f32 %li
+         %x = OpFConvert %f64 %vf
+         %b = OpGroupNonUniformBroadcast %f64 %sub %x %c5
+         %s = OpGroupNonUniformShuffleXor %f64 %sub %x %c3
+         %u = OpGroupNonUniformShuffleUp %f64 %sub %x %c1
+         %d = OpGroupNonUniformShuffleDown %f64 %sub %x %c2
+        %t0 = OpFAdd %f64 %b %s
+        %t1 = OpFAdd %f64 %t0 %u
+        %t2 = OpFAdd %f64 %t1 %d
+       %res = OpFConvert %f32 %t2
+        %po = OpPtrAccessChain %ptr %o %gi
+               OpStore %po %res
+               OpReturn
+               OpFunctionEnd
