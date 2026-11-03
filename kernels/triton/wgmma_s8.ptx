@@ -1,0 +1,118 @@
+//
+// wgmma with 8-bit integer operands: `wgmma.mma_async.sync.aligned.m64n8k32.f32.s8.s8`.
+//
+// The geometry is the fp8 one to the byte. A one-byte element puts sixteen to a
+// core-matrix row, so K is 32, A is 64x32 (2048 bytes: two cores along K, eight
+// along M) and B is 32x8 in four cores of 128 bytes (512 bytes, since a core row
+// is sixteen bytes even though N is eight). Nothing about the walk changes: the
+// instruction reads the same words and decodes them as signed integers instead of
+// e4m3, which is exactly what this fixture is here to separate.
+//
+// The unsigned twin is the same file with `.u8.u8`, and the reference reads the
+// same bytes as different numbers, so a decode wired to the wrong signedness
+// disagrees with it.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry wgmma_s8_kernel(
+	.param .u64 wgmma_s8_kernel_param_0,
+	.param .u64 wgmma_s8_kernel_param_1,
+	.param .u64 wgmma_s8_kernel_param_2
+)
+{
+	.reg .b32 	%r<40>;
+	.reg .f32 	%f<12>;
+	.reg .b64 	%rd<16>;
+
+	.shared .align 128 .b8 weft_ab[2560];
+
+	ld.param.u64 	%rd1, [wgmma_s8_kernel_param_0];
+	ld.param.u64 	%rd2, [wgmma_s8_kernel_param_1];
+	ld.param.u64 	%rd3, [wgmma_s8_kernel_param_2];
+
+	mov.u32 	%r1, %tid.x;
+
+	// A: lane -> one row of 32 int8 values, which is two 16-byte core rows.
+	and.b32 	%r2, %r1, 63;
+	shr.u32 	%r3, %r1, 6;
+	shl.b32 	%r4, %r2, 5;			// row * 32 bytes
+	shl.b32 	%r5, %r3, 4;
+	add.s32 	%r4, %r4, %r5;
+	cvt.u64.u32 	%rd4, %r4;
+	add.s64 	%rd4, %rd1, %rd4;
+	ld.global.v4.b32 	{%r10, %r11, %r12, %r13}, [%rd4];
+
+	shr.u32 	%r6, %r2, 3;
+	shl.b32 	%r6, %r6, 8;			// (row / 8) * SBO(256)
+	shl.b32 	%r7, %r3, 7;			// core row * LBO(128)
+	and.b32 	%r8, %r2, 7;
+	shl.b32 	%r8, %r8, 4;
+	add.s32 	%r9, %r6, %r7;
+	add.s32 	%r9, %r9, %r8;
+	mov.u64 	%rd5, weft_ab;
+	cvt.u64.u32 	%rd6, %r9;
+	add.s64 	%rd6, %rd5, %rd6;
+	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
+
+	// B: lane -> one column and two adjacent K values, which in this layout are
+	// adjacent bytes. A 16-byte chunk holds sixteen values of K for a single column,
+	// so N steps by a whole chunk while K runs inside it.
+	shr.u32 	%r15, %r1, 4;			// n (0..7)
+	and.b32 	%r14, %r1, 15;
+	shl.b32 	%r14, %r14, 1;			// k = 2 * (lane % 16)
+	shl.b32 	%r16, %r14, 3;			// k * 8 bytes, one row of B
+	add.s32 	%r16, %r16, %r15;
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd2, %rd7;
+	ld.global.u8 	%r18, [%rd7];
+	ld.global.u8 	%r22, [%rd7+8];		// the next k, eight bytes on
+
+	shr.u32 	%r19, %r14, 4;			// k / 16: which K group
+	shl.b32 	%r19, %r19, 7;			// * LBO(128)
+	shl.b32 	%r20, %r15, 4;			// n * 16 bytes
+	add.s32 	%r19, %r19, %r20;
+	and.b32 	%r21, %r14, 15;			// k % 16
+	add.s32 	%r19, %r19, %r21;
+	add.s32 	%r19, %r19, 2048;
+	cvt.u64.u32 	%rd8, %r19;
+	add.s64 	%rd8, %rd5, %rd8;
+	st.shared.u8 	[%rd8], %r18;
+	st.shared.u8 	[%rd8+1], %r22;
+
+	bar.sync 	0;
+
+	// A: start 0, LBO = 128 bytes (8 units), SBO = 256 (16 units). B: start 2048
+	// (128 units), LBO = 128, SBO = 128 (8 units) between the four cores along K.
+	mov.u64 	%rd10, 68720001024;
+	mov.u64 	%rd12, 34360262784;
+
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	wgmma.fence.sync.aligned;
+	wgmma.mma_async.sync.aligned.m64n8k32.f32.s8.s8 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+
+	// The accumulator pattern follows N: D[16w+g][2t], [2t+1], and the row 8 below.
+	shr.u32 	%r21, %r1, 5;
+	shr.u32 	%r22, %r1, 2;
+	and.b32 	%r22, %r22, 7;
+	and.b32 	%r23, %r1, 3;
+	shl.b32 	%r24, %r21, 4;
+	add.s32 	%r24, %r24, %r22;
+	shl.b32 	%r25, %r24, 5;
+	shl.b32 	%r26, %r23, 3;
+	add.s32 	%r25, %r25, %r26;
+	cvt.u64.u32 	%rd13, %r25;
+	add.s64 	%rd13, %rd3, %rd13;
+	st.global.b32 	[%rd13], %f5;
+	st.global.b32 	[%rd13+4], %f6;
+	st.global.b32 	[%rd13+256], %f7;
+	st.global.b32 	[%rd13+260], %f8;
+	ret;
+}

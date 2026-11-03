@@ -59,6 +59,9 @@ runf() {
 
 run saxpy      --grid 1048576 --buffers 1048576,1048576,1048576
 run texmix     --grid 65536   --buffers 65536 --textures 64x64   # texture read + nearest sample
+run swzcmp     --grid 65536   --buffers 65536                    # compound swizzle assignment
+# A 1-D texture: one row, one coordinate, bound as a Wx1 image.
+run tex1ds     --grid 65536   --buffers 65536 --textures 64x1d
 
 # Bilinear filtering: the weights are quantised the way the hardware quantises
 # them (round(f * 256) / 256, measured from the GPU) and blended with the fma the
@@ -66,6 +69,18 @@ run texmix     --grid 65536   --buffers 65536 --textures 64x64   # texture read 
 # ulp of the final blend remains — 1.2e-07, where the unquantised weights were
 # 1.4e-03. The run's `agree` is that bound; a regression shows up as DISAGREE.
 run texlin     --grid 65536   --buffers 65536 --textures 64x64   # bilinear, 8-bit weights + fma
+# A 2D array: `--textures 64x64*4` binds four slices, and the kernel reads and
+# samples the slice it names. The layer is folded into the value, so reading the
+# wrong slice — or the whole array from slice 0 — answers wrong rather than close.
+run texarray   --grid 65536   --buffers 65536 --textures '64x64*4'
+# A 3D texture: `--textures 64x64x8` binds a volume, and every read and sample
+# names a plane. The plane is folded into the answer, so reading plane 0 of the
+# volume — or taking the depth for a slice — answers wrong rather than close.
+run tex3d      --grid 65536   --buffers 65536 --textures 64x64x8
+# A cube: `--textures 64x64c` binds six square faces, and a sample takes a
+# direction. Each lane rebuilds the direction that lands on the texel it wants, so
+# a wrong face or a flipped axis reads a different texel.
+run texcube    --grid 65536   --buffers 65536 --textures 64x64c
 run stencil5   --grid 1048576 --buffers 1048576,1048576
 run stencil5   --grid 1000    --buffers 1000,1000          # ragged final group
 run reverse    --grid 1048576 --threads 256 --buffers 1048576,1048576
@@ -79,6 +94,7 @@ run half_tg    --grid 65536   --threads 64 --buffers 65536,1048576  # fp16 in th
 run tg_vec3    --grid 65536   --threads 64 --buffers 1048576,1048576  # float3 in threadgroup memory
 run int_pack   --grid 262144  --buffers 1048576,1048576     # int3/uint3/uchar4/short2/char4
 run vecmath    --grid 4096    --buffers 12288,16384         # dot/cross/normalize/mix/clamp/smoothstep
+run swzwrite   --grid 4096    --buffers 4096,32768          # a swizzle on the left of an assignment
 run atomic_bins --grid 1048576 --buffers 1048576,8          # integer atomics
 run warpscan   --grid 1048576 --threads 256 --buffers 1048576,1048576   # 5 shuffles
 run fillscan   --grid 1048576 --threads 256 --buffers 1048576,1048576   # shuffle_and_fill
@@ -132,11 +148,53 @@ run texrw      --grid 4096 --threads 256 --buffers 4096,4096 --textures 64x64
 # group is 11 groups, not 10.
 run counts     --grid 1000 --threads 96 --buffers 1000
 run counts     --grid 3072 --threads 96 --buffers 3072
+# A struct the kernel body declares for itself, held in locals on both sides of a
+# barrier: the type is lifted to file scope so the state machine can carry the
+# value, and the values read after the wait are the neighbours'.
+run localtype  --grid 1048576 --threads 256 --buffers 1048576,1048576
+# Lambdas called where they are written: the first shadows a local with its own
+# parameter, the second captures one by reference across the barrier.
+run lambdak    --grid 1048576 --threads 256 --buffers 1048576,1048576
+# A lambda kept in a local across the barrier, and the three capture-list shapes.
+run lamstore   --grid 1048576 --threads 256 --buffers 1048576,1048576
+run lamcap     --grid 1048576 --threads 256 --buffers 1048576,1048576
+# A body-declared type with a method of its own, its local held across the wait.
+run localmeth  --grid 1048576 --threads 256 --buffers 1048576,1048576
+# A lambda kept in a local that copies one: the copy has to be the value the lambda
+# was made with, while a `[&w]` beside it follows the blob.
+run stcopy     --grid 1048576 --threads 256 --buffers 1048576,1048576
+run stname     --grid 1048576 --threads 256 --buffers 1048576,1048576
+# ... and one that copies an array local, element by element.
+run starray    --grid 1048576 --threads 256 --buffers 1048576,1048576
+run stinit     --grid 1048576 --threads 256 --buffers 1048576,1048576
+run stmut      --grid 1048576 --threads 256 --buffers 1048576,1048576
+run stparm     --grid 1048576 --threads 256 --buffers 1048576,1048576
+run stnest     --grid 1048576 --threads 256 --buffers 1048576,1048576
+run autolocal  --grid 1048576 --threads 256 --buffers 1048576,1048576
+run arrinit    --grid 1048576 --threads 256 --buffers 1048576,1048576
+run refcap     --grid 1048576 --threads 256 --buffers 1048576,1048576
+run shadow     --grid 1048576 --threads 256 --buffers 1048576,1048576
+run addrspace  --grid 1048576 --threads 256 --buffers 1048576,1048576,1048576
+run arr2d      --grid 1048576 --threads 256 --buffers 1048576,1048576
+run refsub     --grid 1048576 --threads 256 --buffers 1048576,1048576
+run tgblock    --grid 1048576 --threads 256 --buffers 1048576,1048576
+# Packing has one rounding rule and it is a tie that tests it: the values are every
+# byte boundary, exact ties, and snorm's negative half, compared byte for byte.
+run packround  --grid 65536 --buffers 262144,786432
+# A componentwise compare makes a mask, and select/any/all are its three readers.
+run choosemask --grid 65536 --buffers 262144,524288
+# Swizzles in every shape a kernel writes: a prefix, a reversal, a broadcast, two
+# out of order, and a swizzle of a swizzle.
+run swizzle    --grid 65536 --buffers 262144,524288
 
 # The two hard fixtures. A raymarcher is nothing but `length`, `normalize`, `dot`,
 # `reflect` and `smoothstep` in a 64-step loop, so a single bit of difference in
 # the portable library walks the ray somewhere else; the FFT is a permuted tree
 # with a `sin`/`cos` at every node and nine barriers per threadgroup.
+# A 1-D texture: one coordinate, and a 64x1 binding behind it. The height is
+# folded into the answer, so a binding of the wrong shape lands on a different
+# number instead of on a sample that quietly agrees.
+runf kernels/ptx1d.ptx ptx1d --grid 65536 --buffers 65536 --textures 64x1
 runf kernels/hard.metal raymarch --grid 65536 --buffers 65536,65536     # SDF raymarch, 64 steps
 runf kernels/hard.metal fft --grid 2048 --threads 256 --buffers 4096,4096  # 256-point radix-2, 9 barriers
 
@@ -336,7 +394,9 @@ gpucol kernels/cuda/hsum.ptx         256 4096
 gpucol kernels/cuda/pred.ptx         256 4096
 gpucol kernels/cuda/rotate.ptx       256 4096
 gpucol kernels/cuda/scale.ptx        256 4096
-gpucol kernels/cuda/vecscale.ptx     256 4096
+# A v4 load and store is four elements a lane, so the buffers hold 4 x the grid:
+# sized from the grid alone, the kernel's own writes run past the end of both.
+gpucol kernels/cuda/vecscale.ptx     256 4096 --buffers 16384,16384
 # A tree reduction over the whole group: eight barriers, and every thread reads
 # slots another thread wrote, so the barrier has to be the hardware's.
 gpucol kernels/cuda/reduce.ptx       256 4096
@@ -352,6 +412,42 @@ gpucol kernels/triton/wgmma.ptx      128 4096 --buffers 32768,32768,32768
 # The same instruction with bf16 operands: one 16-bit element either way, so the
 # core-matrix layout is identical and only the decode differs.
 gpucol kernels/triton/wgmma_bf16.ptx 128 4096 --buffers 32768,32768,32768
+# tf32: 32-bit operands, so a core-matrix row holds four of them and K is 8.
+gpucol kernels/triton/wgmma_tf32.ptx 128 4096 --buffers 32768,32768,32768
+# fp8: one byte an element, sixteen to a core-matrix row, so K is 32. The buffers
+# are sized to what this kernel touches rather than to the grid: nothing past the
+# tile is written, so a larger buffer would have both engines compared over memory
+# neither of them set.
+gpucol kernels/triton/wgmma_fp8.ptx  128 4096 --buffers 2048,256,512 --buffer-bytes 0=1,1=1
+# 8-bit integers: the fp8 geometry byte for byte, so the same buffers — and the
+# decode alone has to tell signed from unsigned.
+gpucol kernels/triton/wgmma_s8.ptx   128 4096 --buffers 2048,256,512 --buffer-bytes 0=1,1=1
+# Sixteen columns: two N groups, so B's SBO is a real address and a lane holds
+# eight accumulators. A is 1024 halves, B 256, D 1024 floats.
+gpucol kernels/triton/wgmma_n16.ptx  128 4096 --buffers 1024,256,1024 --buffer-bytes 0=2,1=2
+# MN-major operands, and the same tile issued twice into its own accumulator.
+gpucol kernels/triton/wgmma_trans.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+gpucol kernels/triton/wgmma_acc.ptx   128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+# The 128-byte swizzle, which is the layout a real Hopper kernel stages.
+gpucol kernels/triton/wgmma_swz128.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+# The narrow swizzle: a 32-byte atom, where the XOR mask is one bit.
+gpucol kernels/triton/wgmma_swz32.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+# The middle width, and a tile that starts one row into the pattern.
+gpucol kernels/triton/wgmma_swz64.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+gpucol kernels/triton/wgmma_swzbase.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+# A swizzled operand that is MN-major: the mirror of the K-major walk.
+gpucol kernels/triton/wgmma_swztrans.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+# The swizzle on the two ends of the element-width range: four bytes and one.
+gpucol kernels/triton/wgmma_swztf32.ptx 128 4096 --buffers 512,64,512 --buffer-bytes 0=4,1=4
+gpucol kernels/triton/wgmma_swzf8.ptx   128 4096 --buffers 2048,256,512 --buffer-bytes 0=1,1=1
+# The other transpose, and a chain of three issues into one accumulator.
+gpucol kernels/triton/wgmma_swztransb.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+gpucol kernels/triton/wgmma_chain.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+# An integer accumulator, and a two-immediate form, which PTX allows.
+gpucol kernels/triton/wgmma_s32acc.ptx 128 4096 --buffers 2048,256,512 --buffer-bytes 0=1,1=1
+gpucol kernels/triton/wgmma_shortimm.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
+# The same instruction on the 32-lane backend, forced there by a warp-wide fold.
+gpucol kernels/triton/wgmma_warp.ptx 128 4096 --buffers 1024,128,512 --buffer-bytes 0=2,1=2
 # Hand-written samples: predication, bit tricks, a reduction barrier, two
 # threadgroup tiles, and cp.async into threadgroup memory.
 gpucol kernels/reverse.ptx           256 4096
@@ -366,9 +462,79 @@ gpucol kernels/async_copy.ptx         64 4096
 # order the `.tex`/`.surf` declarations appear in.
 gpucol kernels/ptxtex.ptx             64 4096 --textures 64x64 --samplers nearest/clamp
 gpucol kernels/ptxsrf.ptx             64 4096 --textures 64x64
+# One binding written and then sampled: the write needs a read-write view and a
+# filter cannot read through one, so the module declares a second, sampled view of
+# the same texture and the launcher binds one handle to both. `t0` is the lane's own
+# texel, so a sample that read stale storage answers with the image's old contents.
+gpucol kernels/ptxsrftmix.ptx         64 4096 --textures 64x64 --samplers nearest/clamp
+# 64-bit floating point, which this GPU has no instruction for: the GPU column runs
+# the software double over the bits and the CPU column runs the host's own, so the
+# two are the same arithmetic and the comparison is byte for byte. The input is
+# written as raw doubles — the `0d` literals in the kernel used to have no GPU
+# spelling at all — and the answer comes back as one float a lane.
+python3 - "$TMP/f64in.bin" <<'PY'
+import struct, sys
+vals = [0.0, 1.0, -1.0, 0.5, 3.0, 1e-300, 2.0**-1022, 2.0**60, -7.25, 1e300,
+        1234.5678, -0.0, 4096.5, 1e-16]
+vals = (vals * 300)[:4096]
+open(sys.argv[1], 'wb').write(struct.pack('<4096d', *vals))
+PY
+gpucol kernels/ptxf64.ptx             64 4096 --buffers 4096,4096,4096 --buffer-bytes 0=8,1=4,2=8 \
+    --load "0=$TMP/f64in.bin"
 # `tld4` keeps the four texels apart instead of blending them, which is the one
 # thing a filter cannot stand in for.
 gpucol kernels/ptxgather.ptx          64 4096 --textures 64x64
+# The same footprint in the bindings it used to be refused for: a volume gathers in
+# the plane its third coordinate names, a one-row binding puts the second row of the
+# footprint outside the image (so it answers with the two texels along x, as an edge
+# does), and a cube names a face and a place on it instead of a direction.
+gpucol kernels/ptxgather3d.ptx        64 4096 --textures 64x64x8
+gpucol kernels/ptxgather1d.ptx        64 4096 --textures 64x1
+gpucol kernels/ptxgathercube.ptx      64 4096 --textures 64x64c
+# `ldmatrix` hands each lane a row address that another lane supplied, so the tile
+# is only reachable from a backend that holds a whole warp. The two address forms —
+# a named shared symbol and the register a lane computed — must give the same word,
+# and the transposed form must give the transpose; both are checked against the
+# position each value came from rather than against each other.
+python3 -c 'import struct,sys; open(sys.argv[1],"wb").write(struct.pack("<64H",*range(64)))' \
+    "$TMP/ldm_in.bin"
+if env WEFT_WARP=1 "$WEFT" run kernels/ldmatrix.ptx --kernel ldmatrix --cpu-only --grid 32 \
+    --threads 32 --buffers 96,64 --buffer-bytes 1=2 --load 1="$TMP/ldm_in.bin" \
+    --dump 0="$TMP/ldm_out.bin" >/dev/null 2>&1; then :; else
+  echo "FAIL  ptx:ldmatrix  the fixture did not run"; fail=1
+fi
+if python3 - "$TMP/ldm_out.bin" <<'PY'
+import struct, sys
+w = struct.unpack('<96I', open(sys.argv[1], 'rb').read(384))
+bad = 0
+for l in range(32):
+    i = 8 * (l >> 2) + 2 * (l & 3)
+    want = i | ((i + 1) << 16)
+    if w[l] != want: bad += 1
+    if w[32 + l] != want: bad += 1
+    t = 8 * (2 * (l & 3)) + (l >> 2)
+    if w[64 + l] != (t | ((t + 8) << 16)): bad += 1
+if bad:
+    print("  %d of 96 words differ" % bad)
+sys.exit(0 if bad == 0 else 1)
+PY
+then
+  echo "ok    ptx:ldmatrix  symbol, register and transposed forms all match the layout"
+else
+  echo "FAIL  ptx:ldmatrix  a form does not match the documented layout"; fail=1
+fi
+# `.a2d`: a layered sample whose third coordinate is the slice, and `txq.depth`
+# answering with the slice count both readings are folded into the output.
+gpucol kernels/ptxarray.ptx           64 4096 --textures '64x64*4' --samplers nearest/clamp
+# `.3d`: `txq.depth` reports the plane count and `tex.3d` samples the plane its
+# third coordinate names, which is the one thing a 2-D sample cannot express.
+gpucol kernels/ptx3d.ptx             256 65536 --textures 64x64x8 --samplers nearest/clamp
+# `.cube`: PTX names a face and a position on it, where the sampler takes a
+# direction, and `weft_cube_dir` rebuilds the direction that lands back on that
+# face at that place. Every lane covers all six faces over the grid, and the face
+# is folded into the answer, so picking the wrong one cannot hide behind a texel
+# that happens to hold the same number.
+gpucol kernels/ptxcube.ptx          256 65536 --textures 64x64c --samplers nearest/clamp
 # The bit tricks: funnel shifts, `prmt`, `mul.hi` at 32 and 64 bits, and the
 # float-integer conversions. This one used to be a skip — the emitted source
 # compiled and the pipeline step then killed the compiler, because a `mul.hi.u64`
@@ -380,6 +546,8 @@ gpucol kernels/cuda/bits.ptx         256 4096
 # product, unsigned and signed, and a negative times a negative. Ten words per
 # lane out of four words in.
 gpucol kernels/mulhi.ptx            256 4096 --buffers 16384,40960
+gpucol kernels/dp4a.ptx             256 65536 --buffers 65536
+gpucol kernels/mufu.ptx             256 65536 --buffers 65536
 # `redux.sync` is one group instruction on the GPU (`simd_sum` and the other
 # folds), so a warp-wide integer fold has both columns; a lane outside the member
 # mask stands in with the fold's identity, which keeps a partial mask exact.
@@ -415,10 +583,15 @@ gpucol kernels/triton/matmul.ptx     128 4096 --buffers 32768,32768,32768
 # decode. An image and a sampler are bindings a Metal kernel declares, so those
 # two kernels cover the binding side as well.
 spvgpu() {
-  local kernel="$1" file="$2"; shift 2
+  # The first word names the kernel to run and the row that prints. A row that runs
+  # one kernel at a second launch size writes `label=kernel`, so the two results
+  # have different names in this output instead of colliding.
+  local kernel="$1" file="$2" label; shift 2
+  label="$kernel"
+  case "$kernel" in *=*) label="${kernel%%=*}"; kernel="${kernel#*=}" ;; esac
   local out
   if [ -n "$CPUMODE" ]; then
-    echo "skip  spvgpu:$kernel  no gpu on this host"
+    echo "skip  spvgpu:$label  no gpu on this host"
     return
   fi
   local st=0 retried="" attempt=1 tries=""
@@ -434,7 +607,7 @@ spvgpu() {
     attempt=$((attempt + 1))
   done
   if [ -z "$out" ]; then
-    echo "skip  spvgpu:$kernel  three attempts printed nothing, exiting$tries, so nothing was compared"
+    echo "skip  spvgpu:$label  three attempts printed nothing, exiting$tries, so nothing was compared"
     return
   fi
   if [ "$attempt" -gt 1 ]; then
@@ -443,13 +616,13 @@ spvgpu() {
   local why
   why="$(printf '%s\n' "$out" | LC_ALL=C sed -n 's/.*no column for this kernel *//p' | head -1)"
   if [ -n "$why" ]; then
-    echo "skip  spvgpu:$kernel  $why"
+    echo "skip  spvgpu:$label  $why"
     return
   fi
   if printf '%s\n' "$out" | grep -aq '^compare .*agree'; then
-    echo "ok    spvgpu:$kernel  the emitted metal matches the cpu byte for byte$retried"
+    echo "ok    spvgpu:$label  the emitted metal matches the cpu byte for byte$retried"
   else
-    echo "FAIL  spvgpu:$kernel"
+    echo "FAIL  spvgpu:$label"
     printf '%s\n' "$out" | tail -4 | LC_ALL=C sed 's/^/      /'
     fail=1
   fi
@@ -467,6 +640,46 @@ spvgpu texmix       texture   --grid 65536 --buffers 65536 --textures 64x64 \
   --samplers nearest/clamp
 spvgpu texrw        texturerg --grid 4096 --threads 256 --buffers 4096,4096 \
   --textures 64x64
+# `Arrayed` in OpTypeImage: every coordinate carries a layer, and
+# `OpImageQuerySizeLod` reports the slice count as its third component.
+spvgpu texarray     arraytex  --grid 65536 --buffers 65536 --textures '64x64*4' \
+  --samplers nearest/clamp
+# `Dim = 3D` in OpTypeImage: a coordinate of three components, and
+# `OpImageQuerySizeLod` reporting the depth as its third.
+spvgpu tex3d        threed    --grid 65536 --buffers 65536 --textures 64x64x8 \
+  --samplers nearest/clamp
+# Matrices: a 4x4 built from columns, multiplied four ways and transposed, with
+# every product weighed differently so a column taken for a row lands on a
+# different number.
+# The Shader model. A GLCompute module takes no function parameters at all: the
+# buffer, the image and the sampler are module-scope variables, which is the shape
+# glslang emits for a compute shader. `gl2d` is the control that the model decodes
+# at all, `gl1d` samples a plane one row high, and `glcube` builds a direction from
+# a face and a position on it so all six faces are sampled.
+spvgpu gl1d        gl1d    --grid 65536 --buffers 65536 --textures 64x1 --samplers nearest/clamp
+spvgpu gl2d        gl2d    --grid 65536 --buffers 65536 --textures 64x64 --samplers nearest/clamp
+spvgpu glcube      glcube  --grid 65536 --buffers 65536 --textures 64x64c --samplers nearest/clamp
+# `OpImageGather`: the four texels of a 2x2 footprint, one per channel, which is
+# the SPIR-V twin of PTX's `tld4`. It carries a component operand the sample
+# instructions do not, so its image operands start a word later.
+spvgpu glgather    glgather --grid 65536 --buffers 65536 --textures 64x64 --samplers nearest/clamp
+# A gather of one slice of a 2-D array: the footprint is a 2x2 block of the layer
+# the third coordinate names.
+spvgpu glgatherarray glgatherarray --grid 65536 --buffers 65536 --textures '64x64*4' --samplers nearest/clamp
+# A 2-D group. `LocalSize 8 8 1` fixes how a lane id decomposes, so the kernel
+# rebuilds its own flat lane from `LocalInvocationId` and writes a 1 where that
+# equals the global id modulo the group, a 0 where it does not — which is what a
+# wrong decomposition would produce.
+spvgpu glgroup     glgroup  --grid 65536 --buffers 65536
+spvgpu matk         matk      --grid 65536 --buffers 65536,65536
+# OpenCL.std's trigonometry: `sin`, `atan2` and `pow` through the portable
+# library rather than the GPU's own approximation, so every lane is bit-identical.
+spvgpu mathx        mathx     --grid 65536 --buffers 65536,65536
+# The functions that read a float's own bits: `ldexp`, `ilogb`, `logb`,
+# `nextafter`, `maxmag`, `minmag`, `pown`, `rootn`, `expm1`.
+spvgpu mathy        mathy     --grid 65536 --buffers 65536,65536
+spvgpu mathz        mathz     --grid 65536 --buffers 65536,65536
+spvgpu atomf        atomf     --grid 1024 --threads 1024 --buffers 1024,1024,2
 # `OpImageGather` has no column here, and not because it was skipped: the validator
 # refuses it outside a Shader module (`requires one of these capabilities: Shader`),
 # and this front end decodes OpenCL/Kernel modules. The PTX front end's `tld4` is the
@@ -517,7 +730,25 @@ spvgpu atom64sub   atom64sub  --grid 32 --threads 32 --buffers 1,32,32,32,32,32,
 # compared bit for bit, over multiply, add, divide, a catastrophic subtraction, the
 # four roundings, a trip through binary32, a comparison, a cast and a subgroup
 # reduction. The reduction's residual buffer must be zero in every lane.
-spvgpu fp64       fp64       --grid 32 --threads 32 --buffers 32,256,64,32
+spvgpu fp64       fp64       --grid 32 --threads 32 --buffers 32,288,64,32
+# The same software double, two components at a time: a `double2` built, added,
+# multiplied, divided, subtracted and taken apart. The per-component path has to
+# call the fp64 helper rather than apply the operator to the two 64-bit words, and
+# an operator there adds significands as integers — a wrong number, not a refusal.
+spvgpu dvec       dvec       --grid 32 --threads 32 --buffers 32,128
+# The fold in floats: reduce add/min/max and an inclusive and an exclusive scan,
+# over half-integers so every partial sum is exact and every answer can be worked
+# out by hand in the module. The residual slots catch a wrong shift (an exclusive
+# scan that folded its own lane in), a mask that counted a lane which never ran,
+# and any disagreement between the two engines' trees. Sixteen lanes of the last
+# warp are dead in the `--grid 32` case, which is the point of the mask.
+spvgpu subfold    subfold    --grid 32 --threads 32 --buffers 256
+# The same fold over a short warp, which is where a fold that reads a lane outside
+# the grid goes wrong: only 24 of the 32 lanes ran, so the ones past the grid hold
+# nothing and a tree that reads them answers with whatever was there. The hand
+# numbers no longer fit, so this row compares the two engines rather than a
+# residual — that comparison is what caught the 82-off sum.
+spvgpu subfold:ragged=subfold subfold --grid 24 --threads 32 --buffers 256
 # The kernel row proves the path end to end; this one proves each operation on its
 # own, over a value set per operation — every rounding, every comparison against
 # both signs and zero, subnormals, the extremes of the exponent range, and the
@@ -551,7 +782,7 @@ triton reduce reduce_kernel 1 --grid 1024 --buffers 1024,8192
 # fragment-layout or conversion bug, never a rounding one.
 if python3 kernels/triton/fp8_ref.py gen 512 256 "$TMP/f8a.bin" "$TMP/f8b.bin" 2>"$TMP/f8.log" \
    && "$WEFT" run kernels/triton/dotfp8.ptx --kernel dotfp8_kernel --cpu-only \
-        --grid 1 --threads 32 --buffers 128,64,128 \
+        --grid 1 --threads 32 --buffers 512,256,128 --buffer-bytes 0=1,1=1 \
         --load 0="$TMP/f8a.bin" --load 1="$TMP/f8b.bin" --dump 2="$TMP/f8d.bin" >>"$TMP/f8.log" 2>&1 \
    && python3 kernels/triton/fp8_ref.py matmul "$TMP/f8a.bin" "$TMP/f8b.bin" "$TMP/f8d.bin" >>"$TMP/f8.log" 2>&1; then
   echo "ok    triton:dotfp8  m16n8k32 e4m3 matches the e4m3 reference exactly"
@@ -566,7 +797,7 @@ fi
 # descriptor decode and the core-matrix walk the kernel itself uses.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/wa.bin" "$TMP/wb.bin" 2>"$TMP/wg.log" \
    && "$WEFT" run kernels/triton/wgmma.ptx --kernel wgmma_kernel --cpu-only \
-        --grid 128 --threads 128 --buffers 512,64,512 \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
         --load 0="$TMP/wa.bin" --load 1="$TMP/wb.bin" --dump 2="$TMP/wd.bin" >>"$TMP/wg.log" 2>&1 \
    && python3 kernels/triton/wgmma_ref.py check "$TMP/wa.bin" "$TMP/wb.bin" "$TMP/wd.bin" >>"$TMP/wg.log" 2>&1; then
   echo "ok    triton:wgmma  m64n8k16 f16 matches the reference exactly"
@@ -580,7 +811,7 @@ fi
 # in f16 and in bf16.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/wab.bin" "$TMP/wbb.bin" bf16 2>"$TMP/wgb.log" \
    && "$WEFT" run kernels/triton/wgmma_bf16.ptx --kernel wgmma_kernel --cpu-only \
-        --grid 128 --threads 128 --buffers 512,64,512 \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
         --load 0="$TMP/wab.bin" --load 1="$TMP/wbb.bin" --dump 2="$TMP/wdb.bin" >>"$TMP/wgb.log" 2>&1 \
    && python3 kernels/triton/wgmma_ref.py check "$TMP/wab.bin" "$TMP/wbb.bin" "$TMP/wdb.bin" bf16 >>"$TMP/wgb.log" 2>&1; then
   echo "ok    triton:wgmma_bf16  m64n8k16 bf16 matches the reference exactly"
@@ -588,12 +819,283 @@ else
   echo "FAIL  triton:wgmma_bf16"; sed 's/^/      /' "$TMP/wgb.log"; fail=1
 fi
 
+# tf32: the same instruction and descriptor, one element size up. A 16-byte
+# core-matrix row holds four 32-bit values instead of eight halves, so K is 8 and
+# B's core matrix is four columns wide — the two places the geometry could have
+# been written into the decode rather than derived from the element size.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wa32.bin" "$TMP/wb32.bin" tf32 2>"$TMP/wg32.log" \
+   && "$WEFT" run kernels/triton/wgmma_tf32.ptx --kernel wgmma_tf32_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 512,64,512 --buffer-bytes 0=4,1=4 \
+        --load 0="$TMP/wa32.bin" --load 1="$TMP/wb32.bin" --dump 2="$TMP/wd32.bin" >>"$TMP/wg32.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wa32.bin" "$TMP/wb32.bin" "$TMP/wd32.bin" tf32 >>"$TMP/wg32.log" 2>&1; then
+  echo "ok    triton:wgmma_tf32  m64n8k8 tf32 matches the reference exactly"
+else
+  echo "FAIL  triton:wgmma_tf32"; sed 's/^/      /' "$TMP/wg32.log"; fail=1
+fi
+
+# fp8: the widest geometry and the two formats. A one-byte element puts sixteen
+# to a core-matrix row, so K is 32 and B's whole 8 columns fit inside one core.
+# The two formats share that layout exactly and differ only in decode, so the e5m2
+# sample is the e4m3 one with the format swapped — the same instruction stream a
+# compiler emits for the other format, and a reference that can tell them apart.
+for f8 in e4m3 e5m2; do
+  if [ "$f8" = e5m2 ]; then
+    sed 's/\.e4m3\.e4m3/.e5m2.e5m2/g' kernels/triton/wgmma_fp8.ptx > "$TMP/wg_$f8.ptx"
+  else
+    cp kernels/triton/wgmma_fp8.ptx "$TMP/wg_$f8.ptx"
+  fi
+  if python3 kernels/triton/wgmma_ref.py gen "$TMP/a8.bin" "$TMP/b8.bin" "$f8" 2>"$TMP/w8.log" \
+     && "$WEFT" run "$TMP/wg_$f8.ptx" --kernel wgmma_fp8_kernel --cpu-only \
+          --grid 128 --threads 128 --buffers 2048,256,512 --buffer-bytes 0=1,1=1 \
+          --load 0="$TMP/a8.bin" --load 1="$TMP/b8.bin" --dump 2="$TMP/d8.bin" >>"$TMP/w8.log" 2>&1 \
+     && python3 kernels/triton/wgmma_ref.py check "$TMP/a8.bin" "$TMP/b8.bin" "$TMP/d8.bin" "$f8" >>"$TMP/w8.log" 2>&1; then
+    echo "ok    triton:wgmma_$f8  m64n8k32 $f8 matches the reference exactly"
+  else
+    echo "FAIL  triton:wgmma_$f8"; sed 's/^/      /' "$TMP/w8.log"; fail=1
+  fi
+done
+
+# The integer twins: the same bytes read as signed and as unsigned integers. The
+# layout is the fp8 one to the byte, so a disagreement here is a decode rather
+# than a walk — and the reference reads the same bytes as different numbers, which
+# is how a decode wired to the wrong signedness is caught.
+for i8 in s8 u8; do
+  if [ "$i8" = u8 ]; then
+    sed 's/\.s8\.s8/.u8.u8/g' kernels/triton/wgmma_s8.ptx > "$TMP/wgi_$i8.ptx"
+  else
+    cp kernels/triton/wgmma_s8.ptx "$TMP/wgi_$i8.ptx"
+  fi
+  if python3 kernels/triton/wgmma_ref.py gen "$TMP/ai8.bin" "$TMP/bi8.bin" "$i8" 2>"$TMP/wgi.log" \
+     && "$WEFT" run "$TMP/wgi_$i8.ptx" --kernel wgmma_s8_kernel --cpu-only \
+          --grid 128 --threads 128 --buffers 2048,256,512 --buffer-bytes 0=1,1=1 \
+          --load 0="$TMP/ai8.bin" --load 1="$TMP/bi8.bin" --dump 2="$TMP/di8.bin" >>"$TMP/wgi.log" 2>&1 \
+     && python3 kernels/triton/wgmma_ref.py check "$TMP/ai8.bin" "$TMP/bi8.bin" "$TMP/di8.bin" "$i8" >>"$TMP/wgi.log" 2>&1; then
+    echo "ok    triton:wgmma_$i8  m64n8k32 $i8 matches the reference exactly"
+  else
+    echo "FAIL  triton:wgmma_$i8"; sed 's/^/      /' "$TMP/wgi.log"; fail=1
+  fi
+done
+
+# Sixteen columns, which is the tile that can tell the two descriptor offsets apart:
+# with N = 8 the column index never leaves the first group of eight, so B's SBO term
+# is multiplied by zero and a translator that put the K stride in the wrong field
+# would still agree. It also needs two groups of accumulator registers a lane, which
+# nothing else exercises.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wn16a.bin" "$TMP/wn16b.bin" f16n16 2>"$TMP/wn16.log" \
+   && "$WEFT" run kernels/triton/wgmma_n16.ptx --kernel wgmma_n16_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,256,1024 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/wn16a.bin" --load 1="$TMP/wn16b.bin" --dump 2="$TMP/wn16d.bin" >>"$TMP/wn16.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wn16a.bin" "$TMP/wn16b.bin" "$TMP/wn16d.bin" f16n16 >>"$TMP/wn16.log" 2>&1; then
+  echo "ok    triton:wgmma_n16  m64n16k16 f16 matches the reference exactly"
+else
+  echo "FAIL  triton:wgmma_n16"; sed 's/^/      /' "$TMP/wn16.log"; fail=1
+fi
+
+# MN-major operands: the same logical tiles staged the other way up, so the same
+# reference applies — and a walk that read the wrong direction inside the 16-byte
+# chunk would multiply the wrong pairs rather than fail to compile.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wta.bin" "$TMP/wtb.bin" f16 2>"$TMP/wt.log" \
+   && "$WEFT" run kernels/triton/wgmma_trans.ptx --kernel wgmma_trans_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/wta.bin" --load 1="$TMP/wtb.bin" --dump 2="$TMP/wtd.bin" >>"$TMP/wt.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wta.bin" "$TMP/wtb.bin" "$TMP/wtd.bin" f16 >>"$TMP/wt.log" 2>&1; then
+  echo "ok    triton:wgmma_trans  m64n8k16 with MN-major operands matches the reference"
+else
+  echo "FAIL  triton:wgmma_trans"; sed 's/^/      /' "$TMP/wt.log"; fail=1
+fi
+
+# scale-d: two issues into the same accumulator must give exactly twice the product.
+# Every other fixture writes once, so a translator that overwrote instead of adding
+# would agree with all of them.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/waa.bin" "$TMP/wab2.bin" f16acc 2>"$TMP/waa.log" \
+   && "$WEFT" run kernels/triton/wgmma_acc.ptx --kernel wgmma_acc_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/waa.bin" --load 1="$TMP/wab2.bin" --dump 2="$TMP/wad.bin" >>"$TMP/waa.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/waa.bin" "$TMP/wab2.bin" "$TMP/wad.bin" f16acc >>"$TMP/waa.log" 2>&1; then
+  echo "ok    triton:wgmma_acc  two issues with scale-d double the product, exactly"
+else
+  echo "FAIL  triton:wgmma_acc"; sed 's/^/      /' "$TMP/waa.log"; fail=1
+fi
+
+# The swizzled layout: the descriptor carries mode 1 in bits 62-63 and the tile
+# rows are 128 bytes, so the 32 bytes of K an instruction reads are scattered
+# across each row by the chunk/row XOR. A walk that ignored the mode, or applied
+# the wrong width, reads the wrong halves and the product is wrong.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wza.bin" "$TMP/wzb.bin" f16 2>"$TMP/wz.log" \
+   && "$WEFT" run kernels/triton/wgmma_swz128.ptx --kernel wgmma_swz128_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/wza.bin" --load 1="$TMP/wzb.bin" --dump 2="$TMP/wzd.bin" >>"$TMP/wz.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wza.bin" "$TMP/wzb.bin" "$TMP/wzd.bin" f16 >>"$TMP/wz.log" 2>&1; then
+  echo "ok    triton:wgmma_swz128  a 128-byte-swizzled tile matches the reference"
+else
+  echo "FAIL  triton:wgmma_swz128"; sed 's/^/      /' "$TMP/wz.log"; fail=1
+fi
+
+# The narrow swizzle is the same instruction with a different mode in the
+# descriptor, and it separates the two masks: the XOR mask is one bit here and
+# seven for the wide atom, while the mask that holds a byte inside an atom is 31
+# either way — swapping them reads the wrong halves and only this fixture says so.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/w3a.bin" "$TMP/w3b.bin" f16 2>"$TMP/w3.log" \
+   && "$WEFT" run kernels/triton/wgmma_swz32.ptx --kernel wgmma_swz32_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/w3a.bin" --load 1="$TMP/w3b.bin" --dump 2="$TMP/w3d.bin" >>"$TMP/w3.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/w3a.bin" "$TMP/w3b.bin" "$TMP/w3d.bin" f16 >>"$TMP/w3.log" 2>&1; then
+  echo "ok    triton:wgmma_swz32  a 32-byte-swizzled tile matches the reference"
+else
+  echo "FAIL  triton:wgmma_swz32"; sed 's/^/      /' "$TMP/w3.log"; fail=1
+fi
+
+# The middle swizzle width: a 64-byte atom, whose row is twice what an
+# instruction reads, so the pattern moves the second chunk into the other half.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/w4a.bin" "$TMP/w4b.bin" f16 2>"$TMP/w4.log" \
+   && "$WEFT" run kernels/triton/wgmma_swz64.ptx --kernel wgmma_swz64_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/w4a.bin" --load 1="$TMP/w4b.bin" --dump 2="$TMP/w4d.bin" >>"$TMP/w4.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/w4a.bin" "$TMP/w4b.bin" "$TMP/w4d.bin" f16 >>"$TMP/w4.log" 2>&1; then
+  echo "ok    triton:wgmma_swz64  a 64-byte-swizzled tile matches the reference"
+else
+  echo "FAIL  triton:wgmma_swz64"; sed 's/^/      /' "$TMP/w4.log"; fail=1
+fi
+
+# A swizzled tile that begins one row into the pattern. The descriptor's
+# base-offset field (bits 49-51) is what says so; ignoring it puts every element
+# one row out in the pattern, which is a wrong product rather than a crash.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/w5a.bin" "$TMP/w5b.bin" f16 2>"$TMP/w5.log" \
+   && "$WEFT" run kernels/triton/wgmma_swzbase.ptx --kernel wgmma_swzbase_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/w5a.bin" --load 1="$TMP/w5b.bin" --dump 2="$TMP/w5d.bin" >>"$TMP/w5.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/w5a.bin" "$TMP/w5b.bin" "$TMP/w5d.bin" f16 >>"$TMP/w5.log" 2>&1; then
+  echo "ok    triton:wgmma_swzbase  a tile three rows into the pattern matches the reference"
+else
+  echo "FAIL  triton:wgmma_swzbase"; sed 's/^/      /' "$TMP/w5.log"; fail=1
+fi
+
+# The swizzle on an MN-major operand: M is the contiguous direction, so the walk
+# mirrors the K-major one — the byte's place inside an atom is its M offset and the
+# K row is one atom wide. B stays K-major and both tiles are mode 1.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/w6a.bin" "$TMP/w6b.bin" f16 2>"$TMP/w6.log" \
+   && "$WEFT" run kernels/triton/wgmma_swztrans.ptx --kernel wgmma_swztrans_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/w6a.bin" --load 1="$TMP/w6b.bin" --dump 2="$TMP/w6d.bin" >>"$TMP/w6.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/w6a.bin" "$TMP/w6b.bin" "$TMP/w6d.bin" f16 >>"$TMP/w6.log" 2>&1; then
+  echo "ok    triton:wgmma_swztrans  a swizzled MN-major A matches the reference"
+else
+  echo "FAIL  triton:wgmma_swztrans"; sed 's/^/      /' "$TMP/w6.log"; fail=1
+fi
+
+# The swizzle does not care how wide an element is: it places bytes, and the width
+# only decides how many of them a chunk of K holds. tf32 is the wide end — K is 8 and
+# a row of the tile is a quarter of the atom — and an atom measured in elements
+# rather than bytes lands every row on the wrong half.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/w7a.bin" "$TMP/w7b.bin" tf32 2>"$TMP/w7.log" \
+   && "$WEFT" run kernels/triton/wgmma_swztf32.ptx --kernel wgmma_swztf32_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 512,64,512 --buffer-bytes 0=4,1=4 \
+        --load 0="$TMP/w7a.bin" --load 1="$TMP/w7b.bin" --dump 2="$TMP/w7d.bin" >>"$TMP/w7.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/w7a.bin" "$TMP/w7b.bin" "$TMP/w7d.bin" tf32 >>"$TMP/w7.log" 2>&1; then
+  echo "ok    triton:wgmma_swztf32  a swizzled tf32 tile matches the reference"
+else
+  echo "FAIL  triton:wgmma_swztf32"; sed 's/^/      /' "$TMP/w7.log"; fail=1
+fi
+
+# The narrow end: one byte an element, so K is 32 and the byte column runs across
+# the atom's chunks — the phase and the column overlap, which no wider element does.
+# e5m2 is the same geometry, so the same fixture with the format swapped.
+for f8 in e4m3 e5m2; do
+  if [ "$f8" = e5m2 ]; then
+    sed 's/\.e4m3\.e4m3/.e5m2.e5m2/g' kernels/triton/wgmma_swzf8.ptx > "$TMP/wsw_$f8.ptx"
+  else
+    cp kernels/triton/wgmma_swzf8.ptx "$TMP/wsw_$f8.ptx"
+  fi
+  if python3 kernels/triton/wgmma_ref.py gen "$TMP/w9a.bin" "$TMP/w9b.bin" "$f8" 2>"$TMP/w9.log" \
+     && "$WEFT" run "$TMP/wsw_$f8.ptx" --kernel wgmma_swzf8_kernel --cpu-only \
+          --grid 128 --threads 128 --buffers 2048,256,512 --buffer-bytes 0=1,1=1 \
+          --load 0="$TMP/w9a.bin" --load 1="$TMP/w9b.bin" --dump 2="$TMP/w9d.bin" >>"$TMP/w9.log" 2>&1 \
+     && python3 kernels/triton/wgmma_ref.py check "$TMP/w9a.bin" "$TMP/w9b.bin" "$TMP/w9d.bin" "$f8" >>"$TMP/w9.log" 2>&1; then
+    echo "ok    triton:wgmma_swz$f8  a swizzled $f8 tile matches the reference"
+  else
+    echo "FAIL  triton:wgmma_swz$f8"; sed 's/^/      /' "$TMP/w9.log"; fail=1
+  fi
+done
+
+# The other transpose: B is MN-major and A stays K-major, both swizzled. A walk
+# that gave the two operands each other's contiguous direction reads the wrong
+# operand here, and the transposed-A fixture alone cannot say which of the two is
+# right.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wba.bin" "$TMP/wbb.bin" f16 2>"$TMP/wb.log" \
+   && "$WEFT" run kernels/triton/wgmma_swztransb.ptx --kernel wgmma_swztransb_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/wba.bin" --load 1="$TMP/wbb.bin" --dump 2="$TMP/wbd.bin" >>"$TMP/wb.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wba.bin" "$TMP/wbb.bin" "$TMP/wbd.bin" f16 >>"$TMP/wb.log" 2>&1; then
+  echo "ok    triton:wgmma_swztransb  a swizzled MN-major B matches the reference"
+else
+  echo "FAIL  triton:wgmma_swztransb"; sed 's/^/      /' "$TMP/wb.log"; fail=1
+fi
+
+# Three issues into one accumulator: what a K loop looks like. Two issues already
+# pin scale-d, but an accumulator read once and then dropped still passes those;
+# three is where it has to carry every time, so the answer is three products.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wca.bin" "$TMP/wcb.bin" f16chain 2>"$TMP/wc.log" \
+   && "$WEFT" run kernels/triton/wgmma_chain.ptx --kernel wgmma_chain_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/wca.bin" --load 1="$TMP/wcb.bin" --dump 2="$TMP/wcd.bin" >>"$TMP/wc.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wca.bin" "$TMP/wcb.bin" "$TMP/wcd.bin" f16chain >>"$TMP/wc.log" 2>&1; then
+  echo "ok    triton:wgmma_chain  three issues tripled the product, exactly"
+else
+  echo "FAIL  triton:wgmma_chain"; sed 's/^/      /' "$TMP/wc.log"; fail=1
+fi
+
+# The integer accumulator: the same bytes as the s8 fixture, summed in s32, so the
+# answer is an integer and the reference reads it as one. The signedness pair comes
+# for free, the file with `.u8.u8` swapped in.
+for i8 in s8 u8; do
+  if [ "$i8" = u8 ]; then
+    sed 's/\.s8\.s8/.u8.u8/g' kernels/triton/wgmma_s32acc.ptx > "$TMP/w32acc_$i8.ptx"
+  else
+    cp kernels/triton/wgmma_s32acc.ptx "$TMP/w32acc_$i8.ptx"
+  fi
+  if python3 kernels/triton/wgmma_ref.py gen "$TMP/w3a.bin" "$TMP/w3b.bin" "${i8}acc" 2>"$TMP/w3acc.log" \
+     && "$WEFT" run "$TMP/w32acc_$i8.ptx" --kernel wgmma_s32acc_kernel --cpu-only \
+          --grid 128 --threads 128 --buffers 2048,256,512 --buffer-bytes 0=1,1=1 \
+          --load 0="$TMP/w3a.bin" --load 1="$TMP/w3b.bin" --dump 2="$TMP/w3d.bin" >>"$TMP/w3acc.log" 2>&1 \
+     && python3 kernels/triton/wgmma_ref.py check "$TMP/w3a.bin" "$TMP/w3b.bin" "$TMP/w3d.bin" "${i8}acc" >>"$TMP/w3acc.log" 2>&1; then
+    echo "ok    triton:wgmma_${i8}acc  a ${i8} tile summed in s32 matches the reference"
+  else
+    echo "FAIL  triton:wgmma_${i8}acc"; sed 's/^/      /' "$TMP/w3acc.log"; fail=1
+  fi
+done
+
+# A short immediate list. `1, 1` is scale-d then scale-a: accumulate, and negate A.
+# The form was refused as unreadable and is legal PTX; a translator that read it but
+# took every flag as zero returns the product instead of its negative.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wia.bin" "$TMP/wib.bin" f16neg 2>"$TMP/wi.log" \
+   && "$WEFT" run kernels/triton/wgmma_shortimm.ptx --kernel wgmma_shortimm_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/wia.bin" --load 1="$TMP/wib.bin" --dump 2="$TMP/wid.bin" >>"$TMP/wi.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wia.bin" "$TMP/wib.bin" "$TMP/wid.bin" f16neg >>"$TMP/wi.log" 2>&1; then
+  echo "ok    triton:wgmma_shortimm  two immediates negate A, exactly"
+else
+  echo "FAIL  triton:wgmma_shortimm"; sed 's/^/      /' "$TMP/wi.log"; fail=1
+fi
+
+# wgmma on the 32-lane backend. The kernel carries a warp fold, so it cannot run on
+# the per-lane machine at all; one thread there owns a warp of the warpgroup and a
+# lane is `ctx.lid0 + l`. The D tile has to come out the same either way.
+if python3 kernels/triton/wgmma_ref.py gen "$TMP/wwa.bin" "$TMP/wwb.bin" f16 2>"$TMP/ww.log" \
+   && "$WEFT" run kernels/triton/wgmma_warp.ptx --kernel wgmma_warp_kernel --cpu-only \
+        --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
+        --load 0="$TMP/wwa.bin" --load 1="$TMP/wwb.bin" --dump 2="$TMP/wwd.bin" >>"$TMP/ww.log" 2>&1 \
+   && python3 kernels/triton/wgmma_ref.py check "$TMP/wwa.bin" "$TMP/wwb.bin" "$TMP/wwd.bin" f16 >>"$TMP/ww.log" 2>&1; then
+  echo "ok    triton:wgmma_warp  a wgmma on the warp backend matches the reference"
+else
+  echo "FAIL  triton:wgmma_warp"; sed 's/^/      /' "$TMP/ww.log"; fail=1
+fi
+
 # e5m2 is the other fp8 format and the same instruction: 5 exponent bits, 2
 # mantissa bits, infinities and NaN at the top exponent. Same layout, different
 # decode — so this catches a decoder wired to the wrong format.
 if python3 kernels/triton/fp8_ref.py gen 512 256 "$TMP/e5a.bin" "$TMP/e5b.bin" e5m2 2>"$TMP/e5.log" \
    && "$WEFT" run kernels/triton/dote5m2.ptx --kernel dote5m2_kernel --cpu-only \
-        --grid 1 --threads 32 --buffers 128,64,128 \
+        --grid 1 --threads 32 --buffers 512,256,128 --buffer-bytes 0=1,1=1 \
         --load 0="$TMP/e5a.bin" --load 1="$TMP/e5b.bin" --dump 2="$TMP/e5d.bin" >>"$TMP/e5.log" 2>&1 \
    && python3 kernels/triton/fp8_ref.py matmul "$TMP/e5a.bin" "$TMP/e5b.bin" "$TMP/e5d.bin" e5m2 >>"$TMP/e5.log" 2>&1; then
   echo "ok    triton:dote5m2  m16n8k32 e5m2 matches the e5m2 reference exactly"
@@ -796,6 +1298,11 @@ spvcross globk        global      1 --grid 1048576 --buffers 1048576,1048576
 # A storage image, written and read back across lanes: `OpImageWrite` in SPIR-V,
 # `texture2d<..., access::read_write>` in Metal.
 spvcross texrw        texturerg   1 --grid 4096 --threads 256 --buffers 4096,4096 --textures 64x64
+# The array form of both: the SPIR-V module's layered read and sample against
+# the Metal kernel's, on the same four slices.
+spvcross texarray     arraytex    0 --grid 65536 --buffers 65536 --textures '64x64*4' --samplers nearest/clamp
+# The volume, both front ends, on the same eight planes.
+spvcross tex3d        threed      0 --grid 65536 --buffers 65536 --textures 64x64x8 --samplers nearest/clamp
 
 # SPIR-V atomics, checked against arithmetic: each counter rises by exactly the
 # grid, from a zero-thread baseline.
@@ -1209,22 +1716,26 @@ else
   echo "$typed" | sed 's/^/      /'; fail=1
 fi
 
-# SPIR-V states its own layout (ArrayStride, Offset), so weft-gen can report each
-# binding's element width from the module — the pointer's pointee, or one element
-# of the array it names. PTX binds addresses, so it reports none, and a stated
-# width is how that gap gets filled instead of a silent 4 bytes.
+# SPIR-V states its own layout (ArrayStride, Offset), so weft-gen reads each
+# binding's element width off the pointer's pointee. PTX binds an address, so the
+# width comes from the instructions that reach the buffer instead: `ld.global.f32`
+# is four bytes, and a kernel whose only access is a byte-block copy (`cp.async`,
+# whose width is the copy's, not the element's) still reports none rather than a
+# guess. A stated width wins over either.
 spv_types=$(./build/weft-gen kernels/spirv/global.spv --describe)
 if echo "$spv_types" | grep -q "types=4,4"; then
   echo "ok    spirv:types  element widths come from the module's own pointer types"
 else
   echo "FAIL  spirv:types  SPIR-V widths were not reported"; echo "$spv_types" | sed 's/^/      /'; fail=1
 fi
-ptx_none=$(./build/weft-gen kernels/reverse.ptx --describe)
+ptx_types=$(./build/weft-gen kernels/reverse.ptx --describe)
 ptx_stated=$(./build/weft-gen kernels/reverse.ptx --describe --buffer-bytes 0=4,1=16)
-if echo "$ptx_none" | grep -q "types=0,0" && echo "$ptx_stated" | grep -q "types=4,16"; then
-  echo "ok    ptx:types    an address-only front end reports no width; --buffer-bytes states one"
+ptx_none=$(./build/weft-gen kernels/async_copy.ptx --describe)
+if echo "$ptx_types" | grep -q "types=4,4" && echo "$ptx_stated" | grep -q "types=4,16" &&
+   echo "$ptx_none" | grep -q "types=0,4"; then
+  echo "ok    ptx:types    widths come from the instructions that reach each buffer"
 else
-  echo "FAIL  ptx:types    the PTX width fallback drifted"; fail=1
+  echo "FAIL  ptx:types    the PTX width inference drifted"; fail=1
 fi
 
 # weft-gen is what a build system calls, so its manifest has to name the arguments.
@@ -1239,7 +1750,7 @@ fi
 # ... including the launch size a module states, which is the one thing a caller
 # of a Triton kernel cannot infer from the arguments (threads=32 is `.maxntid`).
 tdesc=$(./build/weft-gen kernels/triton/matmul.ptx --describe)
-if echo "$tdesc" | grep -q '^kernel 0 matmul_kernel kernel buffers=3 textures=0 sync=1 threads=32 types=0,0,0$'; then
+if echo "$tdesc" | grep -q '^kernel 0 matmul_kernel kernel buffers=3 textures=0 sync=1 threads=32 types=4,4,4$'; then
   echo "ok    triton:gen  --describe carries the launch size the module declares"
 else
   echo "FAIL  triton:gen"; echo "$tdesc" | sed 's/^/      /'; fail=1

@@ -69,10 +69,11 @@
 
 	shr.u32 	%r19, %r14, 3;
 	shl.b32 	%r19, %r19, 7;
-	and.b32 	%r20, %r14, 7;
-	shl.b32 	%r20, %r20, 4;
+	shl.b32 	%r20, %r15, 4;			// n * 16 bytes: the eight columns are chunks
 	add.s32 	%r19, %r19, %r20;
-	add.s32 	%r19, %r19, %r17;
+	and.b32 	%r21, %r14, 7;
+	shl.b32 	%r21, %r21, 1;			// (k % 8) * 2 bytes, K inside the chunk
+	add.s32 	%r19, %r19, %r21;
 	add.s32 	%r19, %r19, 2048;
 	cvt.u64.u32 	%rd8, %r19;
 	add.s64 	%rd8, %rd5, %rd8;
@@ -85,10 +86,10 @@
 	mov.u64 	%rd10, 68720001024;
 	mov.u64 	%rd12, 68720001152;
 
-	mov.f32 	%f1, 0f00000000;
-	mov.f32 	%f2, 0f00000000;
-	mov.f32 	%f3, 0f00000000;
-	mov.f32 	%f4, 0f00000000;
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
 	wgmma.fence.sync.aligned;
 	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
 	wgmma.commit_group.sync.aligned;

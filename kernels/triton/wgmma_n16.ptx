@@ -1,0 +1,140 @@
+//
+// wgmma at N = 16: `wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16`.
+//
+// Every other wgmma fixture is m64n8, and that hides two things. With N = 8 the
+// column index is always inside the first group of eight, so B's SBO term is
+// multiplied by zero and no fixture can tell whether the translator put the K
+// stride in SBO or LBO. And with one group of eight columns a lane holds exactly
+// four accumulator registers, so the path that walks the rest of the tile was never
+// run at all.
+//
+// Here N is 16: B is 16x16, so there are two N groups and the second one is a real
+// address, and D is 64x16, so a lane holds eight accumulators — D[16w+g][2t..2t+1]
+// and the row 8 below for each of the two groups. The inputs and the product are
+// the same small integers as `wgmma.ptx`, so the same reference still applies.
+//
+// A is 64x16 (2048 bytes): LBO = 128 between the two K groups, SBO = 256 between
+// the eight M groups. B is 16x16: LBO = 128 between K groups, SBO = 256 between N
+// groups — 512 bytes, since two K groups by two N groups of 128.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry wgmma_n16_kernel(
+	.param .u64 wgmma_n16_kernel_param_0,
+	.param .u64 wgmma_n16_kernel_param_1,
+	.param .u64 wgmma_n16_kernel_param_2
+)
+{
+	.reg .b32 	%r<48>;
+	.reg .f32 	%f<16>;
+	.reg .b64 	%rd<24>;
+
+	.shared .align 128 .b8 weft_ab[2560];
+
+	ld.param.u64 	%rd1, [wgmma_n16_kernel_param_0];
+	ld.param.u64 	%rd2, [wgmma_n16_kernel_param_1];
+	ld.param.u64 	%rd3, [wgmma_n16_kernel_param_2];
+	mov.u64 	%rd5, weft_ab;
+
+	mov.u32 	%r1, %tid.x;
+
+	// A: lane -> one row and one K core matrix, 16 bytes each. Unchanged from the
+	// n8 tile: A does not depend on N.
+	and.b32 	%r2, %r1, 63;
+	shr.u32 	%r3, %r1, 6;
+	shl.b32 	%r4, %r2, 5;
+	shl.b32 	%r5, %r3, 4;
+	add.s32 	%r4, %r4, %r5;
+	cvt.u64.u32 	%rd4, %r4;
+	add.s64 	%rd4, %rd1, %rd4;
+	ld.global.v4.b32 	{%r10, %r11, %r12, %r13}, [%rd4];
+
+	shr.u32 	%r6, %r2, 3;
+	shl.b32 	%r6, %r6, 8;			// (row / 8) * SBO(256)
+	shl.b32 	%r7, %r3, 7;			// core row * LBO(128)
+	and.b32 	%r8, %r2, 7;
+	shl.b32 	%r8, %r8, 4;
+	add.s32 	%r9, %r6, %r7;
+	add.s32 	%r9, %r9, %r8;
+	cvt.u64.u32 	%rd6, %r9;
+	add.s64 	%rd6, %rd5, %rd6;
+	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
+
+	// B: lane -> two adjacent K values of one column. K is the contiguous
+	// direction, so the two are two bytes apart once staged; in the row-major input
+	// they are sixteen columns apart.
+	and.b32 	%r14, %r1, 15;			// n (0..15)
+	shr.u32 	%r15, %r1, 4;
+	shl.b32 	%r15, %r15, 1;			// k = 2 * (lane / 16)
+	shl.b32 	%r16, %r15, 4;			// k * 16 columns
+	add.s32 	%r16, %r16, %r14;
+	shl.b32 	%r16, %r16, 1;			// * 2 bytes
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd2, %rd7;
+	ld.global.u16 	%r18, [%rd7];
+	ld.global.u16 	%r19, [%rd7+32];
+
+	shr.u32 	%r20, %r15, 3;
+	shl.b32 	%r20, %r20, 7;			// (k / 8) * LBO(128)
+	shr.u32 	%r21, %r14, 3;
+	shl.b32 	%r21, %r21, 8;			// (n / 8) * SBO(256)
+	add.s32 	%r20, %r20, %r21;
+	and.b32 	%r22, %r15, 7;
+	shl.b32 	%r22, %r22, 1;			// (k % 8) * 2 bytes
+	and.b32 	%r23, %r14, 7;
+	shl.b32 	%r23, %r23, 4;			// (n % 8) * 16 bytes
+	add.s32 	%r20, %r20, %r22;
+	add.s32 	%r20, %r20, %r23;
+	add.s32 	%r20, %r20, 2048;
+	cvt.u64.u32 	%rd8, %r20;
+	add.s64 	%rd8, %rd5, %rd8;
+	st.shared.u16 	[%rd8], %r18;
+	st.shared.u16 	[%rd8+2], %r19;
+
+	bar.sync 	0;
+
+	// A: start 0, LBO = 128 bytes (8 units), SBO = 256 (16 units). B: start 2048
+	// (128 units), the same 128-byte LBO, and SBO = 256 between the two N groups.
+	mov.u64 	%rd10, 68720001024;
+	mov.u64 	%rd12, 68720001152;
+
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	mov.f32 	%f9, 0f00000000;
+	mov.f32 	%f10, 0f00000000;
+	mov.f32 	%f11, 0f00000000;
+	mov.f32 	%f12, 0f00000000;
+	wgmma.fence.sync.aligned;
+	wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {%f5, %f6, %f7, %f8, %f9, %f10, %f11, %f12}, %rd10, %rd12, 1;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+
+	// The accumulator: per N group of eight columns, D[16w+g][2t], [2t+1] and the
+	// row 8 below. The second group is a whole 32 bytes along, and the row 8 below
+	// is 512 — eight rows of sixteen columns.
+	shr.u32 	%r30, %r1, 5;
+	shr.u32 	%r31, %r1, 2;
+	and.b32 	%r31, %r31, 7;
+	and.b32 	%r32, %r1, 3;
+	shl.b32 	%r33, %r30, 4;
+	add.s32 	%r33, %r33, %r31;
+	shl.b32 	%r34, %r33, 6;			// (16w + g) * 64 bytes
+	shl.b32 	%r35, %r32, 3;			// 2t * 4
+	add.s32 	%r34, %r34, %r35;
+	cvt.u64.u32 	%rd13, %r34;
+	add.s64 	%rd13, %rd3, %rd13;
+	st.global.b32 	[%rd13], %f5;
+	st.global.b32 	[%rd13+4], %f6;
+	st.global.b32 	[%rd13+512], %f7;
+	st.global.b32 	[%rd13+516], %f8;
+	st.global.b32 	[%rd13+32], %f9;
+	st.global.b32 	[%rd13+36], %f10;
+	st.global.b32 	[%rd13+544], %f11;
+	st.global.b32 	[%rd13+548], %f12;
+	ret;
+}

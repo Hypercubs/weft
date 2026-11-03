@@ -1,0 +1,67 @@
+; Float atomics over one threadgroup of 1,024 lanes. The three forms that exist
+; for a 32-bit float — min, max and exchange — in one kernel:
+;
+;     min(c[0], v), max(c[1], v)        a device-scope fold over every lane
+;     old = exchange(out[gid], v)       per-lane, so the old value is the seed
+;     barrier
+;     out[gid] = old + min + max
+;
+; The fold is order-free, so both columns must end on the same two floats
+; whatever order their lanes ran in; the exchange returns the value the launcher
+; seeded, which is the same buffer on both sides. A min or a max that silently
+; answered with the operand (what a `cas` loop with the wrong comparison does)
+; lands on a different number instead of the same one.
+;
+; `AtomicFloat32MinMaxEXT` is the capability the validator wants for the pair,
+; and `AtomicFloat32AddEXT` for the add that was already translated.
+;
+; One threadgroup on purpose. A control barrier is a rendezvous among the lanes of
+; a group — `OpControlBarrier` at Device scope included — so a lane in a group of
+; 512 can read the fold while 511 other groups are still folding it, and the two
+; columns then disagree by however far the fold had got. That is not the atomics
+; being wrong; it is a fixture asking for a rendezvous the launch does not have.
+; With a single group the barrier is total and the fold is the same number on both
+; sides.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability AtomicFloat32MinMaxEXT
+               OpExtension "SPV_EXT_shader_atomic_float_min_max"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "atomf" %gid
+               OpName %main "atomf"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+      %v3u64 = OpTypeVector %u64 3
+  %ptr_cw_f = OpTypePointer CrossWorkgroup %f32
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr_cw_f %ptr_cw_f %ptr_cw_f
+       %gid = OpVariable %pin Input
+       %dev = OpConstant %u32 1
+        %ac = OpConstant %u32 2
+       %one = OpConstant %u64 1
+       %main = OpFunction %void None %fnty
+          %i = OpFunctionParameter %ptr_cw_f
+          %o = OpFunctionParameter %ptr_cw_f
+          %c = OpFunctionParameter %ptr_cw_f
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pi = OpPtrAccessChain %ptr_cw_f %i %gi
+          %v = OpLoad %f32 %pi
+        %omn = OpAtomicFMinEXT %f32 %c %dev %ac %v
+       %co = OpPtrAccessChain %ptr_cw_f %c %one
+        %omx = OpAtomicFMaxEXT %f32 %co %dev %ac %v
+         %po = OpPtrAccessChain %ptr_cw_f %o %gi
+        %old = OpAtomicExchange %f32 %po %dev %ac %v
+               OpControlBarrier %dev %dev %ac
+        %mn = OpLoad %f32 %c
+        %mx = OpLoad %f32 %co
+        %s1 = OpFAdd %f32 %old %mn
+        %s2 = OpFAdd %f32 %s1 %mx
+               OpStore %po %s2
+               OpReturn
+               OpFunctionEnd

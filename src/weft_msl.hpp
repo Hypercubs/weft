@@ -309,6 +309,180 @@ static inline bool le(uint64_t a, uint64_t b) { return lt(a, b) || eq(a, b); }
 static inline bool gt(uint64_t a, uint64_t b) { return lt(b, a); }
 static inline bool ge(uint64_t a, uint64_t b) { return le(b, a); }
 
+// ---- fused multiply-add ----
+//
+// `a * b + c`, rounded once. A product of two 53-bit significands needs 106 bits and
+// the addition can cancel almost all of that away, which is exactly why a multiply and
+// then an add is a different answer: no 56-bit working form can hold the intermediate.
+// The three values are placed at one scale in a 192-bit accumulator instead, and the
+// rounding happens once, at the end.
+struct decon {
+  uint64_t sig;   // value = sig * 2^exp, with bit 52 set for a non-zero value
+  int32_t exp;
+};
+struct wide {
+  uint64_t h, m, l;   // (h:m:l) * 2^exp, the exponent being the caller's business
+};
+
+static inline int32_t bitlen64(uint64_t v) { return v == 0ull ? 0 : 64 - (int32_t)clz64(v); }
+
+// A value as an integer significand with its leading bit at 52, so two of them fit a
+// product exactly. A subnormal is shifted up until its leading bit is there, which
+// loses nothing: it has fewer than 53 significant bits to begin with.
+static inline decon decompose(uint64_t b) {
+  decon d;
+  const uint32_t be = (uint32_t)((b >> 52) & 0x7FF);
+  d.sig = b & kFracMask;
+  if (be == 0u) {
+    d.exp = -1074;
+    if (d.sig != 0ull)
+      while ((d.sig & kHidden) == 0ull) { d.sig <<= 1; d.exp -= 1; }
+  } else {
+    d.sig |= kHidden;
+    d.exp = (int32_t)be - 1075;
+  }
+  return d;
+}
+
+static inline bool wide_zero(wide w) { return (w.h | w.m | w.l) == 0ull; }
+
+static inline int wide_cmp(wide a, wide b) {
+  if (a.h != b.h) return a.h > b.h ? 1 : -1;
+  if (a.m != b.m) return a.m > b.m ? 1 : -1;
+  if (a.l != b.l) return a.l > b.l ? 1 : -1;
+  return 0;
+}
+
+static inline wide wide_add(wide a, wide b) {
+  wide r;
+  const uint64_t l = a.l + b.l;
+  const uint64_t carry = (l < a.l) ? 1ull : 0ull;
+  const uint64_t m0 = a.m + b.m;
+  uint64_t c2 = (m0 < a.m) ? 1ull : 0ull;
+  const uint64_t m = m0 + carry;
+  if (m < m0) c2 += 1ull;
+  r.l = l;
+  r.m = m;
+  r.h = a.h + b.h + c2;
+  return r;
+}
+
+static inline wide wide_sub(wide a, wide b) {  // a >= b
+  wide r;
+  const uint64_t br_l = (a.l < b.l) ? 1ull : 0ull;
+  const uint64_t br_m = ((a.m < b.m) || (br_l != 0ull && a.m == b.m)) ? 1ull : 0ull;
+  r.l = a.l - b.l;
+  r.m = a.m - b.m - br_l;
+  r.h = a.h - b.h - br_m;
+  return r;
+}
+
+// Shift right, folding every dropped bit into bit 0. A sticky bit only has to say
+// that something was there, which is all a rounding decision needs from it.
+static inline wide wide_shr(wide v, int32_t k) {
+  if (k <= 0) return v;
+  if (k >= 192) return wide{0ull, 0ull, ((v.h | v.m | v.l) != 0ull) ? 1ull : 0ull};
+  const int32_t wd = k >> 6, b = k & 63;
+  const uint64_t limb[3] = {v.l, v.m, v.h};
+  uint64_t out[3] = {0ull, 0ull, 0ull};
+  uint64_t sticky = 0ull;
+  for (int32_t i = 0; i < wd; i++) sticky |= limb[i];
+  for (int32_t i = 0; i < 3; i++) {
+    const uint64_t cur = (i + wd < 3) ? limb[i + wd] : 0ull;
+    const uint64_t up = (i + wd + 1 < 3) ? limb[i + wd + 1] : 0ull;
+    out[i] = (b == 0) ? cur : ((cur >> b) | (up << (64 - b)));
+  }
+  if (b != 0 && wd < 3) sticky |= limb[wd] & ((1ull << b) - 1ull);
+  wide r;
+  r.l = out[0] | ((sticky != 0ull) ? 1ull : 0ull);
+  r.m = out[1];
+  r.h = out[2];
+  return r;
+}
+
+// Lay the 128-bit `hi:lo` at the accumulator's scale. A negative shift is a value
+// entirely below the window, where only its existence survives.
+static inline wide place(uint64_t hi, uint64_t lo, int32_t sh) {
+  if (sh < 0) {
+    wide v;
+    v.h = 0ull;
+    v.m = hi;
+    v.l = lo;
+    return wide_shr(v, -sh);
+  }
+  const int32_t wd = sh >> 6, b = sh & 63;
+  uint64_t p0 = lo, p1 = hi, p2 = 0ull;
+  if (b != 0) {
+    p2 = hi >> (64 - b);
+    p1 = (hi << b) | (lo >> (64 - b));
+    p0 = lo << b;
+  }
+  wide r;
+  if (wd == 0) { r.h = p2; r.m = p1; r.l = p0; }
+  else if (wd == 1) { r.h = p1; r.m = p0; r.l = 0ull; }
+  else if (wd == 2) { r.h = p0; r.m = 0ull; r.l = 0ull; }
+  else { r.h = 0ull; r.m = 0ull; r.l = 0ull; }
+  return r;
+}
+
+static inline int32_t msb192(wide w) {
+  if (w.h != 0ull) return 191 - (int32_t)clz64(w.h);
+  if (w.m != 0ull) return 127 - (int32_t)clz64(w.m);
+  return 63 - (int32_t)clz64(w.l);
+}
+
+static inline uint64_t fma(uint64_t a, uint64_t b, uint64_t c) {
+  if (is_nan(a) || is_nan(b) || is_nan(c)) return kQNaN;
+  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63), sc = (uint32_t)(c >> 63);
+  const uint32_t sp = sa ^ sb;
+  const bool za = is_zero(a), zb = is_zero(b), zc = is_zero(c);
+  if (is_inf(a) || is_inf(b)) {
+    if (za || zb) return kQNaN;                 // an infinity times a zero
+    if (is_inf(c) && sc != sp) return kQNaN;    // inf - inf
+    return (sp != 0u ? kSign : 0ull) | kInf;
+  }
+  if (is_inf(c)) return c;
+  if (za || zb)
+    return zc ? ((sc != 0u && sp != 0u) ? kSign : 0ull) : c;  // a zero product leaves c
+  if (zc) return mul(a, b);
+  const decon da = decompose(a), db = decompose(b), dc = decompose(c);
+  // The product, exactly: 53 by 53 bits, built from 32-bit halves.
+  const uint64_t p0 = (da.sig & 0xFFFFFFFFull) * (db.sig & 0xFFFFFFFFull);
+  const uint64_t p1 = (da.sig >> 32) * (db.sig & 0xFFFFFFFFull);
+  const uint64_t p2 = (da.sig & 0xFFFFFFFFull) * (db.sig >> 32);
+  const uint64_t p3 = (da.sig >> 32) * (db.sig >> 32);
+  const uint64_t mid = (p0 >> 32) + (p1 & 0xFFFFFFFFull) + (p2 & 0xFFFFFFFFull);
+  const uint64_t plo = (mid << 32) | (p0 & 0xFFFFFFFFull);
+  const uint64_t phi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+  const int32_t pexp = da.exp + db.exp;
+  // One scale for both: the larger operand's top bit lands at bit 190, which leaves
+  // 84 bits below it — more than the 106-bit product spans, so nothing is lost before
+  // the sum and the rounding happens once, at the end.
+  const int32_t tbP = pexp + (phi != 0ull ? 64 + bitlen64(phi) : bitlen64(plo)) - 1;
+  const int32_t tbC = dc.exp + bitlen64(dc.sig) - 1;
+  const int32_t et = tbP > tbC ? tbP : tbC;
+  const int32_t e0 = et - 190;
+  const wide P = place(phi, plo, pexp - e0);
+  const wide C = place(0ull, dc.sig, dc.exp - e0);
+  wide r;
+  uint32_t sign;
+  if (sp == sc) {
+    r = wide_add(P, C);
+    sign = sp;
+  } else {
+    const int cmp = wide_cmp(P, C);
+    if (cmp == 0) return 0ull;                 // exact cancellation is +0
+    if (cmp > 0) { r = wide_sub(P, C); sign = sp; }
+    else { r = wide_sub(C, P); sign = sc; }
+  }
+  if (wide_zero(r)) return 0ull;
+  const int32_t mpos = msb192(r);
+  // Into the form `round_pack` takes: the top bit at 55 with three bits of guard,
+  // round and sticky under it, and the exponent of that top bit.
+  const uint64_t sig = (mpos >= 55) ? wide_shr(r, mpos - 55).l : (r.l << (55 - mpos));
+  return round_pack(sign, e0 + mpos, sig);
+}
+
 // minNum and maxNum: a NaN operand means the other one, and two NaNs mean a NaN.
 // Of two zeros the negative one is the smaller, which is the order IEEE gives them.
 static inline uint64_t min_bits(uint64_t a, uint64_t b) {
@@ -458,6 +632,21 @@ static inline uint64_t ceil_bits(uint64_t b) {
   if (is_nan(b) || is_inf(b) || t == b) return t;
   return ((b >> 63) == 0ull) ? add(t, kOne) : t;
 }
+// To the nearest integer, ties to even — what a conversion to an integer with
+// `.rn` means, and what a cast to an integer does on the CPU. `round_bits` below is
+// GLSL's Round, which breaks a tie away from zero, so the two are not
+// interchangeable: 2.5 is 2 here and 3 there.
+static inline uint64_t rne_bits(uint64_t b) {
+  if (is_nan(b) || is_inf(b)) return b;
+  const uint64_t t = trunc_bits(b);
+  if (t == b) return t;
+  const uint64_t frac = sub(abs_bits(b), abs_bits(t));
+  bool up = gt(frac, kHalf);
+  if (!up && eq(frac, kHalf)) up = ((to_i64(t) & 1) != 0);
+  if (!up) return t;
+  return add(t, ((b >> 63) != 0ull) ? kNegOne : kOne);
+}
+
 // GLSL's Round: to the nearest integer, ties away from zero.
 static inline uint64_t round_bits(uint64_t b) {
   if (is_nan(b) || is_inf(b)) return b;
@@ -513,7 +702,12 @@ static inline uint32_t weft_e4m3x2(float hi, float lo) {
 static inline float weft_e4m3(uint32_t b, int i) {
   const uint32_t v = (b >> (8 * i)) & 0xFFu;
   const uint32_t mag = v & 7u, E = (v >> 3) & 0xFu;
-  const float d = (E == 0) ? (float)mag / 512.0f : ldexp((float)(8u + mag), (int)E - 10);
+  // The scale is an exponent field rather than a library call: E is 1..15 and the
+  // field for 2^(E-10) is E+117, so the multiply is exact. `ldexp` was the one
+  // place a decode leaned on the platform's own rounding, and it disagreed with
+  // the host's — this is the same arithmetic written out.
+  const float d = (E == 0) ? (float)mag / 512.0f
+                           : (float)(8u + mag) * as_type<float>((E + 117u) << 23);
   return (float)((v & 0x80u) ? -d : d);
 }
 static inline uint8_t weft_e5m2_bits(float x) {
@@ -542,8 +736,25 @@ static inline float weft_e5m2(uint32_t b, int i) {
   const uint32_t v = (b >> (8 * i)) & 0xFFu;
   const uint32_t mag = v & 3u, E = (v >> 2) & 0x1Fu;
   if (E == 31u) return (mag == 0u) ? ((v & 0x80u) ? -INFINITY : INFINITY) : NAN;
-  const float d = (E == 0) ? (float)mag / 65536.0f : ldexp((float)(4u + mag), (int)E - 17);
+  const float d = (E == 0) ? (float)mag / 65536.0f
+                           : (float)(4u + mag) * as_type<float>((E + 110u) << 23);
   return (float)((v & 0x80u) ? -d : d);
+}
+// The same bytes with an integer accumulator: exact in s32, where a float stops
+// being the same number past 2^24.
+static inline int32_t weft_s8_i(uint32_t b, int i) {
+  return (int32_t)((int8_t)(uint8_t)((b >> (8 * i)) & 0xFFu));
+}
+static inline int32_t weft_u8_i(uint32_t b, int i) {
+  return (int32_t)((b >> (8 * i)) & 0xFFu);
+}
+// The 8-bit integer operands: one byte, sign-extended or not. Both are exact in
+// f32, so an integer tile's products and the sum of 32 of them are exact.
+static inline float weft_s8(uint32_t b, int i) {
+  return (float)((int)(int8_t)((b >> (8 * i)) & 0xFFu));
+}
+static inline float weft_u8(uint32_t b, int i) {
+  return (float)((b >> (8 * i)) & 0xFFu);
 }
 static inline float weft_tf32(float x) {
   uint32_t u = as_type<uint32_t>(x);
@@ -617,6 +828,155 @@ struct weft_l4 { uint64_t x, y, z, w; };
 struct weft_ul2 { uint64_t x, y; };
 struct weft_ul3 { uint64_t x, y, z; };
 struct weft_ul4 { uint64_t x, y, z, w; };
+// A vector of doubles: the CPU's struct field for field and byte for byte, with
+// the software double's bits as components.
+struct weft_d2 { uint64_t x, y; };
+struct weft_d3 { uint64_t x, y, z; };
+struct weft_d4 { uint64_t x, y, z, w; };
+
+// Matrices, column-major: `m[column][row]`, the way SPIR-V, Metal and every GPU
+// lay them out, so a matrix times a vector is a linear combination of its
+// columns. The arithmetic is written once, here, and compiled by both targets;
+// every accumulation is an explicit fused multiply-add in a fixed order, so the
+// two engines run the same instruction sequence and agree to the bit rather than
+// to close enough.
+struct weft_f2x2 { float m[2][2]; };
+struct weft_f3x3 { float m[3][3]; };
+struct weft_f4x4 { float m[4][4]; };
+
+static inline weft_f2 weft_col(weft_f2x2 a, int c) {
+  return weft_f2{a.m[c][0], a.m[c][1]};
+}
+static inline weft_f3 weft_col(weft_f3x3 a, int c) {
+  return weft_f3{a.m[c][0], a.m[c][1], a.m[c][2]};
+}
+static inline weft_f4 weft_col(weft_f4x4 a, int c) {
+  return weft_f4{a.m[c][0], a.m[c][1], a.m[c][2], a.m[c][3]};
+}
+
+static inline weft_f2x2 weft_mk(weft_f2 p0, weft_f2 p1) {
+  weft_f2x2 r{};
+  r.m[0][0] = p0.x; r.m[0][1] = p0.y;
+  r.m[1][0] = p1.x; r.m[1][1] = p1.y;
+  return r;
+}
+static inline weft_f3x3 weft_mk(weft_f3 p0, weft_f3 p1, weft_f3 p2) {
+  weft_f3x3 r{};
+  r.m[0][0] = p0.x; r.m[0][1] = p0.y; r.m[0][2] = p0.z;
+  r.m[1][0] = p1.x; r.m[1][1] = p1.y; r.m[1][2] = p1.z;
+  r.m[2][0] = p2.x; r.m[2][1] = p2.y; r.m[2][2] = p2.z;
+  return r;
+}
+static inline weft_f4x4 weft_mk(weft_f4 p0, weft_f4 p1, weft_f4 p2,
+                                weft_f4 p3) {
+  weft_f4x4 r{};
+  r.m[0][0] = p0.x; r.m[0][1] = p0.y; r.m[0][2] = p0.z; r.m[0][3] = p0.w;
+  r.m[1][0] = p1.x; r.m[1][1] = p1.y; r.m[1][2] = p1.z; r.m[1][3] = p1.w;
+  r.m[2][0] = p2.x; r.m[2][1] = p2.y; r.m[2][2] = p2.z; r.m[2][3] = p2.w;
+  r.m[3][0] = p3.x; r.m[3][1] = p3.y; r.m[3][2] = p3.z; r.m[3][3] = p3.w;
+  return r;
+}
+
+static inline weft_f2 operator*(weft_f2x2 a, weft_f2 v) {
+  float t[2];
+  for (int r = 0; r < 2; r++) t[r] = metal::fma(a.m[1][r], v.y, a.m[0][r] * v.x);
+  return weft_f2{t[0], t[1]};
+}
+static inline weft_f3 operator*(weft_f3x3 a, weft_f3 v) {
+  float t[3];
+  for (int r = 0; r < 3; r++)
+    t[r] = metal::fma(a.m[2][r], v.z, metal::fma(a.m[1][r], v.y, a.m[0][r] * v.x));
+  return weft_f3{t[0], t[1], t[2]};
+}
+static inline weft_f4 operator*(weft_f4x4 a, weft_f4 v) {
+  float t[4];
+  for (int r = 0; r < 4; r++)
+    t[r] = metal::fma(a.m[3][r], v.w,
+           metal::fma(a.m[2][r], v.z, metal::fma(a.m[1][r], v.y, a.m[0][r] * v.x)));
+  return weft_f4{t[0], t[1], t[2], t[3]};
+}
+
+static inline weft_f2 operator*(weft_f2 v, weft_f2x2 a) {
+  float t[2];
+  for (int c = 0; c < 2; c++) t[c] = metal::fma(v.y, a.m[1][c], v.x * a.m[0][c]);
+  return weft_f2{t[0], t[1]};
+}
+static inline weft_f3 operator*(weft_f3 v, weft_f3x3 a) {
+  float t[3];
+  for (int c = 0; c < 3; c++)
+    t[c] = metal::fma(v.z, a.m[2][c], metal::fma(v.y, a.m[1][c], v.x * a.m[0][c]));
+  return weft_f3{t[0], t[1], t[2]};
+}
+static inline weft_f4 operator*(weft_f4 v, weft_f4x4 a) {
+  float t[4];
+  for (int c = 0; c < 4; c++)
+    t[c] = metal::fma(v.w, a.m[3][c],
+           metal::fma(v.z, a.m[2][c], metal::fma(v.y, a.m[1][c], v.x * a.m[0][c])));
+  return weft_f4{t[0], t[1], t[2], t[3]};
+}
+
+static inline weft_f2x2 operator*(weft_f2x2 a, weft_f2x2 b) {
+  weft_f2x2 r{};
+  for (int c = 0; c < 2; c++) {
+    const weft_f2 v = a * weft_col(b, c);
+    r.m[c][0] = v.x; r.m[c][1] = v.y;
+  }
+  return r;
+}
+static inline weft_f3x3 operator*(weft_f3x3 a, weft_f3x3 b) {
+  weft_f3x3 r{};
+  for (int c = 0; c < 3; c++) {
+    const weft_f3 v = a * weft_col(b, c);
+    r.m[c][0] = v.x; r.m[c][1] = v.y; r.m[c][2] = v.z;
+  }
+  return r;
+}
+static inline weft_f4x4 operator*(weft_f4x4 a, weft_f4x4 b) {
+  weft_f4x4 r{};
+  for (int c = 0; c < 4; c++) {
+    const weft_f4 v = a * weft_col(b, c);
+    r.m[c][0] = v.x; r.m[c][1] = v.y; r.m[c][2] = v.z; r.m[c][3] = v.w;
+  }
+  return r;
+}
+
+static inline weft_f2x2 operator*(weft_f2x2 a, float s) {
+  weft_f2x2 r{};
+  for (int i = 0; i < 2; i++)
+    for (int j = 0; j < 2; j++) r.m[i][j] = a.m[i][j] * s;
+  return r;
+}
+static inline weft_f3x3 operator*(weft_f3x3 a, float s) {
+  weft_f3x3 r{};
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) r.m[i][j] = a.m[i][j] * s;
+  return r;
+}
+static inline weft_f4x4 operator*(weft_f4x4 a, float s) {
+  weft_f4x4 r{};
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++) r.m[i][j] = a.m[i][j] * s;
+  return r;
+}
+
+static inline weft_f2x2 weft_transpose(weft_f2x2 a) {
+  weft_f2x2 r{};
+  for (int i = 0; i < 2; i++)
+    for (int j = 0; j < 2; j++) r.m[i][j] = a.m[j][i];
+  return r;
+}
+static inline weft_f3x3 weft_transpose(weft_f3x3 a) {
+  weft_f3x3 r{};
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) r.m[i][j] = a.m[j][i];
+  return r;
+}
+static inline weft_f4x4 weft_transpose(weft_f4x4 a) {
+  weft_f4x4 r{};
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++) r.m[i][j] = a.m[j][i];
+  return r;
+}
 
 // A load and a store through an address the kernel computed. Both front ends
 // name these, so both targets have them.
@@ -717,11 +1077,85 @@ struct SampledImage {
   sampler s;
 };
 
+// A 2D *array* image: the handle is `texture2d_array`, whose slice count is part
+// of the binding, and every read and sample names the slice it wants. The rest
+// has the same shape as the plain form — one channel, a texel is channel 0 — so
+// these are overloads rather than a second type system.
+struct ArrayImageRef {
+  texture2d_array<float, access::sample> t;
+  uint32_t width;
+  uint32_t height;
+  uint32_t layers;
+};
+struct RWArrayImageRef {
+  texture2d_array<float, access::read_write> t;
+  uint32_t width;
+  uint32_t height;
+  uint32_t layers;
+};
+struct SampledArrayImage {
+  ArrayImageRef tex;
+  sampler s;
+};
+
+// A 3D image: `texture3d`, whose depth is part of the binding the way a 2D
+// array's slice count is, and every read and sample names a plane. The three
+// handles have the same shape, so the kernel-side calls are overloads rather than
+// a second set of names.
+struct Image3DRef {
+  texture3d<float, access::sample> t;
+  uint32_t width;
+  uint32_t height;
+  uint32_t depth;
+};
+struct RWImage3DRef {
+  texture3d<float, access::read_write> t;
+  uint32_t width;
+  uint32_t height;
+  uint32_t depth;
+};
+struct SampledImage3D {
+  Image3DRef tex;
+  sampler s;
+};
+
+// A cube: six square faces, and a sample takes a direction rather than a position.
+// A cube is filterable only — there is no texel to address without a face — so
+// there is no read or write form of it here.
+struct CubeImageRef {
+  texturecube<float, access::sample> t;
+  uint32_t width;
+  uint32_t height;
+};
+struct SampledCubeImage {
+  CubeImageRef tex;
+  sampler s;
+};
+
 static inline ImageRef make_image(texture2d<float, access::sample> t) {
   return ImageRef{t, (uint32_t)t.get_width(), (uint32_t)t.get_height()};
 }
+static inline ArrayImageRef make_array_image(texture2d_array<float, access::sample> t) {
+  return ArrayImageRef{t, (uint32_t)t.get_width(), (uint32_t)t.get_height(),
+                       (uint32_t)t.get_array_size()};
+}
+static inline RWArrayImageRef make_rw_array_image(texture2d_array<float, access::read_write> t) {
+  return RWArrayImageRef{t, (uint32_t)t.get_width(), (uint32_t)t.get_height(),
+                         (uint32_t)t.get_array_size()};
+}
 static inline RWImageRef make_rw_image(texture2d<float, access::read_write> t) {
   return RWImageRef{t, (uint32_t)t.get_width(), (uint32_t)t.get_height()};
+}
+static inline Image3DRef make_image3d(texture3d<float, access::sample> t) {
+  return Image3DRef{t, (uint32_t)t.get_width(), (uint32_t)t.get_height(),
+                    (uint32_t)t.get_depth()};
+}
+static inline RWImage3DRef make_rw_image3d(texture3d<float, access::read_write> t) {
+  return RWImage3DRef{t, (uint32_t)t.get_width(), (uint32_t)t.get_height(),
+                      (uint32_t)t.get_depth()};
+}
+static inline CubeImageRef make_cube_image(texturecube<float, access::sample> t) {
+  return CubeImageRef{t, (uint32_t)t.get_width(), (uint32_t)t.get_height()};
 }
 
 // The launcher binds one-channel images, so a texel is channel 0 and the value
@@ -735,12 +1169,63 @@ static inline T tex_read(thread const R& im, uint32_t x, uint32_t y) {
   return weft_bitcast<T>(im.t.read(uint2(x, y)).x);
 }
 
+// The array form: the same read, of the slice the kernel names. A layer outside
+// the binding is nothing, which is what the CPU runtime answers too.
+template <class T, class R>
+static inline T tex_read(thread const R& im, uint32_t x, uint32_t y, uint32_t layer) {
+  if (x >= im.width || y >= im.height || layer >= im.layers) return (T)0;
+  return weft_bitcast<T>(im.t.read(uint2(x, y), layer).x);
+}
+
+// The 3D form: one coordinate, three components, and a plane outside the binding
+// is nothing — the same answer the CPU runtime gives for the same coordinate.
+template <class T>
+static inline T tex_read(thread const Image3DRef& im, uint32_t x, uint32_t y, uint32_t z) {
+  if (x >= im.width || y >= im.height || z >= im.depth) return (T)0;
+  return weft_bitcast<T>(im.t.read(uint3(x, y, z)).x);
+}
+
 // A sample goes through the bound sampler state, which is where the filter and
 // the address mode live on this target: the CPU runtime models the same two
 // choices, and the launcher hands them to both.
 template <class T>
 static inline T tex_sample(thread const SampledImage& si, float u, float v) {
   return weft_bitcast<T>(si.tex.t.sample(si.s, float2(u, v)).x);
+}
+
+template <class T>
+static inline T tex_sample(thread const SampledArrayImage& si, float u, float v, uint32_t layer) {
+  return weft_bitcast<T>(si.tex.t.sample(si.s, float2(u, v), layer).x);
+}
+
+// A 3D sample: one normalised coordinate in three components, and the hardware's
+// own trilinear filter. The CPU runtime models the same filter with the same 8-bit
+// weights, which is what lets a filtered 3D sample be compared at all.
+template <class T>
+static inline T tex_sample(thread const SampledImage3D& si, float u, float v, float w) {
+  return weft_bitcast<T>(si.tex.t.sample(si.s, float3(u, v, w)).x);
+}
+
+// A face and a position on it, back into a direction: the inverse of the rule the
+// sampler uses, so PTX's `(s, t, face)` coordinate can name a sample here. This is
+// the same text as the CPU runtime's, arithmetic for arithmetic.
+static inline void weft_cube_dir(uint32_t face, float s, float t, thread float& dx,
+                                 thread float& dy, thread float& dz) {
+  switch (face % 6u) {
+    case 0: dx = 1.0f; dy = -t; dz = -s; break;
+    case 1: dx = -1.0f; dy = -t; dz = s; break;
+    case 2: dx = s; dy = 1.0f; dz = t; break;
+    case 3: dx = s; dy = -1.0f; dz = -t; break;
+    case 4: dx = s; dy = -t; dz = 1.0f; break;
+    default: dx = -s; dy = -t; dz = -1.0f; break;
+  }
+}
+
+// A cube sample: the direction picks the face and the place on it, which is the
+// hardware's own rule and the one the CPU runtime models.
+template <class T>
+static inline T tex_sample(thread const SampledCubeImage& si, float dx, float dy, float dz) {
+  return weft_bitcast<T>(si.tex.t.sample(si.s, float3(dx, dy, dz)).x);
 }
 
 // A texel is channel 0 of whatever the module wrote — the format is one channel,
@@ -763,9 +1248,54 @@ static inline void tex_sample4(thread const SampledImage& si, float u, float v,
   out[3] = 1.0f;
 }
 
+template <class T>
+static inline void tex_sample4(thread const SampledArrayImage& si, float u, float v, uint32_t layer,
+                               thread float* out) {
+  out[0] = weft_bitcast<T>(si.tex.t.sample(si.s, float2(u, v), layer).x);
+  out[1] = 0.0f;
+  out[2] = 0.0f;
+  out[3] = 1.0f;
+}
+
+template <class T>
+static inline void tex_sample4(thread const SampledImage3D& si, float u, float v, float w,
+                               thread float* out) {
+  out[0] = weft_bitcast<T>(si.tex.t.sample(si.s, float3(u, v, w)).x);
+  out[1] = 0.0f;
+  out[2] = 0.0f;
+  out[3] = 1.0f;
+}
+
+template <class T>
+static inline void tex_sample4(thread const SampledCubeImage& si, float dx, float dy, float dz,
+                               thread float* out) {
+  out[0] = weft_bitcast<T>(si.tex.t.sample(si.s, float3(dx, dy, dz)).x);
+  out[1] = 0.0f;
+  out[2] = 0.0f;
+  out[3] = 1.0f;
+}
+
+
 // `tld4`: the four texels around the coordinate, each on its own channel,
 // instead of the one a filter would blend. The footprint is the 2x2 block whose
 // base is the texel under the coordinate, which is what the instruction means.
+template <class T>
+static inline void tex_gather4(thread const SampledArrayImage& si, float u, float v, uint32_t layer,
+                               thread float* out) {
+  const int x0 = (int)floor(u * (float)si.tex.width - 0.5f);
+  const int y0 = (int)floor(v * (float)si.tex.height - 0.5f);
+  auto at = [&](int x, int y) -> float {
+    if (x < 0 || y < 0 || (uint32_t)x >= si.tex.width || (uint32_t)y >= si.tex.height ||
+        layer >= si.tex.layers)
+      return 0.0f;
+    return weft_bitcast<T>(si.tex.t.read(uint2((uint32_t)x, (uint32_t)y), layer).x);
+  };
+  out[0] = at(x0, y0);
+  out[1] = at(x0 + 1, y0);
+  out[2] = at(x0, y0 + 1);
+  out[3] = at(x0 + 1, y0 + 1);
+}
+
 template <class T>
 static inline void tex_gather4(thread const SampledImage& si, float u, float v,
                                thread float* out) {
@@ -781,10 +1311,63 @@ static inline void tex_gather4(thread const SampledImage& si, float u, float v,
   out[3] = at(x0 + 1, y0 + 1);
 }
 
+// A 3-D gather: the 2x2 footprint of the plane the coordinate names. The plane is
+// the nearest one under w, because a gather has no filter to blend along z with,
+// and a footprint that leaves the binding answers with nothing — the CPU runtime's
+// text for the same instruction, arithmetic for arithmetic.
+template <class T>
+static inline void tex_gather4(thread const SampledImage3D& si, float u, float v, float w,
+                               thread float* out) {
+  const int x0 = (int)floor(u * (float)si.tex.width - 0.5f);
+  const int y0 = (int)floor(v * (float)si.tex.height - 0.5f);
+  const int z = (int)floor(w * (float)si.tex.depth);
+  auto at = [&](int x, int y) -> float {
+    if (x < 0 || y < 0 || z < 0 || (uint32_t)x >= si.tex.width || (uint32_t)y >= si.tex.height ||
+        (uint32_t)z >= si.tex.depth)
+      return 0.0f;
+    return weft_bitcast<T>(si.tex.t.read(uint3((uint32_t)x, (uint32_t)y, (uint32_t)z)).x);
+  };
+  out[0] = at(x0, y0);
+  out[1] = at(x0 + 1, y0);
+  out[2] = at(x0, y0 + 1);
+  out[3] = at(x0 + 1, y0 + 1);
+}
+
+// A cube gather: a face and a place on it, turned into a layer and a 2-D
+// coordinate. A cube texel is addressed by `read(uint2, face)`, so the four reads
+// are exact on both engines and no sampler is involved.
+template <class T>
+static inline void tex_gather4_cube(thread const SampledCubeImage& si, float s, float v,
+                                    uint32_t face, thread float* out) {
+  const int x0 = (int)floor(((s + 1.0f) * 0.5f) * (float)si.tex.width - 0.5f);
+  const int y0 = (int)floor(((v + 1.0f) * 0.5f) * (float)si.tex.height - 0.5f);
+  const uint32_t f = face % 6u;
+  auto at = [&](int x, int y) -> float {
+    if (x < 0 || y < 0 || (uint32_t)x >= si.tex.width || (uint32_t)y >= si.tex.height) return 0.0f;
+    return weft_bitcast<T>(si.tex.t.read(uint2((uint32_t)x, (uint32_t)y), f).x);
+  };
+  out[0] = at(x0, y0);
+  out[1] = at(x0 + 1, y0);
+  out[2] = at(x0, y0 + 1);
+  out[3] = at(x0 + 1, y0 + 1);
+}
+
 template <class R, class V>
 static inline void tex_write(thread const R& im, uint32_t x, uint32_t y, V v) {
   if (x >= im.width || y >= im.height) return;
   im.t.write(float4(tex_chan(v.x), 0.0f, 0.0f, 0.0f), uint2(x, y));
+}
+
+template <class R, class V>
+static inline void tex_write(thread const R& im, uint32_t x, uint32_t y, uint32_t layer, V v) {
+  if (x >= im.width || y >= im.height || layer >= im.layers) return;
+  im.t.write(float4(tex_chan(v.x), 0.0f, 0.0f, 0.0f), uint2(x, y), layer);
+}
+
+template <class V>
+static inline void tex_write(thread const RWImage3DRef& im, uint32_t x, uint32_t y, uint32_t z, V v) {
+  if (x >= im.width || y >= im.height || z >= im.depth) return;
+  im.t.write(float4(tex_chan(v.x), 0.0f, 0.0f, 0.0f), uint3(x, y, z));
 }
 
 // SPIR-V says `OpAtomicLoad` / `OpAtomicStore` with a type; on the GPU those are
@@ -873,7 +1456,11 @@ static inline float cas_f32(device float* p, float v, int mode) {
   uint32_t wait = 1u;
   for (;;) {
     const float o = as_type<float>(old);
-    const float want = (mode == 1) ? min(o, v) : max(o, v);
+    // The same rule the CPU's `atom_min_f32` uses, spelled out rather than left to
+    // `min`: Metal's `min` is `fmin`, which answers with the non-NaN operand, and
+    // the CPU's comparison answers with `v`. Two columns that disagree on a NaN
+    // are two engines with two answers.
+    const float want = (mode == 1) ? (o < v ? o : v) : (o > v ? o : v);
     if (atomic_compare_exchange_weak_explicit(a, &old, as_type<uint32_t>(want),
                                               memory_order_relaxed, memory_order_relaxed))
       return o;

@@ -1,0 +1,108 @@
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "glcube" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpName %main "glcube"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %blk Block
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %outbuf DescriptorSet 0
+               OpDecorate %outbuf Binding 0
+               OpDecorate %tex DescriptorSet 0
+               OpDecorate %tex Binding 1
+               OpDecorate %smp DescriptorSet 0
+               OpDecorate %smp Binding 2
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+    %v3bool = OpTypeVector %bool 3
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %v3u = OpTypeVector %u32 3
+     %v4f = OpTypeVector %f32 4
+     %v2f = OpTypeVector %f32 2
+     %v3f = OpTypeVector %f32 3
+     %rtarr = OpTypeRuntimeArray %f32
+       %blk = OpTypeStruct %rtarr
+   %ptr_sb = OpTypePointer StorageBuffer %f32
+  %ptr_blk = OpTypePointer StorageBuffer %blk
+      %img1 = OpTypeImage %f32 Cube 0 0 0 1 Unknown
+     %smp_t = OpTypeSampler
+     %si_t = OpTypeSampledImage %img1
+ %ptr_uc_img = OpTypePointer UniformConstant %img1
+ %ptr_uc_smp = OpTypePointer UniformConstant %smp_t
+       %pin = OpTypePointer Input %v3u
+      %fnty = OpTypeFunction %void
+        %gid = OpVariable %pin Input
+    %outbuf = OpVariable %ptr_blk StorageBuffer
+       %tex = OpVariable %ptr_uc_img UniformConstant
+       %smp = OpVariable %ptr_uc_smp UniformConstant
+      %zerou = OpConstant %u32 0
+     %zerof = OpConstant %f32 0
+      %c64 = OpConstant %f32 64
+        %neg = OpConstant %f32 -1
+        %one = OpConstant %f32 1
+       %half = OpConstant %f32 0.5
+     %c0u = OpConstant %u32 0
+     %c1u = OpConstant %u32 1
+     %c2u = OpConstant %u32 2
+     %c3u = OpConstant %u32 3
+     %c4u = OpConstant %u32 4
+     %c5u = OpConstant %u32 5
+     %c6u = OpConstant %u32 6
+    %c12u = OpConstant %u32 12
+    %c63u = OpConstant %u32 63
+       %main = OpFunction %void None %fnty
+      %entry = OpLabel
+          %g = OpLoad %v3u %gid
+         %gi = OpCompositeExtract %u32 %g 0
+         %gf = OpConvertUToF %f32 %gi
+        %gf2 = OpFDiv %f32 %gf %c64
+         %fi = OpShiftRightLogical %u32 %gi %c12u
+         %fm = OpUMod %u32 %fi %c6u
+         %e0 = OpIEqual %bool %fm %c0u
+         %e1 = OpIEqual %bool %fm %c1u
+         %e2 = OpIEqual %bool %fm %c2u
+         %e3 = OpIEqual %bool %fm %c3u
+         %e4 = OpIEqual %bool %fm %c4u
+        %xl = OpBitwiseAnd %u32 %gi %c63u
+        %yh = OpShiftRightLogical %u32 %gi %c6u
+        %yl = OpBitwiseAnd %u32 %yh %c63u
+        %xf = OpConvertUToF %f32 %xl
+        %yf = OpConvertUToF %f32 %yl
+       %xo = OpFAdd %f32 %xf %half
+        %yo = OpFAdd %f32 %yf %half
+        %su = OpFDiv %f32 %xo %c64
+        %tu = OpFDiv %f32 %yo %c64
+        %s2 = OpFAdd %f32 %su %su
+        %t2 = OpFAdd %f32 %tu %tu
+        %s = OpFSub %f32 %s2 %one
+        %t = OpFSub %f32 %t2 %one
+        %ns = OpFNegate %f32 %s
+        %nt = OpFNegate %f32 %t
+         %d0 = OpCompositeConstruct %v3f %one %nt %ns
+         %d1 = OpCompositeConstruct %v3f %neg %nt %s
+         %d2 = OpCompositeConstruct %v3f %s %one %t
+         %d3 = OpCompositeConstruct %v3f %s %neg %nt
+         %d4 = OpCompositeConstruct %v3f %s %nt %one
+         %d5 = OpCompositeConstruct %v3f %ns %nt %neg
+         %be4 = OpCompositeConstruct %v3bool %e4 %e4 %e4
+         %m4 = OpSelect %v3f %be4 %d4 %d5
+         %be3 = OpCompositeConstruct %v3bool %e3 %e3 %e3
+         %m3 = OpSelect %v3f %be3 %d3 %m4
+         %be2 = OpCompositeConstruct %v3bool %e2 %e2 %e2
+         %m2 = OpSelect %v3f %be2 %d2 %m3
+         %be1 = OpCompositeConstruct %v3bool %e1 %e1 %e1
+         %m1 = OpSelect %v3f %be1 %d1 %m2
+        %be0 = OpCompositeConstruct %v3bool %e0 %e0 %e0
+        %dir = OpSelect %v3f %be0 %d0 %m1
+         %c2 = OpCompositeConstruct %v2f %gf2 %gf2
+         %c3 = OpCompositeConstruct %v3f %gf2 %gf2 %gf2
+         %vi = OpLoad %img1 %tex
+         %vs = OpLoad %smp_t %smp
+        %sim = OpSampledImage %si_t %vi %vs
+          %r = OpImageSampleExplicitLod %v4f %sim %dir Lod %zerof
+         %rx = OpCompositeExtract %f32 %r 0
+         %po = OpAccessChain %ptr_sb %outbuf %zerou %gi
+               OpStore %po %rx
+               OpReturn
+               OpFunctionEnd

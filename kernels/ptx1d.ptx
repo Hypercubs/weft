@@ -1,0 +1,52 @@
+// A texture with one row, sampled by one coordinate, the twin of the 2-D case in
+// ptxtex.ptx:
+//
+//     w = txq.width(t), h = txq.height(t)      // a 64x1 binding
+//     x = gid & 63
+//     t = tex1D(t, (x + 0.5) / 64)             // nearest, clamped
+//     out[gid] = t * 2 + h
+//
+// The height is folded into the answer, so a binding of the wrong shape shows up
+// as a different number rather than as a sample that quietly agrees. Every sample
+// lands on a texel centre, so the answer is the texel itself.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.tex .u32 t1, 1, 1, 1, 1;
+
+.visible .entry ptx1d(
+    .param .u64 ptx1d_param_0
+)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<16>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptx1d_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    // The size the binding reports, not a number written into the kernel.
+    txq.width.b32 %r5, [t1];
+    txq.height.b32 %r6, [t1];
+
+    and.b32 %r7, %r4, 63;               // x = gid & 63
+    cvt.rn.f32.u32 %f1, %r7;
+    add.f32 %f2, %f1, 0f3F000000;       // x + 0.5
+    cvt.rn.f32.u32 %f3, %r5;
+    div.rn.f32 %f4, %f2, %f3;           // u
+
+    tex.1d.v4.f32.f32 {%f5,%f6,%f7,%f8}, [t1, {%f4}];
+
+    mul.f32 %f9, %f5, 0f40000000;
+    cvt.rn.f32.u32 %f10, %r6;
+    add.f32 %f11, %f9, %f10;
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f11;
+    ret;
+}

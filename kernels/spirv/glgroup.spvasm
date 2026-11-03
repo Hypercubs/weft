@@ -1,0 +1,46 @@
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "glgroup" %gid %lid
+               OpExecutionMode %main LocalSize 8 8 1
+               OpName %main "glgroup"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+               OpDecorate %blk Block
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %outbuf DescriptorSet 0
+               OpDecorate %outbuf Binding 0
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %v3u = OpTypeVector %u32 3
+     %rtarr = OpTypeRuntimeArray %f32
+       %blk = OpTypeStruct %rtarr
+   %ptr_sb = OpTypePointer StorageBuffer %f32
+  %ptr_blk = OpTypePointer StorageBuffer %blk
+       %pin = OpTypePointer Input %v3u
+      %fnty = OpTypeFunction %void
+        %gid = OpVariable %pin Input
+        %lid = OpVariable %pin Input
+    %outbuf = OpVariable %ptr_blk StorageBuffer
+      %zerou = OpConstant %u32 0
+       %c8u = OpConstant %u32 8
+      %c64u = OpConstant %u32 64
+      %onef = OpConstant %f32 1
+      %zerof = OpConstant %f32 0
+       %main = OpFunction %void None %fnty
+      %entry = OpLabel
+          %g = OpLoad %v3u %gid
+         %gi = OpCompositeExtract %u32 %g 0
+          %l = OpLoad %v3u %lid
+         %lx = OpCompositeExtract %u32 %l 0
+         %ly = OpCompositeExtract %u32 %l 1
+        %row = OpIMul %u32 %ly %c8u
+       %flat = OpIAdd %u32 %lx %row
+        %gmo = OpUMod %u32 %gi %c64u
+         %ok = OpIEqual %bool %flat %gmo
+        %val = OpSelect %f32 %ok %onef %zerof
+         %po = OpAccessChain %ptr_sb %outbuf %zerou %gi
+               OpStore %po %val
+               OpReturn
+               OpFunctionEnd

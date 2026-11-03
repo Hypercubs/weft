@@ -40,6 +40,24 @@ static const char* const kWSoftMath = R"WEFTMATH(
 // to (0.25, 4] by exact power-of-two scaling. Multiplies only: the same trip
 // count on both engines means the same sequence of roundings, and there is no
 // division in the hot path (the old version took sixteen).
+// A float as its bits and back: Metal has `as_type` for this and C++ has
+// memcpy, so the library names both and each target gets its own spelling.
+#ifdef __METAL_VERSION__
+#define weft_bits(x) as_type<uint32_t>(x)
+#define weft_float(x) as_type<float>(x)
+#else
+static inline uint32_t weft_bits(float x) {
+  uint32_t u;
+  std::memcpy(&u, &x, 4);
+  return u;
+}
+static inline float weft_float(uint32_t u) {
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+#endif
+
 inline float weft_sqrt(float v) {
   if (!(v > 0.0f)) return (v == 0.0f) ? v : (v - v) / (v - v);  // 0, or NaN
   if (v > WEFT_INF) return v;                                  // infinity
@@ -296,6 +314,140 @@ inline float weft_asinh(float v) {
 }
 inline float weft_acosh(float v) { return weft_log(v + weft_sqrt(v * v - 1.0f)); }
 inline float weft_atanh(float v) { return 0.5f * weft_log((1.0f + v) / (1.0f - v)); }
+
+// ---- the exponent and magnitude functions -----------------------------------
+//
+// `ldexp` is exact until it overflows, because scaling by two only changes the
+// exponent field. Written as a loop rather than a table of powers so there is no
+// constant to get wrong, and so both targets walk the same ones.
+inline float weft_ldexp(float x, int n) {
+  float s = x;
+  for (; n > 0; n--) s *= 2.0f;
+  for (; n < 0; n++) s *= 0.5f;
+  return s;
+}
+
+inline int weft_ilogb(float x) {
+  const uint32_t u = weft_bits(x);
+  const uint32_t e = (u >> 23) & 0xFFu;
+  if (e == 0xFFu) return 0x7FFFFFFF;  // inf or nan
+  if (e != 0u) return (int)e - 127;
+  if ((u & 0x7FFFFFFFu) == 0u) return -0x7FFFFFFF;  // zero has no exponent
+  // A subnormal renormalises by hand: multiply by 2^23 until the exponent field
+  // is not zero, and subtract what was added on the way.
+  float v = (u >> 31) ? -x : x;
+  int shift = 0;
+  while (((weft_bits(v) >> 23) & 0xFFu) == 0u) {
+    v *= 8388608.0f;
+    shift += 23;
+  }
+  return (int)((weft_bits(v) >> 23) & 0xFFu) - 127 - shift;
+}
+
+inline float weft_logb(float x) {
+  if (!(x == x)) return x;                            // nan
+  if (x == 0.0f) return -1.0f / 0.0f;                 // logb(0) is -inf
+  if (x - x != 0.0f) return 1.0f / 0.0f;              // inf of either sign
+  return (float)weft_ilogb(x);
+}
+
+inline float weft_maxmag(float a, float b) {
+  const float aa = a < 0.0f ? -a : a, bb = b < 0.0f ? -b : b;
+  return aa >= bb ? a : b;
+}
+inline float weft_minmag(float a, float b) {
+  const float aa = a < 0.0f ? -a : a, bb = b < 0.0f ? -b : b;
+  return aa <= bb ? a : b;
+}
+
+// The next float after x toward y: one step of the bit pattern, and the sign
+// decides which way that is.
+inline float weft_nextafter(float x, float y) {
+  if (!(x == x) || !(y == y)) return x + y;
+  if (x == y) return y;
+  if (x == 0.0f) return weft_float(y > 0.0f ? 1u : 0x80000001u);
+  const bool up = (y > x) == (x > 0.0f);
+  return weft_float(weft_bits(x) + (up ? 1u : (uint32_t)-1));
+}
+
+// x^n for an integer n, by squaring, and 1/x^n for a negative one.
+inline float weft_pown(float x, int n) {
+  if (n == 0) return 1.0f;
+  const bool neg = n < 0;
+  // Two's complement, not `-n`: that wraps to itself for INT_MIN, and Metal has no
+  // wider integer to do it in.
+  uint32_t e = neg ? 0u - (uint32_t)n : (uint32_t)n;
+  float r = 1.0f, base = x;
+  for (; e; e >>= 1) {
+    if (e & 1u) r *= base;
+    base *= base;
+  }
+  return neg ? 1.0f / r : r;
+}
+
+// The n-th root, with the sign a negative argument keeps when n is odd.
+inline float weft_rootn(float x, int n) {
+  if (n == 0) return 0.0f / 0.0f;
+  if (n == 1) return x;
+  if (n == 2) return weft_sqrt(x);
+  const int an = n < 0 ? -n : n;
+  const float m = x < 0.0f ? -x : x;
+  const float r = weft_exp2(weft_log2(m) / (float)an);
+  const float s = ((an % 2) != 0 && x < 0.0f) ? -r : r;
+  return n < 0 ? 1.0f / s : s;
+}
+
+// The integer part of a float, by clearing the bits below the binary point
+// rather than calling out: a floor/trunc function is exact on both targets, but
+// this way the same operations run on each.
+inline float weft_trunc_of(float x) {
+  const float m = x < 0.0f ? -x : x;
+  if (!(m < 8388608.0f)) return x;  // every float this large is already an integer
+  const uint32_t u = weft_bits(m);
+  const uint32_t e = (u >> 23) & 0xFFu;
+  if (e < 127u) return x - x;                      // |x| < 1 has no integer part
+  const float t = weft_float(u & (0xFFFFFFFFu << (150u - e)));
+  return x < 0.0f ? -t : t;
+}
+
+// ---- the four that answer with two numbers ----------------------------------
+//
+// `frexp`, `modf`, `sincos` and `remquo` each return a pair, which an extended
+// instruction can carry as a two-member struct. Each half is a plain function so
+// the emitter can name them separately and build the struct in place.
+inline int weft_frexp_e(float x) {
+  if (!(x == x) || x - x != 0.0f || x == 0.0f) return 0;  // nan, inf and zero
+  return weft_ilogb(x) + 1;
+}
+inline float weft_frexp_f(float x) { return weft_ldexp(x, -weft_frexp_e(x)); }
+
+inline float weft_modf_i(float x) { return weft_trunc_of(x); }
+inline float weft_modf_f(float x) { return x - weft_trunc_of(x); }
+
+inline float weft_sincos_s(float x) { return weft_sin(x); }
+inline float weft_sincos_c(float x) { return weft_cos(x); }
+
+// The nearest integer, which is what the quotient of a `remquo` is.
+inline float weft_near_int(float x) {
+  return weft_trunc_of(x < 0.0f ? x - 0.5f : x + 0.5f);
+}
+inline float weft_remquo_r(float x, float y) { return x - y * weft_near_int(x / y); }
+inline int weft_remquo_q(float x, float y) { return (int)weft_near_int(x / y); }
+
+// exp(x) - 1, which keeps its low bits near zero by summing the series instead
+// of subtracting two numbers that are nearly equal.
+inline float weft_expm1(float x) {
+  if (x > -0.001f && x < 0.001f) {
+    float t = x, s = x, k = 1.0f;
+    for (int i = 2; i <= 6; i++) {
+      t *= x;
+      k *= (float)i;
+      s += t / k;
+    }
+    return s;
+  }
+  return weft_exp(x) - 1.0f;
+}
 
 // The vector forms a shader may call, generated from the scalar ones.
 #define WEFT_MAP1(f)                                       \
@@ -637,4 +789,154 @@ inline T weft_warp_prefix(T v, bool inclusive, bool product, uint32_t width) {
 #endif
 
 // ---- end portable math -----------------------------------------------------
+// ---- packing ---------------------------------------------------------------
+//
+// Metal's pack/unpack family is a formula, not an approximation: an unsigned
+// normal is `round(clamp(x, 0, 1) * 255)` and a signed one is
+// `round(clamp(x, -1, 1) * 127)` in two's complement, with the unpack the inverse
+// division (and `-128` clamped to -1, which is the only asymmetric code). Both
+// engines run this text, so the columns cannot disagree with each other; that the
+// formula is *Metal's* is measured rather than assumed — tools/pack_probe.mm runs
+// the hardware's own builtins over every byte boundary and every exact tie, and
+// the rule it reports (nearest, ties away from zero) is the one written here.
+inline float weft_pack_clamp(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// Nearest, and an exact tie away from zero — the rule the spec gives `round()`.
+// A tie is the one case where the hardware's own builtin does not always agree,
+// because its intermediate precision is not this text's: 128.5/255 packs to 128
+// on the GPU while 1.5/255 packs to 2. So both engines run *this* formula and a
+// tie comes out the same on both, and `tools/pack_probe.mm` reports the hardware's
+// divergence at ties rather than failing on it. Every value that is not a tie
+// matches the hardware code for code.
+inline int weft_pack_round(float v) {
+  return v < 0.0f ? -(int)(0.5f - v) : (int)(v + 0.5f);
+}
+
+inline uint weft_pack_u8(float v) {
+  return (uint)weft_pack_round(weft_pack_clamp(v, 0.0f, 1.0f) * 255.0f);
+}
+inline uint weft_pack_s8(float v) {
+  return (uint)weft_pack_round(weft_pack_clamp(v, -1.0f, 1.0f) * 127.0f) & 0xFFu;
+}
+inline uint weft_pack_u16(float v) {
+  return (uint)weft_pack_round(weft_pack_clamp(v, 0.0f, 1.0f) * 65535.0f) & 0xFFFFu;
+}
+inline uint weft_pack_s16(float v) {
+  return (uint)weft_pack_round(weft_pack_clamp(v, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu;
+}
+
+inline uint weft_pack_unorm4x8(float4 v) {
+  return weft_pack_u8(v.x) | (weft_pack_u8(v.y) << 8) | (weft_pack_u8(v.z) << 16) |
+         (weft_pack_u8(v.w) << 24);
+}
+inline uint weft_pack_snorm4x8(float4 v) {
+  return weft_pack_s8(v.x) | (weft_pack_s8(v.y) << 8) | (weft_pack_s8(v.z) << 16) |
+         (weft_pack_s8(v.w) << 24);
+}
+inline uint weft_pack_unorm2x16(float2 v) {
+  return weft_pack_u16(v.x) | (weft_pack_u16(v.y) << 16);
+}
+inline uint weft_pack_snorm2x16(float2 v) {
+  return weft_pack_s16(v.x) | (weft_pack_s16(v.y) << 16);
+}
+
+// A signed byte back to a number: sign-extend, divide, clamp at -1. The clamp is
+// what `-128` needs, since -128/127 is below the range the format covers.
+inline float weft_unpack_snorm_byte(uint b) {
+  const float f = (float)(int)(char)(b & 0xFFu) * (1.0f / 127.0f);
+  return f < -1.0f ? -1.0f : f;
+}
+inline float weft_unpack_snorm_half(uint h) {
+  const float f = (float)(int)(short)(h & 0xFFFFu) * (1.0f / 32767.0f);
+  return f < -1.0f ? -1.0f : f;
+}
+inline float4 weft_unpack_unorm4x8(uint p) {
+  return float4((float)(p & 0xFFu) * (1.0f / 255.0f),
+                (float)((p >> 8) & 0xFFu) * (1.0f / 255.0f),
+                (float)((p >> 16) & 0xFFu) * (1.0f / 255.0f),
+                (float)((p >> 24) & 0xFFu) * (1.0f / 255.0f));
+}
+inline float4 weft_unpack_snorm4x8(uint p) {
+  return float4(weft_unpack_snorm_byte(p), weft_unpack_snorm_byte(p >> 8),
+                weft_unpack_snorm_byte(p >> 16), weft_unpack_snorm_byte(p >> 24));
+}
+inline float2 weft_unpack_unorm2x16(uint p) {
+  return float2((float)(p & 0xFFFFu) * (1.0f / 65535.0f),
+                (float)((p >> 16) & 0xFFFFu) * (1.0f / 65535.0f));
+}
+inline float2 weft_unpack_snorm2x16(uint p) {
+  return float2(weft_unpack_snorm_half(p), weft_unpack_snorm_half(p >> 16));
+}
+// ---- masks -----------------------------------------------------------------
+//
+// A comparison produces a bool vector (see the relational operators in the vector
+// preamble), and `select`, `any` and `all` are what read one back. `select(a, b,
+// c)` is `c ? b : a` componentwise — the argument order is Metal's, which reads
+// backwards until you see it as "select a or b, by c" — and `any`/`all` fold the
+// mask to one answer. Both engines run this text, so a mask cannot mean one thing
+// in the shader and another in the C++.
+inline bool weft_any(bool2 v) { return v.x || v.y; }
+inline bool weft_any(bool3 v) { return v.x || v.y || v.z; }
+inline bool weft_any(bool4 v) { return v.x || v.y || v.z || v.w; }
+inline bool weft_all(bool2 v) { return v.x && v.y; }
+inline bool weft_all(bool3 v) { return v.x && v.y && v.z; }
+inline bool weft_all(bool4 v) { return v.x && v.y && v.z && v.w; }
+
+inline float weft_select(float a, float b, bool c) { return c ? b : a; }
+inline half weft_select(half a, half b, bool c) { return c ? b : a; }
+inline int weft_select(int a, int b, bool c) { return c ? b : a; }
+inline uint weft_select(uint a, uint b, bool c) { return c ? b : a; }
+inline float2 weft_select(float2 a, float2 b, bool2 c) {
+  return float2(c.x ? b.x : a.x, c.y ? b.y : a.y);
+}
+inline float3 weft_select(float3 a, float3 b, bool3 c) {
+  return float3(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z);
+}
+inline float4 weft_select(float4 a, float4 b, bool4 c) {
+  return float4(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z, c.w ? b.w : a.w);
+}
+inline half2 weft_select(half2 a, half2 b, bool2 c) {
+  return half2(c.x ? b.x : a.x, c.y ? b.y : a.y);
+}
+inline half3 weft_select(half3 a, half3 b, bool3 c) {
+  return half3(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z);
+}
+inline half4 weft_select(half4 a, half4 b, bool4 c) {
+  return half4(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z, c.w ? b.w : a.w);
+}
+inline int2 weft_select(int2 a, int2 b, bool2 c) {
+  return int2(c.x ? b.x : a.x, c.y ? b.y : a.y);
+}
+inline int3 weft_select(int3 a, int3 b, bool3 c) {
+  return int3(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z);
+}
+inline int4 weft_select(int4 a, int4 b, bool4 c) {
+  return int4(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z, c.w ? b.w : a.w);
+}
+inline uint2 weft_select(uint2 a, uint2 b, bool2 c) {
+  return uint2(c.x ? b.x : a.x, c.y ? b.y : a.y);
+}
+inline uint3 weft_select(uint3 a, uint3 b, bool3 c) {
+  return uint3(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z);
+}
+inline uint4 weft_select(uint4 a, uint4 b, bool4 c) {
+  return uint4(c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z, c.w ? b.w : a.w);
+}
+
+// One bool over a vector picks all of it, which is how a kernel writes
+// `select(a, b, x > 0.0f)` rather than building a mask first.
+inline float2 weft_select(float2 a, float2 b, bool c) { return c ? b : a; }
+inline float3 weft_select(float3 a, float3 b, bool c) { return c ? b : a; }
+inline float4 weft_select(float4 a, float4 b, bool c) { return c ? b : a; }
+inline half2 weft_select(half2 a, half2 b, bool c) { return c ? b : a; }
+inline half3 weft_select(half3 a, half3 b, bool c) { return c ? b : a; }
+inline half4 weft_select(half4 a, half4 b, bool c) { return c ? b : a; }
+inline int2 weft_select(int2 a, int2 b, bool c) { return c ? b : a; }
+inline int3 weft_select(int3 a, int3 b, bool c) { return c ? b : a; }
+inline int4 weft_select(int4 a, int4 b, bool c) { return c ? b : a; }
+inline uint2 weft_select(uint2 a, uint2 b, bool c) { return c ? b : a; }
+inline uint3 weft_select(uint3 a, uint3 b, bool c) { return c ? b : a; }
+inline uint4 weft_select(uint4 a, uint4 b, bool c) { return c ? b : a; }
 )WEFTMATH";

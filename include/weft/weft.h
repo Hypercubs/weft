@@ -58,8 +58,11 @@ void weft_tile_reset(void);
 uint64_t weft_tile_violations(void);
 
 // Bytes a buffer of `elems` elements needs, from the kernel's own declaration.
-// Falls back to float when the front end cannot type its pointers (PTX and
-// SPIR-V bindings are addresses, not types).
+// A Metal kernel states the type, and the other front ends state the width the
+// instructions that reach the buffer address it at — `ld.global.f32` is four
+// bytes, `ld.global.u8` one, a SPIR-V pointer's pointee is its own size. Four
+// bytes is the fallback only when nothing typed reaches the buffer at all, as
+// with a Triton tile copied by `cp.async` at a width the module never names.
 static inline uint64_t weft_arg_bytes(const weft_kernel_info* k, int i, uint32_t elems) {
   uint32_t e = 4;
   if (k && k->buf_bytes && i >= 0 && i < k->nbufs && k->buf_bytes[i]) e = k->buf_bytes[i];
@@ -71,6 +74,12 @@ void weft_set_param(int index, uint64_t value);
 
 // A texture is an RGBA image of `comps` 4-byte channels per texel.
 void weft_set_texture(int index, void* data, uint32_t width, uint32_t height, uint32_t comps);
+
+// A 2D *array* texture: `layers` slices of `width` x `height`, laid out one
+// after another. This is what `texture2d_array<T>` reads and what the GPU gets
+// as an MTLTextureType2DArray.
+void weft_set_texture_layers(int index, void* data, uint32_t width, uint32_t height, uint32_t comps,
+                             uint32_t layers);
 
 // filter: 0 nearest, 1 linear.  address: 0 clamp to edge, 1 clamp to zero, 2 repeat.
 void weft_set_sampler(int index, int filter, int address);

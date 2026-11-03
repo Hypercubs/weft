@@ -1,0 +1,54 @@
+// `tld4.1d`: a gather on a 1-D binding, which is a plane one row high.
+//
+//     u = (x + 0.5) / 64
+//     g = tld4(row, u)                   // (x,0), (x+1,0), then the row below
+//     out[gid] = g.x + 2 g.y + 3 g.z + 5 g.w
+//
+// The footprint is still 2x2: the second row of it is outside a binding that has one
+// row, so those two texels are nothing and the answer is the two along x. That is
+// the same rule the 2-D form follows at an edge, which is why this is a comparison
+// rather than a tolerance — a footprint that silently wrapped would add the texel at
+// the start of the row twice.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.tex .u32 row, 1, 1, 1, 1;
+
+.visible .entry ptxgather1d(
+    .param .u64 ptxgather1d_param_0
+)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxgather1d_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    txq.width.b32 %r5, [row];
+
+    and.b32 %r6, %r4, 63;               // x
+
+    cvt.rn.f32.u32 %f1, %r6;
+    cvt.rn.f32.u32 %f2, %r5;
+    add.f32 %f3, %f1, 0f3F000000;       // x + 0.5
+    div.rn.f32 %f4, %f3, %f2;           // u
+
+    tld4.b.1d.v4.f32.f32 {%f7,%f8,%f9,%f10}, [row, %f4];
+
+    mul.f32 %f11, %f8, 0f40000000;      // 2 g.y
+    add.f32 %f12, %f7, %f11;
+    mul.f32 %f13, %f9, 0f40400000;      // 3 g.z
+    add.f32 %f12, %f12, %f13;
+    mul.f32 %f14, %f10, 0f40A00000;     // 5 g.w
+    add.f32 %f12, %f12, %f14;
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f12;
+    ret;
+}

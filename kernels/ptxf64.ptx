@@ -1,0 +1,82 @@
+// 64-bit floating point, which this GPU has no instruction for.
+//
+//     x  = in[gid]
+//     y  = ((x + 1) * 3) / 2 - 0.5
+//     z  = max(min(abs(-y), (x + 1) * 3 / 2), y)
+//     out[gid] = (float)((double)(float)z + (double)(int)abs(-y))
+//
+// Every operation on a double is exact IEEE-754 binary64 on both columns: the CPU
+// runs the host's own doubles, and the GPU runs the software one in `weft_fp64`
+// over the bits, so the comparison is of the same arithmetic rather than of an
+// approximation of it. The literals are `0d…` forms, which is what used to have no
+// GPU spelling at all — a double here is the `uint64_t` its bits live in, so the
+// constant is handed over as bits and the register holding it is that same word.
+//
+// The last line crosses back to binary32 so the result is one four-byte value per
+// lane: a rounding that disagreed would show up as a different float, and the two
+// conversions in the middle (`cvt.rn.s32.f64` and `cvt.f64.s32`) check the integer
+// bridge in both directions.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry ptxf64(
+    .param .u64 ptxf64_param_0,
+    .param .u64 ptxf64_param_1,
+    .param .u64 ptxf64_param_2
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    .reg .f64 %fd<24>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [ptxf64_param_0];
+    ld.param.u64 %rd2, [ptxf64_param_1];
+    ld.param.u64 %rd9, [ptxf64_param_2];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    mul.wide.s32 %rd3, %r4, 8;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f64 %fd1, [%rd4];
+
+    add.f64 %fd2, %fd1, 0d3FF0000000000000;    // x + 1
+    mul.f64 %fd3, %fd2, 0d4008000000000000;    // * 3
+    div.f64 %fd4, %fd3, 0d4000000000000000;    // / 2
+    sub.f64 %fd5, %fd4, 0d3FE0000000000000;    // y = that - 0.5
+    neg.f64 %fd6, %fd5;
+    abs.f64 %fd7, %fd6;
+    min.f64 %fd8, %fd7, %fd4;
+    max.f64 %fd9, %fd8, %fd5;                  // z
+
+    // A comparison, folded in as an integer so it needs no 64-bit select.
+    setp.lt.f64 %p1, %fd9, %fd4;
+    selp.b32 %r5, 1, 0, %p1;
+
+    // The integer bridge in both directions, then back to binary32.
+    cvt.rn.s32.f64 %r6, %fd7;
+    cvt.f64.s32 %fd10, %r6;
+    cvt.rn.f32.f64 %f1, %fd9;
+    cvt.f64.f32 %fd11, %f1;
+    add.f64 %fd12, %fd11, %fd10;
+    cvt.rn.f32.f64 %f2, %fd12;
+
+    cvt.rn.f32.s32 %f3, %r5;
+    add.f32 %f4, %f2, %f3;
+
+    mul.wide.s32 %rd5, %r4, 4;
+    add.s64 %rd6, %rd2, %rd5;
+    st.global.f32 [%rd6], %f4;
+
+    // One rounding for a 106-bit intermediate: `a * b + c` where a separate multiply
+    // and add would be two. The result goes to its own buffer as the eight bytes it
+    // is, because a value this large has no binary32 form to fold in.
+    fma.rn.f64 %fd13, %fd2, %fd3, %fd4;
+    add.s64 %rd10, %rd9, %rd3;
+    st.global.f64 [%rd10], %fd13;
+    ret;
+}

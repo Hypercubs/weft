@@ -1,0 +1,117 @@
+//
+// wgmma with the narrow swizzle: a 32-byte atom.
+//
+// Same instruction and the same reference as the 128-byte fixture, a different
+// descriptor field: mode 3 in bits 62-63 instead of 1. An atom is eight rows of
+// 32 bytes, so the pattern is Swizzle<1,4,3> — bit 7 of the byte offset, which is
+// the row's position within four rows, flips the 16-byte chunk index:
+// `off ^ (((off >> 7) & 1) << 4)`. The tile is exactly one atom wide, so a row of
+// A is the 32 bytes of K and the two chunks of each row swap places every four
+// rows.
+//
+// This is the case that tells the two masks apart. The XOR mask is one bit here
+// and seven for the wide layout; the mask that says where a byte sits inside an
+// atom is 31. Using the first where the second belongs reads every second half
+// from the wrong end of the row.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry wgmma_swz32_kernel(
+	.param .u64 wgmma_swz32_kernel_param_0,
+	.param .u64 wgmma_swz32_kernel_param_1,
+	.param .u64 wgmma_swz32_kernel_param_2
+)
+{
+	.reg .b32 	%r<40>;
+	.reg .f32 	%f<12>;
+	.reg .b64 	%rd<16>;
+
+	// A: 64 rows of 32 bytes. B: eight rows of 32 after it.
+	.shared .align 256 .b8 weft_ab[2304];
+
+	ld.param.u64 	%rd1, [wgmma_swz32_kernel_param_0];
+	ld.param.u64 	%rd2, [wgmma_swz32_kernel_param_1];
+	ld.param.u64 	%rd3, [wgmma_swz32_kernel_param_2];
+
+	mov.u32 	%r1, %tid.x;
+	mov.u64 	%rd5, weft_ab;
+
+	// ---- A: one 16-byte chunk of one row ----
+	and.b32 	%r2, %r1, 63;			// row
+	shr.u32 	%r3, %r1, 6;			// which chunk of the row
+	shl.b32 	%r4, %r2, 5;			// row * 32 bytes in the source tile
+	shl.b32 	%r6, %r3, 4;			// chunk * 16
+	add.s32 	%r4, %r4, %r6;
+	cvt.u64.u32 	%rd4, %r4;
+	add.s64 	%rd4, %rd1, %rd4;
+	ld.global.v4.b32 	{%r10, %r11, %r12, %r13}, [%rd4];
+
+	shr.u32 	%r8, %r2, 2;			// the row's half of the pattern
+	and.b32 	%r8, %r8, 1;
+	shl.b32 	%r8, %r8, 4;
+	xor.b32 	%r9, %r6, %r8;			// chunk ^ (row >> 2 & 1) << 4
+	shl.b32 	%r7, %r2, 5;			// row * 32 bytes inside the atom
+	add.s32 	%r9, %r9, %r7;
+	cvt.u64.u32 	%rd6, %r9;
+	add.s64 	%rd6, %rd5, %rd6;
+	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
+
+	// ---- B: one value — row n = lane / 16, column k = lane % 16 ----
+	shr.u32 	%r14, %r1, 4;			// n
+	and.b32 	%r15, %r1, 15;			// k
+	shl.b32 	%r16, %r15, 3;			// B's rows are eight columns wide
+	add.s32 	%r16, %r16, %r14;
+	shl.b32 	%r16, %r16, 1;			// two bytes a value
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd2, %rd7;
+	ld.global.u16 	%r18, [%rd7];
+
+	shl.b32 	%r17, %r15, 1;			// the K byte column
+	shr.u32 	%r19, %r14, 2;
+	and.b32 	%r19, %r19, 1;
+	shl.b32 	%r19, %r19, 4;
+	xor.b32 	%r17, %r17, %r19;
+	shl.b32 	%r20, %r14, 5;			// n * 32
+	add.s32 	%r17, %r17, %r20;
+	add.s32 	%r17, %r17, 2048;		// B starts after A's 2 KiB
+	cvt.u64.u32 	%rd8, %r17;
+	add.s64 	%rd8, %rd5, %rd8;
+	st.shared.u16 	[%rd8], %r18;
+
+	bar.sync 	0;
+
+	// Swizzle mode 3 in bits 62-63; LBO and SBO are 256 bytes, 16 units.
+	mov.u64 	%rd10, 0xC000001000100000;
+	mov.u64 	%rd12, 0xC000001000100080;
+
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	wgmma.fence.sync.aligned;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// lane holds for m64n8k16.
+	shr.u32 	%r21, %r1, 5;
+	shr.u32 	%r22, %r1, 2;
+	and.b32 	%r22, %r22, 7;
+	and.b32 	%r23, %r1, 3;
+	shl.b32 	%r24, %r21, 4;
+	add.s32 	%r24, %r24, %r22;
+	shl.b32 	%r25, %r24, 5;
+	shl.b32 	%r26, %r23, 3;
+	add.s32 	%r25, %r25, %r26;
+	cvt.u64.u32 	%rd13, %r25;
+	add.s64 	%rd13, %rd3, %rd13;
+	st.global.b32 	[%rd13], %f5;
+	st.global.b32 	[%rd13+4], %f6;
+	st.global.b32 	[%rd13+256], %f7;
+	st.global.b32 	[%rd13+260], %f8;
+	ret;
+}

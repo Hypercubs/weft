@@ -32,7 +32,7 @@ all: build/weft build/weft-gen
 
 build/weft: src/main.mm src/translate.cpp src/translate_ptx.cpp src/translate_spirv.cpp src/translate.hpp \
            src/translate_ptx.hpp src/translate_spirv.hpp src/weft_msl.hpp src/weft_warp_msl.hpp \
-           runtime/weft_runtime.hpp runtime/weft_runtime.cpp
+           src/soft_math.hpp runtime/weft_runtime.hpp runtime/weft_runtime.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -DWEFT_ROOT='"$(ROOT)"' $(MAIN) src/translate.cpp src/translate_ptx.cpp \
 	      src/translate_spirv.cpp $(FW) -o build/weft.n && mv build/weft.n build/weft
@@ -42,7 +42,7 @@ build/weft: src/main.mm src/translate.cpp src/translate_ptx.cpp src/translate_sp
 # the CPU path costs nothing at run time.
 build/weft-gen: src/gen.cpp src/translate.cpp src/translate_ptx.cpp src/translate_spirv.cpp \
                 src/translate.hpp src/translate_ptx.hpp src/translate_spirv.hpp src/weft_msl.hpp \
-                src/weft_warp_msl.hpp
+                src/weft_warp_msl.hpp src/soft_math.hpp
 	@mkdir -p build
 	$(CXX) -std=c++20 -O2 -I include src/gen.cpp src/translate.cpp src/translate_ptx.cpp \
 	      src/translate_spirv.cpp -o build/weft-gen.n && mv build/weft-gen.n build/weft-gen

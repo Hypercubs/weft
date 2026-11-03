@@ -1,0 +1,81 @@
+; A 3D image: `3D` in OpTypeImage, a coordinate of three components on every read
+; and sample, and `OpImageQuerySizeLod` reporting (width, height, depth). The
+; SPIR-V twin of basic.metal's `tex3d`:
+;     v3 = size(img); x = gid % w; y = (gid / w) % h; z = (x + y) % d
+;     out[gid] = img.read(uint3(x, y, z)).x * 2 + sample(s, centre).x + z
+; The plane is folded into the answer, so reading plane 0 of the volume, or a size
+; query that answers 1 for the depth, lands on a different number.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability ImageBasic
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "tex3d" %gid
+               OpName %main "tex3d"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+       %v3u = OpTypeVector %u32 3
+       %v3f = OpTypeVector %f32 3
+       %v4f = OpTypeVector %f32 4
+     %v3u64 = OpTypeVector %u64 3
+       %img = OpTypeImage %f32 3D 0 0 0 0 Unknown
+       %smp = OpTypeSampler
+        %si = OpTypeSampledImage %img
+ %ptr_uc_img = OpTypePointer UniformConstant %img
+ %ptr_uc_smp = OpTypePointer UniformConstant %smp
+    %ptr_out = OpTypePointer CrossWorkgroup %f32
+        %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %ptr_out %ptr_uc_img %ptr_uc_smp
+        %gid = OpVariable %pin Input
+      %zerou = OpConstant %u32 0
+       %half = OpConstant %f32 0.5
+        %two = OpConstant %f32 2
+         %z0 = OpConstant %f32 0
+       %main = OpFunction %void None %fnty
+          %o = OpFunctionParameter %ptr_out
+        %tex = OpFunctionParameter %ptr_uc_img
+     %smpvar = OpFunctionParameter %ptr_uc_smp
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %g32 = OpUConvert %u32 %gi
+      %vimg = OpLoad %img %tex
+       %wsz = OpImageQuerySizeLod %v3u %vimg %zerou
+         %w = OpCompositeExtract %u32 %wsz 0
+         %h = OpCompositeExtract %u32 %wsz 1
+         %d = OpCompositeExtract %u32 %wsz 2
+         %x = OpUMod %u32 %g32 %w
+        %dy = OpUDiv %u32 %g32 %w
+         %y = OpUMod %u32 %dy %h
+        %sxy = OpIAdd %u32 %x %y
+         %z = OpUMod %u32 %sxy %d
+       %xyz = OpCompositeConstruct %v3u %x %y %z
+         %ri = OpImageRead %v4f %vimg %xyz
+        %rx = OpCompositeExtract %f32 %ri 0
+         %pi = OpPtrAccessChain %ptr_out %o %gi
+        %xf = OpConvertUToF %f32 %x
+       %xfh = OpFAdd %f32 %xf %half
+        %wf = OpConvertUToF %f32 %w
+         %u = OpFDiv %f32 %xfh %wf
+        %yf = OpConvertUToF %f32 %y
+       %yfh = OpFAdd %f32 %yf %half
+        %hf = OpConvertUToF %f32 %h
+         %v = OpFDiv %f32 %yfh %hf
+        %zf = OpConvertUToF %f32 %z
+       %zfh = OpFAdd %f32 %zf %half
+        %df = OpConvertUToF %f32 %d
+        %ww = OpFDiv %f32 %zfh %df
+      %uvw = OpCompositeConstruct %v3f %u %v %ww
+      %vsmp = OpLoad %smp %smpvar
+       %sis = OpSampledImage %si %vimg %vsmp
+        %sm = OpImageSampleExplicitLod %v4f %sis %uvw Lod %z0
+         %b = OpCompositeExtract %f32 %sm 0
+        %m2 = OpFMul %f32 %rx %two
+        %r2 = OpFAdd %f32 %m2 %b
+        %rv = OpFAdd %f32 %r2 %zf
+               OpStore %pi %rv
+               OpReturn
+               OpFunctionEnd

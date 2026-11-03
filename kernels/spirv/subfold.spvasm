@@ -1,0 +1,120 @@
+; The OpenCL.std fold builtins over a float: the tree the two engines share.
+;
+; A reduce and a scan are one doubling tree, written out rather than called as
+; `simd_sum` — the hardware's own fold would add in its own order, and for floats
+; a different order of additions is a different answer. This module is the case
+; that measures it: the lane's value is (l+1)/2, a half-integer, so every partial
+; sum is exact in binary32 and every hand-worked answer below is exact too.
+;
+;   reduce_add(v)     0.5 + 1 + ... + 16 = 264
+;   reduce_min(v)     the smallest lane's 0.5
+;   reduce_max(v)     the largest lane's 16
+;   scan_inclusive    lane l gets 0.5 + ... + (l+1)/2 = (l+1)(l+2)/4
+;   scan_exclusive    lane l gets 0.5 + ... + l/2     = l(l+1)/4
+;
+; Each slot holds what is left when the hand-worked number is taken away, so a
+; wrong shift, a lane that folded itself in when it should not have, or a mask
+; that counted a lane which never ran is a nonzero slot rather than a hint.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Linkage
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "subfold" %gid
+               OpName %main "subfold"
+               OpName %fadd "sub_group_reduce_add"
+               OpName %fmin "sub_group_reduce_min"
+               OpName %fmax "sub_group_reduce_max"
+               OpName %fscan "sub_group_scan_inclusive_add"
+               OpName %fexcl "sub_group_scan_exclusive_add"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %fadd LinkageAttributes "sub_group_reduce_add" Import
+               OpDecorate %fmin LinkageAttributes "sub_group_reduce_min" Import
+               OpDecorate %fmax LinkageAttributes "sub_group_reduce_max" Import
+               OpDecorate %fscan LinkageAttributes "sub_group_scan_inclusive_add" Import
+               OpDecorate %fexcl LinkageAttributes "sub_group_scan_exclusive_add" Import
+       %void = OpTypeVoid
+        %f32 = OpTypeFloat 32
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+       %f32p = OpTypePointer CrossWorkgroup %f32
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+        %fn1 = OpTypeFunction %f32 %f32
+       %fnty = OpTypeFunction %void %f32p
+        %gid = OpVariable %pin Input
+      %one32 = OpConstant %u32 1
+     %mask31 = OpConstant %u32 31
+      %half = OpConstant %f32 0.5
+   %quarter = OpConstant %f32 0.25
+    %want_all = OpConstant %f32 264
+    %want_min = OpConstant %f32 0.5
+    %want_max = OpConstant %f32 16
+       %fadd = OpFunction %f32 None %fn1
+        %ap1 = OpFunctionParameter %f32
+                OpFunctionEnd
+       %fmin = OpFunction %f32 None %fn1
+        %ap2 = OpFunctionParameter %f32
+                OpFunctionEnd
+       %fmax = OpFunction %f32 None %fn1
+        %ap3 = OpFunctionParameter %f32
+                OpFunctionEnd
+      %fscan = OpFunction %f32 None %fn1
+        %ap4 = OpFunctionParameter %f32
+                OpFunctionEnd
+       %fexcl = OpFunction %f32 None %fn1
+        %ap5 = OpFunctionParameter %f32
+                OpFunctionEnd
+       %main = OpFunction %void None %fnty
+           %o = OpFunctionParameter %f32p
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %gl = OpUConvert %u32 %gi
+      %lane = OpBitwiseAnd %u32 %gl %mask31
+        %l1 = OpIAdd %u32 %lane %one32
+        %vf = OpConvertUToF %f32 %l1
+          %v = OpFMul %f32 %vf %half
+     %redall = OpFunctionCall %f32 %fadd %v
+      %redmn = OpFunctionCall %f32 %fmin %v
+      %redmx = OpFunctionCall %f32 %fmax %v
+      %incl = OpFunctionCall %f32 %fscan %v
+      %excl = OpFunctionCall %f32 %fexcl %v
+        ; (l+1)(l+2)/4 is the inclusive prefix, and l(l+1)/4 the exclusive one.
+        ; Both products are whole numbers below 1,056, so the convert is exact and
+        ; the division by four is a multiply by a power of two.
+        %l2 = OpIAdd %u32 %l1 %one32
+     %iprod = OpIMul %u32 %l1 %l2
+     %ipf = OpConvertUToF %f32 %iprod
+   %wantincl = OpFMul %f32 %ipf %quarter
+     %eprod = OpIMul %u32 %lane %l1
+     %epf = OpConvertUToF %f32 %eprod
+   %wante = OpFMul %f32 %epf %quarter
+       %xe = OpFSub %f32 %excl %wante
+       %xi = OpFSub %f32 %incl %wantincl
+       %xa = OpFSub %f32 %redall %want_all
+       %xn = OpFSub %f32 %redmn %want_min
+       %xx = OpFSub %f32 %redmx %want_max
+       ; Five blocks of 32 slots: the inclusive residual, the exclusive one, and
+       ; the three reductions.
+        ; 0..31 -> the first block, 32..63 -> the second, and so on
+       %p0 = OpPtrAccessChain %f32p %o %gi
+               OpStore %p0 %xi
+     %gl32 = OpIAdd %u32 %gl %mask31
+     %gl33 = OpIAdd %u32 %gl32 %one32
+       %p1 = OpPtrAccessChain %f32p %o %gl33
+               OpStore %p1 %xe
+     %gl64 = OpIAdd %u32 %gl33 %mask31
+     %gl65 = OpIAdd %u32 %gl64 %one32
+       %p2 = OpPtrAccessChain %f32p %o %gl65
+               OpStore %p2 %xa
+     %gl96 = OpIAdd %u32 %gl65 %mask31
+     %gl97 = OpIAdd %u32 %gl96 %one32
+       %p3 = OpPtrAccessChain %f32p %o %gl97
+               OpStore %p3 %xn
+    %gl128 = OpIAdd %u32 %gl97 %mask31
+    %gl129 = OpIAdd %u32 %gl128 %one32
+       %p4 = OpPtrAccessChain %f32p %o %gl129
+               OpStore %p4 %xx
+               OpReturn
+               OpFunctionEnd

@@ -128,6 +128,11 @@ namespace {
 // was most of the per-lane cost.
 struct StepGroup {
   std::vector<weft::Ctx> ctxs;
+  // Threadgroup memory for a state-machine kernel: a Metal kernel's
+  // `threadgroup T name[N]` is a slot in this, keyed by which declaration it is,
+  // the same way the coroutine path's is. Nothing about the slot depends on the
+  // pass, so a lane that re-enters on the next one finds the same memory.
+  weft::SlotState slots{};
   uint32_t built = 0;  // lanes whose launch-invariant fields are already written
 };
 
@@ -149,6 +154,11 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   // A new group's scan caches start empty: the pass number counts from zero in
   // every group, so a key left by the previous group could match this one's.
   for (uint32_t w = 0; w < (live + 31u) / 32u; w++) fold[(size_t)w * weft::kFoldWords] = 0u;
+  // Threadgroup memory is the group's, so it starts here and is not reused from
+  // the previous one.
+  g.slots.bump = 0;
+  g.slots.count = 0;
+  for (int s = 0; s < 64; s++) g.slots.off[s] = 0;
   // Nine of the twelve fields depend on the launch, not on the group, so they are
   // written once per lane instead of once per lane per group: a barrier-heavy
   // kernel sets this up 4,096 times for a 1M-lane grid, and every write past the
@@ -160,7 +170,7 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
       c.lid = i;
       c.tg_size = tg;
       c.grid = grid;
-      c.slots = nullptr;
+      c.slots = &g.slots;
       c.bufs = bufs;
       c.ws = &ws;
       c.warp = warp;
@@ -185,18 +195,12 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   uint32_t remaining = live;
   uint32_t pass = 1;
   while (remaining > 0) {
-    // A whole-group call needs every pass number written first; the per-lane call
-    // writes its own just before it runs, which keeps the store on a line the
-    // call is about to touch anyway.
-    if (k.group_step)
-      for (uint32_t i = 0; i < live; i++) g.ctxs[i].pass = pass;  // shuffles key on this
     if (k.group_step) {
-      // Whole group, one call: the lane loop is in the module's own function.
-      k.group_step(g.ctxs.data(), states, stride, live, bufs, shared);
-      remaining = 0;
-      unsigned char* st = states;
-      for (uint32_t i = 0; i < live; i++, st += stride)
-        if (*reinterpret_cast<uint32_t*>(st) != weft::kThreadDone) remaining++;
+      // Whole group, one call: the lane loop, the pass number the shuffles key on
+      // and the count of lanes still running all live in the module's own
+      // function, so a segment costs one call per threadgroup rather than an
+      // indirect one per lane from here.
+      remaining = k.group_step(g.ctxs.data(), states, stride, live, pass, bufs, shared);
     } else {
       unsigned char* st = states;
       for (uint32_t i = 0; i < live; i++, st += stride) {
@@ -406,6 +410,31 @@ void* coro_alloc(std::size_t n) {
 
 void coro_arena_reset() { t_coro_used = 0; }
 
+namespace {
+// Several lanes reach these in the same instruction, and one message is the
+// whole of what a reader needs.
+std::atomic<bool> g_shared_reported{false};
+}  // namespace
+
+void shared_overflow(std::size_t need, std::size_t cap) {
+  if (!g_shared_reported.exchange(true)) {
+    std::fprintf(stderr,
+                 "weft: this kernel's `threadgroup` declarations need %zu bytes; the arena is "
+                 "%zu bytes for one threadgroup (the GPU has 32 KiB)\n",
+                 need, cap);
+  }
+  std::abort();
+}
+
+void shared_too_many() {
+  if (!g_shared_reported.exchange(true)) {
+    std::fprintf(stderr,
+                 "weft: this kernel declares more than 64 `threadgroup` arrays; the slot table "
+                 "holds 64\n");
+  }
+  std::abort();
+}
+
 void* Task::promise_type::operator new(std::size_t n) { return coro_alloc(n); }
 
 void Task::promise_type::operator delete(void* p, std::size_t n) noexcept {
@@ -426,12 +455,18 @@ uint64_t param(int index) { return (index >= 0 && index < 64) ? g_params[index] 
 // once before dispatch and every threadgroup reads the same image.
 static Texture g_textures[16];
 
-void set_texture(int index, void* data, uint32_t width, uint32_t height, uint32_t elem) {
+void set_texture_layers(int index, void* data, uint32_t width, uint32_t height, uint32_t elem,
+                        uint32_t layers) {
   if (index < 0 || index >= 16) return;
   g_textures[index].data = (unsigned char*)data;
   g_textures[index].width = width;
   g_textures[index].height = height;
   g_textures[index].elem = elem ? elem : 4u;
+  g_textures[index].layers = layers ? layers : 1u;
+}
+
+void set_texture(int index, void* data, uint32_t width, uint32_t height, uint32_t elem) {
+  set_texture_layers(index, data, width, height, elem, 1u);
 }
 
 Texture texture(int index) {
@@ -699,7 +734,17 @@ void disp_thunk(void* p, uint32_t id) {
 
 void dispatch(const KernelDef& k, void* const* bufs, uint32_t grid, uint32_t tg) {
   if (grid == 0) return;
-  if (tg == 0 || tg > kMaxThreadgroup) tg = 256;
+  if (tg == 0 || tg > kMaxThreadgroup) {
+    // Not silent: a launch whose geometry is changed underneath it gives an answer
+    // for a grid the caller did not ask for, and a barrier kernel's is not even the
+    // same shape. It still runs — a caller of weft_run gets no refusal channel —
+    // but it says so, and at the biggest group there is rather than an arbitrary
+    // small one.
+    std::fprintf(stderr,
+                 "weft: %u threads per threadgroup is not a group; this launch used %u\n",
+                 tg, kMaxThreadgroup);
+    tg = kMaxThreadgroup;
+  }
 
   const uint32_t ngroups = (grid + tg - 1) / tg;
 

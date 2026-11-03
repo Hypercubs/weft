@@ -1,0 +1,137 @@
+//
+// wgmma with a swizzled MN-major A operand — the last combination of the three
+// things a descriptor can say.
+//
+// A is transposed (the third immediate after the descriptors), so M is the
+// contiguous direction: a row of the atom is 64 M values, 128 bytes, which is the
+// full width of a 128-byte atom, and eight of those rows are one atom. B stays
+// K-major, and both carry swizzle mode 1.
+//
+// The walk is the mirror of the K-major one: a byte's position inside an atom is
+// its M offset, the K row is one atom wide, and LBO steps eight rows at a time —
+// so with K = 16 the second half of K lives in the second atom, 1024 bytes in.
+// The pattern's phase is the same in either direction, which is the point: a
+// translator that swizzled only the K-major walk would read A's other atom here
+// and produce a wrong product rather than an error.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry wgmma_swztrans_kernel(
+	.param .u64 wgmma_swztrans_kernel_param_0,
+	.param .u64 wgmma_swztrans_kernel_param_1,
+	.param .u64 wgmma_swztrans_kernel_param_2
+)
+{
+	.reg .b32 	%r<40>;
+	.reg .f32 	%f<12>;
+	.reg .b64 	%rd<16>;
+	.reg .pred 	%p<2>;
+
+	// A: two atoms of eight K rows, 2048 bytes. B: eight rows of 128 bytes after.
+	.shared .align 1024 .b8 weft_ab[3072];
+
+	ld.param.u64 	%rd1, [wgmma_swztrans_kernel_param_0];
+	ld.param.u64 	%rd2, [wgmma_swztrans_kernel_param_1];
+	ld.param.u64 	%rd3, [wgmma_swztrans_kernel_param_2];
+
+	mov.u32 	%r1, %tid.x;
+	mov.u64 	%rd5, weft_ab;
+
+	// ---- A: one 16-byte run of M inside one K row — K row = lane / 8, run = lane % 8
+	shr.u32 	%r14, %r1, 3;			// K row
+	and.b32 	%r15, %r1, 7;			// which 16 bytes of M
+	shl.b32 	%r16, %r15, 8;			// 256 bytes of a row
+	shl.b32 	%r17, %r14, 1;			// 2 bytes of K
+	add.s32 	%r16, %r16, %r17;		// ... to the source: A[m][k] at m*32 + 2k
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd1, %rd7;
+
+	shr.u32 	%r18, %r14, 3;			// the atom K = 8 lands in
+	shl.b32 	%r18, %r18, 10;			// 1024 bytes an atom
+	and.b32 	%r19, %r14, 7;			// the K row inside it
+	shl.b32 	%r19, %r19, 7;			// 128 bytes a row
+	add.s32 	%r18, %r18, %r19;		// the row's start: no bits in the pattern
+	and.b32 	%r20, %r14, 7;
+	shl.b32 	%r20, %r20, 4;			// the pattern's phase for this row
+	shl.b32 	%r22, %r15, 4;			// the run's own 16 bytes
+	xor.b32 	%r22, %r22, %r20;
+	add.s32 	%r18, %r18, %r22;
+	cvt.u64.u32 	%rd8, %r18;
+	add.s64 	%rd8, %rd5, %rd8;
+
+	// Eight M values, 16 halves apart in the source and adjacent here.
+	ld.global.u16 	%r30, [%rd7];
+	st.shared.u16 	[%rd8], %r30;
+	ld.global.u16 	%r30, [%rd7+32];
+	st.shared.u16 	[%rd8+2], %r30;
+	ld.global.u16 	%r30, [%rd7+64];
+	st.shared.u16 	[%rd8+4], %r30;
+	ld.global.u16 	%r30, [%rd7+96];
+	st.shared.u16 	[%rd8+6], %r30;
+	ld.global.u16 	%r30, [%rd7+128];
+	st.shared.u16 	[%rd8+8], %r30;
+	ld.global.u16 	%r30, [%rd7+160];
+	st.shared.u16 	[%rd8+10], %r30;
+	ld.global.u16 	%r30, [%rd7+192];
+	st.shared.u16 	[%rd8+12], %r30;
+	ld.global.u16 	%r30, [%rd7+224];
+	st.shared.u16 	[%rd8+14], %r30;
+
+	// ---- B: K-major, one 16-byte chunk of every row: lane = row * 16 + k ----
+	setp.lt.u32 	%p1, %r1, 128;
+	shr.u32 	%r14, %r1, 4;			// n
+	and.b32 	%r15, %r1, 15;			// k
+	shl.b32 	%r16, %r15, 3;
+	add.s32 	%r16, %r16, %r14;
+	shl.b32 	%r16, %r16, 1;
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd2, %rd7;
+	ld.global.u16 	%r18, [%rd7];
+	shl.b32 	%r17, %r15, 1;
+	and.b32 	%r19, %r14, 7;
+	shl.b32 	%r19, %r19, 4;
+	xor.b32 	%r17, %r17, %r19;
+	shl.b32 	%r20, %r14, 7;
+	add.s32 	%r17, %r17, %r20;
+	add.s32 	%r17, %r17, 2048;
+	cvt.u64.u32 	%rd8, %r17;
+	add.s64 	%rd8, %rd5, %rd8;
+	st.shared.u16 	[%rd8], %r18;
+
+	bar.sync 	0;
+
+	// A: mode 1, at 0. B: mode 1, at 2048. Both on a pattern boundary.
+	mov.u64 	%rd10, 0x4000004000400000;
+	mov.u64 	%rd12, 0x4000004000400080;
+
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	wgmma.fence.sync.aligned;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 0, 0, 1, 0;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// lane holds for m64n8k16.
+	shr.u32 	%r21, %r1, 5;
+	shr.u32 	%r22, %r1, 2;
+	and.b32 	%r22, %r22, 7;
+	and.b32 	%r23, %r1, 3;
+	shl.b32 	%r24, %r21, 4;
+	add.s32 	%r24, %r24, %r22;
+	shl.b32 	%r25, %r24, 5;
+	shl.b32 	%r26, %r23, 3;
+	add.s32 	%r25, %r25, %r26;
+	cvt.u64.u32 	%rd13, %r25;
+	add.s64 	%rd13, %rd3, %rd13;
+	st.global.b32 	[%rd13], %f5;
+	st.global.b32 	[%rd13+4], %f6;
+	st.global.b32 	[%rd13+256], %f7;
+	st.global.b32 	[%rd13+260], %f8;
+	ret;
+}

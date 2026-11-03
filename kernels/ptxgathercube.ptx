@@ -1,0 +1,68 @@
+// `tld4.cube`: a gather named by a face and a place on it.
+//
+//     s = (2 sx - 63) / 64, t = (2 sy - 63) / 64, face = (sx + sy) % 6
+//     g = tld4(cube, s, t, face)
+//     out[gid] = g.x + 2 g.y + 3 g.z + 5 g.w + 11 face
+//
+// A cube texel is addressed by a face and a coordinate, so the four reads are exact
+// on both engines and no sampler is involved. Every lane covers all six faces over
+// the grid and the face is folded into the answer, so reading the wrong face cannot
+// hide behind a texel that happens to hold the same number.
+//
+// The coordinate is built so no rounding is involved: 2 sx - 63 is an integer below
+// 128, and dividing by 64 is exact, so the footprint base is `sx` on both engines
+// whether or not one of them fuses the multiply and the subtract.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.tex .u32 cube, 1, 1, 1, 1;
+
+.visible .entry ptxgathercube(
+    .param .u64 ptxgathercube_param_0
+)
+{
+    .reg .b32 %r<24>;
+    .reg .f32 %f<24>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxgathercube_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    and.b32 %r5, %r4, 63;               // sx
+    shr.u32 %r6, %r4, 6;
+    and.b32 %r6, %r6, 63;               // sy
+    add.s32 %r7, %r5, %r6;
+    div.u32 %r8, %r7, 6;
+    mul.lo.s32 %r9, %r8, 6;
+    sub.s32 %r7, %r7, %r9;              // face = (sx + sy) % 6
+
+    shl.b32 %r10, %r5, 1;               // 2 sx
+    sub.s32 %r10, %r10, 63;             // 2 sx - 63
+    shl.b32 %r11, %r6, 1;
+    sub.s32 %r11, %r11, 63;             // 2 sy - 63
+    cvt.rn.f32.s32 %f1, %r10;
+    cvt.rn.f32.s32 %f2, %r11;
+    mul.f32 %f3, %f1, 0f3B800000;       // s
+    mul.f32 %f4, %f2, 0f3B800000;       // t
+
+    tld4.b.cube.v4.f32.f32 {%f8,%f9,%f10,%f11}, [cube, {%f3,%f4,%r7}];
+
+    mul.f32 %f12, %f9, 0f40000000;      // 2 g.y
+    add.f32 %f13, %f8, %f12;
+    mul.f32 %f14, %f10, 0f40400000;     // 3 g.z
+    add.f32 %f13, %f13, %f14;
+    mul.f32 %f15, %f11, 0f40A00000;     // 5 g.w
+    add.f32 %f13, %f13, %f15;
+    cvt.rn.f32.s32 %f16, %r7;           // the face, folded in
+    mul.f32 %f16, %f16, 0f41300000;     // 11
+    add.f32 %f13, %f13, %f16;
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f13;
+    ret;
+}

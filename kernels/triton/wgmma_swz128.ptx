@@ -1,0 +1,119 @@
+//
+// wgmma with swizzled shared operands: the layout every real Hopper kernel uses.
+//
+// A swizzle atom is eight rows of 128 bytes, contiguous, and inside it the
+// 16-byte chunk a row falls in is XORed with the row's position in the pattern —
+// CUTLASS's Swizzle<3,4,3> over byte offsets, `off ^ (((off >> 7) & 7) << 4)`.
+// The descriptor says all of this in bits 62-63 (1 = 128B) instead of the 0 an
+// unswizzled tile carries, and the two strides become whole atoms: SBO = 1024
+// bytes between the eight-row groups, LBO = 1024 unused here because one
+// instruction's 32 bytes of K never leave an atom.
+//
+// The tiles are wider than the instruction reads — a row of A is 128 bytes and
+// K = 16 halves is 32 of them — which is the point: the swizzle scatters those
+// 32 bytes across the whole row, so an address computed without it reads the
+// wrong half rather than a nearby one.
+//
+// The reference multiplies the input tiles directly, so it does not care how
+// they are laid out: only a staging that matches the descriptor walk reproduces
+// the product.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry wgmma_swz128_kernel(
+	.param .u64 wgmma_swz128_kernel_param_0,
+	.param .u64 wgmma_swz128_kernel_param_1,
+	.param .u64 wgmma_swz128_kernel_param_2
+)
+{
+	.reg .b32 	%r<40>;
+	.reg .f32 	%f<12>;
+	.reg .b64 	%rd<16>;
+
+	// A: 64 rows of 128 bytes, eight of them an atom. B: eight rows after it.
+	.shared .align 1024 .b8 weft_ab[9216];
+
+	ld.param.u64 	%rd1, [wgmma_swz128_kernel_param_0];
+	ld.param.u64 	%rd2, [wgmma_swz128_kernel_param_1];
+	ld.param.u64 	%rd3, [wgmma_swz128_kernel_param_2];
+
+	mov.u32 	%r1, %tid.x;
+	mov.u64 	%rd5, weft_ab;
+
+	// ---- A: one 16-byte chunk of one row, at its swizzled address ----
+	and.b32 	%r2, %r1, 63;			// row
+	shr.u32 	%r3, %r1, 6;			// which chunk of the row's 16 halves
+	shl.b32 	%r4, %r2, 5;			// row * 32 bytes in the source tile
+	shl.b32 	%r6, %r3, 4;			// chunk * 16
+	add.s32 	%r4, %r4, %r6;
+	cvt.u64.u32 	%rd4, %r4;
+	add.s64 	%rd4, %rd1, %rd4;
+	ld.global.v4.b32 	{%r10, %r11, %r12, %r13}, [%rd4];
+
+	and.b32 	%r8, %r2, 7;			// the row's place in the pattern
+	shl.b32 	%r8, %r8, 4;
+	xor.b32 	%r9, %r6, %r8;			// chunk ^ (row & 7) << 4
+	shl.b32 	%r7, %r2, 7;			// row * 128 bytes inside the atom
+	add.s32 	%r9, %r9, %r7;
+	cvt.u64.u32 	%rd6, %r9;
+	add.s64 	%rd6, %rd5, %rd6;
+	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
+
+	// ---- B: one value — row n = lane / 16, column k = lane % 16 ----
+	shr.u32 	%r14, %r1, 4;			// n
+	and.b32 	%r15, %r1, 15;			// k
+	shl.b32 	%r16, %r15, 3;			// B's rows are eight columns wide
+	add.s32 	%r16, %r16, %r14;
+	shl.b32 	%r16, %r16, 1;			// two bytes a value
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd2, %rd7;
+	ld.global.u16 	%r18, [%rd7];
+
+	shl.b32 	%r17, %r15, 1;			// the K byte column
+	and.b32 	%r19, %r14, 7;
+	shl.b32 	%r19, %r19, 4;
+	xor.b32 	%r17, %r17, %r19;
+	shl.b32 	%r20, %r14, 7;
+	add.s32 	%r17, %r17, %r20;
+	add.s32 	%r17, %r17, 8192;		// B starts after A's 8 KiB
+	cvt.u64.u32 	%rd8, %r17;
+	add.s64 	%rd8, %rd5, %rd8;
+	st.shared.u16 	[%rd8], %r18;
+
+	bar.sync 	0;
+
+	// Swizzle mode 1 in bits 62-63; LBO and SBO are 1024 bytes, 64 units.
+	mov.u64 	%rd10, 4611686293309489152;
+	mov.u64 	%rd12, 4611686293309489664;
+
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	wgmma.fence.sync.aligned;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// lane holds for m64n8k16.
+	shr.u32 	%r21, %r1, 5;
+	shr.u32 	%r22, %r1, 2;
+	and.b32 	%r22, %r22, 7;
+	and.b32 	%r23, %r1, 3;
+	shl.b32 	%r24, %r21, 4;
+	add.s32 	%r24, %r24, %r22;
+	shl.b32 	%r25, %r24, 5;
+	shl.b32 	%r26, %r23, 3;
+	add.s32 	%r25, %r25, %r26;
+	cvt.u64.u32 	%rd13, %r25;
+	add.s64 	%rd13, %rd3, %rd13;
+	st.global.b32 	[%rd13], %f5;
+	st.global.b32 	[%rd13+4], %f6;
+	st.global.b32 	[%rd13+256], %f7;
+	st.global.b32 	[%rd13+260], %f8;
+	ret;
+}

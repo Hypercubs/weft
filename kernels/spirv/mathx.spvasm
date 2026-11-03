@@ -1,0 +1,45 @@
+; Transcendentals through OpenCL.std: `sin`, `atan2` and `pow`, which are the
+; three shapes a kernel reaches for — one-argument, two-argument, and a power.
+;
+;     out[gid] = sin(x) * 3 + atan2(x, 2) + pow(x, 0.5)
+;
+; Every one of them has to come back bit-identical from the CPU and the GPU: the
+; library is one text compiled twice, so what this checks is that the module's
+; call reached it instead of the hardware's approximation.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+       %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "mathx" %gid
+               OpName %main "mathx"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u64 = OpTypeInt 64 0
+      %v3u64 = OpTypeVector %u64 3
+  %ptr_cw_f = OpTypePointer CrossWorkgroup %f32
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr_cw_f %ptr_cw_f
+       %gid = OpVariable %pin Input
+       %two = OpConstant %f32 2
+      %half = OpConstant %f32 0.5
+     %three = OpConstant %f32 3
+       %main = OpFunction %void None %fnty
+          %i = OpFunctionParameter %ptr_cw_f
+          %o = OpFunctionParameter %ptr_cw_f
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pi = OpPtrAccessChain %ptr_cw_f %i %gi
+          %x = OpLoad %f32 %pi
+         %s1 = OpExtInst %f32 %ocl sin %x
+         %s2 = OpExtInst %f32 %ocl atan2 %x %two
+         %s3 = OpExtInst %f32 %ocl pow %x %half
+         %m1 = OpFMul %f32 %s1 %three
+         %a1 = OpFAdd %f32 %m1 %s2
+         %a2 = OpFAdd %f32 %a1 %s3
+         %po = OpPtrAccessChain %ptr_cw_f %o %gi
+               OpStore %po %a2
+               OpReturn
+               OpFunctionEnd

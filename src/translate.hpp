@@ -18,6 +18,10 @@ struct TranslatedKernel {
   int nsamp = 0;        // samplers it reads through, chosen with --samplers
   bool sync = false;
   bool flat = false;
+  // The module emits a state machine for this kernel rather than a coroutine: the
+  // lane's locals live in the state blob and a barrier is a resume point, so the
+  // dispatcher's per-lane visit is a `switch` and not a frame resume.
+  bool step = false;
   bool warp = false;  // also has a 32-lanes-at-a-time backend
   bool tile = false;  // a render pass's first stage, run before the fragments
   // A `[[mesh]]` stage: its two outputs (one vertex block and one triangle block
@@ -58,6 +62,29 @@ struct TranslatedKernel {
   // geometry a kernel was compiled for is recorded — a caller that guesses a
   // different one gets a kernel indexed over a different number of blocks.
   uint32_t tg_hint = 0;
+  // A group size the module states without depending on it — SPIR-V's `LocalSize`.
+  // It is the launch's default and nothing more: a GLCompute kernel is indexed by
+  // its global invocation id, which does not depend on the group, so a different
+  // one is a different launch of the same program rather than a mislaunch. That is
+  // the difference from `tg_hint`, which is a constraint the program was written
+  // against.
+  uint32_t def_threads = 0;
+  // A group size the module declares as a *constraint*, because the lane identity
+  // is decomposed by it: a 2-D `LocalSize 8 8 1` means lane `l` is (l % 8, l / 8),
+  // so a launch of a different width hands every lane a different identity. A
+  // one-dimensional group has no such decomposition, which is why `def_threads`
+  // is a default and this is not.
+  uint32_t fixed_threads = 0;
+  // What each texture binding has to be, in binding order: `2d`, `1d`, `array`,
+  // `3d` or `cube`. Empty when the front end does not say. A cube kernel handed a
+  // 2-D texture is not a slow run — it reads a texel nobody asked for — so the
+  // launcher checks the shape it was given against this.
+  std::vector<std::string> tex_shape;
+  // Bindings the kernel writes as well as reads, in binding order. A write needs
+  // `access::read_write`, and Metal cannot filter through that mode, so the GPU
+  // module declares a second sampled view of the same texture for the launcher to
+  // bind one past the last binding.
+  std::vector<bool> tex_rw;
   // Pointer parameters the body never reads, so nothing is bound for them. PTX
   // leaves them out of the buffer order, which is why the count can be smaller
   // than the parameter list the signature shows.
@@ -93,6 +120,12 @@ struct RenderMode {
 // translated to C++, and both engines run the identical sequence of IEEE
 // operations (see src/soft_math.hpp).
 std::string rewrite_math_calls(const std::string& text);
+
+// The semantics library a module needs to answer the same way on both targets:
+// Metal's vector types and the portable math written over them. A front end that
+// emits its own preamble rather than the Metal file's adds this to it, so a
+// transcendental in a module reaches the same text the GPU compiles.
+std::string weft_math_preamble();
 
 TranslateResult translate_msl(const std::string& msl, const RenderMode* render = nullptr);
 

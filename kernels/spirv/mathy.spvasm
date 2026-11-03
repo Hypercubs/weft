@@ -1,0 +1,65 @@
+; The exponent and magnitude functions of OpenCL.std, which are the ones that
+; read a float's own bits: `ldexp`, `ilogb`, `logb`, `nextafter`, `maxmag`,
+; `minmag`, `pown`, `rootn` and `expm1`.
+;
+;     a   = |in[gid]| + 1        // positive, so logb is finite and rootn is real
+;     out = ldexp(a,3) + (float)ilogb(a) + logb(a) + maxmag(a,2) + minmag(a,3)
+;         + nextafter(a,1e6) + pown(a,3) + rootn(a,3) + expm1(a)
+;
+; A wrong exponent, a nextafter that stepped the wrong way, or a rootn that
+; dropped a sign all land on a different number, and the CPU and the GPU have to
+; agree on every one of the 65,536 lanes.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+       %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "mathy" %gid
+               OpName %main "mathy"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+      %v3u64 = OpTypeVector %u64 3
+  %ptr_cw_f = OpTypePointer CrossWorkgroup %f32
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr_cw_f %ptr_cw_f
+       %gid = OpVariable %pin Input
+        %one = OpConstant %f32 1
+        %two = OpConstant %f32 2
+      %three = OpConstant %f32 3
+    %million = OpConstant %f32 1000000
+       %ithree = OpConstant %u32 3
+       %main = OpFunction %void None %fnty
+          %i = OpFunctionParameter %ptr_cw_f
+          %o = OpFunctionParameter %ptr_cw_f
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pi = OpPtrAccessChain %ptr_cw_f %i %gi
+          %x = OpLoad %f32 %pi
+        %fab = OpExtInst %f32 %ocl fabs %x
+          %a = OpFAdd %f32 %fab %one
+        %sld = OpExtInst %f32 %ocl ldexp %a %ithree
+        %sil = OpExtInst %u32 %ocl ilogb %a
+         %fil = OpConvertUToF %f32 %sil
+        %slg = OpExtInst %f32 %ocl logb %a
+        %smx = OpExtInst %f32 %ocl maxmag %a %two
+        %smn = OpExtInst %f32 %ocl minmag %a %three
+        %snx = OpExtInst %f32 %ocl nextafter %a %million
+        %spn = OpExtInst %f32 %ocl pown %a %ithree
+        %srt = OpExtInst %f32 %ocl rootn %a %ithree
+        %sem = OpExtInst %f32 %ocl expm1 %a
+        %b1 = OpFAdd %f32 %sld %fil
+        %b2 = OpFAdd %f32 %b1 %slg
+        %b3 = OpFAdd %f32 %b2 %smx
+        %b4 = OpFAdd %f32 %b3 %smn
+        %b5 = OpFAdd %f32 %b4 %snx
+        %b6 = OpFAdd %f32 %b5 %spn
+        %b7 = OpFAdd %f32 %b6 %srt
+        %b8 = OpFAdd %f32 %b7 %sem
+         %po = OpPtrAccessChain %ptr_cw_f %o %gi
+               OpStore %po %b8
+               OpReturn
+               OpFunctionEnd

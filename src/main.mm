@@ -8,6 +8,8 @@
 #endif
 
 #include <dlfcn.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -28,6 +30,160 @@
 
 namespace {
 
+// ---- a buffer's end is a page ----
+//
+// A kernel that indexes past the end of a buffer used to take the whole process
+// down with it, and a bare `Segmentation fault` reads as a broken tool rather
+// than a launch that was too small. The storage a kernel is handed is therefore
+// mapped with a page of PROT_NONE after it, so the first access past the end
+// lands in a handler that says which buffer, by how much, and over what grid.
+// The page size is the host's, not an assumption: Apple silicon maps 16 KiB pages,
+// and a guard page placed at a 4 KiB offset there is not page-aligned at all —
+// `mprotect` refuses it. The value is read once, before the first allocation, and
+// cached so the fault handler can use it without calling anything.
+size_t g_page_bytes = 0;
+
+size_t guard_page() {
+  if (!g_page_bytes) g_page_bytes = (size_t)getpagesize();
+  return g_page_bytes;
+}
+
+struct GuardTag {
+  const char* base = nullptr;
+  size_t bytes = 0;
+  int index = -1;
+};
+
+GuardTag g_guards[64];
+int g_nguards = 0;
+// Two lanes of the same launch can overrun the same buffer in the same
+// instruction, so only the first fault gets to speak.
+volatile sig_atomic_t g_guard_reported = 0;
+uint64_t g_guard_grid = 0;
+uint64_t g_guard_threads = 0;
+
+void* guard_alloc(size_t bytes) {
+  const size_t page = guard_page();
+  size_t pages = (bytes + page - 1) / page;
+  if (pages == 0) pages = 1;
+  void* p = mmap(nullptr, (pages + 1) * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                 -1, 0);
+  if (p == MAP_FAILED) {
+    std::fprintf(stderr, "weft: out of memory for %zu bytes of buffer\n", bytes);
+    std::abort();
+  }
+  if (mprotect((char*)p + pages * page, page, PROT_NONE) != 0) {
+    std::fprintf(stderr, "weft: cannot put a guard page after a %zu byte buffer\n", bytes);
+    std::abort();
+  }
+  return p;
+}
+
+void guard_free(void* p, size_t bytes) {
+  if (!p) return;
+  const size_t page = guard_page();
+  size_t pages = (bytes + page - 1) / page;
+  if (pages == 0) pages = 1;
+  munmap(p, (pages + 1) * page);
+}
+
+// Formatting that is safe in a signal handler: no stdio, no allocation.
+size_t guard_put(char* out, const char* s) {
+  size_t n = 0;
+  while (s[n]) out[n] = s[n], n++;
+  return n;
+}
+
+size_t guard_num(char* out, uint64_t v) {
+  char tmp[24];
+  size_t n = 0;
+  do {
+    tmp[n++] = (char)('0' + (int)(v % 10));
+    v /= 10;
+  } while (v);
+  for (size_t i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+  return n;
+}
+
+void guard_fault(int sig, siginfo_t* si, void*) {
+  const char* at = (const char*)si->si_addr;
+  for (int i = 0; i < g_nguards; i++) {
+    const char* base = g_guards[i].base;
+    if (!base) continue;
+    const size_t page = g_page_bytes ? g_page_bytes : 4096;
+    const size_t len = g_guards[i].bytes;
+    const size_t guard = ((len + page - 1) / page) * page;
+    if (at < base + guard || at >= base + guard + page) continue;
+    if (g_guard_reported) _exit(2);
+    g_guard_reported = 1;
+    char msg[320];
+    size_t n = 0;
+    n += guard_put(msg + n, "weft: the kernel touched byte ");
+    n += guard_num(msg + n, (uint64_t)(at - base));
+    n += guard_put(msg + n, " of buffer ");
+    n += guard_num(msg + n, (uint64_t)g_guards[i].index);
+    n += guard_put(msg + n, ", which is ");
+    n += guard_num(msg + n, len);
+    n += guard_put(msg + n, " bytes long");
+    if (g_guard_grid) {
+      n += guard_put(msg + n, " (the launch was ");
+      n += guard_num(msg + n, g_guard_grid);
+      n += guard_put(msg + n, " threads of ");
+      n += guard_num(msg + n, g_guard_threads);
+      n += guard_put(msg + n, ")");
+    }
+    n += guard_put(msg + n, ". --buffers ");
+    n += guard_num(msg + n, (uint64_t)g_guards[i].index);
+    n += guard_put(msg + n, " is too small for this launch.\n");
+    const ssize_t w = write(STDERR_FILENO, msg, n);
+    (void)w;
+    _exit(2);
+  }
+  // Not one of ours: put the default action back and take the same fault again.
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void guard_install() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  struct sigaction sa;
+  std::memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = guard_fault;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, nullptr);
+  sigaction(SIGBUS, &sa, nullptr);
+}
+
+void guard_tag(const void* base, size_t bytes, int index) {
+  if (!base || index < 0 || index >= 64) return;
+  guard_install();
+  g_guards[index].base = (const char*)base;
+  g_guards[index].bytes = bytes;
+  g_guards[index].index = index;
+  if (index >= g_nguards) g_nguards = index + 1;
+}
+
+// A std::vector's storage, with the guard page after it. Everything the rest of
+// this file does to a buffer — resize, assign, data, size, copy — is unchanged.
+template <class T>
+struct GuardAlloc {
+  using value_type = T;
+  GuardAlloc() = default;
+  template <class U>
+  GuardAlloc(const GuardAlloc<U>&) {}
+  T* allocate(size_t n) { return (T*)guard_alloc(n * sizeof(T)); }
+  void deallocate(T* p, size_t n) { guard_free(p, n * sizeof(T)); }
+  template <class U>
+  bool operator==(const GuardAlloc<U>&) const { return true; }
+  template <class U>
+  bool operator!=(const GuardAlloc<U>&) const { return false; }
+};
+
+using GuardedFloats = std::vector<float, GuardAlloc<float>>;
+
 const char* kUsage =
     "weft — run GPU compute kernels on CPU cores\n"
     "\n"
@@ -44,7 +200,8 @@ const char* kUsage =
     "  --out-gpu PATH    the same frame from the gpu run, for a pixel diff\n"
     "  --render WxH      a render pass instead of a compute one: the fragment\n"
     "                    named by --kernel runs once per pixel of a WxH target\n"
-  "  --textures WxH[,WxH]  textures to bind at index 0, 1, ... (default: none)\n"
+  "  --textures WxH[*L][,...]  textures to bind at index 0, 1, ... (default: none);\n"
+    "                    *L makes it a 2D array of L slices\n"
     "  --samplers F/A[,F/A]  sampler state per index: nearest|linear / clamp|zero|repeat\n"
     "  --bench K         iterations to time (default 20); 1 also turns off the\n"
     "                    thread search described under --cpu-only\n"
@@ -126,7 +283,11 @@ struct Options {
   bool threads_set = false;  // --threads was given, so no module default applies
   std::vector<size_t> bufs;
   std::vector<std::pair<int, uint32_t>> widths;  // --buffer-bytes overrides
-  std::vector<std::pair<uint32_t, uint32_t>> textures;  // width x height, bound in order
+  // One binding per --textures entry: its width x height, the slice count when it
+  // is a 2D array (1 for a plain texture), and the depth when it is a volume —
+  // `WxHxD`, which is 0 for the other two shapes.
+  struct TexBind { uint32_t w, h, layers, d; bool cube; bool one_d; };
+  std::vector<TexBind> textures;  // bound at index 0, 1, ...
   std::vector<std::pair<int, int>> samplers;            // filter, address mode
   std::vector<std::pair<int, uint64_t>> args;  // scalar kernel parameters
   std::vector<std::pair<int, std::string>> dumps, gpu_dumps;
@@ -276,7 +437,18 @@ int main(int argc, char** argv) {
       if (a == "--kernel") o.kernel = next("--kernel");
       else if (a == "--grid") o.grid = (uint32_t)std::strtoul(next("--grid").c_str(), nullptr, 10);
       else if (a == "--threads") {
-        o.threads = (uint32_t)std::strtoul(next("--threads").c_str(), nullptr, 10);
+        const std::string v = next("--threads");
+        o.threads = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
+        // The runtime's cap, and the hardware's: a group of more than 1024 is not a
+        // group on the GPU either. Saying so here is the difference between a
+        // refusal and a launch that quietly ran at a size nobody asked for.
+        if (o.threads == 0 || o.threads > 1024) {
+          std::fprintf(stderr,
+                       "weft: --threads %s is not a threadgroup size; the most a group can "
+                       "have is 1024\n",
+                       v.c_str());
+          return 2;
+        }
         o.threads_set = true;
       }
       else if (a == "--bench") o.bench = (uint32_t)std::strtoul(next("--bench").c_str(), nullptr, 10);
@@ -381,8 +553,40 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "weft: --textures needs WxH entries, got '%s'\n", part.c_str());
             return 2;
           }
-          o.textures.emplace_back((uint32_t)std::strtoul(part.substr(0, x).c_str(), nullptr, 10),
-                                  (uint32_t)std::strtoul(part.substr(x + 1).c_str(), nullptr, 10));
+          // `WxH*L` is a 2D array of L slices, `WxHxD` is a volume of D planes,
+          // `WxHc` is a cube of six square faces, `WxHd` is a 1D texture — one row,
+          // which is what `texture1d` and PTX's `tex.1d` both read — and without any
+          // of them it is one 2D image.
+          const std::string rest = part.substr(x + 1);
+          const size_t star = rest.find('*');
+          const size_t dep = rest.find('x');
+          const size_t cub = rest.find('c');
+          const size_t ond = rest.find('d');
+          size_t stop = star < dep ? star : dep;
+          if (cub < stop) stop = cub;
+          if (ond < stop) stop = ond;
+          const uint32_t tw = (uint32_t)std::strtoul(part.substr(0, x).c_str(), nullptr, 10);
+          const uint32_t th = (uint32_t)std::strtoul(rest.substr(0, stop).c_str(), nullptr, 10);
+          const bool cube = cub != std::string::npos;
+          const bool one_d = ond != std::string::npos;
+          const uint32_t tl =
+              cube ? 6u
+                   : star == std::string::npos
+                         ? 1u
+                         : (uint32_t)std::strtoul(rest.substr(star + 1).c_str(), nullptr, 10);
+          const uint32_t td = dep == std::string::npos
+                                  ? 0u
+                                  : (uint32_t)std::strtoul(rest.substr(dep + 1).c_str(), nullptr, 10);
+          if (!tw || !th || !tl || (dep != std::string::npos && !td) || (cube && tw != th) ||
+              (one_d && th != 1u)) {
+            std::fprintf(stderr, "weft: --textures entry '%s' needs WxH and a non-zero count%s\n",
+                         part.c_str(),
+                         cube    ? " (a cube is square)"
+                         : one_d ? " (a 1D texture is one row: use Wx1d)"
+                                 : "");
+            return 2;
+          }
+          o.textures.push_back(Options::TexBind{tw, th, tl, td, cube, one_d});
           if (comma == std::string::npos) break;
           start = comma + 1;
         }
@@ -510,6 +714,44 @@ int main(int argc, char** argv) {
     // decides which elements a block covers, so guessing a different one runs a
     // different program. `--threads` always wins.
     if (!o.threads_set && kern.tg_hint) o.threads = kern.tg_hint;
+    // A module that states the group it was written to run in without depending on
+    // it — SPIR-V's `LocalSize` — gets it as the default too, but not as a
+    // constraint: the kernel is indexed by its global invocation id.
+    if (!o.threads_set && !kern.tg_hint && kern.def_threads) o.threads = kern.def_threads;
+    // A group wider than a row is not a suggestion: the lane identity is
+    // decomposed by its shape, so the launch is that size or every lane holds a
+    // different identity than the module wrote about.
+    if (kern.fixed_threads && o.threads != kern.fixed_threads) {
+      std::printf("threads   %u given, this kernel declares a %u-lane group: using %u\n",
+                  o.threads, kern.fixed_threads, kern.fixed_threads);
+      o.threads = kern.fixed_threads;
+    }
+    // What each texture binding has to be. A cube kernel handed a 2-D texture is
+    // not a slow run — the sampler reads a texel nobody asked for — so the shape
+    // the command line gave is checked against the shape the module declared, in
+    // binding order.
+    for (size_t t = 0; t < kern.tex_shape.size() && t < o.textures.size(); t++) {
+      const std::string& want = kern.tex_shape[t];
+      if (want.empty()) continue;
+      const Options::TexBind& tb = o.textures[t];
+      const std::string got = tb.cube  ? "cube"
+                              : tb.one_d ? "1d"
+                              : tb.d > 0 ? "3d"
+                              : tb.layers > 1 ? "array"
+                                              : "2d";
+      if (want != got) {
+        std::fprintf(stderr,
+                     "weft: kernel '%s' binds texture %zu as a %s image, but --textures gave a "
+                     "%s one: a %s binding needs a %s entry\n",
+                     kern.name.c_str(), t, want.c_str(), got.c_str(), want.c_str(),
+                     want == "cube"   ? "WxHc"
+                     : want == "1d"   ? "Wx1d"
+                     : want == "3d"   ? "WxHxD"
+                     : want == "array" ? "WxH*L"
+                                      : "WxH");
+        return 2;
+      }
+    }
     // A mesh stage produces one mesh per threadgroup, and the hardware caps a
     // mesh threadgroup at 32 lanes, so that is the group size unless one is given.
     if (!o.threads_set && kern.mesh) o.threads = 32;
@@ -662,17 +904,32 @@ int main(int argc, char** argv) {
 
     // Textures are inputs: the same pixels from the same generator feed the GPU
     // and the CPU, so a texture kernel compares like any other.
+    // A binding may be a 2D array: its slices are filled from the same generator,
+    // one after another, so slice L of the GPU's texture and slice L here hold
+    // the same texels and a layer index has to mean the same thing on both.
     std::vector<std::vector<float>> texdata(o.textures.size());
     for (size_t t = 0; t < o.textures.size(); t++) {
-      const size_t n = (size_t)o.textures[t].first * o.textures[t].second;
+      const uint32_t outer = o.textures[t].d > 0 ? o.textures[t].d : o.textures[t].layers;
+      const size_t n = (size_t)o.textures[t].w * o.textures[t].h * outer;
       texdata[t].resize(n);
       for (size_t i = 0; i < n; i++) texdata[t][i] = det_value((uint32_t)i, (uint32_t)(100 + t));
     }
     auto set_texture =
         (void (*)(int, void*, uint32_t, uint32_t, uint32_t))dlsym(handle, "weft_set_texture");
-    if (set_texture)
+    auto set_texture_layers = (void (*)(int, void*, uint32_t, uint32_t, uint32_t, uint32_t))
+        dlsym(handle, "weft_set_texture_layers");
+    if (set_texture_layers)
       for (size_t t = 0; t < o.textures.size(); t++)
-        set_texture((int)t, texdata[t].data(), o.textures[t].first, o.textures[t].second, 4);
+        set_texture_layers((int)t, texdata[t].data(), o.textures[t].w, o.textures[t].h, 4,
+                           o.textures[t].d > 0 ? o.textures[t].d : o.textures[t].layers);
+    else if (set_texture)
+      for (size_t t = 0; t < o.textures.size(); t++) {
+        if (o.textures[t].layers != 1) {
+          std::fprintf(stderr, "weft: this module cannot bind an array texture\n");
+          return 2;
+        }
+        set_texture((int)t, texdata[t].data(), o.textures[t].w, o.textures[t].h, 4);
+      }
     // Samplers are host state for a SPIR-V kernel, the way a descriptor is on a
     // GPU: one is created per index and the kernel reads through it.
     if (kern.ntex > (int)o.textures.size()) {
@@ -795,8 +1052,10 @@ int main(int argc, char** argv) {
     }
     // Element widths come from the module: `sizeof` of the type each buffer was
     // declared with, so `--buffers N` is N elements of *that* type — 4 bytes for a
-    // float*, 16 for a float4*, 12 for a packed_float3*. A front end that cannot
-    // type its pointers reports nothing and 4 bytes is assumed.
+    // float*, 16 for a float4*, 12 for a packed_float3*. The front ends that bind
+    // addresses report the width their own loads and stores address the buffer at
+    // (or the one `--buffer-bytes` stated), and 4 bytes is the fallback only where
+    // the module has nothing to say.
     // Every bound buffer gets the width the module reports, mesh outputs included:
     // the vertex block is `sizeof` of the shader's own vertex struct, and a
     // primitive is three indices. The colour target has no entry and is not
@@ -814,7 +1073,7 @@ int main(int argc, char** argv) {
     // the target covers — including the short last row and column a target that
     // is not a multiple of 32 still pays for, exactly as the hardware does.
     const uint64_t tiles_x = (o.rw + 31u) / 32u, tiles_y = (o.rh + 31u) / 32u;
-    std::vector<std::vector<float>> host(nbuf);
+    std::vector<GuardedFloats> host(nbuf);
     for (size_t b = 0; b < nbuf; b++) {
       uint64_t bytes;
       if (b < nb)
@@ -876,9 +1135,15 @@ int main(int argc, char** argv) {
       }
       std::memcpy(host[l.first].data(), data.data(), data.size());
     }
-    const std::vector<std::vector<float>> pristine = host;
+    const std::vector<GuardedFloats> pristine = host;
     std::vector<void*> ptrs(nbuf);
     for (size_t b = 0; b < nbuf; b++) ptrs[b] = host[b].data();
+    // The guard pages are only useful if the fault can be named, so every buffer a
+    // kernel is handed is tagged with who it is and how big it is.
+    for (size_t b = 0; b < nbuf; b++)
+      guard_tag(host[b].data(), host[b].size() * sizeof(float), (int)b);
+    g_guard_grid = o.grid;
+    g_guard_threads = o.threads;
 
     // `--emit-gpu` sends the source to stdout so it can be written to a .metal
     // file, and a report in front of it is a syntax error rather than a
@@ -895,9 +1160,12 @@ int main(int argc, char** argv) {
                     o.rh, nb, nb == 1 ? "" : "s");
     }
     else {
-      // A front end that types its pointers names the element (`float4 16B`); one
-      // that binds addresses has nothing to name, and saying `float 4B` there
-      // would be the tool inventing a layout. It says `addr 4B*` and explains.
+      // A front end that types its pointers names the element (`float4 16B`). One
+      // that binds an address has no name to give, and calling it `float` would be
+      // the tool inventing a layout — so it says `addr 8B`, a byte count without a
+      // type. That count is measured (the width the instructions that reach the
+      // buffer address it at), or stated with `--buffer-bytes`; only a buffer
+      // nothing typed reaches is left at the 4-byte fallback, marked `*`.
       std::string types;
       bool unknown_width = false;
       for (size_t b = 0; b < nb; b++) {
@@ -909,11 +1177,7 @@ int main(int argc, char** argv) {
         types += known ? wid : std::string("addr");
         if ((known || literal) && b < elem.size() && elem[b]) {
           types += " " + std::to_string(elem[b]) + "B";
-          if (literal) types += "*";  // stated by the caller, not declared by the module
         } else {
-          // The module does not type this buffer. A stated width is shown, and the
-          // `*` says it came from the command line rather than the declaration;
-          // without one, 4 bytes is assumed and the note below explains.
           types += " " + std::to_string(b < elem.size() ? elem[b] : 4u) + "B*";
           unknown_width = true;
         }
@@ -923,9 +1187,9 @@ int main(int argc, char** argv) {
                     kern.name.c_str(), fmt_uint(o.grid).c_str(), o.threads, nb,
                     nb == 1 ? "" : "s", types.c_str());
       if (report && unknown_width)
-        std::printf("note      * this front end binds addresses, so the element width is not "
-                    "declared:\n"
-                    "           4 bytes is assumed for the buffers marked *. State one with "
+        std::printf("note      * nothing typed reaches the buffers marked *, so the element "
+                    "width is\n"
+                    "           unknown: 4 bytes is assumed. State one with "
                     "`--buffer-bytes I=N[,J=N]`.\n");
       // A parameter the kernel declares and never reads is not bound — Triton's
       // `global_scratch` is the common case — so the buffer count can be one
@@ -978,7 +1242,10 @@ int main(int argc, char** argv) {
     if (hw > 5) cands.push_back(hw / 2);
     if (hw > 2) cands.push_back(hw);
     uint32_t threads = hw;
-    if (cands.size() > 1 && o.bench >= 4) {
+    // `--emit-gpu` asks for the shader source, not a run: nothing is launched, so a
+    // kernel whose buffers were sized for another path cannot take the process
+    // down before the source gets printed.
+    if (cands.size() > 1 && o.bench >= 4 && !o.emit_gpu) {
       const uint32_t trials = std::min(o.bench, 5u);
       double best_trial = 1e18;
       for (uint32_t w : cands) {
@@ -993,7 +1260,7 @@ int main(int argc, char** argv) {
     }
 
     double best_cpu = 1e18, sum_cpu = 0.0;
-    for (uint32_t it = 0; it < o.bench + 1; it++) {
+    for (uint32_t it = 0; it < (o.emit_gpu ? 0u : o.bench + 1); it++) {
       for (size_t b = 0; b < nbuf; b++)
         std::memcpy(host[b].data(), pristine[b].data(), host[b].size() * sizeof(float));
       double s = now_ms();
@@ -1279,19 +1546,87 @@ int main(int argc, char** argv) {
       }
       std::vector<id<MTLTexture>> mtex(o.textures.size());
       for (size_t t = 0; t < o.textures.size(); t++) {
-        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
-                                                     MTLPixelFormatR32Float
-                                                                                      width:o.textures[t].first
-                                                                                     height:o.textures[t].second
-                                                                                  mipmapped:NO];
+        const Options::TexBind& tb = o.textures[t];
+        // A volume is its own descriptor: `texture3d` is `MTLTextureType3D`, whose
+        // planes are stored one after another — the order the host data was filled
+        // in, and the order the CPU runtime indexes.
+        MTLTextureDescriptor* td;
+        if (tb.d > 0) {
+          // This SDK has no `texture3DDescriptor…` class method, so the descriptor
+          // is built field by field — which is what the convenience constructors
+          // do anyway.
+          td = [[MTLTextureDescriptor alloc] init];
+          td.pixelFormat = MTLPixelFormatR32Float;
+          td.textureType = MTLTextureType3D;
+          td.width = tb.w;
+          td.height = tb.h;
+          td.depth = tb.d;
+          td.mipmapLevelCount = 1;
+        } else {
+          td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                  width:tb.w
+                                                                 height:tb.h
+                                                              mipmapped:NO];
+        }
+        // An array binding is the texture type the kernel declares:
+        // `texture2d_array<float>` is an MTLTextureType2DArray of L slices, and
+        // its slices are stored one after another, which is the order the host
+        // data was filled in. A cube is six faces of the same descriptor, in the
+        // same order — the two types differ, the layout does not.
+        if (tb.one_d) {
+          // One row, and the GPU type that says so: `texture1d` is
+          // `MTLTextureType1D`, which has a width and no height at all.
+          td.textureType = MTLTextureType1D;
+        } else if (tb.cube) {
+          td.textureType = MTLTextureTypeCube;
+        } else if (tb.layers > 1) {
+          td.textureType = MTLTextureType2DArray;
+          td.arrayLength = tb.layers;
+        }
         // Writable, because a kernel may hold a storage image: `access::write`
         // needs the GPU's permission to write the resource back.
         td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         mtex[t] = [dev newTextureWithDescriptor:td];
-        [mtex[t] replaceRegion:MTLRegionMake2D(0, 0, o.textures[t].first, o.textures[t].second)
-                   mipmapLevel:0
-                     withBytes:texdata[t].data()
-                   bytesPerRow:(NSUInteger)o.textures[t].first * sizeof(float)];
+        // The slice form uploads one slice per call — its region is a single
+        // slice, not the whole array — so the slices are copied in one at a time
+        // from the same flat buffer the CPU runtime indexes.
+        if (tb.d > 0) {
+          // A volume goes up through a blit: this SDK's `replaceRegion` has no 3D
+          // form, and the blit's source is the same flat buffer the CPU runtime
+          // indexes, one plane after another.
+          id<MTLBuffer> src = [dev newBufferWithBytes:texdata[t].data()
+                                               length:texdata[t].size() * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+          id<MTLCommandQueue> q = [dev newCommandQueue];
+          id<MTLCommandBuffer> cb = [q commandBuffer];
+          id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+          [bl copyFromBuffer:src
+                  sourceOffset:0
+              sourceBytesPerRow:(NSUInteger)tb.w * sizeof(float)
+            sourceBytesPerImage:(NSUInteger)tb.w * tb.h * sizeof(float)
+                    sourceSize:MTLSizeMake(tb.w, tb.h, tb.d)
+                     toTexture:mtex[t]
+              destinationSlice:0
+              destinationLevel:0
+             destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [bl endEncoding];
+          [cb commit];
+          [cb waitUntilCompleted];
+        } else if (tb.layers > 1) {
+          const size_t slice = (size_t)tb.w * tb.h * sizeof(float);
+          for (uint32_t l = 0; l < tb.layers; l++)
+            [mtex[t] replaceRegion:MTLRegionMake3D(0, 0, 0, tb.w, tb.h, 1)
+                       mipmapLevel:0
+                             slice:l
+                         withBytes:texdata[t].data() + (size_t)l * tb.w * tb.h
+                       bytesPerRow:(NSUInteger)tb.w * sizeof(float)
+                      bytesPerImage:slice];
+        }
+        else
+          [mtex[t] replaceRegion:MTLRegionMake2D(0, 0, tb.w, tb.h)
+                     mipmapLevel:0
+                       withBytes:texdata[t].data()
+                     bytesPerRow:(NSUInteger)tb.w * sizeof(float)];
       }
 
       // The sampler state the CPU runtime models is the GPU's descriptor, so the
@@ -1392,6 +1727,16 @@ int main(int argc, char** argv) {
           if (kern.gpu_warp && lock_buf) [enc setBuffer:lock_buf offset:0 atIndex:nbind + 2];
           for (size_t t = 0; t < mtex.size(); t++) [enc setTexture:mtex[t] atIndex:t];
           for (size_t sm = 0; sm < msamp.size(); sm++) [enc setSamplerState:msamp[sm] atIndex:sm];
+          // A binding the kernel writes is `access::read_write`, and Metal cannot
+          // filter through that mode. The module declares a second, sampled view of
+          // the same texture one past the last binding; binding the one handle to
+          // both gives the filter the same storage the writes reach.
+          for (size_t t = 0; t < mtex.size(); t++) {
+            if (t >= kern.tex_rw.size() || !kern.tex_rw[t]) continue;
+            const NSUInteger at = (NSUInteger)(kern.ntex + (int)t);
+            [enc setTexture:mtex[t] atIndex:at];
+            [enc setSamplerState:(t < msamp.size() ? msamp[t] : make_sampler(0, 0)) atIndex:at];
+          }
           // A warp-backend kernel runs a whole 32-lane warp per thread, so the
           // launch is one thread per warp and the group is the same fraction of
           // the threads per group. The kernel multiplies both back to get the

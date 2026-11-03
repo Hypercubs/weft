@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from fractions import Fraction
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROBE_SRC = os.path.join(ROOT, "tools", "f64_probe.mm")
@@ -70,7 +71,7 @@ MAXF = 1.7976931348623157e308
 # right: exact sums, inexact quotients, a tie that rounds one way and a tie that
 # rounds the other, cancellation, both zeros, the top and bottom of the range, the
 # subnormals, and the specials.
-CASES = [
+PAIRS = [
     (1.0, 2.0), (1.0, 1.0 / 3.0), (0.5, 0.25), (-1.5, 2.5), (1.0, -1.0),
     (3.0, 7.0), (1e300, 1e-300), (1e300, -1e300), (MAXF, MAXF), (MAXF, -MAXF),
     (float(2 ** 53), 1.0), (float(2 ** 53) + 2.0, 1.0), (1.5, 0.5), (2.5, 0.5),
@@ -88,15 +89,42 @@ for _ in range(240):
         b = dbl(_rng.getrandbits(64))
         if not (math.isnan(a) or math.isnan(b)):
             break
-    CASES.append((a, b))
+    PAIRS.append((a, b))
+
+# Every case carries a third operand as well: the fused multiply-add takes three, and
+# the two-operand operations ignore it. For `fma` the third value is picked to make the
+# addition do work — most often the exact negation of the product, which is the shape
+# that cancels to nothing and needs all 106 bits of it.
+def _third(a, b, i):
+    p = a * b
+    if i % 3 == 0 and not (math.isinf(p) or math.isnan(p)):
+        return -p
+    if i % 3 == 1:
+        return a
+    return dbl(_rng.getrandbits(64))
+
+
+CASES = [(a, b, _third(a, b, i)) for i, (a, b) in enumerate(PAIRS)]
+
+# `F64_EXTRA=6000 python3 tools/f64_check.py fma` runs a longer sweep than the suite
+# does. A rounding bug in a 192-bit accumulator hides in the case nobody wrote down, and
+# a few thousand random triples is what it takes to say a hand-written fma is exact.
+for _ in range(int(os.environ.get("F64_EXTRA", "0"))):
+    while True:
+        a = dbl(_rng.getrandbits(64))
+        b = dbl(_rng.getrandbits(64))
+        if not (math.isnan(a) or math.isnan(b)):
+            break
+    CASES.append((a, b, _third(a, b, len(CASES))))
 
 
 def kernel(op_expr):
     return ("kernel void probe(device uint64_t* in [[buffer(0)]],\n"
             "                    device uint64_t* out [[buffer(1)]],\n"
             "                    uint id [[thread_position_in_grid]]) {\n"
-            "  const uint64_t a = in[2u * id];\n"
-            "  const uint64_t b = in[2u * id + 1u];\n"
+            "  const uint64_t a = in[3u * id];\n"
+            "  const uint64_t b = in[3u * id + 1u];\n"
+            "  const uint64_t c = in[3u * id + 2u];\n"
             "  out[id] = " + op_expr + ";\n}\n")
 
 
@@ -193,6 +221,52 @@ def expect_to_u64(a, _b):
     return int(math.trunc(a))
 
 
+def _round_f64(fr):
+    """Round an exact rational to binary64, nearest even — what float() would do."""
+    if fr == 0:
+        return 0.0
+    sign = -1.0 if fr < 0 else 1.0
+    x = abs(fr)
+    two = Fraction(2)
+    e = x.numerator.bit_length() - x.denominator.bit_length()
+    while two ** e > x:
+        e -= 1
+    while two ** (e + 1) <= x:
+        e += 1
+    quantum = Fraction(1, 1 << 1074) if e < -1022 else two ** (e - 52)
+    q = x / quantum
+    n = int(q)
+    r = q - n
+    if r > Fraction(1, 2) or (r == Fraction(1, 2) and n % 2):
+        n += 1
+    val = Fraction(n) * quantum
+    if val >= two ** 1024:
+        return sign * INF
+    return sign * float(val)
+
+
+def expect_fma(a, b, c):
+    if math.isnan(a) or math.isnan(b) or math.isnan(c):
+        return 0x7FF8000000000000
+    p = a * b
+    if math.isinf(p) and math.isinf(c):
+        return 0x7FF8000000000000 if (p < 0) != (c < 0) else bits(p)
+    if math.isinf(p):
+        return bits(p)
+    if math.isinf(c):
+        return bits(c)
+    exact = Fraction(a) * Fraction(b) + Fraction(c)
+    if exact == 0:
+        # An exact zero sum is negative only when both addends were negative zeros.
+        neg = math.copysign(1.0, p) < 0 and math.copysign(1.0, c) < 0
+        return bits(-0.0) if neg else bits(0.0)
+    return bits(_round_f64(exact))
+
+
+def _two(fn):
+    return lambda a, b, _c: fn(a, b)
+
+
 def expect_iden(a, _b):
     return bits(a)
 
@@ -206,23 +280,24 @@ def expect_isnan(a, _b):
 
 
 OPS = {
-    "iden": ("a", expect_iden),
-    "isinf": ("(uint64_t)weft_fp64::is_inf(a)", expect_isinf),
-    "isnan": ("(uint64_t)weft_fp64::is_nan(a)", expect_isnan),
-    "add": ("weft_fp64::add(a, b)", expect_add),
-    "sub": ("weft_fp64::sub(a, b)", expect_sub),
-    "mul": ("weft_fp64::mul(a, b)", expect_mul),
-    "div": ("weft_fp64::div(a, b)", expect_div),
-    "lt": ("(uint64_t)weft_fp64::lt(a, b)", expect_lt),
-    "eq": ("(uint64_t)weft_fp64::eq(a, b)", expect_eq),
-    "floor": ("weft_fp64::floor_bits(a)", expect_floor),
-    "ceil": ("weft_fp64::ceil_bits(a)", expect_ceil),
-    "trunc": ("weft_fp64::trunc_bits(a)", expect_trunc),
-    "round": ("weft_fp64::round_bits(a)", expect_round),
-    "fromf32": ("weft_fp64::from_f32((uint32_t)a)", expect_from_f32),
-    "tof32": ("(uint64_t)weft_fp64::to_f32(a)", expect_to_f32),
-    "fromu64": ("weft_fp64::from_u64(a)", expect_from_u64),
-    "tou64": ("weft_fp64::to_u64(a)", expect_to_u64),
+    "iden": ("a", _two(expect_iden)),
+    "isinf": ("(uint64_t)weft_fp64::is_inf(a)", _two(expect_isinf)),
+    "isnan": ("(uint64_t)weft_fp64::is_nan(a)", _two(expect_isnan)),
+    "add": ("weft_fp64::add(a, b)", _two(expect_add)),
+    "sub": ("weft_fp64::sub(a, b)", _two(expect_sub)),
+    "mul": ("weft_fp64::mul(a, b)", _two(expect_mul)),
+    "div": ("weft_fp64::div(a, b)", _two(expect_div)),
+    "fma": ("weft_fp64::fma(a, b, c)", expect_fma),
+    "lt": ("(uint64_t)weft_fp64::lt(a, b)", _two(expect_lt)),
+    "eq": ("(uint64_t)weft_fp64::eq(a, b)", _two(expect_eq)),
+    "floor": ("weft_fp64::floor_bits(a)", _two(expect_floor)),
+    "ceil": ("weft_fp64::ceil_bits(a)", _two(expect_ceil)),
+    "trunc": ("weft_fp64::trunc_bits(a)", _two(expect_trunc)),
+    "round": ("weft_fp64::round_bits(a)", _two(expect_round)),
+    "fromf32": ("weft_fp64::from_f32((uint32_t)a)", _two(expect_from_f32)),
+    "tof32": ("(uint64_t)weft_fp64::to_f32(a)", _two(expect_to_f32)),
+    "fromu64": ("weft_fp64::from_u64(a)", _two(expect_from_u64)),
+    "tou64": ("weft_fp64::to_u64(a)", _two(expect_to_u64)),
 }
 
 
@@ -232,9 +307,10 @@ def main():
         return 2
     head = preamble()
     words = []
-    for a, b in CASES:
+    for a, b, c in CASES:
         words.append(bits(a))
         words.append(bits(b))
+        words.append(bits(c))
     data = struct.pack("<%dQ" % len(words), *words)
     bad = 0
     for name in want:
@@ -256,8 +332,8 @@ def main():
             continue
         got = [int(line, 16) for line in r.stdout.decode().split()]
         fails = 0
-        for (a, b), g in zip(CASES, got):
-            e = expected(a, b)
+        for (a, b, c), g in zip(CASES, got):
+            e = expected(a, b, c)
             if e is None:
                 continue  # the specification leaves this conversion undefined
             if g != e:

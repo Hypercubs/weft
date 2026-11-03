@@ -10,16 +10,23 @@
 ; The input is a float, converted up, so no lane ever sees a NaN out of a buffer whose
 ; bytes were filled as floats:
 ;
-;   a1[8i+0]  x * 1.5 + 0.25        multiply, then add
-;   a1[8i+1]  x / 3                  divide, which is inexact on purpose
-;   a1[8i+2]  x - 1e300             subtract with a huge operand and a small one
-;   a1[8i+3]  floor(x)
-;   a1[8i+4]  ceil(x)
-;   a1[8i+5]  trunc(x)
-;   a1[8i+6]  round(x)              ties away from zero, as OpenCL's round
-;   a1[8i+7]  (double)(float)x      down to binary32 and back: to_f32 and from_f32
+;   a1[9i+0]  x * 1.5 + 0.25        multiply, then add
+;   a1[9i+1]  x / 3                  divide, which is inexact on purpose
+;   a1[9i+2]  x - 1e300             subtract with a huge operand and a small one
+;   a1[9i+3]  floor(x)
+;   a1[9i+4]  ceil(x)
+;   a1[9i+5]  trunc(x)
+;   a1[9i+6]  round(x)              ties away from zero, as OpenCL's round
+;   a1[9i+7]  (double)(float)x      down to binary32 and back: to_f32 and from_f32
+;   a1[9i+8]  fma(x, 1e300, -(x * 1e300))
 ;   a2[2i+0]  x > 0.75
 ;   a2[2i+1]  (int)(x * 100)        converted up to 64 bits, then truncated to 32
+;
+; The last of the doubles is the whole test of the fused form: a float times 1e300
+; needs more than the 53 bits a double has, so the product is rounded and this
+; answer is that rounding's residue — a tiny number whose bits are the test. A
+; multiply followed by an add returns exactly zero in every lane, because the
+; addend is that same rounded product.
 ;
 ; and the last one is the subgroup form the one-word relay could not carry:
 ;
@@ -63,6 +70,7 @@
       %c528 = OpConstant %f64 528
        %c2u = OpConstant %u64 2
        %c8u = OpConstant %u64 8
+       %c9u = OpConstant %u64 9
        %c0u = OpConstant %u64 0
        %c1u = OpConstant %u64 1
        %c2b = OpConstant %u64 2
@@ -99,7 +107,10 @@
          %r6 = OpExtInst %f64 %ocl round %x
       %narrow = OpFConvert %f32 %x
          %r7 = OpFConvert %f64 %narrow
-       %base = OpIMul %u64 %gi %c8u
+       %prod = OpFMul %f64 %x %c1e300
+       %nprod = OpFNegate %f64 %prod
+         %r8 = OpExtInst %f64 %ocl fma %x %c1e300 %nprod
+       %base = OpIMul %u64 %gi %c9u
          %p0 = OpPtrAccessChain %f64p %a1 %base
                 OpStore %p0 %r0
         %i1 = OpIAdd %u64 %base %c1u
@@ -123,6 +134,9 @@
         %i7 = OpIAdd %u64 %base %c7u
          %p7 = OpPtrAccessChain %f64p %a1 %i7
                 OpStore %p7 %r7
+        %i8 = OpIAdd %u64 %base %c8u
+         %p8 = OpPtrAccessChain %f64p %a1 %i8
+                OpStore %p8 %r8
         ; ---- a comparison and a cast ----
          %gt = OpFOrdGreaterThan %bool %x %c0_75
        %gt32 = OpSelect %u32 %gt %one32 %zero32

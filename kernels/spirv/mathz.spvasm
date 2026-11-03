@@ -1,0 +1,88 @@
+; The four extended instructions that compute two numbers. SPIR-V carries the
+; second one through a pointer the instruction takes as its last operand — the
+; validator is explicit, `frexp: expected the last operand to be a pointer` — so
+; each of these is checked on both halves:
+;
+;     fr = frexp(a, &e)        fraction in [0.5,1) and the exponent e
+;     mo = modf(a, &iv)        fractional part and the integer part
+;     sc = sincos(a, &cv)      the sine and the cosine
+;     rq = remquo(a, 3, &qv)   the remainder and the low quotient bits
+;
+;     a = |in[gid]| + 1
+;     out = fr + mo*2 + sc*3 + rq*4 + e + iv*8 + cv*16 + qv*32
+;
+; Every term has a different weight, so a stored half that never reached its slot
+; lands on a different number instead of a coincidence. `sincos` makes both of its
+; values checkable at once: sin^2 + cos^2 is 1 only if neither is a substitute.
+;
+; The exponent and the quotient are `uint` because `Kernel` has no signed
+; integers — the model's rule, not the maths'.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+       %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "mathz" %gid
+               OpName %main "mathz"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+      %v3u64 = OpTypeVector %u64 3
+  %ptr_cw_f = OpTypePointer CrossWorkgroup %f32
+  %ptr_fn_f = OpTypePointer Function %f32
+  %ptr_fn_u = OpTypePointer Function %u32
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr_cw_f %ptr_cw_f
+       %gid = OpVariable %pin Input
+       %zero = OpConstant %f32 0
+        %u0 = OpConstant %u32 0
+        %one = OpConstant %f32 1
+        %two = OpConstant %f32 2
+      %three = OpConstant %f32 3
+       %four = OpConstant %f32 4
+      %eight = OpConstant %f32 8
+     %sixteen = OpConstant %f32 16
+        %th2 = OpConstant %f32 32
+       %main = OpFunction %void None %fnty
+          %i = OpFunctionParameter %ptr_cw_f
+          %o = OpFunctionParameter %ptr_cw_f
+      %entry = OpLabel
+         %ve = OpVariable %ptr_fn_u Function %u0
+        %viv = OpVariable %ptr_fn_f Function %zero
+         %vc = OpVariable %ptr_fn_f Function %zero
+         %vq = OpVariable %ptr_fn_u Function %u0
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pi = OpPtrAccessChain %ptr_cw_f %i %gi
+          %x = OpLoad %f32 %pi
+        %fab = OpExtInst %f32 %ocl fabs %x
+          %a = OpFAdd %f32 %fab %one
+         %fr = OpExtInst %f32 %ocl frexp %a %ve
+         %mo = OpExtInst %f32 %ocl modf %a %viv
+         %sc = OpExtInst %f32 %ocl sincos %a %vc
+         %rq = OpExtInst %f32 %ocl remquo %a %three %vq
+          %e = OpLoad %u32 %ve
+         %iv = OpLoad %f32 %viv
+         %cv = OpLoad %f32 %vc
+         %qv = OpLoad %u32 %vq
+        %ef = OpConvertUToF %f32 %e
+        %qf = OpConvertUToF %f32 %qv
+        %w2 = OpFMul %f32 %mo %two
+        %w3 = OpFMul %f32 %sc %three
+        %w4 = OpFMul %f32 %rq %four
+        %w8 = OpFMul %f32 %iv %eight
+       %w16 = OpFMul %f32 %cv %sixteen
+       %w32 = OpFMul %f32 %qf %th2
+        %b1 = OpFAdd %f32 %fr %w2
+        %b2 = OpFAdd %f32 %b1 %w3
+        %b3 = OpFAdd %f32 %b2 %w4
+        %b4 = OpFAdd %f32 %b3 %ef
+        %b5 = OpFAdd %f32 %b4 %w8
+        %b6 = OpFAdd %f32 %b5 %w16
+        %b7 = OpFAdd %f32 %b6 %w32
+         %po = OpPtrAccessChain %ptr_cw_f %o %gi
+               OpStore %po %b7
+               OpReturn
+               OpFunctionEnd

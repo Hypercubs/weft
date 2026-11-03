@@ -23,6 +23,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -83,9 +85,11 @@ using StepFn = void (*)(Ctx&, void* state, void* const* bufs, unsigned char* sh)
 
 // The same state machine with its lane loop inside the function. A barrier
 // segment then costs one direct call per threadgroup instead of an indirect one
-// per lane, which is the whole of the cost between two barriers.
-using GroupStepFn = void (*)(Ctx* ctxs, unsigned char* states, size_t stride, uint32_t live,
-                             void* const* bufs, unsigned char* sh);
+// per lane, which is the whole of the cost between two barriers. It also returns
+// how many lanes are still running, so the dispatcher does not have to walk the
+// states again to find out.
+using GroupStepFn = uint32_t (*)(Ctx* ctxs, unsigned char* states, size_t stride, uint32_t live,
+                                 uint32_t pass, void* const* bufs, unsigned char* sh);
 constexpr uint32_t kThreadDone = 0xFFFFFFFFu;
 
 // A warp executed as one vector: the 32 lanes of a warp advance together, and a
@@ -259,6 +263,43 @@ inline const unsigned char* wide_read_slot(const Ctx& c, uint32_t lane) {
   return c.warp16 + ((size_t)((c.pass - 1u) & 1u) * c.tg_size + lane) * kWideSlotBytes;
 }
 
+// ---- the two halves of a rendezvous -----------------------------------------
+//
+// A coroutine spells a rendezvous as one suspension: publish before it, read
+// after. A state machine has to name the boundary, so the same two steps are
+// separate calls here — publish at the end of one segment, take at the start of
+// the next. Both shapes go through these, so they cannot disagree about what a
+// rendezvous carries.
+template <class T>
+inline void shfl_publish(Ctx& c, T value) {
+  if constexpr (sizeof(T) <= 4) {
+    ((uint32_t*)shfl_pub_buf(c))[c.lid] = to_bits(value);
+  } else {
+    static_assert(sizeof(T) <= kWideSlotBytes, "a shuffle is at most 16 bytes wide");
+    std::memcpy(wide_pub_slot(c), &value, sizeof(T));
+  }
+}
+
+// The peer's published word, or the fill value when the peer falls outside the
+// group (which is what `simd_shuffle_and_fill_*` promises).
+template <class T>
+inline T shfl_take(Ctx& c, uint32_t b, int mode, uint32_t width = 32u) {
+  if constexpr (sizeof(T) <= 4) {
+    return from_bits<T>(shfl_peer(c, b, mode, width));
+  } else {
+    T v{};
+    std::memcpy(&v, wide_read_slot(c, shfl_peer_lane(c, b, mode, width)), sizeof(T));
+    return v;
+  }
+}
+
+template <class T>
+inline T shfl_take_fill(Ctx& c, uint32_t b, int mode, T fill, uint32_t width = 32u) {
+  const uint32_t lane = c.lid & (width - 1u);
+  const bool in = (mode == kShflUp) ? (lane >= b) : (lane + b < width);
+  return in ? shfl_take<T>(c, b, mode, width) : fill;
+}
+
 template <class T>
 struct ShflAwaitable {
   Ctx* c;
@@ -268,10 +309,8 @@ struct ShflAwaitable {
   uint32_t width = 32u;
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<>) noexcept {
-    ((uint32_t*)shfl_pub_buf(*c))[c->lid] = to_bits(value);
-  }
-  T await_resume() const noexcept { return from_bits<T>(shfl_peer(*c, b, mode, width)); }
+  void await_suspend(std::coroutine_handle<>) noexcept { shfl_publish(*c, value); }
+  T await_resume() const noexcept { return shfl_take<T>(*c, b, mode, width); }
 };
 
 template <class T>
@@ -295,11 +334,9 @@ struct WideShflAwaitable {
   uint32_t width;
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<>) noexcept {
-    std::memcpy(wide_pub_slot(*c), &value, sizeof(T));
-  }
+  void await_suspend(std::coroutine_handle<>) noexcept { shfl_publish(*c, value); }
   T await_resume() noexcept {
-    std::memcpy(&result, wide_read_slot(*c, shfl_peer_lane(*c, b, mode, width)), sizeof(T));
+    result = shfl_take<T>(*c, b, mode, width);
     return result;
   }
 };
@@ -327,12 +364,8 @@ struct ShflFillAwaitable {
   bool in_range;
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<>) noexcept {
-    ((uint32_t*)shfl_pub_buf(*c))[c->lid] = to_bits(value);
-  }
-  T await_resume() const noexcept {
-    return in_range ? from_bits<T>(shfl_peer(*c, b, mode)) : fill;
-  }
+  void await_suspend(std::coroutine_handle<>) noexcept { shfl_publish(*c, value); }
+  T await_resume() const noexcept { return in_range ? shfl_take<T>(*c, b, mode) : fill; }
 };
 
 // simd_prefix_inclusive_sum / exclusive_sum: a warp-wide scalar scan. One
@@ -350,10 +383,11 @@ struct PrefixAwaitable {
   uint32_t site = 0u;  // the emitted call site, 0 for "do not cache"
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<>) noexcept {
-    ((uint32_t*)shfl_pub_buf(*c))[c->lid] = to_bits(value);
-  }
-  T await_resume() const noexcept {
+  void await_suspend(std::coroutine_handle<>) noexcept { shfl_publish(*c, value); }
+  // One implementation, both shapes: a coroutine resumes here, a state machine
+  // calls it once the next pass has begun.
+  T await_resume() const noexcept { return take(); }
+  T take() const noexcept {
     const uint32_t base = c->lid & ~(width - 1u);
     const uint32_t lane = c->lid - base;
     uint32_t* const slot = c->fold;
@@ -387,6 +421,11 @@ struct PrefixAwaitable {
     return lane ? v[lane - 1u] : T(product ? 1 : 0);
   }
 };
+
+template <class T>
+inline T prefix_take(Ctx& c, bool inclusive, bool product, uint32_t width, uint32_t site) {
+  return PrefixAwaitable<T>{&c, T{}, inclusive, product, width, site}.take();
+}
 
 template <class T>
 inline PrefixAwaitable<T> prefix(Ctx& c, T value, bool inclusive, bool product = false,
@@ -491,12 +530,10 @@ struct WideShflFillAwaitable {
   bool in_range;
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<>) noexcept {
-    std::memcpy(wide_pub_slot(*c), &value, sizeof(T));
-  }
+  void await_suspend(std::coroutine_handle<>) noexcept { shfl_publish(*c, value); }
   T await_resume() noexcept {
     if (!in_range) return fill;
-    std::memcpy(&result, wide_read_slot(*c, shfl_peer_lane(*c, b, mode, width)), sizeof(T));
+    result = shfl_take<T>(*c, b, mode, width);
     return result;
   }
 };
@@ -535,10 +572,9 @@ struct ReduceAwaitable {
   uint32_t site = 0u;  // the emitted call site, 0 for "do not cache"
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<>) noexcept {
-    ((uint32_t*)shfl_pub_buf(*c))[c->lid] = to_bits(value);
-  }
-  T await_resume() const noexcept {
+  void await_suspend(std::coroutine_handle<>) noexcept { shfl_publish(*c, value); }
+  T await_resume() const noexcept { return take(); }
+  T take() const noexcept {
     const uint32_t base = c->lid & ~(width - 1u);
     const uint32_t* slots = shfl_read_buf(*c) + base;
     uint32_t* const slot = c->fold;
@@ -571,6 +607,11 @@ struct ReduceAwaitable {
 };
 
 template <class T>
+inline T reduce_take(Ctx& c, int mode, uint32_t width, uint32_t site) {
+  return ReduceAwaitable<T>{&c, T{}, mode, width, site}.take();
+}
+
+template <class T>
 inline ReduceAwaitable<T> grp_reduce(Ctx& c, T value, int mode, uint32_t width = 32u,
                                      uint32_t site = 0u) {
   return ReduceAwaitable<T>{&c, value, mode, width, site};
@@ -585,10 +626,9 @@ struct VoteAwaitable {
   uint32_t width = 32u;
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<>) noexcept {
-    ((uint32_t*)shfl_pub_buf(*c))[c->lid] = value ? 1u : 0u;
-  }
-  uint32_t await_resume() const noexcept {
+  void await_suspend(std::coroutine_handle<>) noexcept { shfl_publish(*c, value); }
+  uint32_t await_resume() const noexcept { return take(); }
+  uint32_t take() const noexcept {
     uint32_t m = vote_ballot(*c);
     uint32_t group_mask = 0xFFFFFFFFu;
     if (width < 32u) {
@@ -604,6 +644,10 @@ struct VoteAwaitable {
   }
 };
 
+inline uint32_t vote_take(Ctx& c, int mode, uint32_t width) {
+  return VoteAwaitable{&c, false, mode, width}.take();
+}
+
 inline VoteAwaitable vote(Ctx& c, bool value, int mode) { return VoteAwaitable{&c, value, mode, 32u}; }
 
 // The same vote inside a group: the mask carries the whole warp, and a quad only
@@ -614,6 +658,12 @@ inline VoteAwaitable grp_vote(Ctx& c, bool value, int mode, uint32_t width) {
 
 void* coro_alloc(std::size_t n);
 void coro_arena_reset();
+
+// Both of these used to trap, which says nothing to anyone reading a terminal.
+// They name what is wrong and stop, once, even when several lanes reach it in
+// the same instruction.
+[[noreturn]] void shared_overflow(std::size_t need, std::size_t cap);
+[[noreturn]] void shared_too_many();
 
 using TaskFn = Task (*)(Ctx&);
 
@@ -638,21 +688,31 @@ struct KernelDef {
 
 // ---- textures ----
 //
-// A texture is a 2D image the launcher fills before the run, so the GPU and the
-// CPU sides read the same pixels. Only the shapes a compute kernel uses are
-// here: no mip levels, no arrays, no depth. `read` is unnormalised and exact;
-// `sample` filters.
+// A texture is an image the launcher fills before the run, so the GPU and the
+// CPU sides read the same texels. Only the shapes a compute kernel uses are here:
+// no mip levels. It is 2D, a 2D *array*, or 3D, and the last two differ only in
+// what the outermost index means — a slice or a plane — so one number and one
+// layout serve both, which is `MTLTextureType2DArray`'s layout and
+// `MTLTextureType3D`'s. `read` is unnormalised and exact; `sample` filters.
 struct Texture {
   // Writable, because a storage image is written: `texture2d<T, access::write>`
   // and `OpImageWrite` land in the same storage the reads come from, which is
   // what the GPU does with a texture flagged for shader writes.
   unsigned char* data = nullptr;
   uint32_t width = 0, height = 0;
-  uint32_t elem = 4;  // bytes per texel (4 for float/uint, 2 for half)
+  uint32_t elem = 4;    // bytes per texel (4 for float/uint, 2 for half)
+  // The outermost extent: the slices of a 2D array, or a 3D texture's depth. One
+  // number because the storage is the same either way — slice after slice, plane
+  // after plane — so a 3D read is the same index arithmetic as a layered one and
+  // neither needs its own path through this file.
+  uint32_t layers = 1;
 };
 
 Texture texture(int index);
 void set_texture(int index, void* data, uint32_t width, uint32_t height, uint32_t elem);
+// The array form: `layers` slices, laid out one after another.
+void set_texture_layers(int index, void* data, uint32_t width, uint32_t height, uint32_t elem,
+                        uint32_t layers);
 
 // A SPIR-V sampler is a value the host creates, not something a kernel declares,
 // so its two meaningful choices come from the command line and arrive here.
@@ -676,11 +736,16 @@ struct SampledImage {
 };
 
 template <class T>
-inline T tex_read(const Texture& t, uint32_t x, uint32_t y) {
-  if (x >= t.width || y >= t.height || !t.data) return T(0);
+inline T tex_read(const Texture& t, uint32_t x, uint32_t y, uint32_t layer) {
+  if (layer >= t.layers || x >= t.width || y >= t.height || !t.data) return T(0);
   T v;
-  std::memcpy(&v, t.data + ((size_t)y * t.width + x) * t.elem, sizeof(T));
+  std::memcpy(&v, t.data + (((size_t)layer * t.height + y) * t.width + x) * t.elem, sizeof(T));
   return v;
+}
+
+template <class T>
+inline T tex_read(const Texture& t, uint32_t x, uint32_t y) {
+  return tex_read<T>(t, x, y, 0u);
 }
 
 // A write to a texture: `OpImageWrite` and `texture2d::write`. The launcher
@@ -692,9 +757,14 @@ inline T tex_read(const Texture& t, uint32_t x, uint32_t y) {
 // one template independent of the vector types, which do not exist yet here —
 // this header is compiled before the preamble that defines them.
 template <class T>
+inline void tex_write(const Texture& t, uint32_t x, uint32_t y, uint32_t layer, T v) {
+  if (layer >= t.layers || x >= t.width || y >= t.height || !t.data || t.elem > sizeof(T)) return;
+  std::memcpy(t.data + (((size_t)layer * t.height + y) * t.width + x) * t.elem, &v, t.elem);
+}
+
+template <class T>
 inline void tex_write(const Texture& t, uint32_t x, uint32_t y, T v) {
-  if (x >= t.width || y >= t.height || !t.data || t.elem > sizeof(T)) return;
-  std::memcpy(t.data + ((size_t)y * t.width + x) * t.elem, &v, t.elem);
+  tex_write<T>(t, x, y, 0u, v);
 }
 
 // Metal's sampler state, reduced to the two choices that change an answer.
@@ -716,18 +786,68 @@ inline uint32_t tex_wrap(int64_t i, uint32_t n, int addr) {
 }
 
 template <class T>
-inline float tex_at_f(const Texture& t, int64_t x, int64_t y, int addr) {
+inline float tex_at_f(const Texture& t, int64_t x, int64_t y, uint32_t layer, int addr) {
+  if (layer >= t.layers) return 0.0f;
   const uint32_t cx = tex_wrap(x, t.width, addr), cy = tex_wrap(y, t.height, addr);
   if (cx == (uint32_t)-1 || cy == (uint32_t)-1) return 0.0f;
-  return (float)tex_read<T>(t, cx, cy);
+  return (float)tex_read<T>(t, cx, cy, layer);
+}
+
+template <class T>
+inline float tex_at_f(const Texture& t, int64_t x, int64_t y, int addr) {
+  return tex_at_f<T>(t, x, y, 0u, addr);
 }
 
 // A `tex` instruction hands back four channels. The launcher binds one-channel
 // images, so the first is the texel and the rest are the shape the hardware
 // returns for an R32 format: nothing, nothing, one.
 template <class T>
+inline void tex_sample4(const Texture& t, float u, float v, uint32_t layer, int filter, int addr,
+                        float out[4]) {
+  out[0] = tex_sample<T>(t, u, v, layer, filter, addr);
+  out[1] = 0.0f;
+  out[2] = 0.0f;
+  out[3] = 1.0f;
+}
+
+template <class T>
 inline void tex_sample4(const Texture& t, float u, float v, int filter, int addr, float out[4]) {
-  out[0] = tex_sample<T>(t, u, v, filter, addr);
+  tex_sample4<T>(t, u, v, 0u, filter, addr, out);
+}
+
+// The 3D form of a `tex` instruction's four channels: one filtered sample of the
+// plane the coordinate names, and the same (value, 0, 0, 1) shape.
+template <class T>
+inline void tex_sample4(const Texture& t, float u, float v, float w, int filter, int addr,
+                        float out[4]) {
+  out[0] = tex_sample<T>(t, u, v, w, filter, addr);
+  out[1] = 0.0f;
+  out[2] = 0.0f;
+  out[3] = 1.0f;
+}
+
+// A face and a position on it, back into the direction a sampler takes. The six
+// faces are +X, -X, +Y, -Y, +Z, -Z, and `s`/`t` run from -1 to 1 across the face
+// with t pointing up, which is what a cube coordinate means. This inverts the rule
+// in `tex_cube_uv` above, so a direction built here lands back on the same face at
+// the same place — that inverse is what makes PTX's `(s, t, face)` form
+// translatable at all. Both engines run this text, so both build the same bits.
+inline void weft_cube_dir(uint32_t face, float s, float t, float& dx, float& dy, float& dz) {
+  switch (face % 6u) {
+    case 0: dx = 1.0f; dy = -t; dz = -s; break;
+    case 1: dx = -1.0f; dy = -t; dz = s; break;
+    case 2: dx = s; dy = 1.0f; dz = t; break;
+    case 3: dx = s; dy = -1.0f; dz = -t; break;
+    case 4: dx = s; dy = -t; dz = 1.0f; break;
+    default: dx = -s; dy = -t; dz = -1.0f; break;
+  }
+}
+
+// A cube `tex` instruction's four channels: a direction instead of a coordinate.
+template <class T>
+inline void tex_sample4_cube(const Texture& t, float dx, float dy, float dz, int filter, int addr,
+                             float out[4]) {
+  out[0] = tex_sample_cube<T>(t, dx, dy, dz, filter, addr);
   out[1] = 0.0f;
   out[2] = 0.0f;
   out[3] = 1.0f;
@@ -737,12 +857,13 @@ inline void tex_sample4(const Texture& t, float u, float v, int filter, int addr
 // blend a filter would produce. The footprint is the 2x2 block based at the texel
 // under the coordinate.
 template <class T>
-inline void tex_gather4(const Texture& t, float u, float v, float out[4]) {
+inline void tex_gather4(const Texture& t, float u, float v, uint32_t layer, float out[4]) {
   const int64_t x0 = (int64_t)std::floor(u * (float)t.width - 0.5f);
   const int64_t y0 = (int64_t)std::floor(v * (float)t.height - 0.5f);
   auto at = [&](int64_t x, int64_t y) -> float {
-    if (x < 0 || y < 0 || (uint64_t)x >= t.width || (uint64_t)y >= t.height) return 0.0f;
-    return (float)tex_read<T>(t, (uint32_t)x, (uint32_t)y);
+    if (x < 0 || y < 0 || (uint64_t)x >= t.width || (uint64_t)y >= t.height || layer >= t.layers)
+      return 0.0f;
+    return (float)tex_read<T>(t, (uint32_t)x, (uint32_t)y, layer);
   };
   out[0] = at(x0, y0);
   out[1] = at(x0 + 1, y0);
@@ -751,32 +872,154 @@ inline void tex_gather4(const Texture& t, float u, float v, float out[4]) {
 }
 
 template <class T>
-inline float tex_sample(const Texture& t, float u, float v, int filter, int addr) {
-  if (filter == kTexNearest) {
-    // The texel under the coordinate, clamped to the image, which is what
-    // nearest filtering is on every GPU.
-    const int64_t x = (int64_t)std::floor(u * (float)t.width);
-    const int64_t y = (int64_t)std::floor(v * (float)t.height);
-    return tex_at_f<T>(t, x, y, addr);
+inline void tex_gather4(const Texture& t, float u, float v, float out[4]) {
+  tex_gather4<T>(t, u, v, 0u, out);
+}
+
+// A 3-D gather: the same 2x2 footprint, in the plane the coordinate names. A
+// gather has no filter, so there is nothing to blend along z — the plane is the
+// nearest one under w, which is the plane a nearest sample of the same coordinate
+// reads. A footprint that leaves the binding answers with nothing, exactly as the
+// 2-D form does.
+template <class T>
+inline void tex_gather4(const Texture& t, float u, float v, float w, float out[4]) {
+  const int64_t x0 = (int64_t)std::floor(u * (float)t.width - 0.5f);
+  const int64_t y0 = (int64_t)std::floor(v * (float)t.height - 0.5f);
+  const int64_t z = (int64_t)std::floor(w * (float)t.layers);
+  auto at = [&](int64_t x, int64_t y) -> float {
+    if (x < 0 || y < 0 || z < 0 || (uint64_t)x >= t.width || (uint64_t)y >= t.height ||
+        (uint64_t)z >= t.layers)
+      return 0.0f;
+    return (float)tex_read<T>(t, (uint32_t)x, (uint32_t)y, (uint32_t)z);
+  };
+  out[0] = at(x0, y0);
+  out[1] = at(x0 + 1, y0);
+  out[2] = at(x0, y0 + 1);
+  out[3] = at(x0 + 1, y0 + 1);
+}
+
+// A cube gather, which is a face and a place on it rather than a direction: PTX
+// names `(s, t, face)` with s and t running -1 to 1 across the face, so the same
+// rebase that `weft_cube_dir` inverts for a sample turns it into a layer and a 2-D
+// coordinate. The faces are stored one after another, so the face is the layer.
+template <class T>
+inline void tex_gather4_cube(const Texture& t, float s, float v, uint32_t face, float out[4]) {
+  if (t.layers == 0) {
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    return;
   }
+  tex_gather4<T>(t, (s + 1.0f) * 0.5f, (v + 1.0f) * 0.5f, face % t.layers, out);
+}
+
+
+
+// The xy half of a filtered sample at one slice: the whole of a 2D sample, and one
+// plane of a 3D one. The weights are the hardware's 8-bit fixed point. Measured on
+// this GPU by sampling between two known texels, the weight it applies is exactly
+// round(f * 256) / 256 — which is what makes filtered samples identical to the GPU
+// instead of close.
+template <class T>
+inline float tex_bilinear(const Texture& t, float u, float v, uint32_t layer, int addr) {
   if (!t.width || !t.height) return 0.0f;
   const float fx = u * (float)t.width - 0.5f;
   const float fy = v * (float)t.height - 0.5f;
   const int64_t x0 = (int64_t)std::floor(fx), y0 = (int64_t)std::floor(fy);
-  // The hardware's filter weights are 8-bit fixed point. Measured on this GPU by
-  // sampling between two known texels: the weight it applies is exactly
-  // round(f * 256) / 256. Applying that here — and blending with the fma below —
-  // is what makes bilinear filtering identical to the GPU instead of close.
   auto weight = [](float f) { return std::nearbyint(f * 256.0f) * (1.0f / 256.0f); };
   const float ax = weight(fx - (float)x0), ay = weight(fy - (float)y0);
-  const float a00 = tex_at_f<T>(t, x0, y0, addr), a10 = tex_at_f<T>(t, x0 + 1, y0, addr);
-  const float a01 = tex_at_f<T>(t, x0, y0 + 1, addr), a11 = tex_at_f<T>(t, x0 + 1, y0 + 1, addr);
+  const float a00 = tex_at_f<T>(t, x0, y0, layer, addr);
+  const float a10 = tex_at_f<T>(t, x0 + 1, y0, layer, addr);
+  const float a01 = tex_at_f<T>(t, x0, y0 + 1, layer, addr);
+  const float a11 = tex_at_f<T>(t, x0 + 1, y0 + 1, layer, addr);
   // The blend is a fused multiply-add on the hardware, not a separate multiply
   // and add: measured over 32 samples between known texels, `fma(t1-t0, w, t0)`
   // reproduces the GPU's answer exactly where `t0 + (t1-t0)*w` is one ulp out.
   // So an fma here is not an optimisation, it is the definition.
   const float top = std::fma(a10 - a00, ax, a00), bot = std::fma(a11 - a01, ax, a01);
   return std::fma(bot - top, ay, top);
+}
+
+template <class T>
+inline float tex_sample(const Texture& t, float u, float v, uint32_t layer, int filter, int addr) {
+  if (layer >= t.layers) return 0.0f;
+  if (filter == kTexNearest) {
+    // The texel under the coordinate, clamped to the image, which is what
+    // nearest filtering is on every GPU.
+    const int64_t x = (int64_t)std::floor(u * (float)t.width);
+    const int64_t y = (int64_t)std::floor(v * (float)t.height);
+    return tex_at_f<T>(t, x, y, layer, addr);
+  }
+  return tex_bilinear<T>(t, u, v, layer, addr);
+}
+
+// A 3D sample: the plane the coordinate names, and for a filter the plane behind
+// it blended in. Nearest takes the plane under w; linear is trilinear, with the z
+// weight quantised and applied with an fma exactly as x and y are. A plane that
+// clamp-to-zero pushes out of the image contributes nothing, so an edge behaves the
+// way a 2D edge does.
+template <class T>
+inline float tex_sample(const Texture& t, float u, float v, float w, int filter, int addr) {
+  const uint32_t n = t.layers;
+  if (n == 0) return 0.0f;
+  if (filter == kTexNearest) {
+    const int64_t x = (int64_t)std::floor(u * (float)t.width);
+    const int64_t y = (int64_t)std::floor(v * (float)t.height);
+    const uint32_t z = tex_wrap((int64_t)std::floor(w * (float)n), n, addr);
+    if (z == (uint32_t)-1) return 0.0f;
+    return tex_at_f<T>(t, x, y, z, addr);
+  }
+  const float fz = w * (float)n - 0.5f;
+  const int64_t z0 = (int64_t)std::floor(fz);
+  auto weight = [](float f) { return std::nearbyint(f * 256.0f) * (1.0f / 256.0f); };
+  const float az = weight(fz - (float)z0);
+  const uint32_t a = tex_wrap(z0, n, addr), b = tex_wrap(z0 + 1, n, addr);
+  const float s0 = a == (uint32_t)-1 ? 0.0f : tex_bilinear<T>(t, u, v, a, addr);
+  const float s1 = b == (uint32_t)-1 ? 0.0f : tex_bilinear<T>(t, u, v, b, addr);
+  return std::fma(s1 - s0, az, s0);
+}
+
+// ---- cubes ----
+//
+// A cube is six square faces stored face after face, which is the same slice
+// layout a 2D array has, so a cube sample is a 2D sample of one of them. What
+// picks the face is the direction: the axis it points along most strongly, and the
+// other two components over that length place the texel on the face. Ties go to X
+// then Y, and the six faces are +X, -X, +Y, -Y, +Z, -Z — `MTLTextureTypeCube`'s
+// order, which is also every other GPU's.
+inline void tex_cube_uv(float dx, float dy, float dz, uint32_t& face, float& u, float& v) {
+  const float ax = std::fabs(dx), ay = std::fabs(dy), az = std::fabs(dz);
+  float sc = 0.0f, tc = 0.0f, ma = 1.0f;
+  if (ax >= ay && ax >= az) {
+    ma = ax;
+    if (dx >= 0.0f) { face = 0; sc = -dz; tc = -dy; }
+    else { face = 1; sc = dz; tc = -dy; }
+  } else if (ay >= az) {
+    ma = ay;
+    if (dy >= 0.0f) { face = 2; sc = dx; tc = dz; }
+    else { face = 3; sc = dx; tc = -dz; }
+  } else {
+    ma = az;
+    if (dz >= 0.0f) { face = 4; sc = dx; tc = -dy; }
+    else { face = 5; sc = -dx; tc = -dy; }
+  }
+  if (ma == 0.0f) { u = 0.5f; v = 0.5f; return; }
+  u = (sc / ma + 1.0f) * 0.5f;
+  v = (tc / ma + 1.0f) * 0.5f;
+}
+
+template <class T>
+inline float tex_sample_cube(const Texture& t, float dx, float dy, float dz, int filter, int addr) {
+  uint32_t face = 0;
+  float u = 0.5f, v = 0.5f;
+  tex_cube_uv(dx, dy, dz, face, u, v);
+  return tex_sample<T>(t, u, v, face, filter, addr);
+}
+
+
+// A plain texture is layer 0 of itself, so every call written before arrays
+// existed keeps its meaning.
+template <class T>
+inline float tex_sample(const Texture& t, float u, float v, int filter, int addr) {
+  return tex_sample<T>(t, u, v, 0u, filter, addr);
 }
 
 // ---- a mesh stage's output ----
@@ -946,28 +1189,27 @@ inline void atomic_store(void* p, T v) {
 float atom_max_f32(float* p, float v);
 float atom_min_f32(float* p, float v);
 
-// Each distinct `threadgroup T name[N]` declaration in a kernel maps to one
-// slot, in declaration order. Every thread in the group runs the same
-// declarations, so the k-th declaration any given thread reaches is the same
-// object as the k-th declaration every other thread reached.
+// Each distinct `threadgroup T name[N]` declaration in a kernel maps to one slot,
+// named by its ordinal in the source. Not by a running count: a resumable kernel
+// jumps into the middle of its body, so the declarations it skipped on the way in do
+// not run — a counter would hand the next declaration the previous one's storage.
+// The ordinal is fixed at translation, so every entry, every lane and every pass
+// finds the same object at the same index.
 template <class T, size_t N>
-T* shared_mem(Ctx& c) {
-  int i = c.slot++;
-  if (i < 0 || i >= 64) __builtin_trap();
-  if (i == c.slots->count) {
+T* shared_mem(Ctx& c, int k) {
+  if (k < 0 || k >= 64) shared_too_many();
+  if (k >= c.slots->count) {
     // Each declaration starts at its own type's alignment, as a threadgroup
     // declaration does on the GPU: a half[3] in front of a half4 must not leave
     // the half4 on a two-byte boundary.
     const size_t al = alignof(T);
     if (al > 1) c.slots->bump = (c.slots->bump + al - 1) & ~(al - 1);
-    c.slots->off[i] = c.slots->bump;
+    c.slots->off[k] = c.slots->bump;
     c.slots->bump += sizeof(T) * N;
-    c.slots->count++;
+    c.slots->count = k + 1;
   }
-  if (c.slots->bump > (size_t)48 * 1024) {
-    __builtin_trap();  // shared memory exhausted — cap is 48 KiB per group
-  }
-  return reinterpret_cast<T*>(const_cast<unsigned char*>(c.shared) + c.slots->off[i]);
+  if (c.slots->bump > (size_t)48 * 1024) shared_overflow(c.slots->bump, (size_t)48 * 1024);
+  return reinterpret_cast<T*>(const_cast<unsigned char*>(c.shared) + c.slots->off[k]);
 }
 
 }  // namespace weft

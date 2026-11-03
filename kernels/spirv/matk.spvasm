@@ -1,0 +1,85 @@
+; A 4x4 built from its columns, multiplied four ways (matrix*vector,
+; vector*matrix, matrix*matrix, matrix*scalar), transposed, and read back by
+; column:
+;
+;     c0 = (s, s+1, s+2, s+3)      c1 = (1, 2, 3, 4)
+;     c2 = (s+3, s+2, s+1, s)      c3 = 2s..5s
+;     M  = (c0, c1, c2, c3)
+;     out[gid] = (M*c1).x + 10*(c1*M).y + 100*(M*M).col[2].w
+;              + 1000*transpose(M).col[0].y + 1000*(M*2*c1).w
+;
+; Every product is weighed differently, so a transposed layout — a column taken
+; for a row, or a product applied to the wrong operand — lands on a different
+; number instead of on the same one. The scale is folded in last, which is what
+; catches a scalar that reached only one column.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Matrix
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "matk" %gid
+               OpName %main "matk"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+       %v4f = OpTypeVector %f32 4
+      %m4x4 = OpTypeMatrix %v4f 4
+     %v3u64 = OpTypeVector %u64 3
+ %ptr_cw_f = OpTypePointer CrossWorkgroup %f32
+        %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %ptr_cw_f %ptr_cw_f
+        %gid = OpVariable %pin Input
+        %one = OpConstant %f32 1
+        %two = OpConstant %f32 2
+      %three = OpConstant %f32 3
+       %four = OpConstant %f32 4
+       %five = OpConstant %f32 5
+        %ten = OpConstant %f32 10
+    %hundred = OpConstant %f32 100
+   %thousand = OpConstant %f32 1000
+       %main = OpFunction %void None %fnty
+          %i = OpFunctionParameter %ptr_cw_f
+          %o = OpFunctionParameter %ptr_cw_f
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+         %pi = OpPtrAccessChain %ptr_cw_f %i %gi
+          %s = OpLoad %f32 %pi
+         %s1 = OpFAdd %f32 %s %one
+         %s2 = OpFAdd %f32 %s %two
+         %s3 = OpFAdd %f32 %s %three
+         %d2 = OpFMul %f32 %s %two
+         %d3 = OpFMul %f32 %s %three
+         %d4 = OpFMul %f32 %s %four
+         %d5 = OpFMul %f32 %s %five
+         %c0 = OpCompositeConstruct %v4f %s %s1 %s2 %s3
+         %c1 = OpCompositeConstruct %v4f %one %two %three %four
+         %c2 = OpCompositeConstruct %v4f %s3 %s2 %s1 %s
+         %c3 = OpCompositeConstruct %v4f %d2 %d3 %d4 %d5
+          %M = OpCompositeConstruct %m4x4 %c0 %c1 %c2 %c3
+          %w = OpMatrixTimesVector %v4f %M %c1
+          %t = OpVectorTimesMatrix %v4f %c1 %M
+          %P = OpMatrixTimesMatrix %m4x4 %M %M
+          %T = OpTranspose %m4x4 %M
+          %S = OpMatrixTimesScalar %m4x4 %M %two
+          %u = OpMatrixTimesVector %v4f %S %c1
+         %wx = OpCompositeExtract %f32 %w 0
+         %ty = OpCompositeExtract %f32 %t 1
+        %Pc2 = OpCompositeExtract %v4f %P 2
+         %pw = OpCompositeExtract %f32 %Pc2 3
+        %Tc0 = OpCompositeExtract %v4f %T 0
+         %tm = OpCompositeExtract %f32 %Tc0 1
+         %uw = OpCompositeExtract %f32 %u 3
+        %a10 = OpFMul %f32 %ty %ten
+       %a100 = OpFMul %f32 %pw %hundred
+      %a1000 = OpFMul %f32 %tm %thousand
+      %b1000 = OpFAdd %f32 %uw %a1000
+         %b1 = OpFAdd %f32 %wx %a10
+         %b2 = OpFAdd %f32 %b1 %a100
+         %b3 = OpFAdd %f32 %b2 %b1000
+         %po = OpPtrAccessChain %ptr_cw_f %o %gi
+               OpStore %po %b3
+               OpReturn
+               OpFunctionEnd

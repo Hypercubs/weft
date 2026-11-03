@@ -1,0 +1,47 @@
+// dp4a: the int8 GEMM's inner instruction, in both sign combinations.
+//
+//     a = round(in[gid])            a 32-bit value the input decides
+//     b = a ^ 0x01020304            the same bytes with different magnitudes
+//     c = gid
+//     u = dp4a.u8.u8 a, b, c        four unsigned byte products
+//     s = dp4a.s8.s8 a, b, c        four signed byte products
+//     out[gid] = u + s
+//
+// The two sign combinations read the same bytes differently, so a translator that
+// ignored the modifiers answers twice with the same number instead of two numbers
+// that differ, and a byte order that is reversed answers on a different value than
+// the lanes next to it. It is integer arithmetic, so the CPU and the GPU have to
+// agree exactly rather than to a tolerance.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry dp4a(
+    .param .u64 dp4a_param_0
+)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [dp4a_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+
+    ld.f32 %f1, [%rd4];
+    cvt.rni.s32.f32 %r5, %f1;           // a
+    xor.b32 %r6, %r5, 0x01020304;       // b
+    add.s32 %r7, %r4, 1;                // c
+
+    dp4a.u8.u8 %r8, %r5, %r6, %r7;
+    dp4a.s8.s8 %r9, %r5, %r6, %r7;
+
+    add.s32 %r10, %r8, %r9;
+    cvt.rn.f32.s32 %f2, %r10;
+    st.f32 [%rd4], %f2;
+    ret;
+}

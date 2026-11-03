@@ -1,0 +1,69 @@
+// A surface that is also sampled: one binding, written and then read through the
+// sampler state.
+//
+//     sust.2d [img, {x, y}], {gid}          // every lane writes its own texel
+//     bar.sync
+//     t0 = tex2D(img, (x + .5)/64, (y + .5)/64)          // its own texel
+//     t1 = tex2D(img, (((x+1)&63) + .5)/64, (y + .5)/64) // the next one along
+//     out[gid] = t0 + 2 t1
+//
+// Reading a surface through a filter was refused: the write needs a read-write
+// view and Metal has no filtered sample of one. The same texture bound a second
+// time as a sampled view is the answer, so this is a comparison again — and because
+// the write comes first and a barrier separates them, `t0` is this lane's own value.
+// A read that saw a stale texel answers with the previous contents of the image.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.surf .u64 img, 1, 1, 1, 1;
+
+.visible .entry ptxsrftmix(
+    .param .u64 ptxsrftmix_param_0
+)
+{
+    .reg .b32 %r<20>;
+    .reg .f32 %f<24>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxsrftmix_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    and.b32 %r5, %r4, 63;               // x
+    shr.u32 %r6, %r4, 6;
+    and.b32 %r6, %r6, 63;               // y
+
+    cvt.rn.f32.s32 %f1, %r4;
+    sust.b.2d.b32 [img, {%r5,%r6}], {%f1};
+
+    bar.sync 0;
+
+    // This texel, through the sampler state.
+    cvt.rn.f32.u32 %f2, %r5;
+    cvt.rn.f32.u32 %f3, %r6;
+    add.f32 %f4, %f2, 0f3F000000;       // x + 0.5
+    add.f32 %f5, %f3, 0f3F000000;       // y + 0.5
+    mul.f32 %f6, %f4, 0f3B800000;       // u
+    mul.f32 %f7, %f5, 0f3B800000;       // v
+    tex.2d.v4.f32.f32 {%f8,%f9,%f10,%f11}, [img, {%f6,%f7}];
+
+    // And the next one along, which another lane wrote: x wraps inside the row, so
+    // the last lane reads the first lane's texel.
+    add.s32 %r7, %r5, 1;
+    and.b32 %r7, %r7, 63;
+    cvt.rn.f32.u32 %f12, %r7;
+    add.f32 %f13, %f12, 0f3F000000;
+    mul.f32 %f14, %f13, 0f3B800000;
+    tex.2d.v4.f32.f32 {%f15,%f16,%f17,%f18}, [img, {%f14,%f7}];
+
+    mul.f32 %f19, %f15, 0f40000000;     // 2 t1
+    add.f32 %f20, %f8, %f19;
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f20;
+    ret;
+}

@@ -1,4 +1,5 @@
 #include "translate_spirv.hpp"
+#include "soft_math.hpp"
 
 #include "weft_msl.hpp"
 
@@ -44,7 +45,7 @@ enum : uint32_t {
   OpVectorShuffle = 79, OpCompositeConstruct = 80, OpCompositeExtract = 81,
   OpCompositeInsert = 82, OpCopyObject = 83, OpTranspose = 84, OpSampledImage = 86,
   OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
-  OpImageFetch = 95, OpImageRead = 98, OpImageWrite = 99, OpImage = 100,
+  OpImageFetch = 95, OpImageGather = 96, OpImageRead = 98, OpImageWrite = 99, OpImage = 100,
   OpImageQuerySizeLod = 103, OpImageQuerySize = 104,
   OpConvertFToU = 109, OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112,
   OpUConvert = 113, OpSConvert = 114, OpFConvert = 115, OpQuantizeToF16 = 116,
@@ -87,6 +88,10 @@ enum : uint32_t {
   OpGroupNonUniformShuffleDown = 348,
   // atomic float add (SPV_EXT_shader_atomic_float_add)
   OpAtomicFAddEXT = 6035,
+  // atomic float min/max (SPV_EXT_shader_atomic_float_min_max). The numbers are
+  // the ones the assembler wrote, read back out of the binary with a word dump
+  // rather than taken from memory.
+  OpAtomicFMinEXT = 5614, OpAtomicFMaxEXT = 5615,
 };
 
 enum : uint32_t { DArrayStride = 6, DBuiltIn = 11, DOffset = 35, DSpecId = 1, DBinding = 33 };
@@ -105,7 +110,7 @@ struct Instr {
 };
 
 enum Kind {
-  KVoid, KBool, KInt, KFloat, KVector, KPointer, KArray, KStruct, KFunction,
+  KVoid, KBool, KInt, KFloat, KVector, KMatrix, KPointer, KArray, KStruct, KFunction,
   KImage, KSampler, KSampledImage, KOther
 };
 
@@ -118,6 +123,7 @@ struct SType {
   uint32_t length_id = 0;
   uint32_t length = 0;  // resolved after all constants are read
   uint32_t storage = 0;
+  uint32_t arrayed = 0;  // OpTypeImage: the coordinate carries a layer
   std::vector<uint32_t> members;
 };
 
@@ -134,6 +140,10 @@ struct Entry {
   uint32_t function = 0;
   std::string name;
   std::vector<uint32_t> iface;
+  // `OpExecutionMode LocalSize x y z`: the group the module was written to run
+  // in. A one-dimensional group is a default for the launch; a 2-D or 3-D one is
+  // a constraint, because the lane identity is decomposed by its shape.
+  uint32_t lx = 0, ly = 1, lz = 1;
 };
 
 struct Function {
@@ -164,6 +174,11 @@ bool no_result(uint32_t op) {
     case OpMemoryBarrier: case OpLoopMerge: case OpSelectionMerge: case OpLabel: case OpNop:
     case OpFunctionEnd: case OpFunctionParameter: case OpVariable: case OpDecorate:
     case OpMemberDecorate: case OpAtomicStore: case OpImageWrite: case OpTypeForwardPointer:
+    // An import has no type operand: its first word is the result id and the rest
+    // is the set's name. Without this it was read as "type, result", so the string
+    // literal's words became a value id and a type id — which showed up much later
+    // as a state field that referred to a number nobody had declared.
+    case OpExtInstImport:
       return true;
     default:
       return false;
@@ -285,7 +300,14 @@ bool parse_module(Mod& m, const std::string& bytes, std::string& err) {
         t.kind = KImage;
         t.elem = ins.a[1];   // sampled type
         t.count = ins.a[2];  // Dim
+        // `count` keeps the Dim, and the two shapes that are not a plane are read
+        // back from it: 0 is 1-D, which is a plane one row high, and 3 is a cube,
+        // six square faces sampled by direction. Both are legal in the Shader
+        // model — `Sampled1D`, `Image1D` and `Shader` are the capabilities the
+        // validator asks for, and a GLCompute module may declare all of them — so
+        // they are decoded rather than named.
         t.storage = ins.a[6];  // Sampled: 0 unknown, 1 sampled, 2 storage
+        t.arrayed = ins.a[4];  // Arrayed: a 2-D array, so a layer per coordinate
         m.types[ins.a[0]] = t;
         break;
       }
@@ -300,8 +322,37 @@ bool parse_module(Mod& m, const std::string& bytes, std::string& err) {
         break;
       }
       case OpTypeMatrix: {
-        err = "type matrix is not supported (matrices are a data-type library, not a translator gap)";
-        return false;
+        // `OpTypeMatrix %column %count`: a matrix is a list of columns, and the
+        // column type is the vector type it is built from. SPIR-V wants those
+        // columns to be floating-point; they are 32-bit here, and the shape is
+        // square because those are the ones a kernel multiplies.
+        if (ins.a.size() < 3) { err = "bad OpTypeMatrix"; return false; }
+        auto col = m.types.find(ins.a[1]);
+        if (col == m.types.end() || col->second.kind != KVector) {
+          err = "a matrix whose column is not a vector";
+          return false;
+        }
+        const uint32_t rows = col->second.count, cols = ins.a[2];
+        if (rows != cols) {
+          err = "a " + std::to_string(cols) + "-by-" + std::to_string(rows) +
+                " matrix: only the square shapes are translated";
+          return false;
+        }
+        if (rows < 2 || rows > 4) {
+          err = "a " + std::to_string(rows) + "-by-" + std::to_string(rows) + " matrix";
+          return false;
+        }
+        auto e = m.types.find(col->second.elem);
+        if (e == m.types.end() || e->second.kind != KFloat || e->second.width != 32) {
+          err = "a matrix of something other than 32-bit floats";
+          return false;
+        }
+        SType t;
+        t.kind = KMatrix;
+        t.elem = ins.a[1];
+        t.count = cols;
+        m.types[ins.a[0]] = t;
+        break;
       }
       case OpConstantTrue: case OpConstantFalse:
         m.cexpr[ins.a[1]] = op == OpConstantTrue ? "true" : "false";
@@ -392,6 +443,16 @@ bool parse_module(Mod& m, const std::string& bytes, std::string& err) {
           m.funcs[cur].body.push_back(ins);
         }
         break;
+      case OpExecutionMode: {
+        // `LocalSize x y z`, all three kept. A one-dimensional group only sets a
+        // default launch width; a wider one also fixes how a lane id decomposes,
+        // so its product becomes the launch width rather than a suggestion.
+        if (ins.a.size() >= 5 && ins.a[1] == 17u && ins.a[2] >= 1u && ins.a[3] >= 1u &&
+            ins.a[4] >= 1u && ins.a[2] * ins.a[3] * ins.a[4] <= 1024u)
+          for (auto& e : m.entries)
+            if (e.function == ins.a[0]) { e.lx = ins.a[2]; e.ly = ins.a[3]; e.lz = ins.a[4]; }
+        break;
+      }
       case OpEntryPoint: {
         Entry e;
         e.exec_model = ins.a[0];
@@ -566,6 +627,14 @@ class Emitter {
   // The access mode of each `[[texture(N)]]` parameter, in binding order: part
   // of the parameter's type, so the caller emits the signature from these.
   const std::vector<std::string>& textures() const { return tex_access; }
+  // And whether each of those parameters is a 2-D array, in the same order.
+  const std::vector<bool>& arrayed_textures() const { return tex_arrayed; }
+  // And whether each of those is a 3-D volume, in the same order.
+  const std::vector<bool>& volume_textures() const { return tex_vol; }
+  // And whether each of those is a cube, in the same order.
+  const std::vector<bool>& cube_textures() const { return tex_cube; }
+  // And what each of those is, by name, for the launcher's binding check.
+  const std::vector<std::string>& texture_shapes() const { return tex_shape; }
 
  private:
   Mod& m_;
@@ -615,6 +684,12 @@ class Emitter {
   // A texture's access mode is part of its MSL type, so it is decided once for
   // the whole kernel. `tex_access` is one entry per `[[texture(N)]]` parameter.
   std::vector<std::string> tex_access;
+  std::vector<bool> tex_arrayed;
+  std::vector<bool> tex_vol;      // the same, for `Dim = 3D`
+  std::vector<bool> tex_cube;     // and for `Dim = Cube`, which is filter-only
+  // What each binding is, by name, so the launcher can check the shape it was
+  // handed against the shape the module declared.
+  std::vector<std::string> tex_shape;
   bool writes_image_ = false;
   bool samples_image_ = false;
   std::set<uint32_t> ptr_globals_;  // module-scope pointer globals: loading one yields its base
@@ -766,19 +841,55 @@ bool Emitter::ctype(uint32_t tid, std::string& out) const {
       // space and has to say so.
       out = gpu ? "device unsigned char*" : "unsigned char*";
       return true;
-    case KImage:
+    case KImage: {
       // On the GPU an image is the bound texture plus its size, held by value.
-      // A kernel that writes it needs the read_write access mode, and that is
-      // the one thing that changes the type.
-      out = gpu ? (writes_image_ ? "weft::RWImageRef" : "weft::ImageRef")
+      // A kernel that writes it needs the read_write access mode, and an arrayed
+      // image is a different handle again — `texture2d_array`, with the slice
+      // count alongside — so those two choices are the type.
+      // `count` is the declaration's Dim: 0 is 1-D, 1 is 2-D, 2 is 3-D and 3 is a
+      // cube. A volume is its own handle on the GPU because `texture3d` is its own
+      // type there, and a cube is `texturecube`, which cannot be read by texel at
+      // all — a cube is filterable only.
+      const bool vol = t.count == 2u;
+      const bool cb = t.count == 3u;
+      out = gpu ? (cb ? "weft::CubeImageRef"
+                      : t.arrayed != 0
+                            ? (writes_image_ ? "weft::RWArrayImageRef" : "weft::ArrayImageRef")
+                            : vol ? (writes_image_ ? "weft::RWImage3DRef" : "weft::Image3DRef")
+                                  : (writes_image_ ? "weft::RWImageRef" : "weft::ImageRef"))
                 : "const weft::Texture*";
       return true;
+    }
     case KSampler:
       // A sampler on the GPU is the bound state object the parameter names, so
       // the type is the language's own `sampler`.
       out = gpu ? "sampler" : "weft::Sampler";
       return true;
-    case KSampledImage: out = "weft::SampledImage"; return true;
+    case KSampledImage: {
+      // The sampled-image type names its image, so an array image joins the
+      // sampler in the array handle and a volume in the 3-D one.
+      auto e = m_.types.find(t.elem);
+      const bool img = gpu && e != m_.types.end() && e->second.kind == KImage;
+      const bool arr = img && e->second.arrayed != 0;
+      const bool vol = img && !arr && e->second.count == 2u;
+      const bool cb = img && e->second.count == 3u;
+      out = cb ? "weft::SampledCubeImage"
+                : vol ? "weft::SampledImage3D"
+                      : arr ? "weft::SampledArrayImage"
+                            : "weft::SampledImage";
+      return true;
+    }
+    case KMatrix: {
+      // The name carries both extents, from the column's own width and the
+      // column count: `weft_f4x4` is four `weft_f4` columns. The preamble
+      // defines the square ones for both targets, so the name is the type.
+      auto e = m_.types.find(t.elem);
+      if (e == m_.types.end() || e->second.kind != KVector) return false;
+      if (e->second.count < 2 || e->second.count > 4) return false;
+      if (t.count != e->second.count) return false;
+      out = "weft_f" + std::to_string(e->second.count) + "x" + std::to_string(t.count);
+      return true;
+    }
     case KVector: {
       auto e = m_.types.find(t.elem);
       if (e == m_.types.end()) return false;
@@ -787,15 +898,20 @@ bool Emitter::ctype(uint32_t tid, std::string& out) const {
       const char* pre = nullptr;
       if (et.kind == KFloat && et.width == 32) pre = "weft_f";
       else if (et.kind == KFloat && et.width == 64) {
-        // A vector of doubles would need a helper call per component, which the
-        // component-wise path spells as an operator. Scalar doubles are carried; this
-        // shape is not, and it fails as an unsupported type rather than as integer
-        // arithmetic on two 64-bit halves.
-        if (gpu) return false;
+        // A vector of doubles: the same software double 2, 3 or 4 times over, so
+        // every operation on one is the fp64 helper applied per component rather
+        // than an operator on two 64-bit halves.
         pre = "weft_d";
       }
       else if (et.kind == KInt && et.width == 32) pre = et.is_signed ? "weft_i" : "weft_u";
       else if (et.kind == KInt && et.width == 64) pre = et.is_signed ? "weft_l" : "weft_ul";
+      // A vector of booleans: the condition of a componentwise select, which a
+      // GLSL emitter produces for `mix` and for a comparison folded into a
+      // ternary. The GPU has `bool2/3/4` already; the CPU needs the same shape.
+      if (et.kind == KBool) {
+        out = std::string(gpu ? "bool" : "weft_b") + std::to_string(t.count);
+        return true;
+      }
       if (!pre) return false;
       out = std::string(pre) + std::to_string(t.count);
       return true;
@@ -818,6 +934,12 @@ bool Emitter::tsize(uint32_t tid, uint32_t& out) const {
       uint32_t es = 0;
       if (!tsize(t.elem, es)) return false;
       out = es * t.count;  // the generated vector structs are packed, no padding
+      return true;
+    }
+    case KMatrix: {
+      uint32_t es = 0;
+      if (!tsize(t.elem, es)) return false;
+      out = es * t.count;  // a column-major array of float, no padding either
       return true;
     }
     case KArray: {
@@ -906,12 +1028,27 @@ std::string Emitter::builtin_expr(uint32_t var, int comp) const {
   auto g = m_.globals.find(var);
   if (g == m_.globals.end() || !g->second.has_builtin) return "";
   const uint32_t bi = g->second.builtin;
+  // The group shape the module declared, when it declared one. A 2-D group's lane
+  // `l` is (l % x, l / x), so the lane identity comes from the shape and not from
+  // the launch width alone — which is why a shape wider than a row also fixes the
+  // launch (`fixed_threads`).
+  uint32_t gx = 0, gy = 1, gz = 1;
+  for (const auto& en : m_.entries)
+    if (en.function == f_.id && en.lx) { gx = en.lx; gy = en.ly; gz = en.lz; break; }
   auto at = [&](int k) -> std::string {
     switch (bi) {
       case BIGlobalInvocationId: return k == 0 ? "ctx.gid" : "0u";
-      case BILocalInvocationId: return k == 0 ? "ctx.lid" : "0u";
+      case BILocalInvocationId:
+        if (k == 0) return gx ? ("(ctx.lid % " + std::to_string(gx) + "u)") : "ctx.lid";
+        if (k == 1)
+          return gy > 1 ? ("((ctx.lid / " + std::to_string(gx) + "u) % " +
+                           std::to_string(gy) + "u)")
+                        : "0u";
+        return gz > 1 ? ("(ctx.lid / " + std::to_string(gx * gy) + "u)") : "0u";
       case BIWorkgroupId: return k == 0 ? "ctx.tgid" : "0u";
-      case BIWorkgroupSize: return k == 0 ? "ctx.tg_size" : "1u";
+      case BIWorkgroupSize:
+        if (k == 0) return gx ? (std::to_string(gx) + "u") : "ctx.tg_size";
+        return k == 1 ? (std::to_string(gy) + "u") : (std::to_string(gz) + "u");
       case BINumWorkgroups: case BINumEnqueuedWorkgroups:
         return k == 0 ? "((ctx.grid + ctx.tg_size - 1u) / ctx.tg_size)" : "1u";
       case BIGlobalSize: return k == 0 ? "ctx.grid" : "0u";
@@ -925,11 +1062,25 @@ std::string Emitter::builtin_expr(uint32_t var, int comp) const {
       default: return "";
     }
   };
-  const uint64_t bits = (bi == BIGlobalInvocationId || bi == BILocalInvocationId ||
-                         bi == BIWorkgroupId || bi == BIWorkgroupSize || bi == BINumWorkgroups ||
-                         bi == BIGlobalSize || bi == BIGlobalOffset || bi == BINumEnqueuedWorkgroups)
-                            ? 64ull
-                            : 32ull;
+  // The width is the module's, not this translator's. OpenCL declares
+  // `GlobalInvocationId` as a `size_t` vector, which is 64-bit here; GLSL declares
+  // the same builtin as a `uvec3`, which is 32-bit. The launch geometry is 64-bit
+  // either way, so the cast has to narrow to whatever the declaration holds —
+  // picking it from the builtin's name was right for one front end's convention
+  // and an error for the other's.
+  uint64_t bits = 64ull;
+  {
+    auto pt = m_.types.find(g->second.type);
+    if (pt != m_.types.end() && pt->second.kind == KPointer) {
+      auto po = m_.types.find(pt->second.elem);
+      if (po != m_.types.end() && po->second.kind == KVector) {
+        auto el = m_.types.find(po->second.elem);
+        if (el != m_.types.end() && el->second.kind == KInt) bits = el->second.width;
+      } else if (po != m_.types.end() && po->second.kind == KInt) {
+        bits = po->second.width;
+      }
+    }
+  }
   const std::string cast = bits == 64 ? "uint64_t" : "uint32_t";
   auto cv = [&](int k) { return "(" + cast + ")" + at(k); };
 
@@ -1252,6 +1403,9 @@ bool Emitter::emit_one(const Instr& ins) {
             case 66: set("weft_fp64::trunc_bits(" + x + ")"); return true;
             case 27: set("weft_fp64::max_bits(" + x + ", " + V(5) + ")"); return true;
             case 28: set("weft_fp64::min_bits(" + x + ", " + V(5) + ")"); return true;
+            // Fused multiply-add: one rounding, and the product is 106 bits wide
+            // before it is, so it cannot be built out of a multiply and an add.
+            case 26: set("weft_fp64::fma(" + x + ", " + V(5) + ", " + V(6) + ")"); return true;
             default:
               err = "OpenCL.std instruction " + std::to_string(num) +
                     " over a double has no GPU form: the arithmetic, the comparisons,"
@@ -1269,6 +1423,45 @@ bool Emitter::emit_one(const Instr& ins) {
         default:
           err = "opcode " + std::to_string(op) + " on a double has no GPU form";
           return false;
+      }
+    }
+  }
+
+  // ---- a vector of 64-bit floats ----
+  //
+  // A double is the `uint64_t` its bits live in, so a vector of them is a struct of
+  // those words and each operation is the helper applied per component. On the CPU
+  // the components are the host's own doubles, where the operator is already right.
+  {
+    uint32_t ve = 0, vn = 0;
+    if (gpu && res && vector_of(rt, ve, vn) && f64_type(ve)) {
+      static const char* const kComp = "xyzw";
+      auto comp = [&](const std::string& A, uint32_t i) {
+        return "(" + A + ")." + std::string(1, kComp[i]);
+      };
+      auto pair = [&](const char* fn, const std::string& A, const std::string& B) -> std::string {
+        std::string e = rty + "{";
+        for (uint32_t i = 0; i < vn; i++) {
+          if (i) e += ", ";
+          e += std::string("weft_fp64::") + fn + "(" + comp(A, i) + ", " + comp(B, i) + ")";
+        }
+        return e + "}";
+      };
+      switch (op) {
+        case OpFAdd: set(pair("add", V(2), V(3))); return true;
+        case OpFSub: set(pair("sub", V(2), V(3))); return true;
+        case OpFMul: set(pair("mul", V(2), V(3))); return true;
+        case OpFDiv: set(pair("div", V(2), V(3))); return true;
+        case OpFNegate: {
+          std::string e = rty + "{";
+          for (uint32_t i = 0; i < vn; i++) {
+            if (i) e += ", ";
+            e += "weft_fp64::neg(" + comp(V(2), i) + ")";
+          }
+          set(e + "}");
+          return true;
+        }
+        default: break;
       }
     }
   }
@@ -1305,6 +1498,13 @@ bool Emitter::emit_one(const Instr& ins) {
     case OpVariable: {
       // A function-scope variable: storage for an array or an address-taken
       // scalar. It is a field of the state, like every other SSA value.
+      //
+      // `OpVariable` is in `no_result` — the field pass treats it as storage rather
+      // than as a value — so the shared `rd` is zero for it and the result id has to
+      // come from the instruction's own second word. Reading `rd` declared a field
+      // named for value 0, which no load could ever name: an address-taken local
+      // translated, then read someone else's slot.
+      const uint32_t vid = a.size() > 1 ? a[1] : 0u;
       auto t = m_.types.find(a[0]);
       if (t == m_.types.end() || t->second.kind != KPointer) { err = "bad OpVariable"; return false; }
       uint32_t sz = 0;
@@ -1313,12 +1513,12 @@ bool Emitter::emit_one(const Instr& ins) {
       // One thread walking 32 lanes needs one copy of a local per lane: the lanes
       // are data there, not threads, so the storage is a row each.
       const std::string th = addr_space("thread", false);
-      decls_ += "  unsigned char " + field(rd) + (warp_ ? "[32][" : "[") +
+      decls_ += "  unsigned char " + field(vid) + (warp_ ? "[32][" : "[") +
                 std::to_string(sz) + "];\n";
-      base_addr_[rd] = "((" + th + "unsigned char*)s->" + field(rd) + (warp_ ? "[l]" : "") + ")";
-      vt_[rd] = a[0];
+      base_addr_[vid] = "((" + th + "unsigned char*)s->" + field(vid) + (warp_ ? "[l]" : "") + ")";
+      vt_[vid] = a[0];
       if (a.size() > 3) {
-        const std::string at = "s->" + field(rd) + (warp_ ? "[l]" : "");
+        const std::string at = "s->" + field(vid) + (warp_ ? "[l]" : "");
         init_ += gpu ? ("  weft::zero_thread(" + at + ", " + std::to_string(sz) + ");\n")
                      : ("  std::memset(" + at + ", 0, " + std::to_string(sz) + ");\n");
       }
@@ -1370,6 +1570,14 @@ bool Emitter::emit_one(const Instr& ins) {
           if (a[i] >= t->second.count) { err = "vector index out of range"; return false; }
           src = "(" + src + ")." + std::string(1, k[a[i]]);
           cur = t->second.elem;
+        } else if (t->second.kind == KMatrix) {
+          // Indexing a matrix yields a column, which is the vector it is built
+          // from: `weft_col(m, i)` is the same accessor the preamble's product
+          // uses, so a caller and the arithmetic cannot disagree about which is
+          // a column and which is a row.
+          if (a[i] >= t->second.count) { err = "matrix column out of range"; return false; }
+          src = "weft_col(" + src + ", " + std::to_string(a[i]) + ")";
+          cur = t->second.elem;
         } else {
           err = "composite extract from a non-vector";
           return false;
@@ -1380,6 +1588,28 @@ bool Emitter::emit_one(const Instr& ins) {
     }
 
     case OpCompositeConstruct: {
+      // A matrix is built from its columns, in order: `weft_mk(c0, c1, ...)`
+      // takes the column type, so a caller cannot pass rows without the compiler
+      // saying so.
+      auto mt = m_.types.find(rt);
+      if (mt != m_.types.end() && mt->second.kind == KMatrix) {
+        if (a.size() - 2 != mt->second.count) {
+          err = "matrix built from a different number of columns";
+          return false;
+        }
+        std::string e = "weft_mk(";
+        for (size_t i = 2; i < a.size(); i++) {
+          const uint32_t vt = vtype(a[i]);
+          if (vt != 0 && vt != mt->second.elem) {
+            err = "matrix built from something other than its column type";
+            return false;
+          }
+          if (i > 2) e += ", ";
+          e += val(a[i]);
+        }
+        set(e + ")");
+        return true;
+      }
       uint32_t n = 0, en = 0;
       if (!vector_of(rt, en, n)) { err = "composite construct of a non-vector"; return false; }
       if (a.size() - 2 != n) { err = "vector built from a different number of parts"; return false; }
@@ -1423,6 +1653,21 @@ bool Emitter::emit_one(const Instr& ins) {
       set(e + "}");
       return true;
     }
+
+    // ---- matrices ----
+    //
+    // The preamble's operators are the arithmetic, and the preamble is one text
+    // compiled by both targets, so a product here is the product a GPU runs
+    // rather than a second implementation kept in step by hand. Column-major on
+    // both sides: `m[c]` is a column, and a matrix times a vector is a linear
+    // combination of them.
+    case OpTranspose: set("weft_transpose(" + V(2) + ")"); return true;
+    case OpMatrixTimesScalar:
+    case OpVectorTimesMatrix:
+    case OpMatrixTimesVector:
+    case OpMatrixTimesMatrix:
+      set("(" + V(2) + " * " + V(3) + ")");
+      return true;
 
     case OpDot: {
       const std::string A = V(2), B = V(3);
@@ -1560,7 +1805,31 @@ bool Emitter::emit_one(const Instr& ins) {
     case OpIsFinite: set(math("isfinite", V(2))); return true;
     case OpSignBitSet: set(math("signbit", V(2))); return true;
 
-    case OpSelect: set("(" + V(2) + " ? " + V(3) + " : " + V(4) + ")"); return true;
+    case OpSelect: {
+      // A vector condition selects component by component, which is the one thing
+      // `?:` cannot say: it takes a scalar. A scalar condition is the ordinary
+      // expression, and it is what every OpenCL module writes.
+      uint32_t cet = 0, cn = 0;
+      if (vector_of(vtype(a[2]), cet, cn) && cn >= 2) {
+        auto ot = m_.types.find(rt);
+        if (ot == m_.types.end() || ot->second.kind != KVector) {
+          err = "a vector select of something that is not a vector";
+          return false;
+        }
+        static const char* kSelComp[] = {"x", "y", "z", "w"};
+        const std::string c = V(2), x = V(3), y = V(4);
+        std::string e = rty + "{";
+        for (uint32_t k = 0; k < ot->second.count && k < 4; k++) {
+          if (k) e += ", ";
+          e += "(" + c + ")." + kSelComp[k] + " ? (" + x + ")." + kSelComp[k] + " : (" + y +
+               ")." + kSelComp[k];
+        }
+        set(e + "}");
+        return true;
+      }
+      set("(" + V(2) + " ? " + V(3) + " : " + V(4) + ")");
+      return true;
+    }
 
     // ---- control flow ----
     case OpLabel: return true;  // emitted by run()
@@ -1627,6 +1896,14 @@ bool Emitter::emit_one(const Instr& ins) {
     // Every one of these is a rendezvous among 32 lanes, and the only rendezvous
     // the runtime has is "hand the worker back and resume later". So: publish my
     // value, yield, then read what the warp published on the next pass.
+    case OpGroupNonUniformElect: {
+      // One lane of the group is chosen and which one is the implementation's
+      // choice; the lowest lane is the one every engine here picks.
+      subgroup_ = true;
+      body_ += "  s->" + field(rd) + " = ((ctx.lid & 31u) == 0u);\n";
+      return true;
+    }
+
     case OpGroupNonUniformBallot: case OpGroupNonUniformAll: case OpGroupNonUniformAny:
     case OpGroupNonUniformAllEqual: case OpGroupNonUniformBroadcast:
     case OpGroupNonUniformBroadcastFirst: case OpGroupNonUniformShuffle:
@@ -1744,6 +2021,28 @@ bool Emitter::emit_one(const Instr& ins) {
           e = "(" + b + " != 0u)";
         }
         body_ += "  " + fref(rd) + " = " + e + ";\n";
+        return true;
+      }
+
+      if (gpu && op == OpGroupNonUniformAllEqual) {
+        // One broadcast of lane 0's value, one predicate, one ballot: the lanes
+        // whose value differs from lane 0's are the lanes the mask marks. The
+        // comparison is by value, which is what the instruction means — a bit
+        // compare would call -0.0 and 0.0 different.
+        std::string peer0;
+        if (!wide_shfl(vtype(a[3]), V(3), "0u", peer0)) return false;
+        uint32_t en = 0, nn = 0;
+        const bool vec = vector_of(vtype(a[3]), en, nn);
+        const int comps = vec ? (int)nn : 1;
+        static const char* kComp[] = {"x", "y", "z", "w"};
+        std::string neq;
+        for (int k = 0; k < comps; k++) {
+          const std::string sfx = vec ? ("." + std::string(1, kComp[k][0])) : std::string();
+          neq += std::string(k ? " || " : "") + "((" + V(3) + ")" + sfx + " != (" + peer0 + ")" +
+                 sfx + ")";
+        }
+        body_ += "  { " + live + "const uint32_t weft_b = ((uint32_t)(simd_vote::vote_t)simd_ballot(" +
+                 neq + ")) & weft_mask;\n    s->" + field(rd) + " = (weft_b == 0u); }\n";
         return true;
       }
 
@@ -1903,7 +2202,8 @@ bool Emitter::emit_one(const Instr& ins) {
     case OpAtomicExchange: case OpAtomicCompareExchange: case OpAtomicCompareExchangeWeak:
     case OpAtomicIIncrement: case OpAtomicIDecrement: case OpAtomicIAdd: case OpAtomicISub:
     case OpAtomicSMin: case OpAtomicUMin: case OpAtomicSMax: case OpAtomicUMax: case OpAtomicAnd:
-    case OpAtomicOr: case OpAtomicXor: case OpAtomicFAddEXT: {
+    case OpAtomicOr: case OpAtomicXor: case OpAtomicFAddEXT:
+    case OpAtomicFMinEXT: case OpAtomicFMaxEXT: {
       const std::string ptr = addr(a[2]);
       // a[3] scope, a[4] semantics, then the value(s)
       std::string fn, val_, cmp;
@@ -1937,6 +2237,8 @@ bool Emitter::emit_one(const Instr& ins) {
         case OpAtomicCompareExchange: case OpAtomicCompareExchangeWeak: fn = "atom_cas"; break;
         case OpAtomicIIncrement: case OpAtomicIDecrement: fn = "atom_add"; break;
         case OpAtomicFAddEXT: fn = "atom_add"; suf = "_f32"; break;
+        case OpAtomicFMinEXT: fn = "atom_min"; suf = "_f32"; break;
+        case OpAtomicFMaxEXT: fn = "atom_max"; suf = "_f32"; break;
         default: break;
       }
       std::string tyop;
@@ -2079,8 +2381,23 @@ bool Emitter::emit_one(const Instr& ins) {
             "*)(" + addr_space("device", false) + "void*)(" + ptr + "), -(" + val_ + "))");
         return true;
       }
-      if (op == OpAtomicFAddEXT || (flt && fn != "atom_add")) {
-        err = "float atomic other than add is not supported";
+      // A float exchange needs no float form: the bits are the value, so it is the
+      // 32-bit exchange with a bitcast on each side, which is exact for every float
+      // including the NaNs a numeric min would have to choose a winner for.
+      if (flt && fn == "atom_exch") {
+        const std::string w = addr_space("device", false) + "uint32_t*";
+        set("weft_bitcast<float>(weft::atom_exch_u32((" + w + ")(" +
+            addr_space("device", false) + "void*)(" + ptr + "), weft_bitcast<uint32_t>(" +
+            val_ + ")))");
+        return true;
+      }
+      // A float compare-exchange is not a spelling this model has, and that is the
+      // spec rather than a gap here: the assembler refuses the instruction outright
+      // — `AtomicCompareExchange: expected Result Type to be integer scalar type`.
+      // Add, min, max and exchange are the float atomics that exist.
+      if (flt && fn != "atom_add" && fn != "atom_min" && fn != "atom_max") {
+        err = "float atomic compare-exchange does not exist in SPIR-V: its result is "
+              "constrained to an integer scalar";
         return false;
       }
       std::string call = "weft::" + fn + suf + "((" + addr_space("device", false) + tyop +
@@ -2097,9 +2414,22 @@ bool Emitter::emit_one(const Instr& ins) {
     // creates; `OpSampledImage` joins the two. The runtime keeps the image as a
     // pointer to the bound texture and the sampler as the two choices that can
     // change an answer, which is everything a compute kernel can observe.
-    case OpSampledImage:
-      set("weft::SampledImage{" + V(2) + ", " + V(3) + "}");
+    case OpSampledImage: {
+      // An array image joins the sampler in its own handle type: the layer is
+      // part of every sample's coordinate, and the GPU form is a different
+      // texture type. The host form is one struct either way.
+      auto st = m_.types.find(vtype(a[2]));
+      const bool img = gpu && st != m_.types.end() && st->second.kind == KImage;
+      const bool arr = img && st->second.arrayed != 0;
+      const bool vol = img && !arr && st->second.count == 2u;
+      const bool cb = img && st->second.count == 3u;
+      set(std::string(cb ? "weft::SampledCubeImage{"
+                          : vol ? "weft::SampledImage3D{"
+                                : arr ? "weft::SampledArrayImage{"
+                                      : "weft::SampledImage{") +
+          V(2) + ", " + V(3) + "}");
       return true;
+    }
 
     case OpImage:  // the image out of a sampled image
       set("(" + V(2) + ").tex");
@@ -2118,15 +2448,39 @@ bool Emitter::emit_one(const Instr& ins) {
       const std::string dot = gpu ? "." : "->";
       const std::string w = "(" + ety + ")(" + img + ")" + dot + "width";
       const std::string h = "(" + ety + ")(" + img + ")" + dot + "height";
-      if (n == 3) set(rty + "{" + w + ", " + h + ", (" + ety + ")1}");
+      // A 2-D array reports its slice count as the third component. A plain
+      // image has no third component and answers one, which is the same number
+      // the Metal front end reports for `get_array_size()`.
+      auto it = m_.types.find(vtype(a[2]));
+      const bool arr = it != m_.types.end() && it->second.arrayed != 0;
+      // A volume's third component is its depth, which is the same outermost
+      // extent an array reports as its slice count.
+      const bool vol = it != m_.types.end() && it->second.kind == KImage && it->second.count == 2u;
+      // The GPU's 3-D handle calls that extent `depth`; the host texture stores a
+      // layered image and a volume the same way and calls it `layers`.
+      const std::string field = (gpu && vol && !arr) ? "depth" : "layers";
+      // A cube's third extent is the six faces it is made of, which the handle
+      // does not carry — it is `texturecube`, with a width and a height only.
+      const bool cb = it != m_.types.end() && it->second.kind == KImage && it->second.count == 3u;
+      const std::string l = cb ? ("(" + ety + ")6")
+                               : (arr || vol)
+                                     ? ("(" + ety + ")(" + img + ")" + dot + field)
+                                     : ("(" + ety + ")1");
+      if (n == 3) set(rty + "{" + w + ", " + h + ", " + l + "}");
       else if (n == 2) set(rty + "{" + w + ", " + h + "}");
       else set(w);
       return true;
     }
 
-    case OpImageRead: case OpImageFetch: case OpImageSampleImplicitLod:
+    case OpImageGather: case OpImageRead: case OpImageFetch: case OpImageSampleImplicitLod:
     case OpImageSampleExplicitLod: {
-      const bool sample = op == OpImageSampleImplicitLod || op == OpImageSampleExplicitLod;
+      // A gather is the four texels of the 2x2 footprint, one per channel, instead
+      // of the blend a filter would produce — the SPIR-V twin of PTX's `tld4`. It
+      // carries a component operand the others do not, which is why its image
+      // operands start one word later.
+      const bool gather = op == OpImageGather;
+      const bool sample = op == OpImageSampleImplicitLod || op == OpImageSampleExplicitLod ||
+                          gather;
       const std::string src = V(2);
       const std::string img = sample ? ("(" + src + ").tex") : src;
       // What a read hands back is the image's sampled element type.
@@ -2147,27 +2501,41 @@ bool Emitter::emit_one(const Instr& ins) {
       std::string ety;
       if (!ctype(it->second.elem, ety)) { err = "image of an unsupported element type"; return false; }
 
-      std::string x, y;
+      // A 1-D image is a plane one row high, so a sample sits at 0.5 — the centre
+      // of that row, which is the texel itself under any filter and any address
+      // mode. A cube's coordinate is a direction, and its three components are
+      // exactly what the sampler takes, so they are read out as they arrive.
+      std::string x, y, lay;
       {
         uint32_t cet = 0, cn = 0;
         const std::string c = V(3);
         if (vector_of(vtype(a[3]), cet, cn) && cn >= 2) {
           x = "(" + c + ").x";
           y = "(" + c + ").y";
+          // The third component of an arrayed coordinate is the slice.
+          if (cn >= 3) lay = "(" + c + ").z";
         } else {
           x = "(" + c + ")";
-          y = "0";
+          y = (it->second.count == 0u) ? "0.5f" : "0";
         }
       }
+      // A layered image and 3-D image both put their outermost index in the third
+      // component; what differs is only what the sampler does with it, so the read
+      // path is shared and the sample below picks its own form.
+      const bool vol = it->second.arrayed == 0 && it->second.count == 2u;
+      const std::string lz = (it->second.arrayed != 0 || vol)
+                                 ? (", (uint32_t)(" + (lay.empty() ? std::string("0") : lay) + ")")
+                                 : std::string();
 
       // The optional image operands, in the order the spec fixes: Bias, Lod,
       // Grad (two ids), ConstOffset, Offset, ConstOffsets, Sample, MinLod. The
       // levels are ignored — a bound texture has one — and the two offsets are
       // how a kernel asks for a neighbouring texel.
       std::string ox = "0", oy = "0";
-      if (a.size() > 4) {
-        const uint32_t mask = a[4];
-        size_t k = 5;
+      const size_t mask_at = gather ? 5u : 4u;
+      if (a.size() > mask_at) {
+        const uint32_t mask = a[mask_at];
+        size_t k = mask_at + 1;
         auto skip = [&](size_t count) {
           for (size_t j = 0; j < count && k < a.size(); j++, k++) {}
         };
@@ -2194,8 +2562,66 @@ bool Emitter::emit_one(const Instr& ins) {
         if (k != a.size()) { err = "an image operand this front end does not know"; return false; }
       }
 
+      if (gather) {
+        // The footprint is a 2x2 block of one plane, and every shape this front
+        // end decodes has one: a plain image, a slice of an array, a plane of a
+        // volume, or the face of a cube the direction lands on. The answer is
+        // four channels of the same sample type, which is the result vector.
+        const std::string g = "weft_g" + std::to_string(a[1]);
+        body_ += "  float " + g + "[4];\n";
+        // The offset is a texel count, so it is added as a fraction of the extent
+        // — the same thing the sample path does with it.
+        const std::string dx = "(" + x + ") + (float)(" + ox + ") / (float)(" +
+                               (gpu ? img : "*" + img) + ").width";
+        const std::string dy = "(" + y + ") + (float)(" + oy + ") / (float)(" +
+                               (gpu ? img : "*" + img) + ").height";
+        const std::string lhs = gpu ? src : ("*" + img);
+        const uint32_t dim = it->second.count;
+        const bool arr = it->second.arrayed != 0;
+        std::string call;
+        if (dim == 1u && !arr)
+          call = "weft::tex_gather4<float>(" + lhs + ", " + dx + ", " + dy + ", " + g + ")";
+        else if (dim == 1u && arr)
+          call = "weft::tex_gather4<float>(" + lhs + ", " + dx + ", " + dy + ", (uint32_t)(" +
+                 lay + "), " + g + ")";
+        else if (dim == 2u) {
+          // Not a gap: `OpImageGather` is defined for a 2D, Cube or Rect image
+          // only, and the validator says so ("Expected Image 'Dim' to be 2D, Cube,
+          // or Rect"), so a volume can never carry one.
+          err = "a gather is a 2D, Cube or Rect image in SPIR-V, and a volume is none of them";
+          return false;
+        } else if (dim == 3u) {
+          // Measured, not assumed: Metal's `gather` exists on a `texturecube` only
+          // for the threadgroup-coherence specialisation, so a cube bound with
+          // `access::sample` cannot gather — and a gather the two engines cannot
+          // both perform is a divergence rather than a lowering.
+          err = "a gather of a cube has no form here: Metal's gather is not available for a "
+                "`texturecube` with `access::sample`, so the four texels cannot be read the "
+                "same way on both engines";
+          return false;
+        } else {
+          err = "a gather of an image this front end cannot name";
+          return false;
+        }
+        body_ += "  " + call + ";\n";
+        set(rty + "{" + g + "[0], " + g + "[1], " + g + "[2], " + g + "[3]}");
+        return true;
+      }
       std::string read;
-      if (sample) {
+      if (sample && it->second.count == 3u) {
+        // The direction goes to the cube sampler, which picks the face and the
+        // place on it: the same rule the CPU runtime models. All three components
+        // are the direction, so a coordinate that does not carry three is a
+        // module this cannot answer rather than one it can answer wrongly.
+        if (lay.empty()) {
+          err = "a cube sample needs a three-component direction";
+          return false;
+        }
+        read = gpu ? ("weft::tex_sample<" + ety + ">(" + src + ", " + x + ", " + y + ", " +
+                      lay + ")")
+                   : ("weft::tex_sample_cube<" + ety + ">(*" + img + ", " + x + ", " + y + ", " +
+                      lay + ", (" + src + ").s.filter, (" + src + ").s.addr)");
+      } else if (sample) {
         std::string u = x, v = y;
         if (ox != "0" || oy != "0") {
           const std::string dot = gpu ? "." : "->";
@@ -2204,12 +2630,16 @@ bool Emitter::emit_one(const Instr& ins) {
         }
         // On the GPU the filter and the address mode live in the bound sampler
         // state, so the sample names the sampler and nothing else.
-        read = gpu ? ("weft::tex_sample<" + ety + ">(" + src + ", " + u + ", " + v + ")")
-                   : ("weft::tex_sample<" + ety + ">(*" + img + ", " + u + ", " + v +
+        // A volume's third coordinate is normalised and stays a float; a layered
+        // one is an integer slice, which is what `lz` carries.
+        const std::string third = vol ? (", (float)(" + (lay.empty() ? std::string("0") : lay) + ")")
+                                      : lz;
+        read = gpu ? ("weft::tex_sample<" + ety + ">(" + src + ", " + u + ", " + v + third + ")")
+                   : ("weft::tex_sample<" + ety + ">(*" + img + ", " + u + ", " + v + third +
                       ", (" + src + ").s.filter, (" + src + ").s.addr)");
       } else {
         read = "weft::tex_read<" + ety + ">(" + (gpu ? img : "*" + img) + ", (uint32_t)(" + x +
-               " + " + ox + "), (uint32_t)(" + y + " + " + oy + "))";
+               " + " + ox + "), (uint32_t)(" + y + " + " + oy + ")" + lz + ")";
       }
       // A read of a sampled image answers with four channels, exactly as the
       // Metal front end's does: (value, 0, 0, 1).
@@ -2242,10 +2672,22 @@ bool Emitter::emit_one(const Instr& ins) {
       const std::string coord = V(1);
       const std::string texel = V(2);
       std::string x = "(uint32_t)(" + coord + ").x", y = "(uint32_t)(" + coord + ").y";
+      std::string lay;
       uint32_t cet = 0, cn = 0;
       if (!vector_of(vtype(a[1]), cet, cn) || cn < 2) {
         x = "(uint32_t)(" + coord + ")";
         y = "0u";
+      } else if (cn >= 3) {
+        lay = "(uint32_t)(" + coord + ").z";
+      }
+      // Only an arrayed image has a slice to write into; a plain one ignores the
+      // third coordinate, which is what a 2-D image does with a spare component.
+      {
+        auto wt = m_.types.find(vtype(a[0]));
+        const bool vol = wt != m_.types.end() && wt->second.kind == KImage &&
+                         wt->second.count == 2u;
+        if (wt == m_.types.end() || (wt->second.arrayed == 0 && !vol)) lay.clear();
+        else lay = ", " + lay;
       }
       // What the image holds: the texel's own type, widened to four channels if
       // the module wrote a scalar or a short vector.
@@ -2266,7 +2708,7 @@ bool Emitter::emit_one(const Instr& ins) {
         v = vt + "{" + texel + ", " + z + ", " + z + ", " + z + "}";
       }
       body_ += "  weft::tex_write(" + (gpu ? img : "*(" + img + ")") + ", " + x + ", " + y +
-               ", " + v + ");\n";
+               lay + ", " + v + ");\n";
       return true;
     }
 
@@ -2289,8 +2731,27 @@ bool Emitter::emit_one(const Instr& ins) {
         // `erfc`. As it stood, a kernel calling `ceil` was translated into a cube
         // root, silently. `cospi` and `expm1` have no name on both targets, so they
         // are refused by number instead of being mapped to something else.
+        // The inverse trigonometry and the pi-scaled family. These were missing
+        // outright: a kernel calling `atan2` — which graphics code calls for every
+        // angle — was refused while the library that answers it was already here.
+        case 0: f = "acos"; break;
+        case 1: f = "acosh"; break;
+        case 3: f = "asin"; break;
+        case 4: f = "asinh"; break;
+        case 6: f = "atan"; break;
+        case 7: f = "atan2"; arity = 2; break;
+        case 8: f = "atanh"; break;
         case 11: f = "cbrt"; break;
         case 12: f = "ceil"; break;
+        case 16: f = "cospi"; break;
+        case 22: f = "expm1"; break;
+        case 41: f = "logb"; break;
+        case 43: f = "maxmag"; arity = 2; break;
+        case 44: f = "minmag"; arity = 2; break;
+        case 47: f = "nextafter"; arity = 2; break;
+        case 50: f = "powr"; arity = 2; break;
+        case 60: f = "sinpi"; break;
+        case 64: f = "tanpi"; break;
         case 13: f = "copysign"; arity = 2; break;
         case 14: f = "cos"; break;
         case 15: f = "cosh"; break;
@@ -2343,6 +2804,64 @@ bool Emitter::emit_one(const Instr& ins) {
         default: f.clear(); break;
       }
       auto arg = [&](int k) -> std::string { return V(4 + k); };
+      // The "pi" forms divide by pi and have no `std` spelling, so they are built
+      // from the library's own function: one expression, the same on both targets.
+      if (num == 2 || num == 5 || num == 9) {
+        const char* base = num == 2 ? "weft_acos" : (num == 5 ? "weft_asin" : "weft_atan");
+        set(std::string(base) + "(" + arg(0) + ") * 0.3183098861837907f");
+        return true;
+      }
+      if (num == 10) {
+        set("weft_atan2(" + arg(0) + ", " + arg(1) + ") * 0.3183098861837907f");
+        return true;
+      }
+      // The three that take an integer: the module's second operand is an `int`,
+      // and the library's own signature says so.
+      if (num == 33) { set("weft_ilogb(" + arg(0) + ")"); return true; }
+      if (num == 34) { set("weft_ldexp(" + arg(0) + ", (int)(" + arg(1) + "))"); return true; }
+      if (num == 49) { set("weft_pown(" + arg(0) + ", (int)(" + arg(1) + "))"); return true; }
+      if (num == 54) { set("weft_rootn(" + arg(0) + ", (int)(" + arg(1) + "))"); return true; }
+      // The four that compute two numbers: the first is the result and the second
+      // is written through the pointer the instruction takes as its last operand.
+      // One call computes both halves, so a caller cannot receive a fraction whose
+      // exponent came from a different input.
+      auto store_out = [&](const std::string& v) -> bool {
+        const uint32_t pid = a.back();
+        auto pt = m_.types.find(vtype(pid));
+        if (pt == m_.types.end() || pt->second.kind != KPointer) {
+          err = "an extended instruction with two results needs a pointer for the second";
+          return false;
+        }
+        std::string ty;
+        if (!ctype(pt->second.elem, ty)) {
+          err = "the second result has an unsupported type";
+          return false;
+        }
+        const std::string sp = space_of(pid);
+        body_ += "  weft_st<" + ty + ">((" + addr_space(sp.c_str(), false) + "void*)" +
+                 addr(pid) + ", " + v + ");\n";
+        return true;
+      };
+      if (num == 31) {
+        if (!store_out("weft_frexp_e(" + arg(0) + ")")) return false;
+        set("weft_frexp_f(" + arg(0) + ")");
+        return true;
+      }
+      if (num == 45) {
+        if (!store_out("weft_modf_i(" + arg(0) + ")")) return false;
+        set("weft_modf_f(" + arg(0) + ")");
+        return true;
+      }
+      if (num == 58) {
+        if (!store_out("weft_sincos_c(" + arg(0) + ")")) return false;
+        set("weft_sincos_s(" + arg(0) + ")");
+        return true;
+      }
+      if (num == 52) {
+        if (!store_out("weft_remquo_q(" + arg(0) + ", " + arg(1) + ")")) return false;
+        set("weft_remquo_r(" + arg(0) + ", " + arg(1) + ")");
+        return true;
+      }
       if (num == 30) {  // fract: min(x - floor(x), largest float below 1)
         set(math("min", arg(0) + " - " + math("floor", arg(0)) + ", weft_f32(0x3f7fffffu)"));
         return true;
@@ -2364,7 +2883,20 @@ bool Emitter::emit_one(const Instr& ins) {
       else {
         std::string args = arg(0);
         for (int k = 1; k < arity; k++) args += ", " + arg(k);
-        call = math(f, args);
+        // The names the portable library defines go through it, on both targets:
+        // one text compiled as MSL for the GPU and C++ for the CPU, which is the
+        // only way the two agree to the bit. A builtin that is exact either way
+        // — `floor`, `fabs`, `fmax` — keeps the language's own spelling.
+        static const char* const kPortable[] = {
+            "sqrt",  "rsqrt", "sin",   "cos",   "tan",   "sinpi", "cospi", "tanpi",
+            "asin",  "acos",  "atan",  "atan2", "sinh",  "cosh",  "tanh",
+            "asinh", "acosh", "atanh", "exp",   "exp2",  "exp10", "log",   "log2",
+            "log10", "pow",   "powr",  "expm1", "logb",  "maxmag", "minmag",
+            "nextafter"};
+        bool portable = false;
+        for (const char* p : kPortable)
+          if (f == p) portable = true;
+        call = portable ? ("weft_" + f + "(" + args + ")") : math(f, args);
       }
       set(call);
       return true;
@@ -2504,6 +3036,19 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
   if (name == "sub_group_size") { result("32u"); return true; }
 
   if (name == "sub_group_ballot" || name == "sub_group_all" || name == "sub_group_any") {
+    if (gpu && !warp_step_) {
+      // The hardware's ballot, with the lanes that exist masked on: a vote is the
+      // one subgroup operation that needs nothing but the predicate.
+      body_ += "  { " + std::string(kLive) +
+               "const uint32_t weft_b = ((uint32_t)(simd_vote::vote_t)simd_ballot((" + arg(0) +
+               ") ? true : false)) & weft_mask;\n";
+      std::string e;
+      if (name == "sub_group_ballot") e = "weft_b";
+      else if (name == "sub_group_all") e = "(weft_b == weft_mask && weft_mask != 0u)";
+      else e = "(weft_b != 0u)";
+      body_ += "    " + fref(a[1]) + " = (" + rty + ")(" + e + "); }\n";
+      return true;
+    }
     const std::string lab = rendezvous("(" + arg(0) + ") ? 1u : 0u");
     body_ += lab;
     if (warp_step_) {
@@ -2592,24 +3137,124 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
       err = "subgroup operation '" + name + "' is not supported";
       return false;
     }
-    // ---- a value wider than the rendezvous ----
+    // ---- the fold: one tree, every target ----
     //
-    // A window of the slot array is one word, and so is the publication buffer, so
-    // a 64-bit payload has nowhere to go. It does not need a third mechanism: the
-    // region that carries a 16-byte shuffle payload is already eight bytes per lane
-    // on the C++ target, and on the warp target two windows side by side are the
-    // same eight bytes. Publish low word then high, park once, and the fold
-    // reassembles each lane's value from the two.
+    // A reduce and a scan are the same doubling tree wherever they run, which is
+    // what makes a float answer the same in both columns: step d adds the value d
+    // lanes below, so a lane ends holding the fold of the lanes under it. A scan
+    // keeps that, and a reduce reads it from the top lane that exists. On the
+    // hardware that is one `simd_shuffle` a step and the value never leaves a
+    // register; on the CPU it is one array read a step of what the warp already
+    // published, so the whole tree still costs one rendezvous rather than one per
+    // step.
+    //
+    // It is a tree downwards and not an XOR butterfly for a reason a short warp
+    // measured: the butterfly folds lane i with lane i^d, and in the last warp of
+    // a launch the lanes past the grid never ran, so the hardware hands back
+    // whatever their registers hold. At 24 lanes that read a sum that was 82 off.
+    // A downward tree only ever *uses* lanes below, and the ones that never ran
+    // still stand in with the fold's identity.
+    //
+    // `simd_sum` and `simd_prefix_inclusive_sum` are the hardware's own folds in
+    // the hardware's own order, and for floats a different order of additions is a
+    // different answer — which is why the tree is written out instead of called.
     const bool wide64 = m_.types[vtype(a[3])].width == 64;
-    const std::string nth = scan ? (incl ? "((ctx.lid & 31u) + 1u)" : "(ctx.lid & 31u)")
-                                 : std::string("32u");
+    const bool excl = scan && !incl;
+    const uint32_t ebits = m_.types[vtype(a[3])].width;
+    // The lanes of this warp that exist, and the top one of them.
+    const std::string live =
+        "const uint32_t weft_live = weft::live_threads(ctx.tgid, ctx.tg_size, ctx.grid); "
+        "const uint32_t weft_wb = ctx.lid & ~31u; "
+        "const uint32_t weft_wl = (weft_live > weft_wb) ? ((weft_live - weft_wb) > 32u ? 32u : "
+        "(weft_live - weft_wb)) : 0u; "
+        "const uint32_t weft_mask = (weft_wl >= 32u) ? 0xFFFFFFFFu : ((1u << weft_wl) - 1u); "
+        "const uint32_t weft_me = ctx.lid & 31u; "
+        "const uint32_t weft_top = weft_wl ? (weft_wl - 1u) : 0u; ";
+    const std::string seedv = "(" + ety + ")(" + seed + ")";
+    // This lane's own value, with a dead lane's replaced by the identity.
+    const std::string mine = "(weft_me < weft_wl) ? (" + ety + ")(" + arg(0) + ") : " + seedv;
+    // Which lane the tree reads for lane `i`: itself for a reduce and an inclusive
+    // scan, the lane below it for an exclusive one — the shift an exclusive prefix
+    // is defined to be. Clamped, so a dead index is still inside the array.
+    const std::string at = excl ? "(i > 0u ? (i - 1u) : 0u)" : "i";
+    const std::string use =
+        excl ? "(i > 0u && (weft_mask & (1u << i)))" : "(weft_mask & (1u << i))";
+    // A reduce's answer is the top live lane's prefix; a scan keeps its own.
+    const std::string keep = scan ? "weft_me" : "weft_top";
+
+    // The tree, over whatever `pre` + `load` fills the warp's values with.
+    auto tree = [&](const std::string& pre, const std::string& load) {
+      body_ += "  { " + live + "\n    " + ety + " weft_pub[32], weft_nxt[32];\n"
+               "    for (uint32_t i = 0; i < 32u; i++) {\n" +
+               pre + "      weft_pub[i] = " + use + " ? (" + load + ") : " + seedv +
+               ";\n    }\n"
+               "    for (uint32_t d = 1; d < 32u; d <<= 1) {\n"
+               "      for (uint32_t i = 0; i < 32u; i++) {\n"
+               "        const " +
+               ety + " weft_a = weft_pub[i];\n"
+                     "        const " +
+               ety + " weft_v = weft_pub[(i >= d) ? (i - d) : i];\n"
+               "        weft_nxt[i] = (i >= d) ? (" +
+               ety + ")(" + comb + ") : weft_pub[i];\n" +
+               "      }\n"
+               "      for (uint32_t i = 0; i < 32u; i++) weft_pub[i] = weft_nxt[i];\n"
+               "    }\n    " +
+               fref(a[1]) + " = weft_pub[" + keep + "]; }\n";
+    };
+
+    if (gpu && !warp_step_) {
+      // Full width, one shuffle a step, nothing published and nothing to wait for.
+      // A narrower element than 32 bits goes through its 32-bit form: that is what
+      // `simd_shuffle` moves.
+      auto step = [&](const std::string& expr, const std::string& peer, std::string& out) -> bool {
+        if (ebits < 32) {
+          out = "((" + ety + ")simd_shuffle((uint32_t)(" + expr + "), (ushort)((" + peer +
+                ") & 31u)))";
+          return true;
+        }
+        return wide_shfl(vtype(a[3]), expr, peer, out);
+      };
+      std::string up;
+      if (!step("weft_a",
+                scan ? "((ctx.lid & 31u) >= d ? (ctx.lid & 31u) - d : (ctx.lid & 31u))"
+                     : "((ctx.lid & 31u) >= d ? (ctx.lid & 31u) - d : (ctx.lid & 31u))",
+                up))
+        return false;
+      std::string start = mine;
+      if (excl) {
+        std::string prev;
+        if (!step("(" + ety + ")(" + arg(0) + ")",
+                  "((ctx.lid & 31u) ? (ctx.lid & 31u) - 1u : 0u)", prev))
+          return false;
+        start = "(weft_me > 0u && weft_me < weft_wl) ? (" + ety + ")(" + prev + ") : " + seedv;
+      }
+      body_ += "  { " + live + "\n    " + ety + " weft_a = " + start +
+               ";\n"
+               "    for (uint32_t d = 1; d < 32u; d <<= 1) {\n"
+               "      const " +
+               ety + " weft_v = (" + ety + ")(" + up +
+               ");\n"
+               "      if (weft_me >= d) weft_a = (" +
+               ety + ")(" + comb + ");\n"
+               "    }\n";
+      if (scan) {
+        body_ += "    " + fref(a[1]) + " = weft_a; }\n";
+      } else {
+        // The total is the top live lane's prefix, read with one more shuffle so
+        // every lane holds it. The lane that is read ran, so nothing here depends
+        // on what a lane that never ran left behind.
+        std::string fin;
+        if (!step("weft_a", "weft_top", fin)) return false;
+        body_ += "    " + fref(a[1]) + " = (" + ety + ")(" + fin + "); }\n";
+      }
+      return true;
+    }
+
     if (wide64) {
       // An integer is already its own bits; a double's have to be carried as the
       // bits they are, which `weft_bitcast` does on both targets.
-      const std::string bits = ety == "double"
-                                   ? ("weft_bitcast<uint64_t>(" + arg(0) + ")")
-                                   : ("(uint64_t)(" + arg(0) + ")");
-      const std::string unpack = "weft_bitcast<" + ety + ">";
+      const std::string bits = ety == "double" ? ("weft_bitcast<uint64_t>(" + arg(0) + ")")
+                                               : ("(uint64_t)(" + arg(0) + ")");
       if (warp_step_) {
         subgroup_ = true;
         const int lo = slot_off_;
@@ -2617,42 +3262,15 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
         body_ += "  { const uint64_t weft_b = " + bits +
                  ";\n"
                  "    weft_slots[" +
-                 std::to_string(lo) +
-                 " + l] = (uint32_t)(weft_b & 0xFFFFFFFFu);\n"
+                 std::to_string(lo) + " + l] = (uint32_t)(weft_b & 0xFFFFFFFFu);\n"
                  "    weft_slots[" +
                  std::to_string(lo + 32) + " + l] = (uint32_t)(weft_b >> 32); }\n  " +
                  park((uint32_t)resume_next_++) + "\n";
-        const std::string mask = slot_mask();
-        body_ += "  { const uint32_t weft_mask = " + mask + ";\n"
-                 "    threadgroup const uint32_t* weft_wl = weft_slots + " +
-                 std::to_string(lo) +
-                 ";\n"
-                 "    threadgroup const uint32_t* weft_wh = weft_slots + " +
-                 std::to_string(lo + 32) +
-                 ";\n"
-                 "    const uint32_t weft_n = " +
-                 nth +
-                 ";\n"
-                 "    " +
-                 ety + " weft_a = (" + ety + ")(" + seed + ");\n"
-                 "    for (uint32_t weft_i = 0; weft_i < weft_n; weft_i++) {\n"
-                 "      if (!(weft_mask & (1u << weft_i))) continue;\n"
-                 "      const uint64_t weft_w = ((uint64_t)weft_wh[weft_i] << 32) | "
-                 "(uint64_t)weft_wl[weft_i];\n"
-                 "      const " +
-                 ety + " weft_v = " + unpack + "(weft_w);\n"
-                 "      weft_a = (" +
-                 ety + ")(" + comb +
-                 ");\n"
-                 "    }\n"
-                 "    " +
-                 fref(a[1]) + " = weft_a; }\n";
+        const std::string l = std::to_string(lo), h = std::to_string(lo + 32);
+        tree("      const uint64_t weft_w = ((uint64_t)weft_slots[" + h + " + " + at +
+                 "] << 32) | (uint64_t)weft_slots[" + l + " + " + at + "];\n",
+             "weft_bitcast<" + ety + ">(weft_w)");
         return true;
-      }
-      if (gpu) {
-        err = "a 64-bit subgroup " + std::string(scan ? "scan" : "reduce") +
-              " on the per-lane GPU target: the eight-byte relay is the warp target's";
-        return false;
       }
       // The C++ target publishes the eight bytes into its wide slot, which the
       // shuffle path already double-buffers by pass.
@@ -2663,66 +3281,24 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
                "; std::memcpy(weft::wide_pub_slot(ctx), &weft_b, 8); }\n"
                "  s->pc = " +
                std::to_string(id) + "u; return;\n  R" + std::to_string(id) + ":;\n";
-      body_ += "  { " + std::string(kLive) + " const uint32_t weft_n = " + nth +
-               ";\n"
-               "    " +
-               ety + " weft_a = (" + ety + ")(" + seed + ");\n"
-               "    for (uint32_t weft_i = 0; weft_i < weft_n; weft_i++) {\n"
-               "      if (!(weft_mask & (1u << weft_i))) continue;\n"
-               "      uint64_t weft_w = 0u;\n"
-               "      std::memcpy(&weft_w, weft::wide_read_slot(ctx, weft_i), 8);\n"
-               "      const " +
-               ety + " weft_v = " + unpack + "(weft_w);\n"
-               "      weft_a = (" +
-               ety + ")(" + comb +
-               ");\n"
-               "    }\n"
-               "    " +
-               fref(a[1]) + " = weft_a; }\n";
+      tree("      uint64_t weft_w = 0u;\n      if (" + use +
+               ") std::memcpy(&weft_w, weft::wide_read_slot(ctx, weft_wb + " + at + "), 8);\n",
+           "weft_bitcast<" + ety + ">(weft_w)");
       return true;
     }
+
     std::string payload;
     if (!shfl_pub(vtype(a[3]), arg(0), payload)) return false;
     const std::string lab = rendezvous(payload);
     body_ += lab;
     if (warp_step_) {
-      // The same fold the C++ target does, over the window this call published into
-      // instead of the shared publication buffer.
-      const std::string mask = slot_mask();
-      body_ += "  { const uint32_t weft_mask = " + mask + ";\n"
-               "    threadgroup const uint32_t* weft_rb = weft_slots + " +
-               std::to_string(last_off) +
-               ";\n"
-               "    const uint32_t weft_n = " +
-               nth +
-               ";\n"
-               "    " +
-               ety + " weft_a = (" + ety + ")(" + seed + ");\n"
-               "    for (uint32_t weft_i = 0; weft_i < weft_n; weft_i++) {\n"
-               "      if (!(weft_mask & (1u << weft_i))) continue;\n"
-               "      const " +
-               ety + " weft_v = weft_bitcast<" + ety + ">(weft_rb[weft_i]);\n"
-               "      weft_a = (" +
-               ety + ")(" + comb +
-               ");\n"
-               "    }\n"
-               "    " +
-               fref(a[1]) + " = weft_a; }\n";
+      const std::string off = std::to_string(last_off);
+      tree("", "weft_bitcast<" + ety + ">(weft_slots[" + off + " + " + at + "])");
       return true;
     }
-    body_ += "  { " + std::string(kLive) +
-             " const uint32_t* weft_rb = (const uint32_t*)weft::shfl_read_buf(ctx) + (ctx.lid & ~31u);\n"
-             "    const uint32_t weft_n = " + (scan ? (incl ? "((ctx.lid & 31u) + 1u)" : "(ctx.lid & 31u)") : std::string("32u")) + ";\n"
-             "    " + ety + " weft_a = (" + ety + ")(" + seed + ");\n"
-             "    for (uint32_t weft_i = 0; weft_i < weft_n; weft_i++) {\n"
-             "      if (!(weft_mask & (1u << weft_i))) continue;\n"
-             "      const " + ety + " weft_v = weft_bitcast<" + ety + ">(weft_rb[weft_i]);\n"
-             "      weft_a = (" + ety + ")(" + comb + ");\n"
-             "    }\n"
-             "    " + fref(a[1]) + " = weft_a; }\n";
+    tree("", "weft_bitcast<" + ety + ">(weft::shfl_read_buf(ctx)[weft_wb + " + at + "])");
     return true;
   }
-
   err = "call to '" + sym + "': '" + name + "' is not supported";
   return false;
 }
@@ -2757,15 +3333,34 @@ bool Emitter::run() {
       // handle onto that binding and not a copied value.
       auto e = m_.types.find(t->second.elem);
       if (e == m_.types.end()) { err = "parameter of an unknown opaque type"; return false; }
-      if (e->second.kind == KImage) {
-        const int idx = ntex_++;
+      if (e->second.kind == KImage) {        const int idx = ntex_++;
+        const bool arr = e->second.arrayed != 0;
+        // A volume is its own handle on the GPU, so it needs its own maker — the
+        // field it fills is declared from the same Dim by `ctype` above.
+        const bool vol = e->second.count == 2u && !arr;
+        const bool cb = e->second.count == 3u;
+        // The shape is a property of the binding, not of the target, so it is
+        // recorded on both passes: the launcher reads its kernel table from the
+        // CPU module, where `gpu` is false.
+        // A 1-D image is a plane one row high on this engine, bound as `Wx1`,
+        // which is a 2-D binding — so it names itself as one. The Metal front end
+        // is the column that binds a real `texture1d`, and its bindings say so.
+        tex_shape.push_back(cb ? "cube" : vol ? "3d" : arr ? "array" : "2d");
         if (gpu) {
           // The binding is a kernel parameter, and a helper cannot reach a
           // parameter, so the handle is made where the parameter is in scope.
-          local_[id] = std::string(writes_image_ ? "weft::make_rw_image(weft_t"
-                                                 : "weft::make_image(weft_t") +
-                       std::to_string(idx) + ")";
+          const char* mk =
+              cb ? "weft::make_cube_image(weft_t"
+                 : vol ? (writes_image_ ? "weft::make_rw_image3d(weft_t" : "weft::make_image3d(weft_t")
+                 : arr ? (writes_image_ ? "weft::make_rw_array_image(weft_t"
+                                        : "weft::make_array_image(weft_t")
+                       : (writes_image_ ? "weft::make_rw_image(weft_t"
+                                        : "weft::make_image(weft_t");
+          local_[id] = std::string(mk) + std::to_string(idx) + ")";
           tex_access.push_back(writes_image_ ? "read_write" : "sample");
+          tex_arrayed.push_back(arr);
+          tex_vol.push_back(vol);
+          tex_cube.push_back(cb);
         } else {
           local_[id] = "weft::texture_ptr(" + std::to_string(idx) + ")";
         }
@@ -2864,6 +3459,51 @@ bool Emitter::run() {
     auto pt = m_.types.find(g.type);
     if (pt == m_.types.end() || pt->second.kind != KPointer) continue;
     vt_[it.first] = g.type;  // so an access chain can see what it points at
+    // A `UniformConstant` variable is an image or a sampler. The Shader model
+    // binds those at module scope — a GLCompute entry point takes no parameters —
+    // so they take the same indices the parameter path hands out, in the order
+    // the module declares them.
+    if (g.storage == 0) {
+      auto e = m_.types.find(pt->second.elem);
+      if (e == m_.types.end()) { err = "module variable of an unknown opaque type"; return false; }
+      if (e->second.kind == KImage) {
+        const int idx = ntex_++;
+        const bool arr = e->second.arrayed != 0;
+        const bool vol = e->second.count == 2u && !arr;
+        const bool cb = e->second.count == 3u;
+        // The shape is a property of the binding, not of the target, so it is
+        // recorded on both passes: the launcher reads its kernel table from the
+        // CPU module, where `gpu` is false.
+        // A 1-D image is a plane one row high on this engine, bound as `Wx1`,
+        // which is a 2-D binding — so it names itself as one. The Metal front end
+        // is the column that binds a real `texture1d`, and its bindings say so.
+        tex_shape.push_back(cb ? "cube" : vol ? "3d" : arr ? "array" : "2d");
+        if (gpu) {
+          const char* mk =
+              cb ? "weft::make_cube_image(weft_t"
+                 : vol ? (writes_image_ ? "weft::make_rw_image3d(weft_t" : "weft::make_image3d(weft_t")
+                 : arr ? (writes_image_ ? "weft::make_rw_array_image(weft_t"
+                                        : "weft::make_array_image(weft_t")
+                       : (writes_image_ ? "weft::make_rw_image(weft_t"
+                                        : "weft::make_image(weft_t");
+          local_[it.first] = std::string(mk) + std::to_string(idx) + ")";
+          tex_access.push_back(writes_image_ ? "read_write" : "sample");
+          tex_arrayed.push_back(arr);
+          tex_vol.push_back(vol);
+          tex_cube.push_back(cb);
+        } else {
+          local_[it.first] = "weft::texture_ptr(" + std::to_string(idx) + ")";
+        }
+      } else if (e->second.kind == KSampler) {
+        const int idx = nsamp_++;
+        local_[it.first] = gpu ? ("weft_s" + std::to_string(idx))
+                               : ("weft::sampler(" + std::to_string(idx) + ")");
+      } else {
+        err = "module variable that is neither an image nor a sampler";
+        return false;
+      }
+      continue;
+    }
     uint32_t sz = 0;
     if (!tsize(pt->second.elem, sz)) {
       err = "global variable of an unsupported type";
@@ -2893,10 +3533,30 @@ bool Emitter::run() {
                         std::to_string(sz) + ");\n")
                      : ("  std::memset(s->w" + std::to_string(it.first) + ", 0, " +
                         std::to_string(sz) + ");\n");
+    } else if (g.storage == 12 || g.storage == 2) {
+      // A Shader-model buffer: an SSBO or a UBO, which is a `Block` struct around
+      // the storage. The host supplies it like any other buffer, but what the
+      // launcher needs to know is the element inside the wrapper — it sizes a
+      // buffer in elements, and the wrapper is one struct whose first member is
+      // the array. A runtime array has no length of its own (the launch says how
+      // much there is), so its element is the stride.
+      base_addr_[it.first] = "((" + addr_space("device", false) + "unsigned char*)bufs[" +
+                             std::to_string(nbuffers_) + "])";
+      uint32_t belt = pt->second.elem;
+      auto st = m_.types.find(belt);
+      if (st != m_.types.end() && st->second.kind == KStruct && !st->second.members.empty()) {
+        auto m0 = m_.types.find(st->second.members[0]);
+        if (m0 != m_.types.end() && m0->second.kind == KArray) belt = m0->second.elem;
+      }
+      buf_elem_.push_back(belt);
+      nbuffers_++;
     } else if (g.storage == 5) {
-      // A module-scope `__global` buffer (OpenCL 2.0 program scope). The host
-      // still has to supply the storage, so it takes the next buffer index after
-      // the explicit arguments — the same order the launcher fills them in.
+      // A module-scope buffer. In the OpenCL model that is a `__global` array
+      // (storage 5); in the Shader model a compute shader's SSBO or UBO arrives
+      // the same way, as a `StorageBuffer` or `Uniform` variable outside every
+      // function, because a GLCompute entry point takes no parameters at all.
+      // Either way the host supplies the storage, so it takes the next buffer
+      // index — the same order the launcher fills them in.
       base_addr_[it.first] = "((" + addr_space("device", false) + "unsigned char*)bufs[" +
                              std::to_string(nbuffers_) + "])";
       buf_elem_.push_back(pt->second.elem);
@@ -2979,10 +3639,14 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       const auto& B = f->second.body;
       int blocks = 0;
       bool wide = false;
-      // A subgroup relay needs this target however the module got here: a vote, a
-      // reduce, a shuffle or a `sub_group_*` import is a hand-off between lanes, and
-      // the per-lane target has nowhere to put it. A barrier on its own is not that —
-      // a real threadgroup barrier does the job there — so the two are told apart.
+      // A subgroup operation is a hand-off between lanes, and the per-lane target
+      // has the hardware for it: `simd_shuffle`, `simd_ballot`. So it is a reason
+      // to take the warp target only when the body has more than one block, where
+      // a lane runs its own program counter and the lanes diverge — a hardware
+      // rendezvous among lanes that have diverged has no answer. One block has
+      // nothing to diverge on, and full width is the faster of the two by the
+      // measure in the README's warp scan.
+      bool sub = false;
       bool vote = false;
       for (const Instr& ins : B) {
         switch (ins.op) {
@@ -3001,14 +3665,11 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
             // back, fold the slots. The OpenCL.std subgroup builtins arrive as calls
             // to imported functions and need exactly the same relay.
             if (ins.op >= OpGroupNonUniformElect && ins.op <= OpGroupNonUniformShuffleDown) {
-              warp_step = true;
-              vote = true;
+              sub = true;
             } else if (ins.op == OpFunctionCall && ins.a.size() > 2) {
               auto nm = m.names.find(ins.a[2]);
-              if (nm != m.names.end() && nm->second.find("sub_group_") != std::string::npos) {
-                warp_step = true;
-                vote = true;
-              }
+              if (nm != m.names.end() && nm->second.find("sub_group_") != std::string::npos)
+                sub = true;
             }
             break;
         }
@@ -3037,6 +3698,7 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
                      "rather than to one lane";
           return false;
         }
+      if (sub && blocks > 1) { warp_step = true; vote = true; }
       warp_pc = blocks > 1 || warp_step;
       return wide || vote;
     };
@@ -3248,11 +3910,17 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
                  ")]],\n                 ";
       // One binding per resource, so the lock table takes the index after the
       // scalars — the same one a warp kernel uses for its geometry.
-
-      for (int i = 0; i < em.ntex; i++)
-        kernels += "texture2d<float, access::" + em.textures()[i] + "> weft_t" +
-                   std::to_string(i) + " [[texture(" + std::to_string(i) +
-                   ")]],\n                 ";
+      for (int i = 0; i < em.ntex; i++) {
+        const bool arr = (size_t)i < em.arrayed_textures().size() && em.arrayed_textures()[i];
+        const bool vol = (size_t)i < em.volume_textures().size() && em.volume_textures()[i];
+        const bool cb = (size_t)i < em.cube_textures().size() && em.cube_textures()[i];
+        kernels += std::string(cb ? "texturecube<float, access::"
+                                   : vol ? "texture3d<float, access::"
+                                        : arr ? "texture2d_array<float, access::"
+                                              : "texture2d<float, access::") +
+                   em.textures()[i] + "> weft_t" + std::to_string(i) + " [[texture(" +
+                   std::to_string(i) + ")]],\n                 ";
+      }
       for (int i = 0; i < em.nsamp; i++)
         kernels += "sampler weft_s" + std::to_string(i) + " [[sampler(" +
                    std::to_string(i) + ")]],\n                 ";
@@ -3288,15 +3956,41 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       kernels += "      default: return;\n    }\n  }\n}\n\n";
     } else {
     kernels += "struct " + st + " {\n  uint32_t pc;\n" + em.decls() + "};\n";
+    // The body, once, inside the lane loop: a call per lane per segment was six
+    // of the fifteen instructions a visit, measured in the generated assembly.
+    // `return` in a lambda leaves the lambda, which is what a segment boundary is.
+    std::string inner;
+    inner += "    " + st + "* s = (" + st + "*)st;\n";
+    inner += "    (void)ctx; (void)bufs; (void)sh;\n";
+    inner += "    if (s->pc != 0u) {\n      switch (s->pc) {\n" + em.cases() +
+             "        default: goto weft_done;\n      }\n    }\n";
+    inner += em.init();
+    inner += em.code();
+    inner += "    weft_done:;\n    s->pc = 0xFFFFFFFFu;\n";
+    // The group form: the lane loop, the pass number and the count of lanes still
+    // running all live here, so a segment costs one call per threadgroup instead
+    // of an indirect one per lane.
+    kernels += "static uint32_t weft_g_" + e.name +
+               "(weft::Ctx* ctxs, unsigned char* states, size_t stride, uint32_t live,\n"
+               " uint32_t pass, void* const* bufs, unsigned char* sh) {\n"
+               "  uint32_t left = 0;\n"
+               "  for (uint32_t i = 0; i < live; i++) {\n"
+               "    unsigned char* st = states + (size_t)i * stride;\n"
+               "    if (*(const uint32_t*)st == weft::kThreadDone) continue;\n"
+               "    weft::Ctx& ctx = ctxs[i];\n"
+               "    ctx.pass = pass;\n"
+               "    [&] {\n" + inner +
+               "    }();\n"
+               "    if (*(const uint32_t*)st != weft::kThreadDone) left++;\n"
+               "  }\n"
+               "  return left;\n"
+               "}\n\n";
+    // One lane, for the paths that resume a single thread: the same body, not a
+    // second copy of it.
     kernels += "static void weft_k_" + e.name +
-               "(weft::Ctx& ctx, void* stp, void* const* bufs, unsigned char* sh) {\n";
-    kernels += "  " + st + "* s = (" + st + "*)stp;\n";
-    kernels += "  (void)ctx; (void)bufs; (void)sh;\n";
-    kernels += "  if (s->pc != 0u) {\n    switch (s->pc) {\n" + em.cases() +
-               "    default: goto weft_done;\n    }\n  }\n";
-    kernels += em.init();
-    kernels += em.code();
-    kernels += "  weft_done:;\n  s->pc = 0xFFFFFFFFu;\n}\n\n";
+               "(weft::Ctx& ctx, void* stp, void* const* bufs, unsigned char* sh) {\n"
+               "  weft_g_" + e.name + "(&ctx, (unsigned char*)stp, 0, 1, ctx.pass, bufs, sh);\n"
+               "}\n\n";
     }
 
     TranslatedKernel tk;
@@ -3304,6 +3998,10 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
     tk.nargs = em.nargs;
     tk.buf_type = em.buf_type;
     tk.nbufs = tk.nargs;  // no render stages in SPIR-V: its own buffers
+    tk.def_threads = e.lx ? e.lx * e.ly * e.lz : 0u;
+    // A group wider than a row fixes the lane identity, so it fixes the launch.
+    if (e.ly > 1u || e.lz > 1u) tk.fixed_threads = tk.def_threads;
+    tk.tex_shape = em.texture_shapes();
     tk.ntex = em.ntex;
     tk.wide = gpu && em.wide_atom;
     tk.gpu_warp = warp_kernel;
@@ -3325,6 +4023,10 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
     // launcher does the dispatch, so there is no table here.
     std::string g = "// generated by weft (spir-v front end, metal target) — do not edit\n";
     g += kWWeftMslPreamble;
+    // The portable library, so a module's transcendental runs one text on both
+    // targets. The Metal front end's own source gets this from the launcher; this
+    // one is generated here, so it is added here.
+    g += kWSoftMath;
     g += kernels;
     r.gpu_src = g;
     r.ok = true;
@@ -3351,6 +4053,9 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       "struct weft_i2 { int32_t x, y; };\n"
       "struct weft_i3 { int32_t x, y, z; };\n"
       "struct weft_i4 { int32_t x, y, z, w; };\n"
+      "struct weft_b2 { bool x, y; };\n"
+      "struct weft_b3 { bool x, y, z; };\n"
+      "struct weft_b4 { bool x, y, z, w; };\n"
       "struct weft_u2 { uint32_t x, y; };\n"
       "struct weft_u3 { uint32_t x, y, z; };\n"
       "struct weft_u4 { uint32_t x, y, z, w; };\n"
@@ -3360,6 +4065,140 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       "struct weft_ul2 { uint64_t x, y; };\n"
       "struct weft_ul3 { uint64_t x, y, z; };\n"
       "struct weft_ul4 { uint64_t x, y, z, w; };\n"
+      // Matrices, column-major: `m[column][row]`, like SPIR-V and every GPU. One
+      // text for both targets, and every accumulation is an explicit fused
+      // multiply-add in a fixed order, so the two engines run the same
+      // instruction sequence and agree to the bit.
+      "struct weft_f2x2 { float m[2][2]; };\n"
+      "struct weft_f3x3 { float m[3][3]; };\n"
+      "struct weft_f4x4 { float m[4][4]; };\n"
+      "static inline weft_f2 weft_col(const weft_f2x2& a, int c) {\n"
+      "  return weft_f2{a.m[c][0], a.m[c][1]};\n"
+      "}\n"
+      "static inline weft_f3 weft_col(const weft_f3x3& a, int c) {\n"
+      "  return weft_f3{a.m[c][0], a.m[c][1], a.m[c][2]};\n"
+      "}\n"
+      "static inline weft_f4 weft_col(const weft_f4x4& a, int c) {\n"
+      "  return weft_f4{a.m[c][0], a.m[c][1], a.m[c][2], a.m[c][3]};\n"
+      "}\n"
+      "static inline weft_f2x2 weft_mk(const weft_f2& p0, const weft_f2& p1) {\n"
+      "  weft_f2x2 r{};\n"
+      "  r.m[0][0] = p0.x; r.m[0][1] = p0.y;\n"
+      "  r.m[1][0] = p1.x; r.m[1][1] = p1.y;\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f3x3 weft_mk(const weft_f3& p0, const weft_f3& p1, const weft_f3& p2) {\n"
+      "  weft_f3x3 r{};\n"
+      "  r.m[0][0] = p0.x; r.m[0][1] = p0.y; r.m[0][2] = p0.z;\n"
+      "  r.m[1][0] = p1.x; r.m[1][1] = p1.y; r.m[1][2] = p1.z;\n"
+      "  r.m[2][0] = p2.x; r.m[2][1] = p2.y; r.m[2][2] = p2.z;\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f4x4 weft_mk(const weft_f4& p0, const weft_f4& p1, const weft_f4& p2,\n"
+      "                                const weft_f4& p3) {\n"
+      "  weft_f4x4 r{};\n"
+      "  r.m[0][0] = p0.x; r.m[0][1] = p0.y; r.m[0][2] = p0.z; r.m[0][3] = p0.w;\n"
+      "  r.m[1][0] = p1.x; r.m[1][1] = p1.y; r.m[1][2] = p1.z; r.m[1][3] = p1.w;\n"
+      "  r.m[2][0] = p2.x; r.m[2][1] = p2.y; r.m[2][2] = p2.z; r.m[2][3] = p2.w;\n"
+      "  r.m[3][0] = p3.x; r.m[3][1] = p3.y; r.m[3][2] = p3.z; r.m[3][3] = p3.w;\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f2 operator*(const weft_f2x2& a, const weft_f2& v) {\n"
+      "  float t[2];\n"
+      "  for (int r = 0; r < 2; r++) t[r] = std::fma(a.m[1][r], v.y, a.m[0][r] * v.x);\n"
+      "  return weft_f2{t[0], t[1]};\n"
+      "}\n"
+      "static inline weft_f3 operator*(const weft_f3x3& a, const weft_f3& v) {\n"
+      "  float t[3];\n"
+      "  for (int r = 0; r < 3; r++)\n"
+      "    t[r] = std::fma(a.m[2][r], v.z, std::fma(a.m[1][r], v.y, a.m[0][r] * v.x));\n"
+      "  return weft_f3{t[0], t[1], t[2]};\n"
+      "}\n"
+      "static inline weft_f4 operator*(const weft_f4x4& a, const weft_f4& v) {\n"
+      "  float t[4];\n"
+      "  for (int r = 0; r < 4; r++)\n"
+      "    t[r] = std::fma(a.m[3][r], v.w,\n"
+      "           std::fma(a.m[2][r], v.z, std::fma(a.m[1][r], v.y, a.m[0][r] * v.x)));\n"
+      "  return weft_f4{t[0], t[1], t[2], t[3]};\n"
+      "}\n"
+      "static inline weft_f2 operator*(const weft_f2& v, const weft_f2x2& a) {\n"
+      "  float t[2];\n"
+      "  for (int c = 0; c < 2; c++) t[c] = std::fma(v.y, a.m[1][c], v.x * a.m[0][c]);\n"
+      "  return weft_f2{t[0], t[1]};\n"
+      "}\n"
+      "static inline weft_f3 operator*(const weft_f3& v, const weft_f3x3& a) {\n"
+      "  float t[3];\n"
+      "  for (int c = 0; c < 3; c++)\n"
+      "    t[c] = std::fma(v.z, a.m[2][c], std::fma(v.y, a.m[1][c], v.x * a.m[0][c]));\n"
+      "  return weft_f3{t[0], t[1], t[2]};\n"
+      "}\n"
+      "static inline weft_f4 operator*(const weft_f4& v, const weft_f4x4& a) {\n"
+      "  float t[4];\n"
+      "  for (int c = 0; c < 4; c++)\n"
+      "    t[c] = std::fma(v.w, a.m[3][c],\n"
+      "           std::fma(v.z, a.m[2][c], std::fma(v.y, a.m[1][c], v.x * a.m[0][c])));\n"
+      "  return weft_f4{t[0], t[1], t[2], t[3]};\n"
+      "}\n"
+      "static inline weft_f2x2 operator*(const weft_f2x2& a, const weft_f2x2& b) {\n"
+      "  weft_f2x2 r{};\n"
+      "  for (int c = 0; c < 2; c++) {\n"
+      "    const weft_f2 v = a * weft_col(b, c);\n"
+      "    r.m[c][0] = v.x; r.m[c][1] = v.y;\n"
+      "  }\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f3x3 operator*(const weft_f3x3& a, const weft_f3x3& b) {\n"
+      "  weft_f3x3 r{};\n"
+      "  for (int c = 0; c < 3; c++) {\n"
+      "    const weft_f3 v = a * weft_col(b, c);\n"
+      "    r.m[c][0] = v.x; r.m[c][1] = v.y; r.m[c][2] = v.z;\n"
+      "  }\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f4x4 operator*(const weft_f4x4& a, const weft_f4x4& b) {\n"
+      "  weft_f4x4 r{};\n"
+      "  for (int c = 0; c < 4; c++) {\n"
+      "    const weft_f4 v = a * weft_col(b, c);\n"
+      "    r.m[c][0] = v.x; r.m[c][1] = v.y; r.m[c][2] = v.z; r.m[c][3] = v.w;\n"
+      "  }\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f2x2 operator*(const weft_f2x2& a, float s) {\n"
+      "  weft_f2x2 r{};\n"
+      "  for (int i = 0; i < 2; i++)\n"
+      "    for (int j = 0; j < 2; j++) r.m[i][j] = a.m[i][j] * s;\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f3x3 operator*(const weft_f3x3& a, float s) {\n"
+      "  weft_f3x3 r{};\n"
+      "  for (int i = 0; i < 3; i++)\n"
+      "    for (int j = 0; j < 3; j++) r.m[i][j] = a.m[i][j] * s;\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f4x4 operator*(const weft_f4x4& a, float s) {\n"
+      "  weft_f4x4 r{};\n"
+      "  for (int i = 0; i < 4; i++)\n"
+      "    for (int j = 0; j < 4; j++) r.m[i][j] = a.m[i][j] * s;\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f2x2 weft_transpose(const weft_f2x2& a) {\n"
+      "  weft_f2x2 r{};\n"
+      "  for (int i = 0; i < 2; i++)\n"
+      "    for (int j = 0; j < 2; j++) r.m[i][j] = a.m[j][i];\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f3x3 weft_transpose(const weft_f3x3& a) {\n"
+      "  weft_f3x3 r{};\n"
+      "  for (int i = 0; i < 3; i++)\n"
+      "    for (int j = 0; j < 3; j++) r.m[i][j] = a.m[j][i];\n"
+      "  return r;\n"
+      "}\n"
+      "static inline weft_f4x4 weft_transpose(const weft_f4x4& a) {\n"
+      "  weft_f4x4 r{};\n"
+      "  for (int i = 0; i < 4; i++)\n"
+      "    for (int j = 0; j < 4; j++) r.m[i][j] = a.m[j][i];\n"
+      "  return r;\n"
+      "}\n"
       "static inline float weft_f32(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }\n"
       "static inline double weft_f64(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }\n"
       "template <class T, class U>\n"
@@ -3383,19 +4222,27 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       "template <class T>\n"
       "static inline T weft_ld(const void* p) { T t; std::memcpy(&t, p, sizeof(T)); return t; }\n"
       "template <class T>\n"
-      "static inline void weft_st(void* p, T v) { std::memcpy(p, &v, sizeof(T)); }\n"
-      "\n" +
-      kernels + "static const weft::KernelDef weft_table[] = {\n";
+      "static inline void weft_st(void* p, T v) { std::memcpy(p, &v, sizeof(T)); }\n";
+  // The portable library, over the vector types it is written in. A module's
+  // transcendental then runs one text on both targets: without it the GPU answers
+  // with its own approximation while the CPU answers with libm, and the two differ
+  // in the last bits — which is the exactness this engine is for.
+  code += weft_math_preamble();
+  code += "\n" + kernels + "static const weft::KernelDef weft_table[] = {\n";
   for (const auto& k : out) {
     code += "  {\"" + k.name + "\", nullptr, " + std::to_string(k.nargs) + ", " +
             (k.sync ? "true" : "false") + ", nullptr, weft_k_" + k.name + ", sizeof(weft_s_" +
-            k.name + "), nullptr, nullptr, 0},\n";
+            k.name + "), nullptr, nullptr, 0, weft_g_" + k.name + "},\n";
   }
   code +=
       "};\n"
       "extern \"C\" void weft_set_param(int i, uint64_t v) { weft::set_param(i, v); }\n"
       "extern \"C\" void weft_set_texture(int i, void* d, uint32_t w, uint32_t h, uint32_t e) {\n"
       "  weft::set_texture(i, d, w, h, e);\n"
+      "}\n"
+      "extern \"C\" void weft_set_texture_layers(int i, void* d, uint32_t w, uint32_t h,\n"
+      "                                       uint32_t e, uint32_t l) {\n"
+      "  weft::set_texture_layers(i, d, w, h, e, l);\n"
       "}\n"
       "extern \"C\" void weft_run(int i, void** bufs, uint32_t grid, uint32_t tg) {\n"
       "  weft::dispatch(weft_table[i], bufs, grid, tg);\n"

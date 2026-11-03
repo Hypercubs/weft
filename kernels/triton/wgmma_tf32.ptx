@@ -1,0 +1,119 @@
+//
+// wgmma with tf32 operands: `wgmma.mma_async.sync.aligned.m64n8k8.f32.tf32.tf32`.
+//
+// The same instruction and the same descriptor, one element size down in K: a
+// core matrix is still 8 rows by 16 bytes, but 16 bytes holds four tf32 values
+// rather than eight halves, so K is 8 and A is 64x8 instead of 64x16. Everything
+// else — the descriptor fields, the core-matrix walk, the accumulator pattern —
+// is the rule from `wgmma.ptx` unchanged, which is what this fixture is for: if
+// the layout had been special-cased somewhere, one of the two would disagree
+// with the reference.
+//
+// A is 64 rows by 8 columns (2048 bytes): two core matrices along K (LBO = 128)
+// and eight along M (SBO = 256). B is 8 by 8 (256 bytes): one core matrix along K
+// and two along N (SBO = 128), because a tf32 core row is four columns wide.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry wgmma_tf32_kernel(
+	.param .u64 wgmma_tf32_kernel_param_0,
+	.param .u64 wgmma_tf32_kernel_param_1,
+	.param .u64 wgmma_tf32_kernel_param_2
+)
+{
+	.reg .b32 	%r<40>;
+	.reg .f32 	%f<12>;
+	.reg .b64 	%rd<16>;
+
+	.shared .align 128 .b8 weft_ab[2304];
+
+	ld.param.u64 	%rd1, [wgmma_tf32_kernel_param_0];
+	ld.param.u64 	%rd2, [wgmma_tf32_kernel_param_1];
+	ld.param.u64 	%rd3, [wgmma_tf32_kernel_param_2];
+
+	mov.u32 	%r1, %tid.x;
+
+	// A: lane -> one row of 8 tf32 values, split into two 16-byte core rows.
+	and.b32 	%r2, %r1, 63;
+	shr.u32 	%r3, %r1, 6;
+	shl.b32 	%r4, %r2, 5;			// row * 32 bytes
+	shl.b32 	%r5, %r3, 4;			// core row * 16
+	add.s32 	%r4, %r4, %r5;
+	cvt.u64.u32 	%rd4, %r4;
+	add.s64 	%rd4, %rd1, %rd4;
+	ld.global.v4.b32 	{%r10, %r11, %r12, %r13}, [%rd4];
+
+	shr.u32 	%r6, %r2, 3;
+	shl.b32 	%r6, %r6, 8;			// (row / 8) * SBO(256)
+	shl.b32 	%r7, %r3, 7;			// core row * LBO(128)
+	and.b32 	%r8, %r2, 7;
+	shl.b32 	%r8, %r8, 4;			// (row % 8) * 16 bytes
+	add.s32 	%r9, %r6, %r7;
+	add.s32 	%r9, %r9, %r8;
+	mov.u64 	%rd5, weft_ab;
+	cvt.u64.u32 	%rd6, %r9;
+	add.s64 	%rd6, %rd5, %rd6;
+	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
+
+	// B: lane -> one (k, n) tf32 value, a single word after the A tile.
+	shr.u32 	%r14, %r1, 3;
+	and.b32 	%r14, %r14, 7;			// k
+	and.b32 	%r15, %r1, 7;			// n
+	shl.b32 	%r16, %r14, 5;			// k * 32 bytes
+	shl.b32 	%r17, %r15, 2;			// n * 4
+	add.s32 	%r16, %r16, %r17;
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd2, %rd7;
+	ld.global.u32 	%r18, [%rd7];
+
+	shr.u32 	%r19, %r14, 2;			// k / 4: the second K group
+	shl.b32 	%r19, %r19, 7;			// * LBO(128)
+	shl.b32 	%r20, %r15, 4;			// n * 16 bytes
+	add.s32 	%r19, %r19, %r20;
+	and.b32 	%r21, %r14, 3;			// k % 4
+	shl.b32 	%r21, %r21, 2;			// * 4 bytes, K inside the chunk
+	add.s32 	%r19, %r19, %r21;
+	add.s32 	%r19, %r19, 2048;
+	cvt.u64.u32 	%rd8, %r19;
+	add.s64 	%rd8, %rd5, %rd8;
+	st.shared.u32 	[%rd8], %r18;
+
+	bar.sync 	0;
+
+	// A: start 0, LBO = 128 bytes (8 units) in bits 16-29, SBO = 256 (16 units)
+	// in 32-45. B: start 2048 (128 units), the same 128-byte LBO, and SBO = 128
+	// bytes (8 units) between the two 4-column cores.
+	mov.u64 	%rd10, 68720001024;
+	mov.u64 	%rd12, 34360262784;
+
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	wgmma.fence.sync.aligned;
+	wgmma.mma_async.sync.aligned.m64n8k8.f32.tf32.tf32 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+
+	// The accumulator pattern is the n-tiling's, not K's: D[16w+g][2t] and
+	// [2t+1] with the row 8 below in the second pair.
+	shr.u32 	%r21, %r1, 5;
+	shr.u32 	%r22, %r1, 2;
+	and.b32 	%r22, %r22, 7;
+	and.b32 	%r23, %r1, 3;
+	shl.b32 	%r24, %r21, 4;
+	add.s32 	%r24, %r24, %r22;
+	shl.b32 	%r25, %r24, 5;
+	shl.b32 	%r26, %r23, 3;
+	add.s32 	%r25, %r25, %r26;
+	cvt.u64.u32 	%rd13, %r25;
+	add.s64 	%rd13, %rd3, %rd13;
+	st.global.b32 	[%rd13], %f5;
+	st.global.b32 	[%rd13+4], %f6;
+	st.global.b32 	[%rd13+256], %f7;
+	st.global.b32 	[%rd13+260], %f8;
+	ret;
+}

@@ -1,0 +1,67 @@
+// A 3D texture from PTX, the twin of basic.metal's `tex3d`:
+//
+//     w = txq.width(vol), h = txq.height(vol), d = txq.depth(vol)
+//     x = gid & 63, y = (gid >> 6) & 63, z = (x + y) % d
+//     out[gid] = tex3d(vol, (x + .5)/w, (y + .5)/h, (z + .5)/d) * 2 + d
+//
+// Every sample lands on a texel centre, so a filter, a plane that is off by one, or
+// a depth reported as 1 all show up as a wrong number instead of hiding in a
+// register. `.tex` says nothing about dimensionality — the `.3d` suffix on the
+// instruction is what makes the binding a volume.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.tex .u32 vol, 1, 1, 1, 1;
+
+.visible .entry ptx3d(
+    .param .u64 ptx3d_param_0
+)
+{
+    .reg .b32 %r<20>;
+    .reg .f32 %f<24>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptx3d_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    // The size the binding reports, not numbers written into the kernel.
+    txq.width.b32 %r5, [vol];
+    txq.height.b32 %r6, [vol];
+    txq.depth.b32 %r7, [vol];
+
+    and.b32 %r8, %r4, 63;               // x = gid & 63
+    shr.u32 %r9, %r4, 6;
+    and.b32 %r10, %r9, 63;              // y = (gid >> 6) & 63
+    add.s32 %r11, %r8, %r10;            // x + y
+    // z = (x + y) % depth, without assuming the depth is a power of two.
+    div.u32 %r12, %r11, %r7;
+    mul.lo.s32 %r13, %r12, %r7;
+    sub.s32 %r11, %r11, %r13;
+
+    cvt.rn.f32.u32 %f1, %r8;
+    cvt.rn.f32.u32 %f2, %r10;
+    cvt.rn.f32.u32 %f3, %r11;
+    add.f32 %f4, %f1, 0f3F000000;       // x + 0.5
+    add.f32 %f5, %f2, 0f3F000000;
+    add.f32 %f6, %f3, 0f3F000000;
+    cvt.rn.f32.u32 %f7, %r5;
+    cvt.rn.f32.u32 %f8, %r6;
+    cvt.rn.f32.u32 %f9, %r7;
+    div.rn.f32 %f10, %f4, %f7;          // u
+    div.rn.f32 %f11, %f5, %f8;          // v
+    div.rn.f32 %f12, %f6, %f9;          // w
+
+    tex.3d.v4.f32.f32 {%f13,%f14,%f15,%f16}, [vol, {%f10,%f11,%f12}];
+
+    mul.f32 %f17, %f13, 0f40000000;
+    cvt.rn.f32.u32 %f18, %r7;           // the depth, folded in
+    add.f32 %f19, %f17, %f18;
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f19;
+    ret;
+}

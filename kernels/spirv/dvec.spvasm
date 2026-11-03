@@ -1,0 +1,84 @@
+; A vector of `double` on a GPU that has no fp64.
+;
+; A scalar double is already carried in software — its bits in a `uint64_t`, every
+; operation an exact IEEE-754 helper. A vector of them is the same thing 2, 3 or 4
+; times over, and the only question this module asks is whether the per-component
+; path calls that helper or falls back to an operator on the 64-bit words.
+;
+;   x   = (double)in[gid]
+;   v   = (x, x + 0.5)
+;   r   = (v + reverse(v)) * 2.5 / 2.5          two components, added and divided
+;   n   = (0, 0) - r                            the subtract on a vector
+;   m   = v * (2.5, 2.5)
+;
+;   a1[4i+0] r.x   a1[4i+1] r.y   a1[4i+2] n.x   a1[4i+3] m.x
+;
+; Every value is exact: a float converted up, plus a half, times 2.5 and back. An
+; operator applied to the two 64-bit words instead of the helper is not a small
+; difference — it adds the significands as integers — so the comparison in
+; check.sh is a bit-for-bit one against the host's own doubles.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Float64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "dvec" %gid
+               OpName %main "dvec"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+        %f32 = OpTypeFloat 32
+        %f64 = OpTypeFloat 64
+       %f32p = OpTypePointer CrossWorkgroup %f32
+       %f64p = OpTypePointer CrossWorkgroup %f64
+         %d2 = OpTypeVector %f64 2
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %f32p %f64p
+        %gid = OpVariable %pin Input
+       %c0_5 = OpConstant %f64 0.5
+       %c2_5 = OpConstant %f64 2.5
+         %c0 = OpConstant %f64 0
+       %c0u = OpConstant %u64 0
+       %c1u = OpConstant %u64 1
+       %c2u = OpConstant %u64 2
+       %c3u = OpConstant %u64 3
+       %c4u = OpConstant %u64 4
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f64p
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %pa0 = OpPtrAccessChain %f32p %a0 %gi
+         %xf = OpLoad %f32 %pa0
+          %x = OpFConvert %f64 %xf
+          %y = OpFAdd %f64 %x %c0_5
+          %v = OpCompositeConstruct %d2 %x %y
+          %w = OpCompositeConstruct %d2 %y %x
+          %s = OpFAdd %d2 %v %w
+          %k = OpCompositeConstruct %d2 %c2_5 %c2_5
+          %m = OpFMul %d2 %s %k
+          %r = OpFDiv %d2 %m %k
+       %zero = OpCompositeConstruct %d2 %c0 %c0
+          %n = OpFSub %d2 %zero %r
+         %mv = OpFMul %d2 %v %k
+         %r0 = OpCompositeExtract %f64 %r 0
+         %r1 = OpCompositeExtract %f64 %r 1
+         %n0 = OpCompositeExtract %f64 %n 0
+         %m0 = OpCompositeExtract %f64 %mv 0
+       %base = OpIMul %u64 %gi %c4u
+         %p0 = OpPtrAccessChain %f64p %a1 %base
+                OpStore %p0 %r0
+        %i1 = OpIAdd %u64 %base %c1u
+         %p1 = OpPtrAccessChain %f64p %a1 %i1
+                OpStore %p1 %r1
+        %i2 = OpIAdd %u64 %base %c2u
+         %p2 = OpPtrAccessChain %f64p %a1 %i2
+                OpStore %p2 %n0
+        %i3 = OpIAdd %u64 %base %c3u
+         %p3 = OpPtrAccessChain %f64p %a1 %i3
+                OpStore %p3 %m0
+                OpReturn
+                OpFunctionEnd

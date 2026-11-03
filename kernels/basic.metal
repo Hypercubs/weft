@@ -58,6 +58,44 @@ kernel void texmix(device float* out [[buffer(0)]],
     out[gid] = a * 2.0f + b;
 }
 
+// Compound assignment to a swizzle: a read-modify-write of part of a value, and
+// the reads are the *old* components — `v.yx *= v.zw` is not a mix of old and new.
+// Integer forms too, so `|=` and `^=` are exercised rather than assumed.
+kernel void swzcmp(device float* out [[buffer(0)]],
+                   uint gid [[thread_position_in_grid]])
+{
+    float4 v = float4(float(gid & 63u), 1.0f, 2.0f, 3.0f);
+    float2 p = float2(0.5f, 0.25f);
+    v.xy += p;                         // two components, one statement
+    v.zw -= float2(1.0f, 0.5f);
+    v.yx *= v.zw;                      // the right-hand side is a swizzle of it
+    v.wz /= float2(2.0f, 4.0f);
+
+    int2 q = int2(int(gid), 7);
+    q |= int2(1, 2);
+    q ^= int2(3, 4);
+    q &= int2(0x7f, 0x3f);
+
+    out[gid] = v.x + v.y * 2.0f + v.z * 4.0f + v.w * 8.0f + float(q.x & 255) +
+               float(q.y & 255) * 16.0f;
+}
+
+// A texture with one row. `texture1d` takes one coordinate, the launcher binds it
+// as `--textures 64x1d`, and a read is unnormalised while a nearest sample at a
+// texel centre is the same texel — so the two must agree with the GPU exactly, and
+// with the PTX column's `tex.1d` behind its own Wx1 binding.
+kernel void tex1ds(device float* out [[buffer(0)]],
+                   texture1d<float> img [[texture(0)]],
+                   uint gid [[thread_position_in_grid]])
+{
+    constexpr sampler near(filter::nearest, address::clamp_to_edge);
+    uint w = img.get_width();
+    uint x = gid % w;
+    float a = img.read(x).x;
+    float b = img.sample(near, (x + 0.5f) / float(w)).x;
+    out[gid] = a * 2.0f + b;
+}
+
 // Bilinear filtering, at a fraction of a texel off the centres. This one agrees
 // to the GPU's filter precision rather than bit for bit: the hardware weights
 // are 8-bit fixed point (see the README).
@@ -69,6 +107,77 @@ kernel void texlin(device float* out [[buffer(0)]],
     float u = (float(gid % 256u) + 0.3f) / 256.0f;
     float v = (float((gid / 256u) % 256u) + 0.7f) / 256.0f;
     out[gid] = img.sample(lin, float2(u, v)).x;
+}
+
+// A 2D *array* texture: every read and sample names a slice, and the slice count
+// is the binding's own (`get_array_size`, which the launcher sets from
+// `--textures WxH*L`). The layer is folded into the value, so a slice that read
+// the wrong slice, or the whole array from slice 0, answers wrong.
+kernel void texarray(device float* out [[buffer(0)]],
+                     texture2d_array<float> img [[texture(0)]],
+                     uint gid [[thread_position_in_grid]])
+{
+    constexpr sampler near(filter::nearest, address::clamp_to_edge);
+    uint w = img.get_width();
+    uint h = img.get_height();
+    uint n = img.get_array_size();
+    uint x = gid % w;
+    uint y = (gid / w) % h;
+    uint l = (x + y) % n;
+    float a = img.read(uint2(x, y), l).x;
+    float b = img.sample(near, float2((x + 0.5f) / float(w), (y + 0.5f) / float(h)), l).x;
+    out[gid] = a * 2.0f + b + float(l);
+}
+
+// ---- a 3D texture: a read and a sample that name a plane ------------------------
+// The volume is `--textures 64x64x8`. Each lane picks a plane from its own
+// coordinates, reads it and samples the same plane at its centre, and folds both
+// the plane and the value into the answer — so a kernel that read plane 0 of the
+// volume, or took the depth for a slice, lands on a different number.
+kernel void tex3d(device float* out [[buffer(0)]],
+                  texture3d<float> vol [[texture(0)]],
+                  uint gid [[thread_position_in_grid]])
+{
+    constexpr sampler near(filter::nearest, address::clamp_to_edge);
+    uint w = vol.get_width();
+    uint h = vol.get_height();
+    uint d = vol.get_depth();
+    uint x = gid % w;
+    uint y = (gid / w) % h;
+    uint z = (x + y) % d;
+    float a = vol.read(uint3(x, y, z)).x;
+    float b = vol.sample(near, float3((x + 0.5f) / float(w), (y + 0.5f) / float(h),
+                                      (z + 0.5f) / float(d))).x;
+    out[gid] = a * 2.0f + b + float(z);
+}
+
+// ---- a cube texture: six faces, sampled by direction ---------------------------
+// `--textures 64x64c` binds a cube of six 64x64 faces, face after face in the same
+// buffer the CPU indexes. Each lane picks a face and a texel inside it, then
+// rebuilds the direction that lands there — the component mapping is the one each
+// face has — so a kernel that used the wrong face, or flipped one axis, reads a
+// different texel rather than the one it asked for.
+kernel void texcube(device float* out [[buffer(0)]],
+                    texturecube<float> cub [[texture(0)]],
+                    uint gid [[thread_position_in_grid]])
+{
+    constexpr sampler near(filter::nearest, address::clamp_to_edge);
+    uint w = cub.get_width();
+    uint h = cub.get_height();
+    uint n = 6u;                            // a cube is six faces, fixed by its type
+    uint face = (gid / 1024u) % n;
+    uint i = gid & 63u;                     // texel x inside the face
+    uint j = (gid >> 6) & 15u;              // texel y inside the face
+    float a = (float(i) + 0.5f) / float(w) * 2.0f - 1.0f;   // -1 < a < 1
+    float b = (float(j) + 0.5f) / float(h) * 2.0f - 1.0f;
+    float3 d;
+    if (face == 0u)      d = float3( 1.0f, -b, -a);   // +X
+    else if (face == 1u) d = float3(-1.0f, -b,  a);   // -X
+    else if (face == 2u) d = float3( a,  1.0f,  b);   // +Y
+    else if (face == 3u) d = float3( a, -1.0f, -b);   // -Y
+    else if (face == 4u) d = float3( a, -b,  1.0f);   // +Z
+    else                 d = float3(-a, -b, -1.0f);   // -Z
+    out[gid] = cub.sample(near, d).x + float(face);
 }
 
 kernel void stencil5(device const float* in [[buffer(0)]],
@@ -1099,4 +1208,584 @@ kernel void rotate(device const uint* in [[buffer(0)]],
                    uint lid [[thread_index_in_threadgroup]])
 {
     out[gid] = simd_shuffle(in[gid], (lid + 1u) & 31u);
+}
+
+// ---- a type the kernel body declares ------------------------------------------
+// The type is not a value, so nothing about it has to survive a resume; the local
+// is, and both of these are live across the barrier. A step machine that cannot
+// carry them has to fall back, and one that carries them wrong answers with a
+// number nobody wrote: `u` is a copy taken before the wait, so a local lost in the
+// wait turns up as zero here, and the peer term is the neighbour's tile.
+kernel void localtype(device const float* in [[buffer(0)]],
+                      device float* out      [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]],
+                      uint lid [[thread_position_in_threadgroup]],
+                      uint tgs [[threads_per_threadgroup]])
+{
+    struct Tap { float w; float v; };
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    Tap t;
+    t.w = in[gid];
+    t.v = t.w * 3.0f + 1.0f;
+    tiles[lid] = t.w + t.v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    Tap u = t;
+    const float peer = tiles[(lid + 1u) % n];
+    u.w += peer;
+    out[gid] = u.w * 0.5f + u.v - peer;
+}
+
+// ---- lambdas used where they are written --------------------------------------
+// A lambda that is called on the spot needs no storage, so it can stay in a step
+// body. What it does need is its parameters keeping their own names: the one below
+// is `v`, which is also a local the blob holds, and they are different variables.
+// The second lambda reads that local through a by-reference capture from the far
+// side of the barrier, so a local lost in the wait answers wrong there.
+kernel void lambdak(device const float* in [[buffer(0)]],
+                    device float* out      [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]],
+                    uint lid [[thread_position_in_threadgroup]],
+                    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    tiles[lid] = v + 1.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float a = ([](float v) { return v * 3.0f + 1.0f; })(tiles[(lid + 1u) % n]);
+    out[gid] = a + [&](float x) { return x + v * 0.5f; }(tiles[lid]);
+}
+
+// ---- a lambda kept in a local and used across the barrier ---------------------
+// The closure has no name a blob field could hold, so its declaration is re-made at
+// every entry rather than stored. It captures `v` by reference and the body changes
+// `v` after the wait, so the lambda that runs has to read the new value — a copy
+// taken at its declaration would answer with the old one.
+kernel void lamstore(device const float* in [[buffer(0)]],
+                     device float* out      [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]],
+                     uint lid [[thread_position_in_threadgroup]],
+                     uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    auto f = [&](float x) { return x * 2.0f + v; };
+    tiles[lid] = v * 0.5f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer * 3.0f;
+    out[gid] = f(peer) + v;
+}
+
+// ---- the three capture-list shapes -------------------------------------------
+// A copy of everything (`[=]`), a reference default with one name copied
+// (`[&, w]`), and one name (`[v]`). A capture list has no room for `weft_s->v`, so
+// each becomes an init-capture of its own that reads the blob where it stands.
+kernel void lamcap(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    float w = v * 2.0f;
+    tiles[lid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    out[gid] = [=](float x) { return x * v + w; }(peer + 1.0f)
+             + [&, w](float x) { return x * 2.0f + w + v; }(peer)
+             + [v](float x) { return x + v * 3.0f; }(peer);
+}
+
+// ---- a body-declared type with a method --------------------------------------
+// C++ already forbids a local class's member functions from naming the enclosing
+// function's variables, so the declaration moves to file scope with its methods
+// intact and means the same thing there.
+kernel void localmeth(device const float* in [[buffer(0)]],
+                      device float* out      [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]],
+                      uint lid [[thread_position_in_threadgroup]],
+                      uint tgs [[threads_per_threadgroup]])
+{
+    struct Tap { float w; float twice() const { return w * 2.0f; } };
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    Tap t;
+    t.w = in[gid];
+    tiles[lid] = t.w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    Tap u = t;
+    out[gid] = u.twice() + tiles[(lid + 1u) % n];
+}
+
+// ---- a lambda kept in a local that copies a local ------------------------------
+// `[=]` takes a copy of `v` where the lambda is written, and the body then changes
+// `v` after the barrier — so the value that comes back has to be the copy, not the
+// blob's. `[v, &w]` mixes the two: the copy stays, the reference follows the new
+// value. Both would answer the same only if nothing changed in between.
+kernel void stcopy(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    auto f = [=](float x) { return x * 2.0f + v; };
+    tiles[lid] = v * 0.5f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer * 3.0f;
+    out[gid] = f(peer) + v;
+}
+
+kernel void stname(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    float w = v + 7.0f;
+    auto g = [v, &w](float x) { return x + v * 2.0f + w; };
+    tiles[lid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer;
+    w = peer * 5.0f;
+    out[gid] = g(peer) + v + w;
+}
+
+// A stored lambda that copies an array local. The four taps are read before the
+// barrier and overwritten after it, so the call on the far side has to use the
+// copy: an array cannot be copy-initialised from an array, so the copy is spelled
+// out element by element in the closure's aggregate.
+kernel void starray(device const float* in [[buffer(0)]],
+                    device float* out      [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]],
+                    uint lid [[thread_position_in_threadgroup]],
+                    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float taps[4];
+    for (uint i = 0u; i < 4u; i++) taps[i] = in[(gid + i) % 1048576u];
+    auto h = [=](float x) { return x * taps[0] + taps[3] - taps[1]; };
+    tiles[lid] = taps[2];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0u; i < 4u; i++) taps[i] = tiles[(lid + i) % n];
+    out[gid] = h(tiles[lid]);
+}
+
+// ---- a capture the lambda itself initialises ----------------------------------
+// `[t = v * 2.0f, u = lid + 1u]` declares variables only this lambda can see, so
+// nothing outside it holds the names. The value each keeps is a member of the
+// closure, taken where the lambda is written: `v` changes after the barrier and the
+// answer must still be the old one, while `u` comes from a parameter.
+kernel void stinit(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    auto f = [t = v * 2.0f, u = lid + 1u](float x) { return x + t + (float)u; };
+    tiles[lid] = v * 0.5f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer * 3.0f;
+    out[gid] = f(peer) + v;
+}
+
+// ---- a closure that writes its own copy ---------------------------------------
+// `mutable` lets the call operator write the copy it holds. That copy has to survive
+// the wait the way a lane's own copy does, so the first call's write is still there
+// when the second one runs.
+kernel void stmut(device const float* in [[buffer(0)]],
+                  device float* out      [[buffer(1)]],
+                  uint gid [[thread_position_in_grid]],
+                  uint lid [[thread_position_in_threadgroup]],
+                  uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float w = in[gid];
+    auto f = [w](float x) mutable { w += x; return w * 2.0f; };
+    tiles[lid] = f(1.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    w = peer;
+    out[gid] = f(peer) + w;
+}
+
+// ---- a closure that reads a kernel parameter ----------------------------------
+// `lid` and `tgs` are recomputed at every entry, so the closure holds a copy of each
+// — taken where it is written, which is the only value it could ever have.
+kernel void stparm(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    auto f = [=](float x) { return x + v * 2.0f + (float)lid + (float)tgs; };
+    tiles[lid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer * 5.0f;
+    out[gid] = f(peer) + v;
+}
+
+// ---- a lambda inside a stored lambda ------------------------------------------
+// The inner one captures what the outer holds — a member now — so it reads the same
+// object the outer does. `[&]` binds it, `[v]` copies the pointer that stands for
+// the outer's reference, and both answer with the blob's `v` after the wait.
+kernel void stnest(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    auto f = [&](float x) {
+        auto g = [v](float y) { return y * v; };
+        auto h = [&](float y) { return y + v; };
+        return g(x) + h(x);
+    };
+    tiles[lid] = v * 0.25f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer * 7.0f;
+    out[gid] = f(peer) + v;
+}
+
+// ---- an `auto` local that has to survive the wait ------------------------------
+// The declaration writes no type, and the blob needs one: `auto` deduced it, and
+// `decay_t<decltype(init)>` is the same type. Each of these reads something
+// different — a buffer through a parameter, a parameter itself, and another `auto`
+// — and all three are used after the barrier, so a local lost in the wait answers 0.
+kernel void autolocal(device const float* in [[buffer(0)]],
+                      device float* out      [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]],
+                      uint lid [[thread_position_in_threadgroup]],
+                      uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    auto v = in[gid] * 2.0f;
+    auto k = lid + 3u;
+    auto m = v * 0.5f + (float)k;
+    tiles[lid] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer;
+    out[gid] = m + v + (float)k;
+}
+
+// ---- an array local with a brace initialiser ------------------------------------
+// `float taps[4] = {a, b, 3.0f}` writes three elements and leaves the fourth zero,
+// as C++ does. An array cannot be assigned, so each element becomes its own
+// statement in the order written. The three set are overwritten after the wait, so
+// a lost local shows up in the sum; the zero-filled fourth catches a wrong extent.
+kernel void arrinit(device const float* in [[buffer(0)]],
+                    device float* out      [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]],
+                    uint lid [[thread_position_in_threadgroup]],
+                    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float taps[4] = {in[gid], in[(gid + 1u) % 1048576u], 3.0f};
+    tiles[lid] = taps[0] + taps[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    taps[0] = peer;
+    taps[1] = peer * 2.0f;
+    taps[2] = peer * 5.0f;
+    out[gid] = taps[0] + taps[1] + taps[2] + taps[3];
+}
+
+// ---- a capture that binds a local under another name ----------------------------
+// `[&q = v]` binds the name `q` to the variable `v`: the closure holds where `v`
+// lives, so the call after the barrier reads the value the body wrote after it.
+// A copy would answer with the pre-wait number.
+kernel void refcap(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    auto f = [&q = v](float x) { return x * 2.0f + q; };
+    tiles[lid] = v * 0.5f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    v = peer * 3.0f;
+    out[gid] = f(peer) + v;
+}
+
+// ---- a name declared again inside a nested scope --------------------------------
+// The inner `v` shadows the outer one and is live across a wait of its own, so the
+// two have to be two fields: the inner is renamed and everything that reads it moves
+// with it, and the outer `v` is still the outer `v` after the block ends. The second
+// barrier is there so the tile write inside the block cannot race a lane's read of
+// its neighbour's slot — each lane writes its own and reads only its own after.
+kernel void shadow(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float v = in[gid];
+    tiles[lid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    {
+        float v = peer * 7.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tiles[lid] = v;
+        out[gid] = v + peer;
+    }
+    out[gid] += v + tiles[lid];
+}
+
+// ---- address spaces on locals ---------------------------------------------------
+// `device`, `constant` and `thread` say where a variable lives on the GPU. On the host
+// they are the same memory: `device` and `thread` carry nothing the blob does not
+// already do, and `constant` is a read-only view — `const`. All three pointers are
+// live across the wait, so a lost one would index from nowhere. The second barrier
+// is the one the algorithm needs: the tile write has to be visible before a lane
+// reads its neighbour's slot.
+kernel void addrspace(device const float* in [[buffer(0)]],
+                      constant float* w      [[buffer(1)]],
+                      device float* out      [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]],
+                      uint lid [[thread_position_in_threadgroup]],
+                      uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    device float* o = out;
+    constant float* r = w;
+    thread float t = r[gid] * 2.0f + in[gid];
+    o[gid] = t;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tiles[lid] = o[gid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    o[gid] = tiles[(lid + 1u) % n] + t;
+}
+
+// ---- a two-dimensional array local ----------------------------------------------
+// `float m[2][2]` is a field of four floats, and `{{1,2},{3,4}}` is four statements
+// in the order written. Both rows are overwritten after the wait, so a local lost in
+// it shows up in the sum, and every element is read back.
+kernel void arr2d(device const float* in [[buffer(0)]],
+                  device float* out      [[buffer(1)]],
+                  uint gid [[thread_position_in_grid]],
+                  uint lid [[thread_position_in_threadgroup]],
+                  uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float m[2][2] = {{in[gid], 2.0f}, {3.0f, 4.0f}};
+    tiles[lid] = m[0][0] + m[1][1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    m[0][0] = peer;
+    m[0][1] = peer * 2.0f;
+    m[1][0] = peer * 3.0f;
+    m[1][1] = peer * 5.0f;
+    out[gid] = m[0][0] + m[0][1] + m[1][0] + m[1][1];
+}
+
+// ---- a capture bound to an element ----------------------------------------------
+// `[&q = taps[1]]` holds the address of the second element. The body overwrites the
+// array after the barrier, so the call has to read the element as it is then — a
+// copy would answer with the value it had at the declaration.
+kernel void refsub(device const float* in [[buffer(0)]],
+                   device float* out      [[buffer(1)]],
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    float taps[4] = {in[gid], in[gid] * 0.5f, 0.0f, 0.0f};
+    auto f = [&q = taps[1]](float x) { return x * 3.0f + q; };
+    tiles[lid] = taps[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float peer = tiles[(lid + 1u) % n];
+    taps[1] = peer * 7.0f;
+    out[gid] = f(peer) + taps[1];
+}
+
+// ---- a threadgroup array declared inside a block --------------------------------
+// A `threadgroup` declaration is a handle onto the group's shared block wherever it
+// stands, so one inside a block is the same storage as one at the top. Two arrays in
+// one kernel is the case that catches a slot handed out in the wrong order: each
+// lane reads its neighbour's value out of the second array after a wait of its own.
+kernel void tgblock(device const float* in [[buffer(0)]],
+                    device float* out      [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]],
+                    uint lid [[thread_position_in_threadgroup]],
+                    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float tiles[256];
+    const uint n = min(tgs, 256u);
+    tiles[lid] = in[gid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup float more[256];
+        more[lid] = tiles[(lid + 1u) % n] * 2.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        out[gid] = more[(lid + 1u) % n] + tiles[lid];
+    }
+}
+
+// ---- the packed formats, at every boundary --------------------------------------
+// An unsigned normal is round(clamp(x, 0, 1) * 255) and a signed one is
+// round(clamp(x, -1, 1) * 127) in two's complement; the inputs here are chosen so
+// the *rounding* is what is under test. Lane k holds k/255 in .x — every exact
+// byte boundary — an exact tie in .y, a value in snorm's negative half in .z, and
+// one that lands between boundaries in .w. Both engines run the same formula
+// (src/soft_math.hpp) and the runs are compared byte for byte, so a tie that
+// rounds the other way on one of them is a difference and not a tolerance.
+kernel void packround(device float* packed   [[buffer(0)]],
+                      device float* unpacked [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]])
+{
+    const float a = (float)(gid % 256u) / 255.0f;             // every byte boundary
+    const float b = ((float)(gid % 128u) + 0.5f) / 127.0f;    // exact ties
+    const float c = -1.0f + (float)(gid % 201u) * 0.01f;      // snorm's negative half
+    const float w = (float)(gid % 64u) * 0.017f + 0.001f;
+    const float4 v = float4(a, b, c, w);
+    const uint pu8 = pack_float_to_unorm4x8(v);
+    const uint ps8 = pack_float_to_snorm4x8(v);
+    const uint pu16 = pack_float_to_unorm2x16(float2(v.x, v.y));
+    const uint ps16 = pack_float_to_snorm2x16(float2(v.x, v.y));
+    packed[gid * 4u + 0u] = as_type<float>(pu8);
+    packed[gid * 4u + 1u] = as_type<float>(ps8);
+    packed[gid * 4u + 2u] = as_type<float>(pu16);
+    packed[gid * 4u + 3u] = as_type<float>(ps16);
+    const float4 du8 = unpack_unorm4x8_to_float(pu8);
+    const float4 ds8 = unpack_snorm4x8_to_float(ps8);
+    const float2 du16 = unpack_unorm2x16_to_float(pu16);
+    const float2 ds16 = unpack_snorm2x16_to_float(ps16);
+    unpacked[gid * 12u + 0u] = du8.x;
+    unpacked[gid * 12u + 1u] = du8.y;
+    unpacked[gid * 12u + 2u] = du8.z;
+    unpacked[gid * 12u + 3u] = du8.w;
+    unpacked[gid * 12u + 4u] = ds8.x;
+    unpacked[gid * 12u + 5u] = ds8.y;
+    unpacked[gid * 12u + 6u] = ds8.z;
+    unpacked[gid * 12u + 7u] = ds8.w;
+    unpacked[gid * 12u + 8u] = du16.x;
+    unpacked[gid * 12u + 9u] = du16.y;
+    unpacked[gid * 12u + 10u] = ds16.x;
+    unpacked[gid * 12u + 11u] = ds16.y;
+}
+
+// ---- masks: a comparison makes a bool vector, and select consumes one ----------
+// Metal's relational operators are componentwise and produce a bool vector, which
+// is what `select`, `any` and `all` take. C++ has no such operator for a struct, so
+// the comparison and the three consumers are written once (the vector preamble and
+// src/soft_math.hpp) and this kernel is what checks them: each lane compares two
+// vectors, selects on the mask and then on a single bool, and folds the mask back
+// to two numbers.
+kernel void choosemask(device const float* in  [[buffer(0)]],
+                       device float* out       [[buffer(1)]],
+                       uint gid [[thread_position_in_grid]])
+{
+    const float4 v = float4(in[gid * 4u + 0u], in[gid * 4u + 1u],
+                            in[gid * 4u + 2u], in[gid * 4u + 3u]);
+    const float3 lo = float3(v.x, v.y, v.z);
+    const float3 hi = float3(v.w, v.y + 1.0f, v.x - 1.0f);
+    const bool3 mask = lo > hi;
+    const float3 a = select(lo, hi, mask);        // a mask picks component by component
+    const float3 b = select(lo, hi, v.x > 0.0f);  // one bool picks all three
+    out[gid * 8u + 0u] = a.x;
+    out[gid * 8u + 1u] = a.y;
+    out[gid * 8u + 2u] = a.z;
+    out[gid * 8u + 3u] = b.x;
+    out[gid * 8u + 4u] = b.y;
+    out[gid * 8u + 5u] = b.z;
+    out[gid * 8u + 6u] = any(mask) ? 1.0f : 0.0f;
+    out[gid * 8u + 7u] = all(lo >= float3(0.0f)) ? 3.0f : 0.0f;
+}
+
+// ---- swizzles: a read of part of a value, in any order --------------------------
+// `.xy` is the first two components and `.zyx` is three in the other order; `.xxx`
+// repeats one and `.wz` picks two that are not adjacent. The translator turns each
+// read into `weft_swz(v, i, j, ...)` and the preamble's overloads pick the result
+// type from the receiver, so the value is the same on both engines — which is what
+// this kernel checks, including a swizzle of a swizzle.
+kernel void swizzle(device const float* in  [[buffer(0)]],
+                    device float* out       [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]])
+{
+    const float4 v = float4(in[gid * 4u + 0u], in[gid * 4u + 1u],
+                            in[gid * 4u + 2u], in[gid * 4u + 3u]);
+    const float2 a = v.xy;    // a prefix
+    const float3 b = v.zyx;   // three, in the other order
+    const float3 c = v.xxx;   // one component, broadcast
+    const float2 d = v.wz;    // two that are not adjacent
+    const float3 e = b.xyx;   // a swizzle of a swizzle
+    out[gid * 8u + 0u] = a.x;
+    out[gid * 8u + 1u] = a.y;
+    out[gid * 8u + 2u] = b.x;
+    out[gid * 8u + 3u] = c.y;
+    out[gid * 8u + 4u] = d.x;
+    out[gid * 8u + 5u] = d.y;
+    out[gid * 8u + 6u] = e.z;
+    out[gid * 8u + 7u] = b.z;
+}
+
+// ---- a swizzle on the left of an assignment -------------------------------------
+// `.yw = ...` stores into the members it names, and the right-hand side is read
+// into locals before any of them is written, so `v.xz = v.wy` reorders in place
+// instead of reading a member it has already overwritten. Every component of the
+// answer is stored separately, so a store into the wrong member cannot hide.
+kernel void swzwrite(device const float* in  [[buffer(0)]],
+                     device float* out       [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]])
+{
+    float4 v = float4(in[gid], 2.0f, 3.0f, 4.0f);
+    // The right-hand side spans two lines on purpose: the scan that finds its end
+    // tracks brackets and ignores the newline.
+    v.yw = float2(v.x * 2.0f,
+                  v.x * 3.0f);   // y = 2x, w = 3x
+    v.xz = v.wy;             // in place: x = 3x, z = 2x
+
+    float3 t = float3(1.0f, 2.0f, 3.0f);
+    t.zyx = float3(v.x, v.y,
+                   v.z);         // three components, the other order
+
+    out[gid * 8u + 0u] = v.x;
+    out[gid * 8u + 1u] = v.y;
+    out[gid * 8u + 2u] = v.z;
+    out[gid * 8u + 3u] = v.w;
+    out[gid * 8u + 4u] = t.x;
+    out[gid * 8u + 5u] = t.y;
+    out[gid * 8u + 6u] = t.z;
+    // One component of a swizzle is a plain member store and needs no rewrite.
+    float4 u = v;
+    u.w = t.x;
+    out[gid * 8u + 7u] = u.w;
 }

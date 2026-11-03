@@ -1,0 +1,119 @@
+//
+// The same wgmma on the 32-lane backend: a kernel that needs the warp for
+// something else and also issues a tensor-core instruction.
+//
+// `redux.sync.add` folds a value across the warp's lanes, which the per-lane
+// machine cannot do without suspending every lane, so a kernel with one runs on
+// the warp backend — one thread owning 32 lanes, a warpgroup being four of those
+// threads. wgmma has to work there too: its lanes are `ctx.lid0 + l`, its
+// accumulators are the vector's elements, and its operands are in shared memory,
+// which the warp backend has.
+//
+// The fold's result is deliberately unused: this fixture is about the tensor-core
+// instruction running at all on that backend, and the D tile is compared as
+// exactly as it is on the per-lane path.
+.version 8.1
+.target sm_90
+.address_size 64
+
+.maxntid 128, 1, 1
+
+.visible .entry wgmma_warp_kernel(
+	.param .u64 wgmma_warp_kernel_param_0,
+	.param .u64 wgmma_warp_kernel_param_1,
+	.param .u64 wgmma_warp_kernel_param_2
+)
+{
+	.reg .b32 	%r<40>;
+	.reg .f32 	%f<12>;
+	.reg .b64 	%rd<16>;
+
+	.shared .align 128 .b8 weft_ab[2304];
+
+	ld.param.u64 	%rd1, [wgmma_warp_kernel_param_0];
+	ld.param.u64 	%rd2, [wgmma_warp_kernel_param_1];
+	ld.param.u64 	%rd3, [wgmma_warp_kernel_param_2];
+
+	mov.u32 	%r1, %tid.x;
+
+	// A: lane -> one row and one K core matrix, 16 bytes each.
+	and.b32 	%r2, %r1, 63;
+	shr.u32 	%r3, %r1, 6;
+	shl.b32 	%r4, %r2, 5;
+	shl.b32 	%r5, %r3, 4;
+	add.s32 	%r4, %r4, %r5;
+	cvt.u64.u32 	%rd4, %r4;
+	add.s64 	%rd4, %rd1, %rd4;
+	ld.global.v4.b32 	{%r10, %r11, %r12, %r13}, [%rd4];
+
+	shr.u32 	%r6, %r2, 3;
+	shl.b32 	%r6, %r6, 8;
+	shl.b32 	%r7, %r3, 7;
+	and.b32 	%r8, %r2, 7;
+	shl.b32 	%r8, %r8, 4;
+	add.s32 	%r9, %r6, %r7;
+	add.s32 	%r9, %r9, %r8;
+	mov.u64 	%rd5, weft_ab;
+	cvt.u64.u32 	%rd6, %r9;
+	add.s64 	%rd6, %rd5, %rd6;
+	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
+
+	// B: lane -> one row and one column, a single half after the A tile.
+	shr.u32 	%r14, %r1, 3;
+	and.b32 	%r15, %r1, 7;
+	shl.b32 	%r16, %r14, 4;
+	shl.b32 	%r17, %r15, 1;
+	add.s32 	%r16, %r16, %r17;
+	cvt.u64.u32 	%rd7, %r16;
+	add.s64 	%rd7, %rd2, %rd7;
+	ld.global.u16 	%r18, [%rd7];
+
+	shr.u32 	%r19, %r14, 3;
+	shl.b32 	%r19, %r19, 7;
+	shl.b32 	%r20, %r15, 4;
+	add.s32 	%r19, %r19, %r20;
+	and.b32 	%r21, %r14, 7;
+	shl.b32 	%r21, %r21, 1;
+	add.s32 	%r19, %r19, %r21;
+	add.s32 	%r19, %r19, 2048;
+	cvt.u64.u32 	%rd8, %r19;
+	add.s64 	%rd8, %rd5, %rd8;
+	st.shared.u16 	[%rd8], %r18;
+
+	bar.sync 	0;
+
+	mov.u64 	%rd10, 68720001024;
+	mov.u64 	%rd12, 68720001152;
+
+	mov.f32 	%f5, 0f00000000;
+	mov.f32 	%f6, 0f00000000;
+	mov.f32 	%f7, 0f00000000;
+	mov.f32 	%f8, 0f00000000;
+	wgmma.fence.sync.aligned;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// lane holds for m64n8k16.
+	shr.u32 	%r22, %r1, 5;
+	shr.u32 	%r23, %r1, 2;
+	and.b32 	%r23, %r23, 7;
+	and.b32 	%r24, %r1, 3;
+	shl.b32 	%r25, %r22, 4;
+	add.s32 	%r25, %r25, %r23;
+	shl.b32 	%r26, %r25, 5;
+	shl.b32 	%r27, %r24, 3;
+	add.s32 	%r26, %r26, %r27;
+	cvt.u64.u32 	%rd13, %r26;
+	add.s64 	%rd13, %rd3, %rd13;
+	st.global.b32 	[%rd13], %f5;
+	st.global.b32 	[%rd13+4], %f6;
+	st.global.b32 	[%rd13+256], %f7;
+	st.global.b32 	[%rd13+260], %f8;
+
+	// The instruction that makes the warp backend the only one that can run this
+	// kernel: a fold across the warp's lanes.
+	redux.sync.add.u32 	%r30, %r1, 0xffffffff;
+	ret;
+}

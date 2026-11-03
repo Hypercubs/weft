@@ -1,0 +1,58 @@
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "glgather" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpName %main "glgather"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %blk Block
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %outbuf DescriptorSet 0
+               OpDecorate %outbuf Binding 0
+               OpDecorate %tex DescriptorSet 0
+               OpDecorate %tex Binding 1
+               OpDecorate %smp DescriptorSet 0
+               OpDecorate %smp Binding 2
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+    %v3bool = OpTypeVector %bool 3
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %v3u = OpTypeVector %u32 3
+     %v4f = OpTypeVector %f32 4
+     %v2f = OpTypeVector %f32 2
+     %v3f = OpTypeVector %f32 3
+     %rtarr = OpTypeRuntimeArray %f32
+       %blk = OpTypeStruct %rtarr
+   %ptr_sb = OpTypePointer StorageBuffer %f32
+  %ptr_blk = OpTypePointer StorageBuffer %blk
+      %img1 = OpTypeImage %f32 2D 0 0 0 1 Unknown
+     %smp_t = OpTypeSampler
+     %si_t = OpTypeSampledImage %img1
+ %ptr_uc_img = OpTypePointer UniformConstant %img1
+ %ptr_uc_smp = OpTypePointer UniformConstant %smp_t
+       %pin = OpTypePointer Input %v3u
+      %fnty = OpTypeFunction %void
+        %gid = OpVariable %pin Input
+    %outbuf = OpVariable %ptr_blk StorageBuffer
+       %tex = OpVariable %ptr_uc_img UniformConstant
+       %smp = OpVariable %ptr_uc_smp UniformConstant
+      %zerou = OpConstant %u32 0
+     %zerof = OpConstant %f32 0
+      %c64 = OpConstant %f32 64
+       %main = OpFunction %void None %fnty
+      %entry = OpLabel
+          %g = OpLoad %v3u %gid
+         %gi = OpCompositeExtract %u32 %g 0
+         %gf = OpConvertUToF %f32 %gi
+        %gf2 = OpFDiv %f32 %gf %c64
+         %c2 = OpCompositeConstruct %v2f %gf2 %gf2
+         %c3 = OpCompositeConstruct %v3f %gf2 %gf2 %gf2
+         %vi = OpLoad %img1 %tex
+         %vs = OpLoad %smp_t %smp
+        %sim = OpSampledImage %si_t %vi %vs
+          %r = OpImageGather %v4f %sim %c2 %zerou
+         %rx = OpCompositeExtract %f32 %r 0
+         %po = OpAccessChain %ptr_sb %outbuf %zerou %gi
+               OpStore %po %rx
+               OpReturn
+               OpFunctionEnd

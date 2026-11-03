@@ -2,6 +2,10 @@
 
 #include "weft_msl.hpp"
 #include "weft_warp_msl.hpp"
+// The portable library, emitted into both of this front end's texts. `.approx` is
+// a hardware polynomial and no CPU reproduces its bits, so the answer is the one
+// this project already gives for Metal's `sqrt`: both engines run the same text.
+#include "soft_math.hpp"
 
 #include <cctype>
 #include <cstdio>
@@ -175,6 +179,17 @@ struct Emitter {
   std::map<std::string, int> tex_index;
   int ntex = 0;
   std::vector<bool> tex_write;
+  // The bindings an `.a2d` instruction names. PTX's `.tex` says nothing about
+  // dimensionality, so the array form is a property of the instruction: the body
+  // is scanned for it before emission, and both the GPU parameter type and
+  // `txq.depth` read the answer.
+  std::vector<bool> tex_array;
+  // The same question for `.3d`: a volume on the GPU is `texture3d`, and its
+  // outermost index is a plane rather than a slice.
+  std::vector<bool> tex_3d;
+  // And for `.cube`: six square faces, which on the GPU are `texturecube` — a
+  // parameter type of its own, and one that cannot be read or written by texel.
+  std::vector<bool> tex_cube;
   int shared_bytes = 0;      // the threadgroup arena this kernel needs, at compile time
   bool shared_extern = false;  // it was `extern .shared`: the launch chooses the size
   bool uses_red = false;     // a reduction barrier: needs its publish slots
@@ -380,6 +395,18 @@ struct Emitter {
   std::map<std::string, int> params;   // buffer parameters
   std::map<std::string, int> scalars;  // plain value parameters
   std::vector<std::string> unused;     // parameters the body never names
+  // What each buffer parameter is *addressed as*, by the instructions that reach
+  // it. PTX binds an address, not a type: a parameter is `.u64` and its register
+  // is `.b64`, so nothing in the declaration says a buffer holds floats. The load
+  // or store does — `ld.global.f32` is a four-byte element, `ld.global.u8` one —
+  // and that is the only place the width exists. A parameter reached at two
+  // different widths has no single answer and reports 0, which the ABI reads as
+  // unknown rather than as four bytes.
+  std::map<int, uint32_t> param_bytes;
+  // The register holding a parameter's base address, through `ld.param`, `cvta`,
+  // `mov` and `add` — the instructions every front end puts between a binding and
+  // its first access.
+  std::map<std::string, int> ptr_param;
   std::map<std::string, std::string> reg_types;  // "r" -> "uint32_t"
   std::string decls;
 
@@ -393,9 +420,8 @@ struct Emitter {
     if (t[0] != '%') {
       if (t.size() == 10 && t.compare(0, 2, "0f") == 0) return "weft_f32(0x" + t.substr(2) + "u)";
       if (t.size() == 18 && t.compare(0, 2, "0d") == 0) {
-        // Metal has no double on this host, so a 64-bit float literal has no GPU
-        // answer to give. The CPU column still runs it.
-        if (msl) { err = "a 64-bit float has no Metal form on this host"; return t; }
+        // A double on the GPU target is its bits in a `uint64_t` and `weft_f64` is
+        // the identity there, so the constant has one spelling for both targets.
         return "weft_f64(0x" + t.substr(2) + "ull)";
       }
       if (!t.empty() && (std::isalpha((unsigned char)t[0]) || t[0] == '_')) {
@@ -498,13 +524,15 @@ struct Emitter {
   }
 
   // `[%rd1+16]` -> ("rd[1] + 16", base register). `[tile]` -> ("0", "").
-  bool mem_operand(const std::string& op, std::string& addr, std::string& param_name) {
+  bool mem_operand(const std::string& op, std::string& addr, std::string& param_name,
+                   std::string* base_reg = nullptr) {
     std::string s = trim(op);
     if (s.size() < 2 || s.front() != '[' || s.back() != ']') {
       err = "expected a memory operand, got '" + op + "'";
       return false;
     }
     s = trim(s.substr(1, s.size() - 2));
+    if (base_reg) base_reg->clear();
     if (!s.empty() && s[0] != '%') {
       param_name = s;  // a symbol: param or shared array name
       addr = "0";
@@ -518,12 +546,80 @@ struct Emitter {
     }
     if (cut == std::string::npos) {
       addr = "(" + reg_expr(s) + ")";
+      if (base_reg) {
+        Reg r = parse_reg(s);
+        *base_reg = (r.ok && r.special.empty()) ? reg_key(r) : std::string();
+      }
       return err.empty();
     }
-    base = reg_expr(trim(s.substr(0, cut)));
+    const std::string first = trim(s.substr(0, cut));
+    base = reg_expr(first);
+    if (base_reg) {
+      Reg r = parse_reg(first);
+      *base_reg = (r.ok && r.special.empty()) ? reg_key(r) : std::string();
+    }
     std::string off = trim(s.substr(cut + 1));
     addr = "(" + base + (negative ? " - " : " + ") + off + ")";
     return err.empty();
+  }
+
+  // The parameter a token names: the symbol itself, or the register an address is
+  // walking through. -1 when it names neither.
+  int ptr_index(const std::string& tok) const {
+    const std::string t = trim(tok);
+    if (t.empty()) return -1;
+    if (t[0] != '%') {
+      auto it = params.find(t);
+      return it == params.end() ? -1 : it->second;
+    }
+    Reg r = parse_reg(t);
+    if (!r.ok || !r.special.empty()) return -1;
+    auto it = ptr_param.find(reg_key(r));
+    return it == ptr_param.end() ? -1 : it->second;
+  }
+
+  // Follow an address from the binding to the register that holds it. Only a
+  // 64-bit destination is a pointer, which is what keeps `add.s32 %r5, %r4, %r1`
+  // from being mistaken for one.
+  void track_ptr(const std::string& op, const std::vector<std::string>& parts,
+                 const std::vector<std::string>& args) {
+    if (args.size() < 2) return;
+    Reg d = parse_reg(args[0]);
+    if (!d.ok || !d.special.empty()) return;
+    if (cpp_size(reg_type_of(args[0])) != 8) return;
+    // `ld.param.u64 %rd1, [buf];` is where the kernel's own parameter becomes a
+    // register, so it is the head of every address chain.
+    if (op == "ld" && has_part(parts, "param")) {
+      std::string s = trim(args[1]);
+      if (s.size() >= 2 && s.front() == '[' && s.back() == ']') s = trim(s.substr(1, s.size() - 2));
+      const int i = ptr_index(s);
+      if (i >= 0) ptr_param[reg_key(d)] = i;
+      return;
+    }
+    if (op == "cvta" || op == "mov" || op == "add" || op == "lea") {
+      const int i = ptr_index(args[1]);
+      if (i >= 0) ptr_param[reg_key(d)] = i;
+    }
+  }
+
+  // Record what width one access addresses a buffer parameter at. `sym` is the
+  // operand when it names a symbol outright (`[buf]`), `reg` the register it
+  // walks through otherwise.
+  void note_width(const std::string& sym, const std::string& reg, const std::string& ty) {
+    int i = -1;
+    auto p = params.find(sym);
+    if (p != params.end()) {
+      i = p->second;
+    } else if (!reg.empty()) {
+      auto r = ptr_param.find(reg);
+      if (r != ptr_param.end()) i = r->second;
+    }
+    if (i < 0) return;
+    const int n = cpp_size(ty);
+    if (!n) return;
+    auto it = param_bytes.find(i);
+    if (it == param_bytes.end()) param_bytes[i] = (uint32_t)n;
+    else if (it->second != (uint32_t)n) it->second = 0;  // two widths: no answer
   }
 
   // One memory access for the 32 lanes of the warp. When what the lanes touch
@@ -766,6 +862,7 @@ std::string Emitter::emit(const std::string& raw) {
   // load or a store later on can see whether the lanes are walking consecutive
   // addresses.
   vec_update(opcode, args);
+  track_ptr(op, parts, args);
 
   if (op == "ld" || op == "st") {
     if (!need(2)) return "";
@@ -783,14 +880,21 @@ std::string Emitter::emit(const std::string& raw) {
       else if (p == "v4") lanes = 4;
     }
     const int esz = cpp_size(ty) ? cpp_size(ty) : 4;
+    // A 64-bit float is read and written as the word its bits are on the GPU
+    // target, because the type itself does not exist there. The width is the same
+    // eight bytes either way, so the addresses do not change.
+    const std::string ty_mem = (msl && ty == "double") ? "uint64_t" : ty;
 
     auto at = [&](const std::string& a, int k) {
       return k == 0 ? a : "(" + a + " + " + std::to_string(k * esz) + ")";
     };
 
     if (op == "ld") {
-      std::string addr, name;
-      if (!mem_operand(args[1], addr, name)) return "";
+      std::string addr, name, base;
+      if (!mem_operand(args[1], addr, name, &base)) return "";
+      // `ld.param.u64 %rd1, [buf]` reads the *binding*, which is an eight-byte
+      // address; it says nothing about what the buffer holds.
+      if (!param) note_width(name, base, ty);
       auto load_at = [&](const std::string& a) -> std::string {
         if (param) {
           auto b = params.find(name);
@@ -801,8 +905,8 @@ std::string Emitter::emit(const std::string& raw) {
           return "0";
         }
         if (shared)
-          return "*(" + addr_space("threadgroup", is_const) + ty + "*)(sh + " + a + ")";
-        return "*(" + addr_space("device", is_const) + ty + "*)(uintptr_t)(" + a + ")";
+          return "*(" + addr_space("threadgroup", is_const) + ty_mem + "*)(sh + " + a + ")";
+        return "*(" + addr_space("device", is_const) + ty_mem + "*)(uintptr_t)(" + a + ")";
       };
       std::string dsts = trim(args[0]);
       if (lanes == 1 || dsts.find('{') == std::string::npos) {
@@ -812,7 +916,7 @@ std::string Emitter::emit(const std::string& raw) {
           std::string plain = store(args[0], "weft_p[l]", ty);
           vec_select = sel;
           return vec_mem_access(args[1], esz, plain, store(args[0], load_at(addr), ty),
-                                "const " + ty);
+                                "const " + ty_mem);
         }
         return guard + store(args[0], load_at(addr), ty);
       }
@@ -833,27 +937,31 @@ std::string Emitter::emit(const std::string& raw) {
       return guard + out;
     }
 
-    std::string addr, name;
-    if (!mem_operand(args[0], addr, name)) return "";
+    std::string addr, name, base;
+    if (!mem_operand(args[0], addr, name, &base)) return "";
+    if (!param) note_width(name, base, ty);
     auto store_at = [&](const std::string& a, const std::string& v) -> std::string {
       if (shared)
-        return "*((" + addr_space("threadgroup", false) + ty + "*)(sh + " + a + ")) = " + v + ";";
-      return "*((" + addr_space("device", false) + ty + "*)(uintptr_t)(" + a + ")) = " + v + ";";
+        return "*((" + addr_space("threadgroup", false) + ty_mem + "*)(sh + " + a + ")) = " + v +
+               ";";
+      return "*((" + addr_space("device", false) + ty_mem + "*)(uintptr_t)(" + a + ")) = " + v +
+             ";";
     };
     std::string srcs = trim(args[1]);
     if (lanes == 1 || srcs.find('{') == std::string::npos) {
       if (vec) {
-        std::string val = operand_as(args[1], ty);
+        std::string val = operand_as(args[1], ty_mem);
         return vec_mem_access(args[0], esz, "weft_p[l] = " + val + ";", store_at(addr, val), ty);
       }
-      return guard + store_at(addr, operand_as(args[1], ty));
+      return guard + store_at(addr, operand_as(args[1], ty_mem));
     }
     srcs = srcs.substr(srcs.find('{') + 1);
     srcs = srcs.substr(0, srcs.find('}'));
     auto vals = split_top(srcs, ',');
     if ((int)vals.size() != lanes) { err = "vector store register count mismatch"; return ""; }
     std::string out;
-    for (int k = 0; k < lanes; k++) out += store_at(at(addr, k), operand_as(vals[k], ty)) + " ";
+    for (int k = 0; k < lanes; k++)
+      out += store_at(at(addr, k), operand_as(vals[k], ty_mem)) + " ";
     if (vec) return lane_block(out);
     return guard + out;
   }
@@ -883,6 +991,9 @@ std::string Emitter::emit(const std::string& raw) {
                                reg_expr(parts2[1]) + " << 32))",
                            ty);
     }
+    // A software double is moved as the word it lives in, not converted.
+    if (msl && ty == "double")
+      return guard + store(args[0], operand_as(args[1], "uint64_t"), "uint64_t");
     return guard + store(args[0], operand_as(args[1], ty), ty);
   }
 
@@ -916,6 +1027,11 @@ std::string Emitter::emit(const std::string& raw) {
   if (op == "cvt") {
     if (!need(2)) return "";
     std::string dstty, mode;
+    // `.rni` and `.rn` are two different instructions, not two spellings: the
+    // three-letter form rounds the *value* to an integer and keeps the float type
+    // (`rint`), and the two-letter form rounds the significand to the destination's
+    // precision. Treating the first as the second turns 2.5 into 2.
+    bool integer_round = false;
     for (size_t i = 1; i < parts.size(); i++) {
       const std::string t = cpp_type("." + parts[i]);
       if (!t.empty()) {
@@ -923,9 +1039,10 @@ std::string Emitter::emit(const std::string& raw) {
       } else if ((parts[i] == "rn" || parts[i] == "rz" || parts[i] == "rm" ||
                   parts[i] == "rp" || parts[i] == "rni" || parts[i] == "rzi" ||
                   parts[i] == "rmi" || parts[i] == "rpi")) {
-        // PTX spells these .rni/.rzi/.rmi/.rpi; the two-letter forms are the
-        // same rounding modes without the omitted-integer suffix.
+        // PTX spells these .rni/.rzi/.rmi/.rpi; the trailing `i` is what makes
+        // them round to an integer rather than to the destination's precision.
         mode = parts[i].substr(0, 2);
+        integer_round = parts[i].size() == 3;
       } else if (parts[i] == "ftz" || parts[i] == "sat") {
         // Renormalising a denormal and clamping to the destination range are
         // both what the CPU does anyway for the conversions reached here.
@@ -935,6 +1052,45 @@ std::string Emitter::emit(const std::string& raw) {
       }
     }
     if (dstty.empty()) { err = "unsupported conversion '" + opcode + "'"; return ""; }
+    // A conversion to or from a 64-bit float on the GPU target goes through the
+    // software double: the value is bits, so a cast would convert the pattern.
+    if (msl && (dstty == "double" || ty == "double")) {
+      const std::string b = operand_as(args[1], "uint64_t");
+      if (dstty == "double") {
+        if (ty == "double") return guard + store(args[0], b, "uint64_t");
+        if (ty == "float")
+          return guard + store(args[0],
+                               "weft_fp64::from_f32(weft_bitcast<uint32_t>(" +
+                                   operand_as(args[1], "float") + "))",
+                               "uint64_t");
+        const bool sgn = ty == "int32_t" || ty == "int64_t";
+        const std::string wide = sgn ? ("(int64_t)" + operand_as(args[1], "int64_t"))
+                                     : ("(uint64_t)" + operand_as(args[1], "uint64_t"));
+        return guard + store(args[0],
+                             std::string("weft_fp64::from_") + (sgn ? "i64(" : "u64(") + wide + ")",
+                             "uint64_t");
+      }
+      // A double read as a float: the narrowing *is* the rounding, and `to_f32`
+      // rounds the significand to nearest even. Rounding to an integer first would
+      // be a different number — 2.5 would come back as 2 — so the mode is not
+      // applied here at all.
+      if (dstty == "float") {
+        // `.rni` to a float is a round to an integer that stays a float.
+        std::string fv = b;
+        if (integer_round && mode == "rn") fv = "weft_fp64::rne_bits(" + fv + ")";
+        return guard + store(args[0], "weft_bitcast<float>(weft_fp64::to_f32(" + fv + "))",
+                             "float");
+      }
+      // A double read as an integer: the mode rounds the double to an integer
+      // first, because the hardware rounds before it truncates too.
+      std::string v = b;
+      if (!mode.empty() && mode != "rz")
+        v = std::string("weft_fp64::") +
+            (mode == "rn" ? "rne_bits(" : mode == "rm" ? "floor_bits(" : "ceil_bits(") + v + ")";
+      const bool sgn = dstty == "int32_t" || dstty == "int64_t";
+      const std::string c = std::string("weft_fp64::to_") + (sgn ? "i64(" : "u64(") + v + ")";
+      return guard + store(args[0], "(" + dstty + ")" + c, dstty);
+    }
     // The source is coerced to the *instruction's* type, not the register's:
     // `cvt.rzi.s32.f32` on a `.b32` register holds a float in it, and reading
     // those bits as an integer converts the bit pattern rather than the value.
@@ -948,11 +1104,24 @@ std::string Emitter::emit(const std::string& raw) {
     // to round off, and on the GPU `rint` of an unsigned int is ambiguous
     // between the half and float overloads, so the conversion is a plain cast.
     if (!mode.empty() && dst_f && src_f) {
-      const char* fn = mode == "rn" ? "nearbyint"
-                     : mode == "rz" ? "trunc"
-                     : mode == "rm" ? "floor"
-                                     : "ceil";
-      e = "(" + dstty + ")(" + rounded_math(fn, src) + ")";
+      if (integer_round) {
+        // `.rni` rounds the value to an integer and keeps the float type, which is
+        // `rint` — what a compiler emits before narrowing to a half.
+        const char* fn = mode == "rn" ? "nearbyint"
+                       : mode == "rz" ? "trunc"
+                       : mode == "rm" ? "floor"
+                                       : "ceil";
+        e = "(" + dstty + ")(" + rounded_math(fn, src) + ")";
+      } else if (mode == "rn") {
+        // Between two floats, `.rn` is what a cast already does: it rounds the
+        // significand to the destination's precision, ties to even. Rounding to an
+        // integer first would be a different number — `cvt.rn.f32.f64` of
+        // 1234.5678 came out as 1235.
+        e = "(" + dstty + ")(" + src + ")";
+      } else {
+        const char* fn = mode == "rz" ? "trunc" : (mode == "rm" ? "floor" : "ceil");
+        e = "(" + dstty + ")(" + rounded_math(fn, src) + ")";
+      }
     } else if (!mode.empty() && src_f) {
       // Float to integer: the cast truncates, so .rz needs nothing and the
       // other three round first. Rounding a float in double keeps .rn exact for
@@ -984,6 +1153,11 @@ std::string Emitter::emit(const std::string& raw) {
     else if (cmp == "hs") sym = ">=";
     // NaN tests are not comparisons: .nan is true when *either* operand is a
     // NaN, .num when neither is, and every other predicate is ordered.
+    if (msl && ty == "double" && (cmp == "nan" || cmp == "num")) {
+      const std::string a = operand_as(args[1], "uint64_t"), b = operand_as(args[2], "uint64_t");
+      const std::string any = "(weft_fp64::is_nan(" + a + ") || weft_fp64::is_nan(" + b + "))";
+      return guard + store(args[0], cmp == "nan" ? any : ("(!" + any + ")"), "bool");
+    }
     if (cmp == "nan" || cmp == "num") {
       const std::string a = operand_as(args[1], ty), b = operand_as(args[2], ty);
       const std::string an = isnan_of(a);
@@ -993,6 +1167,19 @@ std::string Emitter::emit(const std::string& raw) {
                            "bool");
     }
     if (!sym) { err = "unsupported comparison '" + opcode + "'"; return ""; }
+    // An ordered comparison of two software doubles is the helper, not an
+    // operator: the same functions the SPIR-V front end calls for the same
+    // predicates.
+    if (msl && ty == "double") {
+      const std::string a = operand_as(args[1], "uint64_t"), b = operand_as(args[2], "uint64_t");
+      const std::string e = cmp == "eq" ? ("weft_fp64::eq(" + a + ", " + b + ")")
+                          : cmp == "ne" ? ("(!weft_fp64::eq(" + a + ", " + b + "))")
+                          : cmp == "lt" ? ("weft_fp64::lt(" + a + ", " + b + ")")
+                          : cmp == "le" ? ("weft_fp64::le(" + a + ", " + b + ")")
+                          : cmp == "gt" ? ("weft_fp64::gt(" + a + ", " + b + ")")
+                                        : ("weft_fp64::ge(" + a + ", " + b + ")");
+      return guard + store(args[0], e, "bool");
+    }
     std::string boolop;
     for (const auto& p : parts)
       if (p == "and" || p == "or" || p == "xor") boolop = p;
@@ -1378,6 +1565,11 @@ std::string Emitter::emit(const std::string& raw) {
   if (op == "selp") {
     if (!need(3)) return "";
     std::string p = args.size() > 3 ? reg_expr(args[3]) : "true";
+    if (msl && ty == "double")
+      return guard + store(args[0],
+                           p + " ? " + operand_as(args[1], "uint64_t") + " : " +
+                               operand_as(args[2], "uint64_t"),
+                           "uint64_t");
     return guard + store(args[0],
                          p + " ? " + operand_as(args[1], ty) + " : " + operand_as(args[2], ty), ty);
   }
@@ -1500,6 +1692,24 @@ std::string Emitter::emit(const std::string& raw) {
                          "uint32_t");
   }
 
+  // A 64-bit float on the GPU target is bits in a `uint64_t`, so there is no
+  // operator to apply: each of these is the software double's own function, over
+  // the same text the SPIR-V front end calls. The CPU column keeps the host's
+  // double, which is what makes the two comparable bit for bit.
+  if (msl && ty == "double" && args.size() >= 3) {
+    const char* f64fn = op == "add"   ? "add"
+                        : op == "sub" ? "sub"
+                        : op == "mul" ? "mul"
+                        : op == "div" ? "div"
+                                      : nullptr;
+    if (f64fn)
+      return guard + store(args[0],
+                           std::string("weft_fp64::") + f64fn + "(" +
+                               operand_as(args[1], "uint64_t") + ", " +
+                               operand_as(args[2], "uint64_t") + ")",
+                           "uint64_t");
+  }
+
   auto it = binop.find(op);
   if (it != binop.end() && args.size() >= 3) {
     return guard + store(args[0],
@@ -1509,6 +1719,22 @@ std::string Emitter::emit(const std::string& raw) {
 
   if (op == "fma" || op == "mad") {
     if (!need(4)) return "";
+    // `mad` rounds twice and `fma` rounds once, so on the software double the first
+    // is two calls and the second is the one helper that keeps the intermediate
+    // exact — a 192-bit accumulator with a single rounding at the end.
+    if (msl && ty == "double") {
+      if (op == "mad")
+        return guard + store(args[0],
+                             "weft_fp64::add(weft_fp64::mul(" + operand_as(args[1], "uint64_t") +
+                                 ", " + operand_as(args[2], "uint64_t") + "), " +
+                                 operand_as(args[3], "uint64_t") + ")",
+                             "uint64_t");
+      return guard + store(args[0],
+                           "weft_fp64::fma(" + operand_as(args[1], "uint64_t") + ", " +
+                               operand_as(args[2], "uint64_t") + ", " +
+                               operand_as(args[3], "uint64_t") + ")",
+                           "uint64_t");
+    }
     return guard + store(args[0],
                          operand_as(args[1], ty) + " * " + operand_as(args[2], ty) + " + " +
                              operand_as(args[3], ty),
@@ -1517,16 +1743,30 @@ std::string Emitter::emit(const std::string& raw) {
 
   if (op == "neg") {
     if (!need(2)) return "";
+    if (msl && ty == "double")
+      return guard + store(args[0], "weft_fp64::neg(" + operand_as(args[1], "uint64_t") + ")",
+                           "uint64_t");
     return guard + store(args[0], "-" + operand_as(args[1], ty), ty);
   }
 
   if (op == "abs") {
     if (!need(2)) return "";
+    if (msl && ty == "double")
+      return guard + store(args[0],
+                           "weft_fp64::abs_bits(" + operand_as(args[1], "uint64_t") + ")",
+                           "uint64_t");
     return guard + store(args[0], math("abs", operand_as(args[1], ty)), ty);
   }
 
   if (op == "min" || op == "max") {
     if (!need(3)) return "";
+    // minNum/maxNum on the software double: a NaN operand means the other one.
+    if (msl && ty == "double")
+      return guard + store(args[0],
+                           std::string("weft_fp64::") + op + "_bits(" +
+                               operand_as(args[1], "uint64_t") + ", " +
+                               operand_as(args[2], "uint64_t") + ")",
+                           "uint64_t");
     return guard + store(
         args[0], math(op, operand_as(args[1], ty) + ", " + operand_as(args[2], ty)), ty);
   }
@@ -1564,6 +1804,48 @@ std::string Emitter::emit(const std::string& raw) {
                        operand_as(args[3], "uint32_t") + "))";
     return guard + store(args[0], "(" + keep + " | " + ins + ")", "uint32_t");
   }
+  // ---- integer dot products ----
+  //
+  // `dp4a.atype.btype d, a, b, c` takes four bytes from `a`, four from `b`, the
+  // sign of each chosen by its own modifier, and accumulates the four products
+  // into `c`. It is the inner instruction of an int8 GEMM and both Triton and
+  // cuBLAS emit it, so a kernel carrying one was being refused outright.
+  //
+  // It is pure integer arithmetic, which is why one expression is exact on both
+  // targets — the columns cannot drift apart the way a `mul` on floats can.
+  //
+  // `satfinite` saturates the result to [0, INT_MAX]. With byte inputs the largest
+  // magnitude that can reach it is 4 * 255 * 255 = 260,100, so the clamp is
+  // unreachable and is not emitted; the modifier is accepted so that a kernel
+  // spelling it stays translatable rather than being refused for a word.
+  if (op == "dp4a" && args.size() >= 4) {
+    bool sgn_a = true, sgn_b = true, seen_a = false, seen_b = false;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "u8" || p == "s8") {
+        if (!seen_a) { sgn_a = (p == "s8"); seen_a = true; }
+        else if (!seen_b) { sgn_b = (p == "s8"); seen_b = true; }
+      } else if (p == "satfinite" || p == "b32" || p == "s32" || p == "u32") {
+        continue;
+      } else {
+        err = "unsupported dp4a modifier '" + p + "'";
+        return "";
+      }
+    }
+    auto byte_at = [](const std::string& w, int i) {
+      return "(((uint32_t)(" + w + ") >> " + std::to_string(8 * i) + ") & 0xFFu)";
+    };
+    auto extend = [](const std::string& b, bool sgn) {
+      return sgn ? ("((int32_t)(int8_t)" + b + ")") : ("((int32_t)" + b + ")");
+    };
+    const std::string a = operand_as(args[1], "uint32_t");
+    const std::string b = operand_as(args[2], "uint32_t");
+    std::string sum = operand_as(args[3], "int32_t");
+    for (int i = 0; i < 4; i++)
+      sum += " + " + extend(byte_at(a, i), sgn_a) + " * " + extend(byte_at(b, i), sgn_b);
+    return guard + store(args[0], "(" + sum + ")", ty.empty() ? "int32_t" : ty);
+  }
+
   if (op == "clz" && args.size() >= 2)
     return guard + store(args[0], "(uint32_t)__builtin_clz(" + operand_as(args[1], ty) + ")", ty);
   if (op == "popc" && args.size() >= 2)
@@ -1576,20 +1858,56 @@ std::string Emitter::emit(const std::string& raw) {
       args.size() >= 2) {
     std::string a = operand_as(args[1], ty);
     std::string e;
-    if (op == "ex2") e = math("exp2", a);
-    else if (op == "lg2") e = math("log2", a);
-    else if (op == "rcp") e = "(1.0f / " + a + ")";
-    else if (op == "rsqrt") e = "(1.0f / " + math("sqrt", a) + ")";
-    else if (op == "sqrt") e = math("sqrt", a);
+    // The library, not the target's math. `sqrt.approx` on the GPU is bit-for-bit
+    // `x * rsqrt(x)`, and its `ex2` and `lg2` are the unit's own polynomials, so
+    // lowering these to the hardware made the two columns disagree in the last
+    // bits (measured at 3.4e-07 relative over 65,536 lanes). `div` stays a
+    // division, which is correctly rounded on both.
+    if (op == "ex2") e = "weft_exp2(" + a + ")";
+    else if (op == "lg2") e = "weft_log2(" + a + ")";
+    else if (op == "rcp") e = "(1.0f / (" + a + "))";
+    else if (op == "rsqrt") e = "weft_rsqrt(" + a + ")";
+    else if (op == "sqrt") e = "weft_sqrt(" + a + ")";
     else e = a + " / " + (args.size() > 2 ? operand_as(args[2], ty) : "1.0f");
     return guard + store(args[0], e, ty);
   }
+  // `mufu.<op>.approx.f32` is the multifunction unit's own approximation — the
+  // only mode it has — and it is the same bargain as the `.approx` forms above:
+  // the silicon's polynomial, which no CPU reproduces. So it runs the portable
+  // library like everything else, and one expression is exact on both columns.
+  if (op == "mufu" && args.size() >= 2) {
+    std::string f;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "rcp" || p == "rsqrt" || p == "sqrt" || p == "sin" || p == "cos" ||
+          p == "ex2" || p == "lg2" || p == "tanh")
+        f = p;
+      else if (p == "approx" || p == "ftz" || p == "f32" || p == "rn")
+        continue;
+      else {
+        err = "unsupported mufu operation '" + p + "'";
+        return "";
+      }
+    }
+    if (f.empty()) {
+      err = "mufu without an operation";
+      return "";
+    }
+    const std::string arg = operand_as(args[1], "float");
+    std::string e;
+    if (f == "rcp") e = "(1.0f / (" + arg + "))";
+    else if (f == "ex2") e = "weft_exp2(" + arg + ")";
+    else if (f == "lg2") e = "weft_log2(" + arg + ")";
+    else e = "weft_" + f + "(" + arg + ")";
+    return guard + store(args[0], e, ty.empty() ? "float" : ty);
+  }
+
   if (op == "sin" && args.size() >= 2)
-    return guard + store(args[0], math("sin", operand_as(args[1], ty)), ty);
+    return guard + store(args[0], "weft_sin(" + operand_as(args[1], ty) + ")", ty);
   if (op == "cos" && args.size() >= 2)
-    return guard + store(args[0], math("cos", operand_as(args[1], ty)), ty);
+    return guard + store(args[0], "weft_cos(" + operand_as(args[1], ty) + ")", ty);
   if (op == "tanh" && args.size() >= 2)
-    return guard + store(args[0], math("tanh", operand_as(args[1], ty)), ty);
+    return guard + store(args[0], "weft_tanh(" + operand_as(args[1], ty) + ")", ty);
 
   // ---- atomics ----
   // ---- tensor cores ----
@@ -1674,6 +1992,8 @@ std::string Emitter::emit(const std::string& raw) {
       active += " && ((((uint32_t)" + operand_as(args[2], "uint32_t") + ") >> l) & 1u)";
     const std::string dst = reg_expr(args[0]), src = reg_expr(args[1]);
     vec_side = true;
+    // Five butterflies, not one running sum: a stage is 32 independent combines,
+    // and an accumulator is one dependency chain. Measured, in the README.
     std::string out = "{ " + ty + " weft_t[32]; ";
     out += "for (uint32_t l = 0; l < 32u; l++) weft_t[l] = (" + active + ") ? " + src + " : (" +
            ty + ")(" + ident + "); ";
@@ -1716,15 +2036,37 @@ std::string Emitter::emit(const std::string& raw) {
     }
     std::string addr, sym;
     if (!mem_operand(args[1], addr, sym)) return "";
+    // A named symbol is `[tile]` or `[tile+128]`: the address a lane would supply
+    // is a place inside the shared window that is known at translation time, so
+    // nothing has to be read out of a peer's register — the rows are the 16-byte
+    // ones the tile was declared with.
     if (!sym.empty()) {
-      err = "ldmatrix from a named symbol is not supported";
-      return "";
+      std::string nm = sym;
+      long long k = 0;
+      const size_t cut = sym.find_first_of("+/-");
+      if (cut != std::string::npos) {
+        nm = trim(sym.substr(0, cut));
+        k = std::strtoll(sym.c_str() + cut + 1, nullptr, 0);
+        if (sym[cut] == '-') k = -k;
+      }
+      nm = trim(nm);
+      auto so = shared_offsets.find(nm);
+      if (so == shared_offsets.end()) {
+        err = "'" + nm + "' is not a shared array: ldmatrix reads threadgroup memory";
+        return "";
+      }
+      addr = std::to_string((long long)so->second + k);
     }
     // The address a lane supplies points at one row of 8 halves, and another
     // lane is the one that reads it: matrix k's row i is addressed by lane 8k+i,
     // and lane l wants row l>>2 of it. So the address is read out of the peer's
     // slot, not this lane's.
-    auto peer_addr = [&](const std::string& who) {
+    // A register address names one row of the tile, and the peer is the lane that
+    // holds it, so the row is read out of that slot. A named symbol names the whole
+    // tile instead, so the row is an offset from its start — 16 bytes per row.
+    const bool uniform = !sym.empty();
+    auto row_addr = [&](const std::string& who) -> std::string {
+      if (uniform) return "(" + addr + "ull + 16u * (" + who + "))";
       std::string s = addr;
       for (size_t p = 0; (p = s.find("[l]", p)) != std::string::npos;)
         s.replace(p, 3, "[" + who + "]");
@@ -1741,18 +2083,16 @@ std::string Emitter::emit(const std::string& raw) {
         const std::string rowlo = "8u * " + m + "u + 2u * weft_c";
         const std::string rowhi = "8u * " + m + "u + 2u * weft_c + 1u";
         out += "const uint16_t weft_lo" + m + " = *(" + addr_space("threadgroup", true) +
-               "uint16_t*)(sh + " + peer_addr(rowlo) +
-               " + 2u * weft_r); ";
+               "uint16_t*)(sh + " + row_addr(rowlo) + " + 2u * weft_r); ";
         out += "const uint16_t weft_hi" + m + " = *(" + addr_space("threadgroup", true) +
-               "uint16_t*)(sh + " + peer_addr(rowhi) +
-               " + 2u * weft_r); ";
+               "uint16_t*)(sh + " + row_addr(rowhi) + " + 2u * weft_r); ";
         out += store(regs[k],
                      "((uint32_t)weft_lo" + m + " | ((uint32_t)weft_hi" + m + " << 16))",
                      "uint32_t");
       } else {
         out += store(regs[k],
                      "*(" + addr_space("threadgroup", true) +
-                     "uint32_t*)(sh + " + peer_addr("8u * " + m + "u + weft_r") +
+                     "uint32_t*)(sh + " + row_addr("8u * " + m + "u + weft_r") +
                          " + 4u * weft_c)",
                      "uint32_t");
       }
@@ -1770,11 +2110,11 @@ std::string Emitter::emit(const std::string& raw) {
   // One instruction is issued by a warpgroup — 128 lanes — and reads *both*
   // operands out of shared memory through a 64-bit descriptor. That last part is
   // what makes it translatable here at all: unlike `mma`, no lane ever needs
-  // another lane's register, so the per-lane state machine can express it as long
-  // as the thread it runs on knows which lane of the warpgroup it is — and the
-  // per-lane body runs one thread per threadgroup, so `ctx.lid` is exactly that,
-  // 0 to 127. The 32-lane vector path has no such identity, so wgmma simply has
-  // no vector form and the kernel stays on the lane backend.
+  // another lane's register, so one lane's worth of work is enough to compute one
+  // lane's accumulators. The per-lane backend runs a thread per threadgroup lane,
+  // so `ctx.lid` is the warpgroup lane, 0 to 127. The 32-lane backend runs a
+  // thread per *warp*, so its lanes are `ctx.lid0 + l` and the same body runs
+  // once per lane there under the warp's active mask.
   //
   // The descriptor (PTX ISA "Matrix Descriptor") packs five fields: the shared
   // memory start address in bits 0-13, the leading byte offset (between core
@@ -1784,11 +2124,6 @@ std::string Emitter::emit(const std::string& raw) {
   // (i, k) of an unswizzled K-major operand is at
   // start + (i/8)*SBO + (k/8)*LBO + (i%8)*16 + (k%8)*element_size.
   if (op == "wgmma") {
-    if (vec) {
-      // No 32-lane form: the accumulator is a 64xN tile spread over four warps.
-      err = "wgmma is a warpgroup instruction and has no 32-lane form";
-      return "";
-    }
     if (parts.size() >= 2 && (parts[1] == "fence" || parts[1] == "commit_group" ||
                               parts[1] == "wait_group")) {
       // Group bookkeeping for the async proxy: on a GPU these order the wgmma
@@ -1800,18 +2135,43 @@ std::string Emitter::emit(const std::string& raw) {
       err = "unsupported wgmma instruction '" + opcode + "'";
       return "";
     }
-    // f16 and bf16 are the same 16-bit element, so the core-matrix geometry below
-    // reads either one without changing a single offset: only the decode differs.
-    // tf32 and the 8-bit types are 4- and 1-byte elements, and their element
-    // stride inside a 16-byte core-matrix row is not the layout written here.
+    // One layout rule, four element widths. A core-matrix row is 16 bytes, so it
+    // holds 16/elements values and the instruction's K is 32/elements: 32 for the
+    // 8-bit types (fp8 and the integers), 16 for f16 and bf16, 8 for tf32. The
+    // descriptor fields, the row walk and the accumulator pattern do not depend on
+    // which, so this is a few derived numbers and one decode rather than a decoder
+    // per format.
+    const char* fp8dec = has_part(parts, "e5m2") ? "weft_e5m2("
+                         : has_part(parts, "e4m3") ? "weft_e4m3(" : nullptr;
+    // An 8-bit integer operand is the same one-byte read as an fp8 one: only the
+    // reading of the byte changes, which is why signedness is a decode and not a
+    // second layout.
+    // An accumulator is f32 for every float operand and s32 for the 8-bit
+    // integers, which is the pair the instruction set offers; the integer form
+    // also decodes its bytes as integers, because a sum that leaves 2^24 is no
+    // longer the same number in a float.
+    const bool iacc = has_part(parts, "s32");
+    const char* i8dec = has_part(parts, "s8") ? (iacc ? "weft_s8_i(" : "weft_s8(")
+                        : has_part(parts, "u8") ? (iacc ? "weft_u8_i(" : "weft_u8(")
+                                                 : nullptr;
+    const char* bytedec = fp8dec ? fp8dec : i8dec;
+    const std::string dty = iacc ? "int32_t" : "float";
     const bool bw = has_part(parts, "bf16");
-    if (has_part(parts, "tf32") || has_part(parts, "e4m3") || has_part(parts, "e5m2") ||
-        has_part(parts, "s8") || has_part(parts, "u8") || has_part(parts, "s32") ||
-        parts.size() < 5) {
+    const bool tf = has_part(parts, "tf32");
+    if (parts.size() < 5) {
       err = "unsupported wgmma operands in '" + opcode +
-            "': f16 and bf16 operands with an f32 accumulator are translated";
+            "': f16, bf16, tf32, fp8 (e4m3/e5m2) and 8-bit integer operands with "
+            "an f32 accumulator are translated";
       return "";
     }
+    if (iacc && !i8dec) {
+      err = "unsupported wgmma accumulator in '" + opcode +
+            "': an s32 accumulator is the 8-bit integer form (s8 or u8 operands); "
+            "f16, bf16, tf32 and fp8 accumulate in f32";
+      return "";
+    }
+    const int esz = bytedec ? 1 : tf ? 4 : 2;  // bytes of one operand element
+    const int ktot = 32 / esz;                 // the instruction's K
     int ncols = 0;
     for (const auto& p : parts) {
       const size_t np = p.find('n'), kp = p.find('k');
@@ -1819,8 +2179,10 @@ std::string Emitter::emit(const std::string& raw) {
         continue;
       const std::string ms = p.substr(1, np - 1), ns = p.substr(np + 1, kp - np - 1),
                         ks = p.substr(kp + 1);
-      if (ms != "64" || ks != "16") {
-        err = "unsupported wgmma shape '" + p + "': only m64nNk16 is translated";
+      if (ms != "64" || ks != std::to_string(ktot)) {
+        err = "unsupported wgmma shape '" + p + "': with these operands the tile "
+              "shape must be m64nNk" + std::to_string(ktot) + " (f16/bf16 m64nNk16, "
+              "tf32 m64nNk8, fp8 and integer m64nNk32)";
         return "";
       }
       ncols = std::atoi(ns.c_str());
@@ -1831,15 +2193,32 @@ std::string Emitter::emit(const std::string& raw) {
       return "";
     }
     if (args.size() < 4) { err = "bad " + opcode; return ""; }
-    // Trailing immediates select MN-major operands, which walk the core matrices
-    // differently; only the K-major form (immediate 0) is translated.
-    for (size_t i = 4; i < args.size(); i++) {
-      if (trim(args[i]) != "0") {
-        err = "unsupported wgmma operand layout in '" + opcode +
-              "': only K-major operands (transpose immediate 0) are translated";
+    // After the operands the immediates run in a fixed order: scale-d, scale-a,
+    // scale-b, transpose-a, transpose-b. PTX says the trailing ones may be left
+    // off, so a run of one to five is legal and whatever is missing is zero — a
+    // shorter list is not a different instruction, and refusing it refused
+    // assembly GCC and Triton both emit.
+    const size_t nargs = args.size();
+    if (nargs > 8) {
+      err = "wgmma '" + opcode + "' takes at most 5 immediates (scale-d, then "
+            "scale-a scale-b, then transpose-a transpose-b), got " +
+            std::to_string(nargs - 3);
+      return "";
+    }
+    bool flag[5] = {false, false, false, false, false};
+    static const char* const kImmName[5] = {"scale-d", "scale-a", "scale-b",
+                                            "transpose-a", "transpose-b"};
+    for (size_t i = 0; i < 5 && 3 + i < nargs; i++) {
+      const std::string v = trim(args[3 + i]);
+      if (v != "0" && v != "1") {
+        err = "wgmma '" + opcode + "': the " + kImmName[i] +
+              " immediate must be 0 or 1, got '" + v + "'";
         return "";
       }
+      flag[i] = (v == "1");
     }
+    const bool scale_d = flag[0], neg_a = flag[1], neg_b = flag[2];
+    const bool trans_a = flag[3], trans_b = flag[4];
     std::string dlist = trim(args[0]);
     if (dlist.find('{') == std::string::npos) {
       err = "wgmma needs an accumulator register list";
@@ -1850,7 +2229,7 @@ std::string Emitter::emit(const std::string& raw) {
     const std::vector<std::string> dregs = split_top(dlist, ',');
     const int groups = ncols / 8;
     if ((int)dregs.size() != 4 * groups) {
-      err = "wgmma m64n" + std::to_string(ncols) + "k16 takes " +
+      err = "wgmma m64n" + std::to_string(ncols) + "k" + std::to_string(ktot) + " takes " +
             std::to_string(4 * groups) + " accumulator registers, got " +
             std::to_string(dregs.size());
       return "";
@@ -1858,53 +2237,159 @@ std::string Emitter::emit(const std::string& raw) {
     const std::string da = operand_as(args[1], "uint64_t");
     const std::string db = operand_as(args[2], "uint64_t");
     auto elem_at = [&](const std::string& off) {
+      if (bytedec) {
+        // One byte, and the decode is the format's own: e4m3 saturates at 448 and
+        // has no infinities, e5m2 has them, an s8 sign-extends and a u8 does not —
+        // the helpers `mma` reads its operands with, so the paths cannot drift
+        // apart.
+        return std::string(bytedec) + "(uint32_t)*(" + addr_space("threadgroup", true) +
+               "uint8_t*)(sh + (" + off + ")), 0)";
+      }
+      if (tf) {
+        // tf32 is a float whose low 13 mantissa bits the instruction ignores, so
+        // the read is four bytes and the decode is the same truncation `mma` uses.
+        const std::string raw = "(uint32_t)*(" + addr_space("threadgroup", true) +
+                                "uint32_t*)(sh + (" + off + "))";
+        return "weft_tf32(weft_f32(" + raw + "))";
+      }
       const std::string raw = "(uint32_t)*(" + addr_space("threadgroup", true) +
                               "uint16_t*)(sh + (" + off + "))";
       return (bw ? "weft_bf16(" : "weft_h16(") + raw + ", 0)";
     };
     std::string out =
-        "{ const uint64_t weft_da = " + da + ", weft_db = " + db + "; "
-        "if ((((weft_da >> 62) | (weft_db >> 62)) & 3u) != 0u) { "
-        "__builtin_printf(\"weft: wgmma descriptor asks for a swizzled layout, "
-        "which is not translated\\n\"); __builtin_trap(); } "
+        "const uint64_t weft_da = " + da + ", weft_db = " + db + "; "
+        "const uint32_t weft_sma = (uint32_t)(weft_da >> 62), "
+        "weft_smb = (uint32_t)(weft_db >> 62); "
+        // Swizzle: mode 1, 2 or 3 is an atom 128, 64 or 32 bytes wide, and over
+        // byte offsets that is CUTLASS's Swizzle<3,4,3>, <2,4,3> or <1,4,3> —
+        // `offset ^ (((offset >> 7) & mask) << 4)`. No swizzle (mode 0) is the
+        // 16-byte core matrix, which is the same rule with the shift at 4 and an
+        // empty mask, so one walk covers all four and nothing here has to be
+        // refused. The width is a shift held in a variable rather than a
+        // constant because the mode is a field of the descriptor, which is data.
+        "const uint32_t weft_as = weft_sma ? 8u - weft_sma : 4u, "
+        "weft_bs = weft_smb ? 8u - weft_smb : 4u; "
+        "const uint32_t weft_aw = 1u << weft_as, weft_bw = 1u << weft_bs; "
+        // Two different masks, one for where a byte sits inside an atom (all of
+        // its width) and one for the XOR (the 16-byte chunks, one per 16 bytes of
+        // that width). Using the second for the first drops every byte past the
+        // eighth, which reads the wrong half rather than a nearby one.
+        "const uint32_t weft_ak = weft_aw - 1u, weft_bk = weft_bw - 1u; "
+        "const uint32_t weft_am = (weft_aw >> 4u) - 1u, weft_bm = (weft_bw >> 4u) - 1u; "
+        // Where the pattern starts, when the tile does not begin on one: bits 49-51
+        // hold the distance from the pattern origin to the descriptor's start in
+        // 128-byte units, and it shifts the phase of the XOR without moving any
+        // address. A tile that does begin on a pattern boundary carries zero here.
+        "const uint32_t weft_ao = (uint32_t)((weft_da >> 49u) & 7u) << 7u, "
+        "weft_bo = (uint32_t)((weft_db >> 49u) & 7u) << 7u; "
         "const uint64_t weft_ba = (weft_da & 0x3FFFu) << 4, "
         "weft_bb = (weft_db & 0x3FFFu) << 4; "
         "const uint64_t weft_la = ((weft_da >> 16) & 0x3FFFu) << 4, "
         "weft_sa = ((weft_da >> 32) & 0x3FFFu) << 4; "
         "const uint64_t weft_lb = ((weft_db >> 16) & 0x3FFFu) << 4, "
         "weft_sb = ((weft_db >> 32) & 0x3FFFu) << 4; "
-        "const uint32_t weft_l = ctx.lid, weft_w = weft_l >> 5u, "
-        "weft_g = (weft_l >> 2u) & 7u, weft_t = weft_l & 3u; ";
-    // A: row 16w+g (and 16w+g+8), column k. B: row k, column 8q+2t+c.
-    auto aval = [&](int rowhalf, int k) {
-      const std::string row = rowhalf ? "(uint64_t)(2u * weft_w + 1u)"
-                                      : "(uint64_t)(2u * weft_w)";
-      const std::string off = "weft_ba + " + row + " * weft_sa + " +
-                              std::to_string(k / 8) + "u * weft_la + 16u * weft_g + " +
-                              std::to_string(2 * (k % 8)) + "u";
-      return elem_at(off);
+        "";
+    std::string body;
+    const bool weft_sel = vec_select;
+    vec_select = false;
+    // The swizzle, applied to an offset measured from the descriptor's start. An
+    // atom is a run of eight rows and the pattern restarts every atom, so the
+    // strides the descriptor carries (both whole atoms) leave the phase alone and
+    // the XOR is the only thing that moves an address.
+    auto swz = [&](const std::string& d, const char* sfx) {
+      const std::string x = "(((" + d + ") + weft_" + sfx + "o) >> 7u)";
+      return "((" + d + ") ^ ((" + x + " & weft_" + sfx + "m) << 4u))";
     };
+    // A: row 16w+g (and 16w+g+8), column k. B: row k, column 8q+2t+c.
+    //
+    // Majorness does not move the descriptor's two offsets — SBO steps between MN
+    // groups and LBO between K groups either way. It decides which direction is
+    // contiguous inside an atom: K-major puts K in it and the eight rows an atom
+    // width apart, MN-major is the mirror image of that.
+    auto aval = [&](int rowhalf, int k) {
+      const std::string rowg = rowhalf ? "(2u * weft_w + 1u)" : "(2u * weft_w)";
+      const std::string rowi = rowhalf ? "(16u * weft_w + weft_g + 8u)"
+                                       : "(16u * weft_w + weft_g)";
+      // The byte column of this k inside a row. With no swizzle that is a 16-byte
+      // core matrix and LBO steps between them; a wider atom holds the K of a
+      // whole instruction, so the step lands on zero and the same atom strides it.
+      const std::string kb = "(" + std::to_string(esz * k) + "u >> weft_as)";
+      const std::string ko = "(" + std::to_string(esz * k) + "u & weft_ak)";
+      std::string d;
+      if (trans_a) {
+        // Along M, so an atom spans the atom width of M and eight rows of K: the
+        // K row is one atom wide and LBO steps eight of them.
+        const std::string mb = "((" + rowi + ") * " + std::to_string(esz) + "u)";
+        d = "(" + mb + " >> weft_as) * weft_sa + " + std::to_string(k / 8) +
+            "u * weft_la + (" + mb + " & weft_ak) + " + std::to_string(k % 8) +
+            "u * weft_aw";
+      } else {
+        d = rowg + " * weft_sa + " + kb + " * weft_la + weft_g * weft_aw + " + ko;
+      }
+      const std::string v = elem_at("weft_ba + " + swz(d, "a"));
+      return neg_a ? ((iacc ? "(0 - " : "(0.0f - ") + v + ")") : v;
+    };
+    // B is K rows by N columns. The two descriptor offsets do not change with
+    // majorness — SBO steps between MN groups and LBO between K groups either way —
+    // but which direction lives contiguously inside an atom does. In a K-major
+    // operand K is the contiguous one: an atom holds values of K, and the eight
+    // values of N are an atom width apart. That is exactly the mirror of A's
+    // K-major walk and of what this used to do, which put K 16 bytes apart and N
+    // contiguous — the MN-major arrangement, under an instruction that says K-major.
+    // Every fixture gave B an LBO and an SBO of the same value, so the two readings
+    // produced identical addresses and no test could tell them apart.
     auto bval = [&](int q, int c, int k) {
-      const std::string off = "weft_bb + " + std::to_string(k / 8) + "u * weft_lb + " +
-                              std::to_string(q) + "u * weft_sb + " +
-                              std::to_string(16 * (k % 8)) + "u + 4u * weft_t + " +
-                              std::to_string(2 * c) + "u";
-      return elem_at(off);
+      const std::string n = "(8u * " + std::to_string(q) + "u + 2u * weft_t + " +
+                            std::to_string(c) + "u)";
+      const std::string kb = "(" + std::to_string(esz * k) + "u >> weft_bs)";
+      const std::string ko = "(" + std::to_string(esz * k) + "u & weft_bk)";
+      std::string d;
+      if (trans_b) {
+        const std::string nb = "((" + n + ") * " + std::to_string(esz) + "u)";
+        d = "(" + nb + " >> weft_bs) * weft_sb + " + std::to_string(k / 8) +
+            "u * weft_lb + (" + nb + " & weft_bk) + " + std::to_string(k % 8) +
+            "u * weft_bw";
+      } else {
+        d = "(" + n + ") / 8u * weft_sb + " + kb + " * weft_lb + (" + n +
+            " % 8u) * weft_bw + " + ko;
+      }
+      const std::string v = elem_at("weft_bb + " + swz(d, "b"));
+      return neg_b ? ((iacc ? "(0 - " : "(0.0f - ") + v + ")") : v;
     };
     for (int q = 0; q < groups; q++) {
       for (int j = 0; j < 4; j++) {
         const int rowhalf = j / 2, colhalf = j % 2;
         std::string sum;
-        for (int k = 0; k < 16; k++) {
+        for (int k = 0; k < ktot; k++) {
           if (k) sum += " + ";
           sum += aval(rowhalf, k) + " * " + bval(q, colhalf, k);
         }
-        out += store(dregs[(size_t)(4 * q + j)], sum, "float");
-        out += " ";
+        // scale-d = 1 is D = A*B + D, and the register is read before it is
+        // written. With scale-d = 0 the accumulator's old value is ignored, which is
+        // what the instruction says and what a first issue into a tile wants.
+        const std::string acc =
+            scale_d ? ("(" + operand_as(dregs[(size_t)(4 * q + j)], dty) + ") + (" +
+                       sum + ")")
+                    : sum;
+        body += store(dregs[(size_t)(4 * q + j)], acc, dty);
+        body += " ";
       }
     }
-    out += "}";
-    return out;
+    vec_select = weft_sel;
+    // The lane-dependent half. On the per-lane backend the thread *is* one lane.
+    // On the 32-lane backend it is one warp of the warpgroup, so its lanes are
+    // `ctx.lid0 + l` and each accumulator is that lane's element of the vector —
+    // which works only because wgmma reads both operands out of shared memory and
+    // never another lane's register.
+    const std::string ldecl =
+        "const uint32_t weft_l = " +
+        std::string(vec ? "(ctx.lid0 + l)" : "ctx.lid") +
+        ", weft_w = weft_l >> 5u, weft_g = (weft_l >> 2u) & 7u, weft_t = weft_l & 3u; ";
+    // Everything goes inside the lane loop on the vector backend: the descriptor
+    // fields are read out of per-lane registers there, so they cannot be hoisted.
+    const std::string inner = out + ldecl + body;
+    if (!vec) return "{ " + inner + "}";
+    return "{ " + lane_block(inner) + "}";
   }
 
   if (op == "mma") {
@@ -2030,8 +2515,9 @@ std::string Emitter::emit(const std::string& raw) {
     const size_t ai = is_atom ? 1 : 0;
     const size_t vi = is_atom ? 2 : 1;
     if (args.size() < vi + 1) { err = "bad " + opcode; return ""; }
-    std::string addr, name;
-    if (!mem_operand(args[ai], addr, name)) return "";
+    std::string addr, name, base;
+    if (!mem_operand(args[ai], addr, name, &base)) return "";
+    note_width(name, base, ty);
     // The operation is one of several modifiers: real codegen writes
     // `atom.acquire.sys.global.max.s64`, so the scope and the semantic
     // qualifiers are skipped rather than assumed away.
@@ -2179,10 +2665,26 @@ std::string Emitter::emit(const std::string& raw) {
   if (op == "tex" || op == "tld4" || op == "txq" || op == "suld" || op == "sust") {
     vec_ok = false;
     if (args.empty()) { err = "bad " + opcode; return ""; }
-    if (op != "txq" && opcode.find("2d") == std::string::npos) {
-      err = "only a 2-D texture is bound here, and '" + opcode + "' is not one";
+    // PTX's cube form is `(s, t, face)` — a face number and a position on it —
+    // where the sampler here takes the direction that decomposes into exactly
+    // those three. The two are the same information, so `weft_cube_dir` rebuilds
+    // the direction that lands back on that face at that place; both engines run
+    // that text, so both build the same bits and the sample agrees.
+    const bool cube = opcode.find("cube") != std::string::npos;
+    const bool d3 = !cube && opcode.find("3d") != std::string::npos;
+    // A 1-D texture is a 2-D one with a single row: the binding is `Wx1` and the
+    // sample sits at 0.5, the centre of that row, which is the texel itself under
+    // any filter and any address mode. So the lowering is exact rather than
+    // approximate, and `txq` still answers with what was actually bound.
+    const bool d1 = !cube && !d3 && opcode.find("1d") != std::string::npos;
+    if (op != "txq" && !cube && opcode.find("2d") == std::string::npos && !d3 && !d1) {
+      err = "only a 1-D, 2-D or 3-D texture is bound here, and '" + opcode + "' is not one";
       return "";
     }
+    // A gather is a 2x2 footprint, and every form of the binding has one: a volume
+    // gathers in the plane its third coordinate names, and a 1-D binding is the
+    // `Wx1` plane its sample already reads, so its footprint is the two texels along
+    // x and the second row is outside the image — zero, on both engines.
     // `tld4` is a gather rather than a filter: the same footprint, each texel on
     // its own channel. Both targets have the helper, so the two runs compare the
     // same four reads.
@@ -2234,6 +2736,15 @@ std::string Emitter::emit(const std::string& raw) {
       const std::string i = std::to_string(idx);
       if (!msl) return "*weft::texture_ptr(" + i + ")";
       const bool rw = idx < (int)tex_write.size() && tex_write[idx];
+      const bool arr = idx < (int)tex_array.size() && tex_array[idx];
+      if (idx < (int)tex_cube.size() && tex_cube[idx])
+        return "weft::make_cube_image(weft_t" + i + ")";
+      if (idx < (int)tex_3d.size() && tex_3d[idx])
+        return std::string(rw ? "weft::make_rw_image3d(weft_t" : "weft::make_image3d(weft_t") + i +
+               ")";
+      if (arr)
+        return std::string(rw ? "weft::make_rw_array_image(weft_t" : "weft::make_array_image(weft_t") +
+               i + ")";
       return std::string(rw ? "weft::make_rw_image(weft_t" : "weft::make_image(weft_t") + i +
              ")";
     };
@@ -2244,15 +2755,29 @@ std::string Emitter::emit(const std::string& raw) {
       const int idx = binding(args[1], list);
       if (idx < 0) return "";
       std::string what;
+      const bool arr = (size_t)idx < tex_array.size() && tex_array[idx];
+      const bool vol = (size_t)idx < tex_3d.size() && tex_3d[idx];
+      // A cube's third extent is the six faces it is made of, which is a number
+      // neither its width nor its height can produce.
+      const bool cb = (size_t)idx < tex_cube.size() && tex_cube[idx];
       if (opcode.find("width") != std::string::npos) what = "width";
       else if (opcode.find("height") != std::string::npos) what = "height";
-      else if (opcode.find("depth") != std::string::npos) what = "1";
+      // A layered binding has slices rather than a depth, and a volume has planes;
+      // how many is the one number neither can derive from anything else it is
+      // given.
+      else if (opcode.find("depth") != std::string::npos)
+        what = (arr || vol) ? "layers" : (cb ? "6" : "1");
       else { err = "txq asks for a texture's width, height or depth"; return ""; }
       const std::string i = std::to_string(idx);
+      // The GPU handle names that extent `depth` on a volume and `layers` on a
+      // layered image; the host `weft::Texture` calls it `layers` either way,
+      // because it stores both the same way.
+      const std::string msl_field = (what == "layers" && vol) ? "depth" : what;
       const std::string expr =
-          msl ? ("(uint32_t)" + image_of(idx) + "." + what)
-              : (what == "1" ? std::string("1u")
-                             : ("(uint32_t)weft::texture_ptr(" + i + ")->" + what));
+          what == "6" ? std::string("6u")
+                       : what == "1" ? std::string("1u")
+                       : (msl ? ("(uint32_t)" + image_of(idx) + "." + msl_field)
+                              : ("(uint32_t)weft::texture_ptr(" + i + ")->" + what));
       return guard + store(args[0], expr, "uint32_t");
     }
 
@@ -2262,14 +2787,26 @@ std::string Emitter::emit(const std::string& raw) {
       std::vector<std::string> coords;
       const int idx = binding(args[read ? 1 : 0], coords);
       if (idx < 0) return "";
-      if (coords.size() < 2) { err = "a 2-D surface needs two coordinates"; return ""; }
+      const bool arr = (size_t)idx < tex_array.size() && tex_array[idx];
+      const bool vol = (size_t)idx < tex_3d.size() && tex_3d[idx];
+      if (coords.size() < ((arr || vol) ? 3u : (d1 ? 1u : 2u))) {
+        err = vol ? "a 3-D surface needs x, y and a plane"
+                  : arr ? "a 2-D array surface needs x, y and a layer"
+                  : d1  ? "a 1-D surface needs one coordinate"
+                        : "a 2-D surface needs two coordinates";
+        return "";
+      }
       if (!read && idx < (int)tex_write.size()) tex_write[idx] = true;
       const std::string x = "(uint32_t)(" + operand_as(coords[0], "uint32_t") + ")";
-      const std::string y = "(uint32_t)(" + operand_as(coords[1], "uint32_t") + ")";
+      const std::string y = d1 ? std::string("0u")
+                               : "(uint32_t)(" + operand_as(coords[1], "uint32_t") + ")";
+      const std::string lay = (arr || vol)
+                                  ? (", (uint32_t)(" + operand_as(coords[2], "uint32_t") + ")")
+                                  : std::string();
       if (read) {
         return guard + store(args[0],
                              "weft::tex_read<uint32_t>(" + image_of(idx) + ", " + x + ", " + y +
-                                 ")",
+                                 lay + ")",
                              "uint32_t");
       }
       std::vector<std::string> vals = reg_list(args[1]);
@@ -2279,11 +2816,57 @@ std::string Emitter::emit(const std::string& raw) {
       // hardware too.
       const std::string v = operand_as(vals[0], "float");
       const std::string call =
-          msl ? ("weft::tex_write(" + image_of(idx) + ", " + x + ", " + y + ", float4(" + v +
-                 ", 0.0f, 0.0f, 0.0f))")
-              : ("weft::tex_write(" + image_of(idx) + ", " + x + ", " + y + ", (float)(" + v +
-                 "))");
+          msl ? ("weft::tex_write(" + image_of(idx) + ", " + x + ", " + y + lay + ", float4(" +
+                 v + ", 0.0f, 0.0f, 0.0f))")
+              : ("weft::tex_write(" + image_of(idx) + ", " + x + ", " + y + lay + ", (float)(" +
+                 v + "))");
       return guard + call + ";";
+    }
+
+    // A cube sample: the face and the position on it, turned into the direction
+    // the sampler takes. `weft_cube_dir` is the inverse of the rule that picks a
+    // face, so the direction comes back to this face at this place.
+    if (cube) {
+      std::vector<std::string> coords;
+      const int idx = binding(args[1], coords);
+      if (idx < 0) return "";
+      if (coords.size() < 3) {
+        err = "a cube sample needs s, t and a face";
+        return "";
+      }
+      const std::string s = operand_as(coords[0], "float");
+      const std::string t = operand_as(coords[1], "float");
+      const std::string f = "(uint32_t)(" + operand_as(coords[2], "uint32_t") + ")";
+      const std::string i = std::to_string(idx);
+      // A binding the kernel also writes is declared read_write on this target,
+      // and a filter cannot read through that mode — so the sample reaches the
+      // second, sampled view of the same texture that the module declares.
+      const std::string tn = (msl && idx < (int)tex_write.size() && tex_write[idx])
+                                 ? ("weft_t" + i + "_s")
+                                 : ("weft_t" + i);
+      const std::string img =
+          msl ? ("weft::SampledCubeImage{weft::make_cube_image(" + tn + "), weft_s" + i + "}")
+              : ("*weft::texture_ptr(" + i + ")");
+      // A gather keeps the four texels apart, and a face is a layer here, so it
+      // needs no direction: `(s, t, face)` rebases straight to a coordinate.
+      const bool cgather = op == "tld4";
+      const std::string call =
+          cgather ? ("weft::tex_gather4_cube<float>(" + img + ", " + s + ", " + t + ", " + f +
+                     ", weft_t4)")
+          : msl ? ("weft::tex_sample4<float>(" + img + ", weft_dx, weft_dy, weft_dz, weft_t4)")
+                : ("weft::tex_sample4_cube<float>(" + img +
+                    ", weft_dx, weft_dy, weft_dz, weft::sampler(" + i + ").filter, " +
+                    "weft::sampler(" + i + ").addr, weft_t4)");
+      std::vector<std::string> dsts = reg_list(args[0]);
+      std::string out = guard + "{ float weft_t4[4]; " +
+                        (cgather ? std::string()
+                                 : "float weft_dx, weft_dy, weft_dz; weft::weft_cube_dir(" + f +
+                                       ", " + s + ", " + t + ", weft_dx, weft_dy, weft_dz); ") +
+                        call + ";";
+      for (size_t k = 0; k < dsts.size() && k < 4; k++)
+        out += " " + store(dsts[k], "weft_t4[" + std::to_string(k) + "]", "float");
+      out += " }";
+      return out;
     }
 
     // `tex`: a filtered sample at normalised coordinates. The filter and the
@@ -2293,28 +2876,50 @@ std::string Emitter::emit(const std::string& raw) {
     std::vector<std::string> coords;
     const int idx = binding(args[1], coords);
     if (idx < 0) return "";
-    if (coords.size() < 2) { err = "a 2-D texture needs two coordinates"; return ""; }
-    if (idx < (int)tex_write.size() && tex_write[idx]) {
-      err = "a texture that is also a surface has no filtered form on this target";
+    const bool arr = (size_t)idx < tex_array.size() && tex_array[idx];
+    const bool vol = (size_t)idx < tex_3d.size() && tex_3d[idx];
+    if (coords.size() < ((arr || vol) ? 3u : (d1 ? 1u : 2u))) {
+      err = vol ? "a 3-D texture needs u, v and w"
+                : arr ? "a 2-D array texture needs u, v and a layer"
+                : d1  ? "a 1-D texture needs one coordinate"
+                      : "a 2-D texture needs two coordinates";
       return "";
     }
     const std::string u = operand_as(coords[0], "float");
-    const std::string v = operand_as(coords[1], "float");
+    // One row, so 0.5 is its centre: every filter and address mode lands on the
+    // texel the coordinate names instead of mixing in a row that is not there.
+    const std::string v = d1 ? std::string("0.5f") : operand_as(coords[1], "float");
+    // The layer is a float coordinate in the array form — CUDA's `tex2DLayered`
+    // passes the slice as one — so it is truncated to the index the slice has.
+    // A volume's third coordinate stays a float: it is a normalised position in
+    // the stack of planes, not a slice index to truncate.
+    const std::string lay = vol ? (", " + operand_as(coords[2], "float"))
+                                : arr ? (", (uint32_t)(" + operand_as(coords[2], "float") + ")")
+                                      : std::string();
     const std::string i = std::to_string(idx);
     // The sampled element type comes from the instruction's own `.f32`, so the
     // channels land in registers of the type PTX asked for.
     const bool gather = op == "tld4";
-    const std::string img = msl ? ("weft::SampledImage{weft::make_image(weft_t" + i +
-                                  "), weft_s" + i + "}")
-                               : ("*weft::texture_ptr(" + i + ")");
+    // A binding the kernel also writes is `access::read_write` on this target, and
+    // no filter reads through that mode: the sample takes the second, sampled view
+    // of the same texture instead. Same storage, other access mode.
+    const std::string tn = (msl && idx < (int)tex_write.size() && tex_write[idx])
+                               ? ("weft_t" + i + "_s")
+                               : ("weft_t" + i);
+    const std::string img =
+        msl ? (std::string(vol ? "weft::SampledImage3D{weft::make_image3d("
+                               : arr ? "weft::SampledArrayImage{weft::make_array_image("
+                                     : "weft::SampledImage{weft::make_image(") +
+               tn + "), weft_s" + i + "}")
+            : ("*weft::texture_ptr(" + i + ")");
     std::string call;
     if (gather)
-      call = "weft::tex_gather4<float>(" + img + ", " + u + ", " + v + ", weft_t4)";
+      call = "weft::tex_gather4<float>(" + img + ", " + u + ", " + v + lay + ", weft_t4)";
     else if (msl)
-      call = "weft::tex_sample4<float>(" + img + ", " + u + ", " + v + ", weft_t4)";
+      call = "weft::tex_sample4<float>(" + img + ", " + u + ", " + v + lay + ", weft_t4)";
     else
-      call = "weft::tex_sample4<float>(" + img + ", " + u + ", " + v + ", weft::sampler(" + i +
-             ").filter, weft::sampler(" + i + ").addr, weft_t4)";;
+      call = "weft::tex_sample4<float>(" + img + ", " + u + ", " + v + lay +
+             ", weft::sampler(" + i + ").filter, weft::sampler(" + i + ").addr, weft_t4)";;
     std::vector<std::string> dsts = reg_list(args[0]);
     std::string out = guard + "{ float weft_t4[4]; " + call + ";";
     for (size_t k = 0; k < dsts.size() && k < 4; k++)
@@ -2412,6 +3017,71 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     em.tex_index = tex_index;
     em.ntex = ntex;
     em.tex_write.assign((size_t)ntex, false);
+    // The body says which bindings are arrays — an `.a2d` instruction names one
+    // with `[name, {...}]` — so it is scanned once here rather than guessed from
+    // the declaration, which does not carry dimensionality.
+    em.tex_array.assign((size_t)ntex, false);
+    // The same scan for `.3d`: the declaration says nothing about dimensionality,
+    // so the instruction is what makes a binding a volume.
+    em.tex_3d.assign((size_t)ntex, false);
+    em.tex_cube.assign((size_t)ntex, false);
+    {
+      size_t at = brace;
+      while (at < end) {
+        const size_t hit = src.find(".3d", at);
+        if (hit == std::string::npos || hit >= end) break;
+        const size_t semi = src.find(';', hit);
+        const size_t lb = src.find('[', hit);
+        if (lb != std::string::npos && lb < end && (semi == std::string::npos || lb < semi)) {
+          size_t e3 = lb + 1;
+          while (e3 < src.size() && std::isspace((unsigned char)src[e3])) e3++;
+          const size_t b3 = e3;
+          while (e3 < src.size() && is_word(src[e3])) e3++;
+          auto t3 = tex_index.find(src.substr(b3, e3 - b3));
+          if (t3 != tex_index.end() && (size_t)t3->second < em.tex_3d.size())
+            em.tex_3d[t3->second] = true;
+        }
+        at = hit + 3;
+      }
+    }
+    {
+      size_t at = brace;
+      while (at < end) {
+        const size_t hit = src.find(".cube", at);
+        if (hit == std::string::npos || hit >= end) break;
+        const size_t semi = src.find(';', hit);
+        const size_t lb = src.find('[', hit);
+        if (lb != std::string::npos && lb < end && (semi == std::string::npos || lb < semi)) {
+          size_t ec = lb + 1;
+          while (ec < src.size() && std::isspace((unsigned char)src[ec])) ec++;
+          const size_t bc = ec;
+          while (ec < src.size() && is_word(src[ec])) ec++;
+          auto tc = tex_index.find(src.substr(bc, ec - bc));
+          if (tc != tex_index.end() && (size_t)tc->second < em.tex_cube.size())
+            em.tex_cube[tc->second] = true;
+        }
+        at = hit + 5;
+      }
+    }
+    {
+      size_t at = brace;
+      while (at < end) {
+        const size_t hit = src.find("a2d", at);
+        if (hit == std::string::npos || hit >= end) break;
+        const size_t semi = src.find(';', hit);
+        const size_t lb = src.find('[', hit);
+        if (lb != std::string::npos && lb < end && (semi == std::string::npos || lb < semi)) {
+          size_t e = lb + 1;
+          while (e < src.size() && std::isspace((unsigned char)src[e])) e++;
+          const size_t b = e;
+          while (e < src.size() && is_word(src[e])) e++;
+          auto t2 = tex_index.find(src.substr(b, e - b));
+          if (t2 != tex_index.end() && (size_t)t2->second < em.tex_array.size())
+            em.tex_array[t2->second] = true;
+        }
+        at = hit + 3;
+      }
+    }
     // ---- parameters, in declaration order ----
     //
     // A pointer the body never names is not bound. Triton hands every kernel a
@@ -2600,10 +3270,15 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
           int count = 1;
           size_t lt = reg.find('<');
           if (lt != std::string::npos) count = std::atoi(reg.c_str() + lt + 1);
-          if (e.msl && ty == "double") {
-            e.err = "a 64-bit float has no Metal form on this host (register '" + rr.base + "')";
-            return false;
-          }
+          // A double on the GPU target is the `uint64_t` its bits live in — the
+          // language has no fp64 type and every operation on one is a `weft_fp64`
+          // helper. The register is the same storage either way, so the decode
+          // written for the CPU column is the decode that runs here.
+          // A double is stored as the word its bits are, on both back ends that
+          // cannot hold one natively: Metal has no fp64 type, and the warp backend
+          // masks every register as integers. `operand_as` and `store` bitcast
+          // across, so the decode above them is unchanged either way.
+          if ((e.msl || e.vec) && ty == "double") ty = "uint64_t";
           if (e.vec && ty == "bool") ty = "uint32_t";
           e.reg_types[rr.base] = ty;
           struct_decls += "  " + ty + " " + rr.base + "[" + std::to_string(count) + "]" +
@@ -2657,6 +3332,7 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     emv.tex_index = tex_index;
     emv.ntex = ntex;
     emv.tex_write.assign((size_t)ntex, false);
+    emv.tex_cube = em.tex_cube;
     emv.params = em.params;
     emv.scalars = em.scalars;
     emv.reg_reads = em.reg_reads;
@@ -2671,6 +3347,17 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     // 32-lane warp, so a peer's register is `r[l]` and no shuffle is involved.
     // What that back end cannot express yet — a barrier, a shuffle, threadgroup
     // memory — still has no GPU form, and the message says which one stopped it.
+    // The per-lane body stops at the first instruction it cannot express — a
+    // tensor-core one — so a buffer reached only after that point is typed by the
+    // warp body instead. Merge what each pass saw, keeping 0 wherever the two
+    // disagree about a width.
+    if (have_vec) {
+      for (const auto& pb : emv.param_bytes) {
+        auto it = em.param_bytes.find(pb.first);
+        if (it == em.param_bytes.end()) em.param_bytes[pb.first] = pb.second;
+        else if (it->second != pb.second) it->second = 0;
+      }
+    }
     const bool warp_only = !lane_ok && em.warp_only && have_vec;
     // A 64-bit atomic is built out of 32-bit ones in the warp runtime, which is
     // where the lock table lives — so a kernel that holds one is emitted for the
@@ -2831,16 +3518,31 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
                    ")]],\n                 ";
 
       // An image is a binding, and on the GPU a binding is a kernel parameter.
-      // The access mode is part of the type, and a surface — a binding the kernel
-      // writes — is the one that cannot also be sampled.
+      // The access mode is part of the type: a surface needs `read_write` and a
+      // filter needs `sample`, which is why a written binding is declared twice.
       for (int i = 0; i < em.ntex; i++) {
         const bool rw = (size_t)i < em.tex_write.size() && em.tex_write[i];
-        body_out += std::string("texture2d<float, access::") + (rw ? "read_write" : "sample") +
-                    "> weft_t" + std::to_string(i) + " [[texture(" + std::to_string(i) +
-                    ")]],\n                 ";
-        if (!rw)
-          body_out += "sampler weft_s" + std::to_string(i) + " [[sampler(" +
-                      std::to_string(i) + ")]],\n                 ";
+        const bool arr = (size_t)i < em.tex_array.size() && em.tex_array[i];
+        const bool vol = (size_t)i < em.tex_3d.size() && em.tex_3d[i];
+        const bool cb = (size_t)i < em.tex_cube.size() && em.tex_cube[i];
+        const std::string shape =
+            cb ? "texturecube<float, access::"
+            : vol ? "texture3d<float, access::"
+                 : arr ? "texture2d_array<float, access::" : "texture2d<float, access::";
+        const std::string ni = std::to_string(i);
+        body_out += shape + (rw ? "read_write" : "sample") + "> weft_t" + ni + " [[texture(" +
+                    ni + ")]],\n                 ";
+        // A binding the kernel writes needs `access::read_write` for the write,
+        // and no filter reads through that mode. So the same texture is declared
+        // a second time as a sampled view, one past the last binding, and the
+        // launcher binds the one handle to both: the storage is the same, only the
+        // access mode differs, and a filtered read reaches what the writes put
+        // there.
+        const std::string si = std::to_string(rw ? i + em.ntex : i);
+        if (rw)
+          body_out += shape + "sample> weft_t" + ni + "_s [[texture(" + si +
+                      ")]],\n                 ";
+        body_out += "sampler weft_s" + ni + " [[sampler(" + si + ")]],\n                 ";
       }
       body_out += "uint weft_lid [[thread_index_in_threadgroup]],\n                 ";
       body_out += "uint3 weft_tgid [[threadgroup_position_in_grid]],\n                 ";
@@ -2883,9 +3585,10 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       // reached by one call per threadgroup per barrier segment, and the loop
       // keeps the state blob in cache between lanes. The same code was a call
       // per lane before, and at ~20 cycles a lane the call was most of it.
-      head += "static void weft_g_" + name +
+      head += "static uint32_t weft_g_" + name +
               "(weft::Ctx* ctxs, unsigned char* states, size_t stride, uint32_t live,\n"
-              " void* const* bufs, unsigned char* sh) {\n";
+              " uint32_t weft_pass, void* const* bufs, unsigned char* sh) {\n";
+      head += "  uint32_t weft_left = 0;\n";
       head += "  for (uint32_t i = 0; i < live; i++) {\n";
       head += "    " + st + "* s = (" + st + "*)(states + (size_t)i * stride);\n";
       head += "    if (s->pc == weft::kThreadDone) continue;\n";
@@ -2894,17 +3597,19 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       // the lane's own. Labels and the switch stay inside it.
       head += "    [&]() {\n";
       head += "      weft::Ctx& ctx = ctxs[i];\n";
+      head += "      ctx.pass = weft_pass;\n";
       head += "      (void)bufs; (void)sh;\n";
       head += "      switch (s->pc) {\n" + em.resume_cases + "      }\n";
       head += code;
       head += "      s->pc = weft::kThreadDone;\n";
       head += "    }();\n";
-      head += "  }\n}\n";
+      head += "    if (s->pc != weft::kThreadDone) weft_left++;\n";
+      head += "  }\n  return weft_left;\n}\n";
       // One lane, for the paths that still resume a single thread: a direct call
       // into the loop above rather than a second copy of the body.
       head += "static void weft_k_" + name +
               "(weft::Ctx& ctx, void* stp, void* const* bufs, unsigned char* sh) {\n";
-      head += "  weft_g_" + name + "(&ctx, (unsigned char*)stp, 0, 1, bufs, sh);\n}\n\n";
+      head += "  weft_g_" + name + "(&ctx, (unsigned char*)stp, 0, 1, ctx.pass, bufs, sh);\n}\n\n";
       body_out += head;
     }
 
@@ -2950,12 +3655,28 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     tk.name = name;
     tk.nargs = (int)em.params.size();
     tk.nbufs = tk.nargs;  // a PTX kernel has no render stages: its own buffers
+    // Each binding's element width, from the instructions that reach it. A
+    // parameter with no typed access keeps 0 — unknown, not four bytes.
+    tk.buf_type.assign((size_t)tk.nbufs, std::string("0"));
+    for (const auto& pb : em.param_bytes)
+      if (pb.first >= 0 && pb.first < tk.nbufs && pb.second)
+        tk.buf_type[(size_t)pb.first] = std::to_string(pb.second);
     tk.sync = em.uses_barrier || em.uses_shfl || !shared_decl.empty();
     tk.flat = false;
     tk.warp = have_vec;
     tk.tg_hint = tg_hint;
     tk.ntex = em.ntex;
+    // What each binding is, by name. PTX's `.tex` says nothing about the shape, so
+    // the instruction that reads it is what names it — and a 1-D texture lowers
+    // onto a plane one row high, so its binding is a 2-D one.
+    for (int i = 0; i < em.ntex; i++) {
+      const bool cb = (size_t)i < em.tex_cube.size() && em.tex_cube[i];
+      const bool vol = (size_t)i < em.tex_3d.size() && em.tex_3d[i];
+      const bool arr = (size_t)i < em.tex_array.size() && em.tex_array[i];
+      tk.tex_shape.push_back(cb ? "cube" : vol ? "3d" : arr ? "array" : "2d");
+    }
     tk.nsamp = em.ntex;  // the sampler state that goes with each binding
+    tk.tex_rw = em.tex_write;
     tk.unused = em.unused;
     tk.warp_only = warp_only;
     kernels.push_back(tk);
@@ -2975,6 +3696,13 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     std::string g = "// generated by weft (ptx front end, metal target) — do not edit\n";
     g += kWWeftMslPreamble;
     g += kWWeftWarpMsl;
+    // The portable library. Metal's `sqrt` is `x * rsqrt(x)` bit for bit and its
+    // `ex2`, `lg2`, `sin` and `cos` are the unit's own polynomials, so a `.approx`
+    // form lowered to the hardware answers differently from the same form lowered
+    // to the host's libm — measured at 3.4e-07 relative on 65,536 lanes before
+    // this line existed. One text on both targets is the answer the rest of this
+    // project already gives.
+    g += kWSoftMath;
     g += body_out;
     r.gpu_src = g;
     r.ok = true;
@@ -2990,17 +3718,158 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       "#include <cmath>\n"
       "#include <cstdint>\n"
       "#include <cstring>\n"
+      // The vector and half types the portable library names, with Metal's sizes
+      // and alignments and the operators Metal defines for them: the library is
+      // written once and expects the same language on both sides.
+      "using half = _Float16;\n"
+      // Metal spells the 32-bit unsigned type `uint`; the library is written once
+      // and uses it, so C++ gets the same name rather than a second copy of the
+      // text with every type renamed.
+      "using uint = uint32_t;\n"
+      "struct alignas(8) float2 { float x = 0, y = 0;\n"
+      "  float2() {}\n"
+      "  float2(float v) : x(v), y(v) {}\n"
+      "  float2(float a, float b) : x(a), y(b) {}\n"
+      "};\n"
+      "struct alignas(16) float3 { float x = 0, y = 0, z = 0, _pad = 0;\n"
+      "  float3() {}\n"
+      "  float3(float v) : x(v), y(v), z(v) {}\n"
+      "  float3(float a, float b, float c) : x(a), y(b), z(c) {}\n"
+      "};\n"
+      "struct alignas(16) float4 { float x = 0, y = 0, z = 0, w = 0;\n"
+      "  float4() {}\n"
+      "  float4(float v) : x(v), y(v), z(v), w(v) {}\n"
+      "  float4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}\n"
+      "};\n"
+      "struct alignas(4) half2 { half x = 0, y = 0;\n"
+      "  half2() {}\n"
+      "  half2(half v) : x(v), y(v) {}\n"
+      "  half2(half a, half b) : x(a), y(b) {}\n"
+      "};\n"
+      "struct alignas(8) half3 { half x = 0, y = 0, z = 0, _pad = 0;\n"
+      "  half3() {}\n"
+      "  half3(half v) : x(v), y(v), z(v) {}\n"
+      "  half3(half a, half b, half c) : x(a), y(b), z(c) {}\n"
+      "};\n"
+      "struct alignas(8) half4 { half x = 0, y = 0, z = 0, w = 0;\n"
+      "  half4() {}\n"
+      "  half4(half v) : x(v), y(v), z(v), w(v) {}\n"
+      "  half4(half a, half b, half c, half d) : x(a), y(b), z(c), w(d) {}\n"
+      "};\n"
+      // The operators the library's vector overloads use: negate, add, subtract,
+      // multiply and divide, by a vector or by a scalar.
+      // One macro per arity, because a `float4` has four members and a `float2`
+      // two: the first attempt took a fixed third member and could not build the
+      // four-element types at all.
+      "#define WEFT_VEC2(T, S) \\\n"
+      "  static inline T operator-(T a) { return T(-a.x, -a.y); } \\\n"
+      "  static inline T operator+(T a, T b) { return T(a.x + b.x, a.y + b.y); } \\\n"
+      "  static inline T operator-(T a, T b) { return T(a.x - b.x, a.y - b.y); } \\\n"
+      "  static inline T operator*(T a, T b) { return T(a.x * b.x, a.y * b.y); } \\\n"
+      "  static inline T operator/(T a, T b) { return T(a.x / b.x, a.y / b.y); } \\\n"
+      "  static inline T operator*(T a, S s) { return T(a.x * s, a.y * s); } \\\n"
+      "  static inline T operator*(S s, T a) { return T(a.x * s, a.y * s); } \\\n"
+      "  static inline T operator/(T a, S s) { return T(a.x / s, a.y / s); }\n"
+      "#define WEFT_VEC3(T, S) \\\n"
+      "  static inline T operator-(T a) { return T(-a.x, -a.y, -a.z); } \\\n"
+      "  static inline T operator+(T a, T b) { return T(a.x + b.x, a.y + b.y, a.z + b.z); } \\\n"
+      "  static inline T operator-(T a, T b) { return T(a.x - b.x, a.y - b.y, a.z - b.z); } \\\n"
+      "  static inline T operator*(T a, T b) { return T(a.x * b.x, a.y * b.y, a.z * b.z); } \\\n"
+      "  static inline T operator/(T a, T b) { return T(a.x / b.x, a.y / b.y, a.z / b.z); } \\\n"
+      "  static inline T operator*(T a, S s) { return T(a.x * s, a.y * s, a.z * s); } \\\n"
+      "  static inline T operator*(S s, T a) { return T(a.x * s, a.y * s, a.z * s); } \\\n"
+      "  static inline T operator/(T a, S s) { return T(a.x / s, a.y / s, a.z / s); }\n"
+      "#define WEFT_VEC4(T, S) \\\n"
+      "  static inline T operator-(T a) { return T(-a.x, -a.y, -a.z, -a.w); } \\\n"
+      "  static inline T operator+(T a, T b) { return T(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); } \\\n"
+      "  static inline T operator-(T a, T b) { return T(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w); } \\\n"
+      "  static inline T operator*(T a, T b) { return T(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); } \\\n"
+      "  static inline T operator/(T a, T b) { return T(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w); } \\\n"
+      "  static inline T operator*(T a, S s) { return T(a.x * s, a.y * s, a.z * s, a.w * s); } \\\n"
+      "  static inline T operator*(S s, T a) { return T(a.x * s, a.y * s, a.z * s, a.w * s); } \\\n"
+      "  static inline T operator/(T a, S s) { return T(a.x / s, a.y / s, a.z / s, a.w / s); }\n"
+      "WEFT_VEC2(float2, float)\n"
+      "WEFT_VEC3(float3, float)\n"
+      "WEFT_VEC4(float4, float)\n"
+      // The integer vectors with Metal's sizes: a 2-element to twice the element,
+      // a 3- or 4-element to four times it, a short3 padded to 8 and a char3 to 4.
+      "struct alignas(8) int2 { int32_t x = 0, y = 0;\n"
+      "  int2() {}\n"
+      "  int2(int32_t v) : x(v), y(v) {}\n"
+      "  int2(int32_t a, int32_t b) : x(a), y(b) {}\n"
+      "};\n"
+      "struct alignas(16) int3 { int32_t x = 0, y = 0, z = 0, _pad = 0;\n"
+      "  int3() {}\n"
+      "  int3(int32_t v) : x(v), y(v), z(v) {}\n"
+      "  int3(int32_t a, int32_t b, int32_t c) : x(a), y(b), z(c) {}\n"
+      "};\n"
+      "struct alignas(16) int4 { int32_t x = 0, y = 0, z = 0, w = 0;\n"
+      "  int4() {}\n"
+      "  int4(int32_t v) : x(v), y(v), z(v), w(v) {}\n"
+      "  int4(int32_t a, int32_t b, int32_t c, int32_t d) : x(a), y(b), z(c), w(d) {}\n"
+      "};\n"
+      "struct alignas(8) uint2 { uint32_t x = 0, y = 0;\n"
+      "  uint2() {}\n"
+      "  uint2(uint32_t v) : x(v), y(v) {}\n"
+      "  uint2(uint32_t a, uint32_t b) : x(a), y(b) {}\n"
+      "};\n"
+      "struct alignas(16) uint3 { uint32_t x = 0, y = 0, z = 0, _pad = 0;\n"
+      "  uint3() {}\n"
+      "  uint3(uint32_t v) : x(v), y(v), z(v) {}\n"
+      "  uint3(uint32_t a, uint32_t b, uint32_t c) : x(a), y(b), z(c) {}\n"
+      "};\n"
+      "struct alignas(16) uint4 { uint32_t x = 0, y = 0, z = 0, w = 0;\n"
+      "  uint4() {}\n"
+      "  uint4(uint32_t v) : x(v), y(v), z(v), w(v) {}\n"
+      "  uint4(uint32_t a, uint32_t b, uint32_t c, uint32_t d) : x(a), y(b), z(c), w(d) {}\n"
+      "};\n"
+      "struct alignas(4) short2 { int16_t x = 0, y = 0; };\n"
+      "struct alignas(8) short3 { int16_t x = 0, y = 0, z = 0, _pad = 0; };\n"
+      "struct alignas(8) short4 { int16_t x = 0, y = 0, z = 0, w = 0; };\n"
+      "struct alignas(4) ushort2 { uint16_t x = 0, y = 0; };\n"
+      "struct alignas(8) ushort3 { uint16_t x = 0, y = 0, z = 0, _pad = 0; };\n"
+      "struct alignas(8) ushort4 { uint16_t x = 0, y = 0, z = 0, w = 0; };\n"
+      "struct alignas(4) char2 { int8_t x = 0, y = 0; };\n"
+      "struct alignas(4) char3 { int8_t x = 0, y = 0, z = 0, _pad = 0; };\n"
+      "struct alignas(4) char4 { int8_t x = 0, y = 0, z = 0, w = 0; };\n"
+      "struct alignas(4) uchar2 { uint8_t x = 0, y = 0; };\n"
+      "struct alignas(4) uchar3 { uint8_t x = 0, y = 0, z = 0, _pad = 0; };\n"
+      "struct alignas(4) uchar4 { uint8_t x = 0, y = 0, z = 0, w = 0; };\n"
+      "struct alignas(2) bool2 { bool x = false, y = false;\n"
+      "  bool2() {}\n"
+      "  bool2(bool a, bool b) : x(a), y(b) {}\n"
+      "};\n"
+      "struct alignas(4) bool3 { bool x = false, y = false, z = false, _pad = false;\n"
+      "  bool3() {}\n"
+      "  bool3(bool a, bool b, bool c) : x(a), y(b), z(c) {}\n"
+      "};\n"
+      "struct alignas(4) bool4 { bool x = false, y = false, z = false, w = false;\n"
+      "  bool4() {}\n"
+      "  bool4(bool a, bool b, bool c, bool d) : x(a), y(b), z(c), w(d) {}\n"
+      "};\n"
+      "WEFT_VEC2(half2, half)\n"
+      "WEFT_VEC3(half3, half)\n"
+      "WEFT_VEC4(half4, half)\n"
+      "WEFT_VEC2(int2, int32_t)\n"
+      "WEFT_VEC3(int3, int32_t)\n"
+      "WEFT_VEC4(int4, int32_t)\n"
+      "WEFT_VEC2(uint2, uint32_t)\n"
+      "WEFT_VEC3(uint3, uint32_t)\n"
+      "WEFT_VEC4(uint4, uint32_t)\n"
       "using std::min;\n"
       "using std::max;\n"
       "using std::abs;\n"
       "using std::sqrt;\n"
       "static inline float weft_f32(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }\n"
       "static inline double weft_f64(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }\n"
+
       "template <class T, class U>\n"
       "static inline T weft_bitcast(U u) { T t; std::memcpy(&t, &u, sizeof(T)); return t; }\n"
       // A tensor-core fragment register holds two halves, low half first, which
       // is the order the hardware packs them in.
-      "static inline uint32_t weft_bits(float f) { uint32_t b; std::memcpy(&b, &f, 4); return b; }\n"
+      // `weft_bits` comes from the portable library, which defines it for both
+      // targets; defining it here as well was a redefinition the moment the
+      // library was emitted into this text.
       // `brev.b32` as eight mask swaps rather than `__builtin_bitreverse32`,
       // which is clang's alone; gcc folds this back to `rbit` on aarch64.
       "static inline uint32_t weft_bitrev32(uint32_t v) {\n"
@@ -3068,8 +3937,12 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       "static inline float weft_e4m3(uint32_t b, int i) {\n"
       "  const uint32_t v = (b >> (8 * i)) & 0xFFu;\n"
       "  const uint32_t mag = v & 7u, E = (v >> 3) & 0xFu;\n"
-      "  const double d = (E == 0) ? (double)mag / 512.0\n"
-      "                          : std::ldexp((double)(8u + mag), (int)E - 10);\n"
+      // 2^(E-10) as an exponent field, so the scale is a bit pattern and not a
+      // library call — the same arithmetic the Metal side writes, which is what
+      // makes the two decodes bit-for-bit the same function.
+      "  const uint32_t sb = (E + 117u) << 23;\n"
+      "  float sc; std::memcpy(&sc, &sb, 4);\n"
+      "  const float d = (E == 0) ? (float)mag / 512.0f : (float)(8u + mag) * sc;\n"
       "  return (float)((v & 0x80u) ? -d : d);\n"
       "}\n"
       // e5m2: 2 mantissa bits and a 5-bit exponent, with infinities and NaN — the
@@ -3096,12 +3969,31 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       "static inline uint32_t weft_e5m2x2(float hi, float lo) {\n"
       "  return (uint32_t)weft_e5m2_bits(lo) | ((uint32_t)weft_e5m2_bits(hi) << 8);\n"
       "}\n"
+      // The same bytes with an integer accumulator. The sum of 32 products of
+      // bytes is exact in s32, and converting to float would stop being the same
+      // number past 2^24 — so the integer form reads the byte as an integer.
+      "static inline int32_t weft_s8_i(uint32_t b, int i) {\n"
+      "  return (int32_t)(int8_t)(uint8_t)((b >> (8 * i)) & 0xFFu);\n"
+      "}\n"
+      "static inline int32_t weft_u8_i(uint32_t b, int i) {\n"
+      "  return (int32_t)((b >> (8 * i)) & 0xFFu);\n"
+      "}\n"
+      // The 8-bit integers are the same one-byte operand read a different way: a
+      // signed byte sign-extends, an unsigned one does not. Both are exact in f32,
+      // so an integer tile's products and the sum of 32 of them are exact.
+      "static inline float weft_s8(uint32_t b, int i) {\n"
+      "  return (float)(int)(int8_t)(uint8_t)((b >> (8 * i)) & 0xFFu);\n"
+      "}\n"
+      "static inline float weft_u8(uint32_t b, int i) {\n"
+      "  return (float)((b >> (8 * i)) & 0xFFu);\n"
+      "}\n"
       "static inline float weft_e5m2(uint32_t b, int i) {\n"
       "  const uint32_t v = (b >> (8 * i)) & 0xFFu;\n"
       "  const uint32_t mag = v & 3u, E = (v >> 2) & 0x1Fu;\n"
       "  if (E == 31u) return (mag == 0u) ? ((v & 0x80u) ? -INFINITY : INFINITY) : NAN;\n"
-      "  const double d = (E == 0) ? (double)mag / 65536.0\n"
-      "                          : std::ldexp((double)(4u + mag), (int)E - 17);\n"
+      "  const uint32_t sb = (E + 110u) << 23;\n"
+      "  float sc; std::memcpy(&sc, &sb, 4);\n"
+      "  const float d = (E == 0) ? (float)mag / 65536.0f : (float)(4u + mag) * sc;\n"
       "  return (float)((v & 0x80u) ? -d : d);\n"
       "}\n"
       // tf32 keeps 10 mantissa bits, rounded to nearest-even: an operand is
@@ -3166,7 +4058,7 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       "  if (b < 0) h -= (uint64_t)a;\n"
       "  return (int64_t)h;\n"
       "}\n"
-      "\n" +
+      "\n" + std::string(kWSoftMath) +
       body_out + "static const weft::KernelDef weft_table[] = {\n";
   for (const auto& k : kernels) {
     code += "  {\"" + k.name + "\", nullptr, " + std::to_string(k.nargs) + ", " +
@@ -3182,6 +4074,10 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       "extern \"C\" void weft_set_param(int i, uint64_t v) { weft::set_param(i, v); }\n"
       "extern \"C\" void weft_set_texture(int i, void* d, uint32_t w, uint32_t h, uint32_t e) {\n"
       "  weft::set_texture(i, d, w, h, e);\n"
+      "}\n"
+      "extern \"C\" void weft_set_texture_layers(int i, void* d, uint32_t w, uint32_t h,\n"
+      "                                       uint32_t e, uint32_t l) {\n"
+      "  weft::set_texture_layers(i, d, w, h, e, l);\n"
       "}\n"
       "extern \"C\" void weft_run(int i, void** bufs, uint32_t grid, uint32_t tg) {\n"
       "  weft::dispatch(weft_table[i], bufs, grid, tg);\n"

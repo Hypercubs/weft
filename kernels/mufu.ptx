@@ -1,0 +1,68 @@
+// mufu: the multifunction unit's seven approximations, all in one lane.
+//
+//     a  = |in[gid]| + 1.5                 positive and bounded
+//     b  = 1 / (1 + a)                     in (0, 0.4]
+//     r  = mufu.rcp.approx     a           1/a
+//     q  = mufu.rsqrt.approx   a           1/sqrt(a)
+//     u  = mufu.sqrt.approx    a           sqrt(a)
+//     e  = mufu.ex2.approx     b - 1       in (1/8, 1]
+//     l  = mufu.lg2.approx     a
+//     s  = mufu.sin.approx     a
+//     c  = mufu.cos.approx     a
+//     t  = mufu.tanh.approx    a
+//     out[gid] = r + 2q + 4u + 8e + 16l + 32s + 64c + 128t
+//
+// `.approx` is the only mode the unit has, and the approximation is the silicon's
+// own polynomial: no CPU reproduces those bits, so the same argument that made
+// Metal's `sqrt` a library call applies here. Both columns run the portable text,
+// which is why this kernel can be compared byte for byte instead of by a
+// tolerance. Every term is a different weight, so one operation mapped to another
+// lands on a different number.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry mufu(
+    .param .u64 mufu_param_0
+)
+{
+    .reg .b32 %r<8>;
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [mufu_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+
+    ld.f32 %f1, [%rd4];
+    abs.f32 %f2, %f1;
+    add.f32 %f3, %f2, 0f3FC00000;      // a = |in| + 1.5
+    add.f32 %f4, %f3, 0f3F800000;      // 1 + a
+    rcp.approx.f32 %f5, %f4;           // b
+
+    mufu.rcp.approx.f32 %f6, %f3;
+    mufu.rsqrt.approx.f32 %f7, %f3;
+    mufu.sqrt.approx.f32 %f8, %f3;
+    add.f32 %f9, %f5, 0fBF800000;      // b - 1
+    mufu.ex2.approx.f32 %f10, %f9;
+    mufu.lg2.approx.f32 %f11, %f3;
+    mufu.sin.approx.f32 %f12, %f3;
+    mufu.cos.approx.f32 %f13, %f3;
+    mufu.tanh.approx.f32 %f14, %f3;
+
+    add.f32 %f15, %f6, %f7;            // r + q
+    add.f32 %f15, %f15, %f7;           // + q   (2q)
+    fma.rn.f32 %f15, %f8, 0f40800000, %f15;   // + 4u
+    fma.rn.f32 %f15, %f10, 0f41000000, %f15;  // + 8e
+    fma.rn.f32 %f15, %f11, 0f41800000, %f15;  // + 16l
+    fma.rn.f32 %f15, %f12, 0f42000000, %f15;  // + 32s
+    fma.rn.f32 %f15, %f13, 0f42800000, %f15;  // + 64c
+    fma.rn.f32 %f15, %f14, 0f43000000, %f15;  // + 128t
+
+    st.f32 [%rd4], %f15;
+    ret;
+}

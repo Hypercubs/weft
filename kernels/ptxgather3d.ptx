@@ -1,0 +1,70 @@
+// `tld4.3d`: the four texels around a coordinate, in the plane the third
+// coordinate names.
+//
+//     u = (x + 0.5) / 64, v = (y + 0.5) / 64, w = (z + 0.5) / depth
+//     g = tld4(vol, u, v, w)             // (x,y), (x+1,y), (x,y+1), (x+1,y+1)
+//     out[gid] = g.x + 2 g.y + 3 g.z + 5 g.w + z
+//
+// A gather is exact — four texel reads, no filter — so both columns compare bytes.
+// The plane is folded into the answer as well as into the coordinate, so a footprint
+// taken from the wrong plane cannot hide behind four texels that happen to be equal.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.tex .u32 vol, 1, 1, 1, 1;
+
+.visible .entry ptxgather3d(
+    .param .u64 ptxgather3d_param_0
+)
+{
+    .reg .b32 %r<20>;
+    .reg .f32 %f<24>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxgather3d_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    txq.depth.b32 %r7, [vol];
+
+    and.b32 %r5, %r4, 63;               // x
+    shr.u32 %r6, %r4, 6;
+    and.b32 %r6, %r6, 63;               // y
+    // z = (x + y) % depth, so every plane is covered without assuming a power of
+    // two and the coordinate is built from integers rather than rounded.
+    add.s32 %r8, %r5, %r6;
+    div.u32 %r9, %r8, %r7;
+    mul.lo.s32 %r10, %r9, %r7;
+    sub.s32 %r8, %r8, %r10;             // z
+
+    cvt.rn.f32.u32 %f1, %r5;
+    cvt.rn.f32.u32 %f2, %r6;
+    cvt.rn.f32.u32 %f3, %r8;
+    add.f32 %f4, %f1, 0f3F000000;       // x + 0.5
+    add.f32 %f5, %f2, 0f3F000000;       // y + 0.5
+    add.f32 %f6, %f3, 0f3F000000;       // z + 0.5
+    cvt.rn.f32.u32 %f7, %r7;
+    // 1/64 is exact in binary, so these are exact scalings of exact values.
+    mul.f32 %f10, %f4, 0f3B800000;      // u
+    mul.f32 %f11, %f5, 0f3B800000;      // v
+    div.rn.f32 %f12, %f6, %f7;          // w
+
+    tld4.b.3d.v4.f32.f32 {%f13,%f14,%f15,%f16}, [vol, {%f10,%f11,%f12}];
+
+    mul.f32 %f17, %f14, 0f40000000;     // 2 g.y
+    add.f32 %f18, %f13, %f17;
+    mul.f32 %f19, %f15, 0f40400000;     // 3 g.z
+    add.f32 %f18, %f18, %f19;
+    mul.f32 %f20, %f16, 0f40A00000;     // 5 g.w
+    add.f32 %f18, %f18, %f20;
+    cvt.rn.f32.u32 %f21, %r8;           // the plane, folded in
+    add.f32 %f21, %f18, %f21;
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f21;
+    ret;
+}

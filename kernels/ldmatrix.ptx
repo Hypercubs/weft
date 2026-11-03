@@ -1,0 +1,70 @@
+// `ldmatrix` two ways: through a named shared symbol, and through the address a
+// lane computes.
+//
+// The tile is 8 rows by 8 halves and holds 0..63 in row-major order, so the value a
+// register carries is itself the position it came from. Lane l holds row l>>2 and
+// the two halves at columns 2(l&3) and 2(l&3)+1, so with this tile its word is
+//     idx0 = 8 (l>>2) + 2 (l&3),  word = idx0 | (idx0+1) << 16
+// and the transposed form hands back element (c, r) for element (r, c):
+//     idx0 = 8 (2 (l&3)) + (l>>2),  word = idx0 | (idx0+8) << 16
+//
+// The two address forms have to produce the same word, which is what makes this a
+// check rather than two runs of the same path. The second form is also what the
+// instruction is for on a GPU — lane 8k+i supplies row i of matrix k — so the
+// register it reads is a peer's, and only a backend that holds the whole warp can
+// run it.
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry ldmatrix(
+    .param .u64 ldmatrix_param_0,
+    .param .u64 ldmatrix_param_1
+)
+{
+    .reg .b16 %rs<4>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+
+    .shared .align 128 .b8 tile[128];
+
+    ld.param.u64 %rd1, [ldmatrix_param_0];
+    ld.param.u64 %rd2, [ldmatrix_param_1];
+
+    mov.u32 %r1, %tid.x;
+
+    // ---- fill the tile from the other buffer: half i and half i+32 ----
+    mul.wide.s32 %rd3, %r1, 2;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.u16 %rs1, [%rd4];
+
+    mov.u64 %rd5, tile;
+    add.s64 %rd6, %rd5, %rd3;
+    st.shared.u16 [%rd6], %rs1;
+
+    add.s64 %rd7, %rd4, 64;             // the half 32 slots on
+    ld.global.u16 %rs2, [%rd7];
+    add.s64 %rd8, %rd6, 64;
+    st.shared.u16 [%rd8], %rs2;
+
+    bar.sync 0;
+
+    // ---- a named symbol: the whole tile, no register involved ----
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r10}, [tile];
+
+    // ---- a register address: lane 8k+i names row i of matrix k ----
+    and.b32 %r2, %r1, 7;
+    shl.b32 %r3, %r2, 4;                // row * 16 bytes
+    cvt.u64.u32 %rd9, %r3;
+    add.s64 %rd10, %rd5, %rd9;
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r11}, [%rd10];
+    ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%r12}, [%rd10];
+
+    // ---- out: 32 words per form, one lane each ----
+    mul.wide.s32 %rd11, %r1, 4;
+    add.s64 %rd12, %rd1, %rd11;
+    st.global.b32 [%rd12], %r10;
+    st.global.b32 [%rd12+128], %r11;
+    st.global.b32 [%rd12+256], %r12;
+    ret;
+}
