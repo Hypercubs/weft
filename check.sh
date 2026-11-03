@@ -196,15 +196,28 @@ run swizzle    --grid 65536 --buffers 262144,524288
 # number instead of on a sample that quietly agrees.
 runf kernels/ptx1d.ptx ptx1d --grid 65536 --buffers 65536 --textures 64x1
 runf kernels/sharedofs.ptx sharedofs --grid 256 --buffers 768
+runf kernels/mbar.ptx mbar --grid 32 --threads 32 --buffers 32
+
+# The value is the point: 42 is what the group wrote before the last arrival, so a lane
+# released early reads the arena instead. The store is `.b32`, so the word is the
+# integer 42 rather than a float's bits.
+"$WEFT" run kernels/mbar.ptx --kernel mbar --grid 32 --threads 32 --buffers 32 \
+    --dump 0="$TMP/mbar.bin" >/dev/null
+arrived=$(od -An -tu4 -v "$TMP/mbar.bin" | tr -s ' ' '\n' | grep -c '^42$' || true)
+if [ "$arrived" = "32" ]; then
+  echo "ok    mbar     every lane was released by the last arrival (32/32)"
+else
+  echo "FAIL  mbar     $arrived of 32 lanes read what the group wrote"; fail=1
+fi
 
 # Three words, three answers: 7, 9 and 5. An offset that is swallowed reads one of
 # them three times, so counting each value says whether the address moved.
 "$WEFT" run kernels/sharedofs.ptx --kernel sharedofs --grid 256 --buffers 768 \
     --dump 0="$TMP/sharedofs.bin" >/dev/null
 words=$(od -An -tu4 -v "$TMP/sharedofs.bin" | tr -s ' ' '\n')
-sevens=$(echo "$words" | grep -c '^7$')
-nines=$(echo "$words" | grep -c '^9$')
-fives=$(echo "$words" | grep -c '^5$')
+sevens=$(echo "$words" | grep -c '^7$' || true)
+nines=$(echo "$words" | grep -c '^9$' || true)
+fives=$(echo "$words" | grep -c '^5$' || true)
 if [ "$sevens" = "256" ] && [ "$nines" = "256" ] && [ "$fives" = "256" ]; then
   echo "ok    sharedofs  [buf], [buf+4], [buf+8] read 7, 9, 5 (256 each)"
 else

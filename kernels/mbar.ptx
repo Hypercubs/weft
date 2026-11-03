@@ -1,0 +1,57 @@
+// `mbarrier`: an arrival-counted barrier with a phase, in threadgroup memory.
+//
+//     init  [mbr], 32       one arrival owed per lane of the group
+//     bar.sync 0            every lane sees the object before anyone arrives
+//     data[0] = 42; arrive  all 32 lanes, so the phase flips on the last one
+//     try_wait.parity [mbr], 0   until that flip
+//     out[gid] = data[0]
+//
+// Every lane arrives and every lane waits: that is the shape Triton emits, where the
+// count is the size of the group. A lane that arrives before the rest reaches the wait
+// with the phase still where it started, so the wait has to hold it until the last
+// arrival, and the value it reads afterwards was written by another lane.
+//
+// The extents below are the arena's own: every `.shared` array is laid out by the byte
+// count in its brackets, so `mbr[8]` reserves the eight bytes an mbarrier is (the owed
+// count and the phase word) and `data[16]` starts after them. Spelling it `mbr[1]`
+// would put `data` at offset four, on top of the phase.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry mbar(
+    .param .u64 mbar_param_0
+)
+{
+    // Declared inside the body, which is where the arena scan reads them.
+    .shared .align 8 .b64 mbr[8];
+    .shared .align 4 .b32 data[16];
+
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [mbar_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    // The count is the size of the group, which is what Triton emits: one arrival
+    // owed per lane, so the phase flips on the last one to arrive.
+    mbarrier.init.shared.b64 [mbr], %r3;
+    bar.sync 0;
+
+    mov.u32 %r6, 42;
+    st.shared.b32 [data], %r6;
+    mbarrier.arrive.shared.b64 %rd2, [mbr];
+
+WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
+    @!%p2 bra WAIT;
+
+    ld.shared.b32 %r7, [data];
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.b32 [%rd4], %r7;
+    ret;
+}

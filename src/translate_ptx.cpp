@@ -540,15 +540,24 @@ struct Emitter {
       // Keeping both inside the name put every `[tile + n]` at the array's first
       // byte, so the second word of anything read as its first.
       const size_t cut = s.find_first_of("+-");
-      if (cut == std::string::npos) {
-        param_name = s;  // a symbol: param or shared array name
-        addr = "0";
+      param_name = cut == std::string::npos ? s : trim(s.substr(0, cut));
+      std::string off;
+      if (cut != std::string::npos) {
+        off = trim(s.substr(cut + 1));
+        if (!off.empty() && off[0] == '%') off = reg_expr(off);
+        if (s[cut] == '-') off = "(0 - " + off + ")";
+      }
+      // A shared array's address is its offset inside the threadgroup window, and
+      // that is known here; a parameter's is the binding, which is resolved by the
+      // access itself. Without the base every `.shared` array started at the window's
+      // first byte, so the second array of a kernel wrote over the first.
+      auto so = shared_offsets.find(param_name);
+      if (so != shared_offsets.end()) {
+        addr = std::to_string(so->second);
+        if (!off.empty()) addr = "(" + addr + " + " + off + ")";
         return true;
       }
-      param_name = trim(s.substr(0, cut));
-      std::string off = trim(s.substr(cut + 1));
-      if (!off.empty() && off[0] == '%') off = reg_expr(off);
-      addr = s[cut] == '-' ? ("(0 - " + off + ")") : ("(0 + " + off + ")");
+      addr = off.empty() ? "0" : ("(0 + " + off + ")");
       return true;
     }
     std::string base;
@@ -1334,6 +1343,143 @@ std::string Emitter::emit(const std::string& raw) {
     if (!guard.empty())
       return guard + "{ s->pc = " + std::to_string(id) + "u; return; }\n  " + label;
     return "s->pc = " + std::to_string(id) + "u; return;\n  " + label;
+  }
+
+  // mbarrier: an arrival-counted barrier with a phase, in threadgroup memory.
+  //
+  // The object is eight bytes and this runtime defines what is in them, because
+  // nothing else writes it: the first word is how many arrivals are still owed and
+  // the second is the initial count shifted up one place, with the phase in its low
+  // bit. When the owed count reaches zero the count is restored and the phase flips,
+  // which is the whole rule.
+  //
+  // A wait cannot spin on the CPU — one worker runs one lane at a time, so a lane that
+  // spun would never let the lane that owes the arrival run — so it publishes a
+  // resume point and gives the worker back, which is the shape `bar.sync` has and what
+  // the warp scheduler releases once nothing else can run. On the GPU the lanes of a
+  // group are resident together, so the phase is readable state and the caller's loop
+  // around the branch is the waiting.
+  if (op == "mbarrier") {
+    std::string mode;
+    for (const auto& p : parts)
+      if (p == "init" || p == "arrive" || p == "try_wait" || p == "test_wait" ||
+          p == "expect_tx" || p == "inval" || p == "invalidate")
+        mode = p;
+    if (mode.empty() || args.empty()) { err = "unsupported mbarrier '" + opcode + "'"; return ""; }
+    // The object is whichever operand is bracketed.
+    int ai = -1;
+    for (size_t i = 0; i < args.size(); i++)
+      if (!args[i].empty() && args[i][0] == '[') { ai = (int)i; break; }
+    if (ai < 0) { err = "an mbarrier instruction without an address"; return ""; }
+    std::string inner = trim(args[ai]);
+    const size_t rb = inner.find(']');
+    inner = trim(rb == std::string::npos ? inner.substr(1) : inner.substr(1, rb - 1));
+    std::string nm = inner, extra;
+    const size_t plus = inner.find('+');
+    if (plus != std::string::npos) {
+      nm = trim(inner.substr(0, plus));
+      extra = trim(inner.substr(plus + 1));
+    }
+    auto so = shared_offsets.find(nm);
+    if (so == shared_offsets.end()) {
+      err = "'" + nm + "' is not a shared array: an mbarrier lives in threadgroup memory";
+      return "";
+    }
+    std::string addr = std::to_string(so->second);
+    if (!extra.empty()) addr += " + " + operand_as(extra, "uint64_t");
+    // On the GPU the object is the only channel between the thread that arrives and
+    // the threads that wait on it, so every access is a volatile one: a plain load
+    // can be kept in a register across the caller's retry loop and the notification
+    // would never be seen.
+    const std::string ct = msl ? "threadgroup " : "";
+    const std::string cv = msl ? "volatile " : "";
+    const std::string w0 = "*(( " + cv + ct + "uint32_t*)(sh + " + addr + "))";
+    const std::string w1 = "*(( " + cv + ct + "uint32_t*)(sh + " + addr + " + 4u))";
+    // A waiting lane reads the phase on every pass, so on the GPU the read is one the
+    // compiler may not keep in a register: that read is the whole notification.
+    const std::string phase = msl
+        ? ("*((volatile " + ct + "const uint32_t*)(sh + " + addr + " + 4u))")
+        : w1;
+    // One warp body runs a statement for all 32 lanes at once, so every mode that
+    // touches the object says which lanes it applies to.
+    const std::string lane = "for (uint32_t l = 0; l < 32u; l++) if (am[l]";
+
+    if (mode == "init") {
+      if ((int)args.size() <= ai + 1) { err = "an mbarrier init without a count"; return ""; }
+      const std::string n = "(uint32_t)(" + operand_as(args[ai + 1], "uint32_t") + ")";
+      if (vec) {
+        // `vec_side` rather than `vec_control`: the lane loop is written here, and the
+        // statement still has to sit under the predicate of `@%p` if it carries one.
+        vec_side = true;
+        return "{ " + lane + ") { const uint32_t weft_n = " + n + "; " + w0 + " = weft_n; " +
+               w1 + " = (weft_n << 1); } }";
+      }
+      return guard + "{ const uint32_t weft_n = " + n + "; " + w0 + " = weft_n; " + w1 +
+             " = (weft_n << 1); }";
+    }
+    if (mode == "arrive") {
+      // The lanes of a group arrive at the same instant, so on the GPU the decrement
+      // is one atomic. A read, a subtract and a write let two arrivals see the same
+      // count and one of them never be counted, which is a wait that never ends —
+      // measured at 32 lanes, where the phase stayed put and the launch hung. The CPU
+      // column runs one lane at a time, so there the plain form is already exact.
+      const std::string body = msl
+          ? ("threadgroup atomic_uint* weft_a = (threadgroup atomic_uint*)(sh + " + addr +
+             "); const uint32_t weft_left = atomic_fetch_sub_explicit(weft_a, 1u, "
+             "memory_order_relaxed); if (weft_left == 1u) { "
+             "atomic_store_explicit(weft_a, (uint32_t)(*((volatile threadgroup const "
+             "uint32_t*)(sh + " + addr + " + 4u)) >> 1u), memory_order_relaxed); "
+             "*((volatile threadgroup uint32_t*)(sh + " + addr + " + 4u)) = "
+             "(*((volatile threadgroup const uint32_t*)(sh + " + addr +
+             " + 4u)) ^ 1u); }")
+          : ("if (" + w0 + " != 0u) { " + w0 + " = " + w0 +
+             " - 1u; if (" + w0 + " == 0u) { " + w0 + " = " + w1 +
+             " >> 1; " + w1 + " ^= 1u; } }");
+      // The state the instruction hands back is not read here: a parity wait names the
+      // phase it is waiting for instead.
+      bool have_state = false;
+      std::string state;
+      if (ai > 0 && !args[0].empty()) {
+        const std::string rd = trim(args[0]);
+        if (!rd.empty() && rd[0] == '%') {
+          have_state = true;
+          state = store(rd, "0ull", "uint64_t") + ";";
+        }
+      }
+      if (vec) {
+        vec_side = true;
+        return "{ " + lane + ") { " + body + (have_state ? " " + state : std::string()) + " } }";
+      }
+      std::string out = guard + "{ " + body;
+      if (have_state) out += " " + state;
+      return out + " }";
+    }
+    if (mode == "try_wait" || mode == "test_wait") {
+      if ((int)args.size() <= ai + 1) { err = "an mbarrier wait without a phase"; return ""; }
+      const std::string ph = "(uint32_t)(" + operand_as(args[ai + 1], "uint32_t") + ")";
+      const std::string done = "((" + phase + " & 1u) != " + ph + ")";
+      // A test never waits. Nor does anyone on the GPU: the lanes of a group are
+      // resident together and an arrival from another warp is ordered through a
+      // `bar.sync`, which is a rendezvous, so the read is the answer and the caller's
+      // loop around the branch is the waiting.
+      if (mode == "test_wait" || msl || vec) return guard + store(args[0], done, "bool");
+      // The CPU column has no other way: the retry is a resume point, so the phase is
+      // read again on the way back in rather than spun on.
+      const int id = next_resume++;
+      resume_cases += "    case " + std::to_string(id) + ": goto R" + std::to_string(id) + ";\n";
+      const std::string sid = std::to_string(id);
+      // `@%p` narrows the wait: a lane whose predicate is false does not wait at all,
+      // so only a lane that was asked to wait may park.
+      std::string cond;
+      if (guard.size() > 6 && guard.compare(0, 4, "if (") == 0)
+        cond = guard.substr(4, guard.size() - 6);
+      return "R" + sid + ":;\n  if (!(" + done + ")" +
+             (cond.empty() ? std::string() : " && (" + cond + ")") + ") { s->pc = " + sid +
+             "u; return; }\n  " + guard + store(args[0], done, "bool");
+    }
+    // An expectation and an invalidation only matter to a bulk copy, which has no form
+    // here yet: a kernel that initialises a barrier and arrives on it needs neither.
+    return guard + ";";
   }
 
   if (op == "ret" || op == "exit") {
