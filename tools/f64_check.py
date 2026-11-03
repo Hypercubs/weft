@@ -192,6 +192,17 @@ def expect_round(a, _b):
     return bits(signed_zero(t, a))
 
 
+def expect_sqrt(a, _b):
+    # IEEE pins the square root exactly, so this is the host's own correctly rounded
+    # answer rather than an approximation of it. -0.0 roots to -0.0 and a negative
+    # roots to a NaN; the packed value is the quiet one this runtime returns.
+    if math.isnan(a) or a < 0.0:
+        return 0x7FF8000000000000
+    if math.isinf(a):
+        return bits(a)
+    return bits(math.sqrt(a))
+
+
 def expect_from_f32(a, _b):
     # The operand is a binary32 pattern in the low half, so it is the words of the
     # double being reinterpreted, not the double's value.
@@ -294,6 +305,7 @@ OPS = {
     "ceil": ("weft_fp64::ceil_bits(a)", _two(expect_ceil)),
     "trunc": ("weft_fp64::trunc_bits(a)", _two(expect_trunc)),
     "round": ("weft_fp64::round_bits(a)", _two(expect_round)),
+    "sqrt": ("weft_fp64::sqrt_bits(a)", _two(expect_sqrt)),
     "fromf32": ("weft_fp64::from_f32((uint32_t)a)", _two(expect_from_f32)),
     "tof32": ("(uint64_t)weft_fp64::to_f32(a)", _two(expect_to_f32)),
     "fromu64": ("weft_fp64::from_u64(a)", _two(expect_from_u64)),

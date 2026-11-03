@@ -23,7 +23,8 @@
 .visible .entry ptxf64(
     .param .u64 ptxf64_param_0,
     .param .u64 ptxf64_param_1,
-    .param .u64 ptxf64_param_2
+    .param .u64 ptxf64_param_2,
+    .param .u64 ptxf64_param_3
 )
 {
     .reg .b32 %r<16>;
@@ -35,6 +36,7 @@
     ld.param.u64 %rd1, [ptxf64_param_0];
     ld.param.u64 %rd2, [ptxf64_param_1];
     ld.param.u64 %rd9, [ptxf64_param_2];
+    ld.param.u64 %rd11, [ptxf64_param_3];
     mov.u32 %r1, %tid.x;
     mov.u32 %r2, %ctaid.x;
     mov.u32 %r3, %ntid.x;
@@ -78,5 +80,12 @@
     fma.rn.f64 %fd13, %fd2, %fd3, %fd4;
     add.s64 %rd10, %rd9, %rd3;
     st.global.f64 [%rd10], %fd13;
+
+    // The square root, which IEEE pins to the correctly rounded answer — so the
+    // software one is the host's own number and not an approximation of it. It is
+    // taken of `abs(-y)`, a value the arithmetic above already produced.
+    sqrt.rn.f64 %fd14, %fd7;
+    add.s64 %rd12, %rd11, %rd3;
+    st.global.f64 [%rd12], %fd14;
     ret;
 }

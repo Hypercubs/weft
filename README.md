@@ -440,10 +440,14 @@ wherever the answer is deterministic.
   on the CPU — and every operation on it is the helper applied per component, because
   an operator there would add two significands as integers and answer with a wrong
   number rather than refuse. `dvec` builds, adds, multiplies, divides, subtracts and
-  takes one apart against the host's doubles, **max |diff| 0**. What stays on the CPU
-  is the transcendental library over a double (`sqrt`, `pow`, `exp`, …): those round
-  through a shared library on the host and there is no bit-exact software form here
-  to compare against.
+  takes one apart against the host's doubles, **max |diff| 0**. The square root is
+  carried as well, and it is the one function in that library IEEE pins to the
+  correctly rounded answer: an integer restoring root over the significand, so the
+  software value is the host's own number rather than an approximation of it, and
+  `tools/f64_check.py sqrt` sweeps it against `math.sqrt` bit for bit. What stays on
+  the CPU is the rest of the transcendental library over a double (`pow`, `exp`,
+  `log`, the trigonometry): those round through whatever the host's libm chose, so
+  there is no bit-exact software form to compare against.
 - **A ceiling says so.** `--threads` above 1024 is refused instead of quietly
   running at 256; a kernel whose `threadgroup` declarations need more than the
   48 KiB arena stops with the number it needed and the cap; more than 64

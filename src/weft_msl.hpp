@@ -483,6 +483,72 @@ static inline uint64_t fma(uint64_t a, uint64_t b, uint64_t c) {
   return round_pack(sign, e0 + mpos, sig);
 }
 
+// ---- square root ----
+//
+// `sqrt` is the one function in the transcendental library that IEEE-754 pins
+// exactly: the result is the correctly rounded root, so a software one is not an
+// approximation of the host's — it is the same number, and the two can be compared
+// bit for bit. Everything else in that library rounds through whatever the vendor
+// chose and is therefore not carried here.
+//
+// The root is built from the significand as an integer: the input is written
+// `sig * 2^e` with `sig` in [2^52, 2^53) and `e` even, `sig << 54` is the radicand,
+// and `floor(sqrt(that))` is 54 bits of the answer. The restoring loop is the one
+// from pencil-and-paper long division, two radicand bits a step — its remainder is
+// below `2q + 1`, so everything after the first line fits in 64 bits.
+static inline uint64_t bit128(uint64_t hi, uint64_t lo, int b) {
+  return b >= 64 ? ((hi >> (b - 64)) & 1ull) : ((lo >> b) & 1ull);
+}
+
+// floor(sqrt(hi:lo)); `exact` says the square was a whole number.
+static inline uint64_t isqrt128(uint64_t hi, uint64_t lo, thread bool& exact) {
+  uint64_t rem = 0ull, q = 0ull;
+  for (int i = 53; i >= 0; i--) {
+    rem = (rem << 2) | ((bit128(hi, lo, 2 * i + 1) << 1) | bit128(hi, lo, 2 * i));
+    const uint64_t trial = (q << 2) | 1ull;
+    if (rem >= trial) {
+      rem -= trial;
+      q = (q << 1) | 1ull;
+    } else {
+      q <<= 1;
+    }
+  }
+  exact = (rem == 0ull);
+  return q;
+}
+
+static inline uint64_t sqrt_bits(uint64_t b) {
+  if (is_nan(b)) return kQNaN;
+  if ((b >> 63) != 0ull) return is_zero(b) ? b : kQNaN;  // -0 is -0; a negative is a NaN
+  if (is_zero(b) || is_inf(b)) return b;
+  decon d = decompose(b);
+  int32_t e = d.exp;
+  // An odd exponent moves one bit into the significand, which is exact and makes the
+  // halving below a shift rather than a rounding.
+  if ((e & 1) != 0) {
+    d.sig <<= 1;
+    e -= 1;
+  }
+  bool exact = false;
+  const uint64_t q = isqrt128(d.sig >> 10, (d.sig & 0x3FFull) << 54, exact);
+  // sqrt(value) = (q + frac) * 2^(e/2 - 27) with q in [2^53, 2^54), so the leading bit
+  // of the significand is the exponent below and `q >> 1` is the 53 bits that follow.
+  int32_t k = e / 2 + 26;
+  uint64_t s = q >> 1;
+  const uint64_t guard = q & 1ull;
+  if (guard != 0ull && ((exact ? 0ull : 1ull) != 0ull || (s & 1ull) != 0ull)) s += 1ull;
+  if (s == (1ull << 53)) {  // the rounding carried out of the field
+    s >>= 1;
+    k += 1;
+  }
+  const int32_t biased = k + 1023;
+  // No finite double roots below the smallest normal — sqrt(2^-1074) is 2^-537 — so
+  // the subnormal branch has nothing to carry.
+  if (biased >= 2047) return kInf;
+  if (biased <= 0) return kInf;
+  return ((uint64_t)biased << 52) | (s & kFracMask);
+}
+
 // minNum and maxNum: a NaN operand means the other one, and two NaNs mean a NaN.
 // Of two zeros the negative one is the smaller, which is the order IEEE gives them.
 static inline uint64_t min_bits(uint64_t a, uint64_t b) {

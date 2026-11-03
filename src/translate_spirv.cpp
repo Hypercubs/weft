@@ -1346,6 +1346,15 @@ bool Emitter::emit_one(const Instr& ins) {
   // `uint64_t` its bits live in, and each operation below is an exact IEEE-754 helper
   // from `weft_fp64`. Memory, `select`, `phi`, a copy and a shuffle need nothing: they
   // move the bits, and the bits are the value.
+  // The square root over a double on the CPU target: the host's own `std::sqrt`, which
+  // is the correctly rounded answer the software one is compared against. It is written
+  // here rather than routed through the portable library because that library's `sqrt`
+  // is a float overload set and a double in the middle of it is ambiguous.
+  if (!gpu && op == OpExtInst && a.size() > 4 && a[3] == 61u && rty == "double") {
+    set("std::sqrt(" + V(4) + ")");
+    return true;
+  }
+
   if (gpu) {
     const bool r64 = res && f64_type(rt);
     const bool o64 = a.size() > 2 && f64_type(vtype(a[2]));
@@ -1406,10 +1415,13 @@ bool Emitter::emit_one(const Instr& ins) {
             // Fused multiply-add: one rounding, and the product is 106 bits wide
             // before it is, so it cannot be built out of a multiply and an add.
             case 26: set("weft_fp64::fma(" + x + ", " + V(5) + ", " + V(6) + ")"); return true;
+            // The square root is the one member of that library IEEE pins exactly, so
+            // it is carried here rather than left to the host.
+            case 61: set("weft_fp64::sqrt_bits(" + x + ")"); return true;
             default:
               err = "OpenCL.std instruction " + std::to_string(num) +
                     " over a double has no GPU form: the arithmetic, the comparisons,"
-                    " the conversions, floor/ceil/trunc/round and min/max do";
+                    " the conversions, floor/ceil/trunc/round, min/max, sqrt and fma do";
               return false;
           }
         }

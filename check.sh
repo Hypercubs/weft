@@ -479,7 +479,7 @@ vals = [0.0, 1.0, -1.0, 0.5, 3.0, 1e-300, 2.0**-1022, 2.0**60, -7.25, 1e300,
 vals = (vals * 300)[:4096]
 open(sys.argv[1], 'wb').write(struct.pack('<4096d', *vals))
 PY
-gpucol kernels/ptxf64.ptx             64 4096 --buffers 4096,4096,4096 --buffer-bytes 0=8,1=4,2=8 \
+gpucol kernels/ptxf64.ptx             64 4096 --buffers 4096,4096,4096,4096 --buffer-bytes 0=8,1=4,2=8,3=8 \
     --load "0=$TMP/f64in.bin"
 # `tld4` keeps the four texels apart instead of blending them, which is the one
 # thing a filter cannot stand in for.
@@ -730,7 +730,7 @@ spvgpu atom64sub   atom64sub  --grid 32 --threads 32 --buffers 1,32,32,32,32,32,
 # compared bit for bit, over multiply, add, divide, a catastrophic subtraction, the
 # four roundings, a trip through binary32, a comparison, a cast and a subgroup
 # reduction. The reduction's residual buffer must be zero in every lane.
-spvgpu fp64       fp64       --grid 32 --threads 32 --buffers 32,288,64,32
+spvgpu fp64       fp64       --grid 32 --threads 32 --buffers 32,320,64,32
 # The same software double, two components at a time: a `double2` built, added,
 # multiplied, divided, subtracted and taken apart. The per-component path has to
 # call the fp64 helper rather than apply the operator to the two 64-bit words, and

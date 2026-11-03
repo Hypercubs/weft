@@ -1773,6 +1773,13 @@ std::string Emitter::emit(const std::string& raw) {
 
   if (op == "sqrt") {
     if (!need(2)) return "";
+    // The square root is the one function in that library with an exact
+    // specification, so the software double answers it and the host's own `sqrt`
+    // is the same number rather than an approximation of it.
+    if (msl && ty == "double")
+      return guard + store(args[0],
+                           "weft_fp64::sqrt_bits(" + operand_as(args[1], "uint64_t") + ")",
+                           "uint64_t");
     return guard + store(args[0], math("sqrt", operand_as(args[1], ty)), ty);
   }
 
