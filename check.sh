@@ -741,6 +741,10 @@ spvgpu dvec       dvec       --grid 32 --threads 32 --buffers 32,128
 # call goes through the same helper ids again — the case a one-call-site inliner gets
 # wrong — and the values are hand-checkable: twice(x) = 2x + 1.
 spvgpu helper     helper     --grid 32 --threads 32 --buffers 32,64
+# A matrix that is not square: 2 rows by 3 columns, its 3x2 transpose, and a vector
+# each way. A square shape cannot tell a row from a column — they are the same size —
+# so the oblong ones are what pin the layout.
+spvgpu matns      matns      --grid 32 --threads 32 --buffers 32,128
 # The fold in floats: reduce add/min/max and an inclusive and an exclusive scan,
 # over half-integers so every partial sum is exact and every answer can be worked
 # out by hand in the module. The residual slots catch a wrong shift (an exclusive

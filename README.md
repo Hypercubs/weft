@@ -53,7 +53,7 @@ ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 | `half` arithmetic, and `half` in threadgroup memory | yes | — | — |
 | packed and vector types (`float3`, `uchar4`, …) | yes | yes | yes |
 | 64-bit floats: arithmetic, comparisons, conversions | yes | yes | yes |
-| matrices: products, transpose, scale | `simdgroup_matrix` | `mma`, `wgmma` | 2x2, 3x3, 4x4 |
+| matrices: products, transpose, scale | `simdgroup_matrix` | `mma`, `wgmma` | every shape: 2–4 columns of 2–4 rows |
 | Triton `tl.dot`: f16, tf32, bf16, fp8 | — | yes | — |
 | portable math (`sqrt`, `pow`, `sin`, …) | yes | yes | yes |
 

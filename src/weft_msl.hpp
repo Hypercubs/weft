@@ -900,147 +900,135 @@ struct weft_d2 { uint64_t x, y; };
 struct weft_d3 { uint64_t x, y, z; };
 struct weft_d4 { uint64_t x, y, z, w; };
 
-// Matrices, column-major: `m[column][row]`, the way SPIR-V, Metal and every GPU
-// lay them out, so a matrix times a vector is a linear combination of its
-// columns. The arithmetic is written once, here, and compiled by both targets;
-// every accumulation is an explicit fused multiply-add in a fixed order, so the
-// two engines run the same instruction sequence and agree to the bit rather than
-// to close enough.
-struct weft_f2x2 { float m[2][2]; };
-struct weft_f3x3 { float m[3][3]; };
-struct weft_f4x4 { float m[4][4]; };
+// Matrices, column-major: `m[column][row]`, the way SPIR-V, Metal and every GPU lay
+// them out, so a matrix times a vector is a linear combination of its columns. One
+// template covers every shape SPIR-V allows — two to four columns of two to four
+// rows — because one shader multiplies a 4x4 by a 4-vector and a 3x4 skinning matrix
+// by a 3-vector in the same file, and the square-only set refused the second. Every
+// accumulation is an explicit fused multiply-add in a fixed order, so the two engines
+// run the same instruction sequence and agree to the bit. Everything here takes its
+// operands by value: Metal wants an address space on every pointer and every
+// reference, and this one text is compiled by both engines.
+template <int R, int C>
+struct weft_mat { float m[C][R]; };
+using weft_f2x2 = weft_mat<2, 2>;
+using weft_f2x3 = weft_mat<2, 3>;
+using weft_f2x4 = weft_mat<2, 4>;
+using weft_f3x2 = weft_mat<3, 2>;
+using weft_f3x3 = weft_mat<3, 3>;
+using weft_f3x4 = weft_mat<3, 4>;
+using weft_f4x2 = weft_mat<4, 2>;
+using weft_f4x3 = weft_mat<4, 3>;
+using weft_f4x4 = weft_mat<4, 4>;
 
-static inline weft_f2 weft_col(weft_f2x2 a, int c) {
-  return weft_f2{a.m[c][0], a.m[c][1]};
+// The components of a row on their way into a vector, as a value rather than a
+// pointer so no address space has to be named.
+struct weft_n { float v[4]; };
+
+// The width of a vector type, so a matrix can name the vector it multiplies and the
+// loops below are written once for all nine shapes instead of once per shape.
+template <int N> struct weft_vt;
+template <> struct weft_vt<2> {
+  using type = weft_f2;
+  static type mk(weft_n t) { return weft_f2{t.v[0], t.v[1]}; }
+};
+template <> struct weft_vt<3> {
+  using type = weft_f3;
+  static type mk(weft_n t) { return weft_f3{t.v[0], t.v[1], t.v[2]}; }
+};
+template <> struct weft_vt<4> {
+  using type = weft_f4;
+  static type mk(weft_n t) { return weft_f4{t.v[0], t.v[1], t.v[2], t.v[3]}; }
+};
+template <class V> struct weft_vlen;
+template <> struct weft_vlen<weft_f2> { enum { N = 2 }; };
+template <> struct weft_vlen<weft_f3> { enum { N = 3 }; };
+template <> struct weft_vlen<weft_f4> { enum { N = 4 }; };
+
+static inline float weft_comp(weft_f2 v, int k) { return k == 0 ? v.x : v.y; }
+static inline float weft_comp(weft_f3 v, int k) {
+  return k == 0 ? v.x : (k == 1 ? v.y : v.z);
 }
-static inline weft_f3 weft_col(weft_f3x3 a, int c) {
-  return weft_f3{a.m[c][0], a.m[c][1], a.m[c][2]};
-}
-static inline weft_f4 weft_col(weft_f4x4 a, int c) {
-  return weft_f4{a.m[c][0], a.m[c][1], a.m[c][2], a.m[c][3]};
+static inline float weft_comp(weft_f4 v, int k) {
+  return k == 0 ? v.x : (k == 1 ? v.y : (k == 2 ? v.z : v.w));
 }
 
-static inline weft_f2x2 weft_mk(weft_f2 p0, weft_f2 p1) {
-  weft_f2x2 r{};
-  r.m[0][0] = p0.x; r.m[0][1] = p0.y;
-  r.m[1][0] = p1.x; r.m[1][1] = p1.y;
+// A matrix from its columns, which is the order a composite build arrives in.
+template <class V0, class... Rest>
+static inline weft_mat<weft_vlen<V0>::N, 1 + (int)sizeof...(Rest)> weft_mk(V0 p0,
+                                                                     Rest... rest) {
+  const V0 cols[1 + sizeof...(Rest)] = {p0, rest...};
+  weft_mat<weft_vlen<V0>::N, 1 + (int)sizeof...(Rest)> r{};
+  for (int c = 0; c < 1 + (int)sizeof...(Rest); c++)
+    for (int i = 0; i < weft_vlen<V0>::N; i++) r.m[c][i] = weft_comp(cols[c], i);
   return r;
 }
-static inline weft_f3x3 weft_mk(weft_f3 p0, weft_f3 p1, weft_f3 p2) {
-  weft_f3x3 r{};
-  r.m[0][0] = p0.x; r.m[0][1] = p0.y; r.m[0][2] = p0.z;
-  r.m[1][0] = p1.x; r.m[1][1] = p1.y; r.m[1][2] = p1.z;
-  r.m[2][0] = p2.x; r.m[2][1] = p2.y; r.m[2][2] = p2.z;
-  return r;
-}
-static inline weft_f4x4 weft_mk(weft_f4 p0, weft_f4 p1, weft_f4 p2,
-                                weft_f4 p3) {
-  weft_f4x4 r{};
-  r.m[0][0] = p0.x; r.m[0][1] = p0.y; r.m[0][2] = p0.z; r.m[0][3] = p0.w;
-  r.m[1][0] = p1.x; r.m[1][1] = p1.y; r.m[1][2] = p1.z; r.m[1][3] = p1.w;
-  r.m[2][0] = p2.x; r.m[2][1] = p2.y; r.m[2][2] = p2.z; r.m[2][3] = p2.w;
-  r.m[3][0] = p3.x; r.m[3][1] = p3.y; r.m[3][2] = p3.z; r.m[3][3] = p3.w;
-  return r;
+
+// One column of a matrix, as the vector of its rows.
+template <int R, int C>
+static inline typename weft_vt<R>::type weft_col(weft_mat<R, C> a, int c) {
+  weft_n t{};
+  for (int i = 0; i < R; i++) t.v[i] = a.m[c][i];
+  return weft_vt<R>::mk(t);
 }
 
-static inline weft_f2 operator*(weft_f2x2 a, weft_f2 v) {
-  float t[2];
-  for (int r = 0; r < 2; r++) t[r] = metal::fma(a.m[1][r], v.y, a.m[0][r] * v.x);
-  return weft_f2{t[0], t[1]};
-}
-static inline weft_f3 operator*(weft_f3x3 a, weft_f3 v) {
-  float t[3];
-  for (int r = 0; r < 3; r++)
-    t[r] = metal::fma(a.m[2][r], v.z, metal::fma(a.m[1][r], v.y, a.m[0][r] * v.x));
-  return weft_f3{t[0], t[1], t[2]};
-}
-static inline weft_f4 operator*(weft_f4x4 a, weft_f4 v) {
-  float t[4];
-  for (int r = 0; r < 4; r++)
-    t[r] = metal::fma(a.m[3][r], v.w,
-           metal::fma(a.m[2][r], v.z, metal::fma(a.m[1][r], v.y, a.m[0][r] * v.x)));
-  return weft_f4{t[0], t[1], t[2], t[3]};
-}
-
-static inline weft_f2 operator*(weft_f2 v, weft_f2x2 a) {
-  float t[2];
-  for (int c = 0; c < 2; c++) t[c] = metal::fma(v.y, a.m[1][c], v.x * a.m[0][c]);
-  return weft_f2{t[0], t[1]};
-}
-static inline weft_f3 operator*(weft_f3 v, weft_f3x3 a) {
-  float t[3];
-  for (int c = 0; c < 3; c++)
-    t[c] = metal::fma(v.z, a.m[2][c], metal::fma(v.y, a.m[1][c], v.x * a.m[0][c]));
-  return weft_f3{t[0], t[1], t[2]};
-}
-static inline weft_f4 operator*(weft_f4 v, weft_f4x4 a) {
-  float t[4];
-  for (int c = 0; c < 4; c++)
-    t[c] = metal::fma(v.w, a.m[3][c],
-           metal::fma(v.z, a.m[2][c], metal::fma(v.y, a.m[1][c], v.x * a.m[0][c])));
-  return weft_f4{t[0], t[1], t[2], t[3]};
-}
-
-static inline weft_f2x2 operator*(weft_f2x2 a, weft_f2x2 b) {
-  weft_f2x2 r{};
-  for (int c = 0; c < 2; c++) {
-    const weft_f2 v = a * weft_col(b, c);
-    r.m[c][0] = v.x; r.m[c][1] = v.y;
+// Matrix times vector: row `i` of the result is the dot of row `i` with the vector,
+// which is `m[0][i] * v[0]` and then one fused multiply-add a column.
+template <int R, int C>
+static inline typename weft_vt<R>::type operator*(weft_mat<R, C> a,
+                                                 typename weft_vt<C>::type v) {
+  weft_n t{};
+  for (int i = 0; i < R; i++) {
+    float acc = a.m[0][i] * weft_comp(v, 0);
+    for (int k = 1; k < C; k++) acc = metal::fma(a.m[k][i], weft_comp(v, k), acc);
+    t.v[i] = acc;
   }
-  return r;
+  return weft_vt<R>::mk(t);
 }
-static inline weft_f3x3 operator*(weft_f3x3 a, weft_f3x3 b) {
-  weft_f3x3 r{};
-  for (int c = 0; c < 3; c++) {
-    const weft_f3 v = a * weft_col(b, c);
-    r.m[c][0] = v.x; r.m[c][1] = v.y; r.m[c][2] = v.z;
+
+// Vector times matrix: the vector multiplies the rows, so column `c` of the result is
+// the dot of the vector with column `c`.
+template <int R, int C>
+static inline typename weft_vt<C>::type operator*(typename weft_vt<R>::type v,
+                                                 weft_mat<R, C> a) {
+  weft_n t{};
+  for (int c = 0; c < C; c++) {
+    float acc = weft_comp(v, 0) * a.m[c][0];
+    for (int k = 1; k < R; k++) acc = metal::fma(weft_comp(v, k), a.m[c][k], acc);
+    t.v[c] = acc;
   }
-  return r;
+  return weft_vt<C>::mk(t);
 }
-static inline weft_f4x4 operator*(weft_f4x4 a, weft_f4x4 b) {
-  weft_f4x4 r{};
-  for (int c = 0; c < 4; c++) {
-    const weft_f4 v = a * weft_col(b, c);
-    r.m[c][0] = v.x; r.m[c][1] = v.y; r.m[c][2] = v.z; r.m[c][3] = v.w;
-  }
+
+// Matrix times matrix: each column of the result is the first matrix times the
+// matching column of the second.
+template <int R, int C, int P>
+static inline weft_mat<R, P> operator*(weft_mat<R, C> a, weft_mat<C, P> b) {
+  weft_mat<R, P> r{};
+  for (int c = 0; c < P; c++)
+    for (int i = 0; i < R; i++) {
+      float acc = a.m[0][i] * b.m[c][0];
+      for (int k = 1; k < C; k++) acc = metal::fma(a.m[k][i], b.m[c][k], acc);
+      r.m[c][i] = acc;
+    }
   return r;
 }
 
-static inline weft_f2x2 operator*(weft_f2x2 a, float s) {
-  weft_f2x2 r{};
-  for (int i = 0; i < 2; i++)
-    for (int j = 0; j < 2; j++) r.m[i][j] = a.m[i][j] * s;
+template <int R, int C>
+static inline weft_mat<R, C> operator*(weft_mat<R, C> a, float s) {
+  weft_mat<R, C> r{};
+  for (int c = 0; c < C; c++)
+    for (int i = 0; i < R; i++) r.m[c][i] = a.m[c][i] * s;
   return r;
 }
-static inline weft_f3x3 operator*(weft_f3x3 a, float s) {
-  weft_f3x3 r{};
-  for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) r.m[i][j] = a.m[i][j] * s;
-  return r;
-}
-static inline weft_f4x4 operator*(weft_f4x4 a, float s) {
-  weft_f4x4 r{};
-  for (int i = 0; i < 4; i++)
-    for (int j = 0; j < 4; j++) r.m[i][j] = a.m[i][j] * s;
-  return r;
-}
+template <int R, int C>
+static inline weft_mat<R, C> operator*(float s, weft_mat<R, C> a) { return a * s; }
 
-static inline weft_f2x2 weft_transpose(weft_f2x2 a) {
-  weft_f2x2 r{};
-  for (int i = 0; i < 2; i++)
-    for (int j = 0; j < 2; j++) r.m[i][j] = a.m[j][i];
-  return r;
-}
-static inline weft_f3x3 weft_transpose(weft_f3x3 a) {
-  weft_f3x3 r{};
-  for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) r.m[i][j] = a.m[j][i];
-  return r;
-}
-static inline weft_f4x4 weft_transpose(weft_f4x4 a) {
-  weft_f4x4 r{};
-  for (int i = 0; i < 4; i++)
-    for (int j = 0; j < 4; j++) r.m[i][j] = a.m[j][i];
+template <int R, int C>
+static inline weft_mat<C, R> weft_transpose(weft_mat<R, C> a) {
+  weft_mat<C, R> r{};
+  for (int c = 0; c < C; c++)
+    for (int i = 0; i < R; i++) r.m[i][c] = a.m[c][i];
   return r;
 }
 

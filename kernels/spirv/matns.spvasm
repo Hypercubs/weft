@@ -1,0 +1,91 @@
+; A matrix that is not square.
+;
+; SPIR-V allows any number of columns from two to four over any column width from two
+; to four, and shader code uses the oblong ones: a 3x4 skinning matrix, a 2x3 tile
+; basis, a 2x4 for a sheared quad. Only the square shapes were translated, so this
+; module is the fixture for the rest.
+;
+;   c0 = (x, x+1)   c1 = (x+2, x+3)   c2 = (x+4, x+5)        2 rows, 3 columns
+;   m  = (c0, c1, c2)
+;   v  = (x, 2x, 3x)
+;   r  = m * v                 a 2-vector: a linear combination of the columns
+;   t  = transpose(m)          the same matrix, 3 rows by 2 columns
+;   rt = t * r                 a 3-vector
+;
+;   out[4i+0..3] = r.x, r.y, rt.x, rt.y
+;
+; A row and a column swapped anywhere in the layout shows up as a different number
+; here rather than as a refusal, which is the point: the square shapes could not
+; tell the two apart because they are the same size.
+               OpCapability Kernel
+               OpCapability Matrix
+               OpCapability Int64
+               OpCapability Addresses
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "matns" %gid
+               OpName %main "matns"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+        %u32 = OpTypeInt 32 0
+        %u64 = OpTypeInt 64 0
+        %f32 = OpTypeFloat 32
+       %f32p = OpTypePointer CrossWorkgroup %f32
+       %f2col = OpTypeVector %f32 2
+        %f3col = OpTypeVector %f32 3
+        %m23 = OpTypeMatrix %f2col 3
+        %m32 = OpTypeMatrix %f3col 2
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %f32p %f32p
+        %gid = OpVariable %pin Input
+       %c1_0 = OpConstant %f32 1
+       %c2_0 = OpConstant %f32 2
+       %c3_0 = OpConstant %f32 3
+       %c4_0 = OpConstant %f32 4
+       %c5_0 = OpConstant %f32 5
+       %c0u = OpConstant %u64 0
+       %c1u = OpConstant %u64 1
+       %c2u = OpConstant %u64 2
+       %c3u = OpConstant %u64 3
+       %c4u = OpConstant %u64 4
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f32p
+     %mentry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %pa0 = OpPtrAccessChain %f32p %a0 %gi
+          %x = OpLoad %f32 %pa0
+        %x1 = OpFAdd %f32 %x %c1_0
+        %x2 = OpFAdd %f32 %x %c2_0
+        %x3 = OpFAdd %f32 %x %c3_0
+        %x4 = OpFAdd %f32 %x %c4_0
+        %x5 = OpFAdd %f32 %x %c5_0
+        %c0 = OpCompositeConstruct %f2col %x %x1
+        %c1 = OpCompositeConstruct %f2col %x2 %x3
+        %c2 = OpCompositeConstruct %f2col %x4 %x5
+         %m = OpCompositeConstruct %m23 %c0 %c1 %c2
+       %two = OpFMul %f32 %x %c2_0
+      %three = OpFMul %f32 %x %c3_0
+         %v = OpCompositeConstruct %f3col %x %two %three
+         %r = OpMatrixTimesVector %f2col %m %v
+         %t = OpTranspose %m32 %m
+        %rt = OpMatrixTimesVector %f3col %t %r
+        %rx = OpCompositeExtract %f32 %r 0
+        %ry = OpCompositeExtract %f32 %r 1
+       %rtx = OpCompositeExtract %f32 %rt 0
+       %rty = OpCompositeExtract %f32 %rt 1
+       %base = OpIMul %u64 %gi %c4u
+         %p0 = OpPtrAccessChain %f32p %a1 %base
+                OpStore %p0 %rx
+        %i1 = OpIAdd %u64 %base %c1u
+         %p1 = OpPtrAccessChain %f32p %a1 %i1
+                OpStore %p1 %ry
+        %i2 = OpIAdd %u64 %base %c2u
+         %p2 = OpPtrAccessChain %f32p %a1 %i2
+                OpStore %p2 %rtx
+        %i3 = OpIAdd %u64 %base %c3u
+         %p3 = OpPtrAccessChain %f32p %a1 %i3
+                OpStore %p3 %rty
+                OpReturn
+                OpFunctionEnd
