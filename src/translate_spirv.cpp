@@ -87,6 +87,13 @@ enum : uint32_t {
   OpGroupNonUniformShuffleXor = 346, OpGroupNonUniformShuffleUp = 347,
   OpGroupNonUniformShuffleDown = 348, OpGroupNonUniformQuadBroadcast = 365,
   OpGroupNonUniformQuadSwap = 366,
+  OpGroupNonUniformIAdd = 349, OpGroupNonUniformFAdd = 350,
+  OpGroupNonUniformIMul = 351, OpGroupNonUniformFMul = 352,
+  OpGroupNonUniformSMin = 353, OpGroupNonUniformUMin = 354,
+  OpGroupNonUniformFMin = 355, OpGroupNonUniformSMax = 356,
+  OpGroupNonUniformUMax = 357, OpGroupNonUniformFMax = 358,
+  OpGroupNonUniformBitwiseAnd = 359, OpGroupNonUniformBitwiseOr = 360,
+  OpGroupNonUniformBitwiseXor = 361,
   // atomic float add (SPV_EXT_shader_atomic_float_add)
   OpAtomicFAddEXT = 6035,
   // atomic float min/max (SPV_EXT_shader_atomic_float_min_max). The numbers are
@@ -1462,6 +1469,13 @@ bool Emitter::emit_one(const Instr& ins) {
         case OpGroupNonUniformShuffle: case OpGroupNonUniformShuffleXor:
         case OpGroupNonUniformShuffleUp: case OpGroupNonUniformShuffleDown:
         case OpGroupNonUniformQuadBroadcast: case OpGroupNonUniformQuadSwap:
+        case OpGroupNonUniformIAdd: case OpGroupNonUniformFAdd:
+        case OpGroupNonUniformIMul: case OpGroupNonUniformFMul:
+        case OpGroupNonUniformSMin: case OpGroupNonUniformUMin:
+        case OpGroupNonUniformFMin: case OpGroupNonUniformSMax:
+        case OpGroupNonUniformUMax: case OpGroupNonUniformFMax:
+        case OpGroupNonUniformBitwiseAnd: case OpGroupNonUniformBitwiseOr:
+        case OpGroupNonUniformBitwiseXor:
         case OpBitcast: case OpFunctionCall:
           break;
         default:
@@ -2767,6 +2781,52 @@ bool Emitter::emit_one(const Instr& ins) {
       return true;
     }
 
+    // ---- subgroup arithmetic (the core opcodes) ----
+    //
+    // `subgroupAdd` in a shader is OpGroupNonUniformFAdd, not the OpenCL.std
+    // extended instruction, and these were refused as unsupported opcodes: the fold
+    // that answers them was already here, reachable only by the other spelling. The
+    // operands are (type, result, scope, group action, value[, cluster size]) and the
+    // group action is a constant, so dropping it leaves exactly the shape the named
+    // form takes — the fold that runs is the same one, on every engine.
+    case OpGroupNonUniformIAdd: case OpGroupNonUniformFAdd:
+    case OpGroupNonUniformIMul: case OpGroupNonUniformFMul:
+    case OpGroupNonUniformSMin: case OpGroupNonUniformUMin: case OpGroupNonUniformFMin:
+    case OpGroupNonUniformSMax: case OpGroupNonUniformUMax: case OpGroupNonUniformFMax:
+    case OpGroupNonUniformBitwiseAnd: case OpGroupNonUniformBitwiseOr:
+    case OpGroupNonUniformBitwiseXor: {
+      if (a.size() < 5) { err = "a subgroup fold is missing its value"; return false; }
+      const char* kind =
+          (op == OpGroupNonUniformIAdd || op == OpGroupNonUniformFAdd) ? "add"
+          : (op == OpGroupNonUniformIMul || op == OpGroupNonUniformFMul) ? "mul"
+          : (op == OpGroupNonUniformSMin || op == OpGroupNonUniformUMin ||
+             op == OpGroupNonUniformFMin) ? "min"
+          : (op == OpGroupNonUniformSMax || op == OpGroupNonUniformUMax ||
+             op == OpGroupNonUniformFMax) ? "max"
+          : op == OpGroupNonUniformBitwiseAnd ? "and"
+          : op == OpGroupNonUniformBitwiseOr ? "or" : "xor";
+      // 0 reduces, 1 is an inclusive scan, 2 an exclusive one. The group operation is a
+      // literal in this instruction — that is why an assembler writes it as `Reduce`
+      // rather than as a constant id — so it is already the operand's own number. A
+      // module that carried it as an id instead is resolved through the constants.
+      const uint32_t action = a[3];
+      if (action > 2) {
+        err = "a subgroup fold with group operation " + std::to_string(action) +
+              ": this reads the form where it is 0, 1 or 2";
+        return false;
+      }
+      if (action > 2) {
+        err = "a subgroup fold with group action " + std::to_string(action);
+        return false;
+      }
+      Instr sub = ins;
+      sub.a.erase(sub.a.begin() + 3);
+      return emit_import(sub, action == 0
+                                 ? std::string("sub_group_reduce_") + kind
+                                 : std::string("sub_group_scan_") +
+                                       (action == 2 ? "exclusive_" : "inclusive_") + kind);
+    }
+
     // ---- extended instructions (OpenCL.std) ----
     case OpExtInst: {
       const uint32_t set_id = a[2];
@@ -3059,6 +3119,11 @@ const char* const kBuiltinNames[] = {
     "sub_group_scan_inclusive_max", "sub_group_scan_inclusive_and",
     "sub_group_scan_inclusive_or", "sub_group_scan_inclusive_xor",
     "sub_group_reduce_add", "sub_group_reduce_min", "sub_group_reduce_max",
+    // OpenCL.std has no product fold, so the name only ever arrives from the
+    // core opcodes: the fold is the same one, and it needs a name to look up.
+    "sub_group_reduce_mul",
+    "sub_group_scan_inclusive_mul",
+    "sub_group_scan_exclusive_mul",
     "sub_group_reduce_and", "sub_group_reduce_or", "sub_group_reduce_xor",
     "sub_group_shuffle_xor", "sub_group_shuffle_up", "sub_group_shuffle_down",
     "sub_group_shuffle", "sub_group_broadcast", "sub_group_ballot", "sub_group_all",
@@ -3234,6 +3299,11 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
       } else if (kind == "min") {
         seed = "0x7FF0000000000000ull";
         comb = "weft_fp64::min_bits(weft_a, weft_v)";
+      } else if (kind == "mul") {
+        // 1.0's pattern, and the library's multiply: `weft_a * weft_v` over two
+        // bit patterns would be an integer multiply of their mantissas.
+        seed = "0x3FF0000000000000ull";
+        comb = "weft_fp64::mul(weft_a, weft_v)";
       } else if (kind == "max") {
         seed = "0xFFF0000000000000ull";
         comb = "weft_fp64::max_bits(weft_a, weft_v)";
@@ -3242,6 +3312,7 @@ bool Emitter::emit_import(const Instr& ins, const std::string& sym) {
         return false;
       }
     } else if (kind == "add") { seed = "0"; comb = "weft_a + weft_v"; }
+    else if (kind == "mul") { seed = "1"; comb = "weft_a * weft_v"; }
     else if (kind == "and") { seed = "~(" + ety + ")0"; comb = "weft_a & weft_v"; }
     else if (kind == "or") { seed = "0"; comb = "weft_a | weft_v"; }
     else if (kind == "xor") { seed = "0"; comb = "weft_a ^ weft_v"; }    else if (kind == "min" || kind == "max") {

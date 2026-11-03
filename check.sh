@@ -577,6 +577,30 @@ PY
 else
   echo "FAIL  spvgpu:dblshfl  the fixture did not run"; fail=1
 fi
+
+# A product folds from 1, not from 0: seeded with the addition identity every answer
+# is 0 and both columns would still agree on it.
+if "$WEFT" run kernels/spirv/submul.spv --kernel submul --cpu-only --grid 32 --threads 32 --buffers 32 --dump 0="$TMP/submul.bin" >/dev/null 2>&1; then
+  if python3 - "$TMP/submul.bin" <<'PY'
+import struct, sys
+v = struct.unpack("<32f", open(sys.argv[1], "rb").read(128))
+bad = []
+for i in range(32):
+    want = 3.5 + 7 + (i + 1 if i < 5 else i + 7)
+    if v[i] != want:
+        bad.append((i, v[i], want))
+for i, got, want in bad[:4]:
+    print("  lane %d wrote %g, wanted %g" % (i, got, want))
+sys.exit(0 if not bad else 1)
+PY
+  then
+    echo "ok    spvgpu:submul  a product fold over a double and a u32, and its scan"
+  else
+    echo "FAIL  spvgpu:submul  the product fold is seeded wrong or runs on the bits"; fail=1
+  fi
+else
+  echo "FAIL  spvgpu:submul  the fixture did not run"; fail=1
+fi
 # `.a2d`: a layered sample whose third coordinate is the slice, and `txq.depth`
 # answering with the slice count both readings are folded into the output.
 gpucol kernels/ptxarray.ptx           64 4096 --textures '64x64*4' --samplers nearest/clamp
@@ -692,6 +716,9 @@ spvgpu quads       quads      --grid 32 --threads 32 --buffers 32,32
 # A double through all four shuffle modes, which the relay moves two words at a
 # time: the fixture's sum is recomputed by hand below.
 spvgpu dblshfl     dblshfl    --grid 32 --threads 32 --buffers 32
+# A product fold over a double, over a u32, and an inclusive scan of the same:
+# the value the fold starts from is the point of the fixture.
+spvgpu submul      submul     --grid 32 --threads 32 --buffers 32
 spvgpu serial_sum   llvm      --grid 1 --threads 1 --buffers 1000,1 --arg 0=1000
 spvgpu globk        global    --grid 1048576 --buffers 1048576,1048576
 # An image read and a filtered sample; then a storage image written, barriered,

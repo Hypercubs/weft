@@ -1,0 +1,71 @@
+; The subgroup folds a compiler actually emits: the core arithmetic opcodes, which
+; carry the group action as a constant operand rather than as an extended instruction.
+;
+;     d  = (lane == 7) ? 3.5 : 1.0          the product over the warp is 3.5
+;     i  = (lane == 5) ? 7 : 1              ... and 7
+;     r  = OpGroupNonUniformFMul  Reduce   d      f64, so the relay carries two words
+;     ri = OpGroupNonUniformIMul  Reduce   i
+;     si = OpGroupNonUniformIAdd  InclusiveScan  i
+;     out[gid] = r + ri + si
+;
+; Inclusive scan of `i` is lane+1 before lane 5 and lane+7 from it, so every answer is
+; 11.5 + lane before 5 and 17.5 + lane from 5 on — exact, and recomputed by check.sh.
+; A fold seeded with the addition's identity answers 0, one that reads the bits of a
+; double answers garbage, and one that ignores the group action answers the reduce
+; three times; none of those can pass while agreeing with itself.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Float64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformArithmetic
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "submul" %gid %lid
+               OpName %main "submul"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+       %f32 = OpTypeFloat 32
+       %f64 = OpTypeFloat 64
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+    %v3u64 = OpTypeVector %u64 3
+       %ptr = OpTypePointer CrossWorkgroup %f32
+       %inp = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr
+       %gid = OpVariable %inp Input
+       %lid = OpVariable %inp Input
+       %sub = OpConstant %u32 3
+        %c5 = OpConstant %u32 5
+        %c7 = OpConstant %u32 7
+       %c31 = OpConstant %u32 31
+        %u1 = OpConstant %u32 1
+        %u7 = OpConstant %u32 7
+       %d10 = OpConstant %f64 1
+      %d3p5 = OpConstant %f64 3.5
+      %main = OpFunction %void None %fnty
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+      %lane = OpBitwiseAnd %u32 %li %c31
+       %isd = OpIEqual %bool %lane %c7
+        %dx = OpSelect %f64 %isd %d3p5 %d10
+         %r = OpGroupNonUniformFMul %f64 %sub Reduce %dx
+       %isi = OpIEqual %bool %lane %c5
+        %ix = OpSelect %u32 %isi %u7 %u1
+        %ri = OpGroupNonUniformIMul %u32 %sub Reduce %ix
+        %si = OpGroupNonUniformIAdd %u32 %sub InclusiveScan %ix
+        %df = OpFConvert %f32 %r
+        %rf = OpConvertUToF %f32 %ri
+        %sf = OpConvertUToF %f32 %si
+        %t0 = OpFAdd %f32 %df %rf
+        %t1 = OpFAdd %f32 %t0 %sf
+        %po = OpPtrAccessChain %ptr %o %gi
+               OpStore %po %t1
+               OpReturn
+               OpFunctionEnd
