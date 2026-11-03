@@ -1,0 +1,70 @@
+; The logical folds on a boolean: and, or, xor, and an exclusive-xor scan.
+;
+;     p = (lane == 5)                    exactly one lane of the warp is true
+;     o = OpGroupNonUniformLogicalOr   Reduce        p     true
+;     a = OpGroupNonUniformLogicalAnd  Reduce        p     false
+;     x = OpGroupNonUniformLogicalXor  Reduce        p     true  (one of them)
+;     s = OpGroupNonUniformLogicalXor  InclusiveScan p     false up to lane 4, then true
+;     out[gid] = o + 2a + 4x + 8s
+;
+; So every lane below 5 writes 5 and every lane from 5 on writes 13 — exact, and
+; recomputed by check.sh. A fold that seeded `and` with false answers 0 for it, and
+; one that seeded `or` with true answers 1 for a lane that never ran; neither moves
+; the sum the way the identity above does.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformArithmetic
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "subbool" %gid %lid
+               OpName %main "subbool"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+    %v3u64 = OpTypeVector %u64 3
+       %ptr = OpTypePointer CrossWorkgroup %f32
+       %inp = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr
+       %gid = OpVariable %inp Input
+       %lid = OpVariable %inp Input
+       %sub = OpConstant %u32 3
+        %c5 = OpConstant %u32 5
+       %c31 = OpConstant %u32 31
+       %f00 = OpConstant %f32 0
+       %f01 = OpConstant %f32 1
+       %f02 = OpConstant %f32 2
+       %f04 = OpConstant %f32 4
+       %f08 = OpConstant %f32 8
+      %main = OpFunction %void None %fnty
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+      %lane = OpBitwiseAnd %u32 %li %c31
+         %p = OpIEqual %bool %lane %c5
+        %or = OpGroupNonUniformLogicalOr %bool %sub Reduce %p
+       %and = OpGroupNonUniformLogicalAnd %bool %sub Reduce %p
+       %xor = OpGroupNonUniformLogicalXor %bool %sub Reduce %p
+      %scan = OpGroupNonUniformLogicalXor %bool %sub InclusiveScan %p
+       %or1 = OpSelect %f32 %or %f01 %f00
+      %and1 = OpSelect %f32 %and %f01 %f00
+      %xor1 = OpSelect %f32 %xor %f01 %f00
+     %scan1 = OpSelect %f32 %scan %f01 %f00
+        %t0 = OpFMul %f32 %and1 %f02
+        %t1 = OpFMul %f32 %xor1 %f04
+        %t2 = OpFMul %f32 %scan1 %f08
+        %s0 = OpFAdd %f32 %or1 %t0
+        %s1 = OpFAdd %f32 %s0 %t1
+        %s2 = OpFAdd %f32 %s1 %t2
+        %po = OpPtrAccessChain %ptr %o %gi
+               OpStore %po %s2
+               OpReturn
+               OpFunctionEnd

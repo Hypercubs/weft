@@ -601,6 +601,27 @@ PY
 else
   echo "FAIL  spvgpu:submul  the fixture did not run"; fail=1
 fi
+
+# A boolean fold has two identities and they are not the same one: `and` starts true,
+# `or` and `xor` start false. The sum below is 5 below lane 5 and 13 from it, so a
+# swapped identity moves it.
+if "$WEFT" run kernels/spirv/subbool.spv --kernel subbool --cpu-only --grid 32 --threads 32 --buffers 32 --dump 0="$TMP/subbool.bin" >/dev/null 2>&1; then
+  if python3 - "$TMP/subbool.bin" <<'PY'
+import struct, sys
+v = struct.unpack("<32f", open(sys.argv[1], "rb").read(128))
+bad = [(i, v[i]) for i in range(32) if v[i] != (5.0 if i < 5 else 13.0)]
+for i, got in bad[:4]:
+    print("  lane %d wrote %g, wanted %g" % (i, got, 5.0 if i < 5 else 13.0))
+sys.exit(0 if not bad else 1)
+PY
+  then
+    echo "ok    spvgpu:subbool  and, or and xor folds over a boolean, and an xor scan"
+  else
+    echo "FAIL  spvgpu:subbool  a boolean fold is seeded with the wrong identity"; fail=1
+  fi
+else
+  echo "FAIL  spvgpu:subbool  the fixture did not run"; fail=1
+fi
 # `.a2d`: a layered sample whose third coordinate is the slice, and `txq.depth`
 # answering with the slice count both readings are folded into the output.
 gpucol kernels/ptxarray.ptx           64 4096 --textures '64x64*4' --samplers nearest/clamp
@@ -719,6 +740,9 @@ spvgpu dblshfl     dblshfl    --grid 32 --threads 32 --buffers 32
 # A product fold over a double, over a u32, and an inclusive scan of the same:
 # the value the fold starts from is the point of the fixture.
 spvgpu submul      submul     --grid 32 --threads 32 --buffers 32
+# A boolean folded three ways, plus an xor scan: the identities are true for `and`
+# and false for the others, which is what the fixture's sum pins.
+spvgpu subbool     subbool    --grid 32 --threads 32 --buffers 32
 spvgpu serial_sum   llvm      --grid 1 --threads 1 --buffers 1000,1 --arg 0=1000
 spvgpu globk        global    --grid 1048576 --buffers 1048576,1048576
 # An image read and a filtered sample; then a storage image written, barriered,

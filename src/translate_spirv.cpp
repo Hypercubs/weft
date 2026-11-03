@@ -93,7 +93,8 @@ enum : uint32_t {
   OpGroupNonUniformFMin = 355, OpGroupNonUniformSMax = 356,
   OpGroupNonUniformUMax = 357, OpGroupNonUniformFMax = 358,
   OpGroupNonUniformBitwiseAnd = 359, OpGroupNonUniformBitwiseOr = 360,
-  OpGroupNonUniformBitwiseXor = 361,
+  OpGroupNonUniformBitwiseXor = 361, OpGroupNonUniformLogicalAnd = 362,
+  OpGroupNonUniformLogicalOr = 363, OpGroupNonUniformLogicalXor = 364,
   // atomic float add (SPV_EXT_shader_atomic_float_add)
   OpAtomicFAddEXT = 6035,
   // atomic float min/max (SPV_EXT_shader_atomic_float_min_max). The numbers are
@@ -1476,6 +1477,8 @@ bool Emitter::emit_one(const Instr& ins) {
         case OpGroupNonUniformUMax: case OpGroupNonUniformFMax:
         case OpGroupNonUniformBitwiseAnd: case OpGroupNonUniformBitwiseOr:
         case OpGroupNonUniformBitwiseXor:
+        case OpGroupNonUniformLogicalAnd: case OpGroupNonUniformLogicalOr:
+        case OpGroupNonUniformLogicalXor:
         case OpBitcast: case OpFunctionCall:
           break;
         default:
@@ -2794,7 +2797,9 @@ bool Emitter::emit_one(const Instr& ins) {
     case OpGroupNonUniformSMin: case OpGroupNonUniformUMin: case OpGroupNonUniformFMin:
     case OpGroupNonUniformSMax: case OpGroupNonUniformUMax: case OpGroupNonUniformFMax:
     case OpGroupNonUniformBitwiseAnd: case OpGroupNonUniformBitwiseOr:
-    case OpGroupNonUniformBitwiseXor: {
+    case OpGroupNonUniformBitwiseXor:
+    case OpGroupNonUniformLogicalAnd: case OpGroupNonUniformLogicalOr:
+    case OpGroupNonUniformLogicalXor: {
       if (a.size() < 5) { err = "a subgroup fold is missing its value"; return false; }
       const char* kind =
           (op == OpGroupNonUniformIAdd || op == OpGroupNonUniformFAdd) ? "add"
@@ -2803,8 +2808,10 @@ bool Emitter::emit_one(const Instr& ins) {
              op == OpGroupNonUniformFMin) ? "min"
           : (op == OpGroupNonUniformSMax || op == OpGroupNonUniformUMax ||
              op == OpGroupNonUniformFMax) ? "max"
-          : op == OpGroupNonUniformBitwiseAnd ? "and"
-          : op == OpGroupNonUniformBitwiseOr ? "or" : "xor";
+          : (op == OpGroupNonUniformBitwiseAnd || op == OpGroupNonUniformLogicalAnd)
+                ? "and"
+          : (op == OpGroupNonUniformBitwiseOr || op == OpGroupNonUniformLogicalOr) ? "or"
+                                                                              : "xor";
       // 0 reduces, 1 is an inclusive scan, 2 an exclusive one. The group operation is a
       // literal in this instruction — that is why an assembler writes it as `Reduce`
       // rather than as a constant id — so it is already the operand's own number. A
