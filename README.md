@@ -31,7 +31,7 @@ ok    raymarch         65,536 values     ·  max |diff| 0  — agree
 ok    spirv:atom64     4,096 lanes: add/max olds sum exactly, signed compare included,
 ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 ...
-293 ok, 0 fail, 0 skip
+294 ok, 0 fail, 0 skip
 ```
 
 ## What runs
@@ -264,7 +264,7 @@ The CPU path is exact, and the suites compare bytes rather than tolerances
 wherever the answer is deterministic.
 
 - **Every fixture in `check.sh` is a byte comparison** between the CPU and the GPU
-  where a GPU is present, and between two front ends where it is not: 293 checks,
+  where a GPU is present, and between two front ends where it is not: 294 checks,
   none skipped on this host.
 - **The math library is one text compiled twice.** A SPIR-V module's `sin`,
   `atan2` or `pow` is routed through it as well — the whole OpenCL.std
