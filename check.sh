@@ -523,6 +523,35 @@ then
 else
   echo "FAIL  ptx:ldmatrix  a form does not match the documented layout"; fail=1
 fi
+
+# A quad is four lanes, and a quad operation addresses them by an index or an XOR.
+# The fixture writes q0 + 2q1 + 4q2 + 8q3 + 16s0 + 32s1 + 64s2 of the value `lane`,
+# so the number it writes is a fingerprint of all seven lookups: check.sh recomputes
+# it from the lane id. Agreement between the two columns cannot catch a base taken
+# from the warp instead of the quad, because both would take it the same way.
+if "$WEFT" run kernels/spirv/quads.spv --kernel quads --cpu-only --grid 32 --threads 32 --buffers 32,32 --dump 1="$TMP/quads.bin" >/dev/null 2>&1; then
+  if python3 - "$TMP/quads.bin" <<'PY'
+import struct, sys
+v = struct.unpack("<32f", open(sys.argv[1], "rb").read(128))
+bad = []
+for i in range(32):
+    b, x = i & ~3, i & 3
+    want = ((b + 0) + (b + 1) * 2 + (b + 2) * 4 + (b + 3) * 8
+            + (b + (x ^ 1)) * 16 + (b + (x ^ 2)) * 32 + (b + (x ^ 3)) * 64)
+    if v[i] != float(want):
+        bad.append((i, v[i], want))
+for i, got, want in bad[:4]:
+    print("  lane %d wrote %g, wanted %d" % (i, got, want))
+sys.exit(0 if not bad else 1)
+PY
+  then
+    echo "ok    spvgpu:quads  all four broadcast indices and all three swap directions"
+  else
+    echo "FAIL  spvgpu:quads  a quad index, a swap direction or the base is wrong"; fail=1
+  fi
+else
+  echo "FAIL  spvgpu:quads  the fixture did not run"; fail=1
+fi
 # `.a2d`: a layered sample whose third coordinate is the slice, and `txq.depth`
 # answering with the slice count both readings are folded into the output.
 gpucol kernels/ptxarray.ptx           64 4096 --textures '64x64*4' --samplers nearest/clamp
@@ -632,6 +661,9 @@ spvgpu warpscan     warpscan  --grid 1048576 --threads 256 --buffers 1048576,104
 spvgpu block_reduce blockreduce --grid 1048576 --threads 256 --buffers 1048576,4096
 spvgpu votek        vote      --grid 1048576 --threads 256 --buffers 1048576,1048576
 spvgpu wide_shfl    wide      --grid 1048576 --threads 256 --buffers 1048576,1048576
+# A quad broadcast at each of the four lane indices, and the three quad swaps. The
+# fixture writes a weighted sum that check.sh recomputes below.
+spvgpu quads       quads      --grid 32 --threads 32 --buffers 32,32
 spvgpu serial_sum   llvm      --grid 1 --threads 1 --buffers 1000,1 --arg 0=1000
 spvgpu globk        global    --grid 1048576 --buffers 1048576,1048576
 # An image read and a filtered sample; then a storage image written, barriered,

@@ -1,0 +1,81 @@
+; Quads: the four-lane groups a subgroup operation addresses by XOR.
+;
+;     x  = (float)lane                 a value that says which lane it came from
+;     qk = quadBroadcast(x, k)         the value of lane base+k      (k = 0..3)
+;     sk = quadSwap(x, k)              the value of lane base+(x^m)  (m = 1, 2, 3)
+;     out[gid] = q0 + 2q1 + 4q2 + 8q3 + 16s0 + 32s1 + 64s2
+;
+; With x = lane every term is a small integer, so the sum is exact in a float and the
+; weights turn it into a fingerprint: the four broadcasts pin the four lane indices
+; and the three swaps pin the three XOR directions, while a base taken from the warp
+; instead of the quad moves every term at once. check.sh recomputes the number from
+; the lane id, so agreement between the two columns is not the only witness — both
+; of them taking a warp base would still be wrong.
+;
+; `Index` has to be a constant instruction at this module's version, so the four
+; broadcasts are written out rather than looped over.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformQuad
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "quads" %gid %lid
+               OpName %main "quads"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+    %v3u64 = OpTypeVector %u64 3
+       %ptr = OpTypePointer CrossWorkgroup %f32
+       %inp = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr %ptr
+       %gid = OpVariable %inp Input
+       %lid = OpVariable %inp Input
+       %sub = OpConstant %u32 3
+        %c0 = OpConstant %u32 0
+        %c1 = OpConstant %u32 1
+        %c2 = OpConstant %u32 2
+        %c3 = OpConstant %u32 3
+       %w01 = OpConstant %f32 1
+       %w02 = OpConstant %f32 2
+       %w04 = OpConstant %f32 4
+       %w08 = OpConstant %f32 8
+       %w16 = OpConstant %f32 16
+       %w32 = OpConstant %f32 32
+       %w64 = OpConstant %f32 64
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %ptr
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+         %x = OpConvertUToF %f32 %li
+        %q0 = OpGroupNonUniformQuadBroadcast %f32 %sub %x %c0
+        %q1 = OpGroupNonUniformQuadBroadcast %f32 %sub %x %c1
+        %q2 = OpGroupNonUniformQuadBroadcast %f32 %sub %x %c2
+        %q3 = OpGroupNonUniformQuadBroadcast %f32 %sub %x %c3
+        %s0 = OpGroupNonUniformQuadSwap %f32 %sub %x %c0
+        %s1 = OpGroupNonUniformQuadSwap %f32 %sub %x %c1
+        %s2 = OpGroupNonUniformQuadSwap %f32 %sub %x %c2
+        %a1 = OpFMul %f32 %q1 %w02
+        %a2 = OpFMul %f32 %q2 %w04
+        %a3 = OpFMul %f32 %q3 %w08
+        %b0 = OpFMul %f32 %s0 %w16
+        %b1 = OpFMul %f32 %s1 %w32
+        %b2 = OpFMul %f32 %s2 %w64
+        %t0 = OpFAdd %f32 %q0 %a1
+        %t1 = OpFAdd %f32 %t0 %a2
+        %t2 = OpFAdd %f32 %t1 %a3
+        %t3 = OpFAdd %f32 %t2 %b0
+        %t4 = OpFAdd %f32 %t3 %b1
+        %t5 = OpFAdd %f32 %t4 %b2
+        %po = OpPtrAccessChain %ptr %o %gi
+               OpStore %po %t5
+               OpReturn
+               OpFunctionEnd

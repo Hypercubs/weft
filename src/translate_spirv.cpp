@@ -85,7 +85,8 @@ enum : uint32_t {
   OpGroupNonUniformBallotBitCount = 342, OpGroupNonUniformBallotFindLSB = 343,
   OpGroupNonUniformBallotFindMSB = 344, OpGroupNonUniformShuffle = 345,
   OpGroupNonUniformShuffleXor = 346, OpGroupNonUniformShuffleUp = 347,
-  OpGroupNonUniformShuffleDown = 348,
+  OpGroupNonUniformShuffleDown = 348, OpGroupNonUniformQuadBroadcast = 365,
+  OpGroupNonUniformQuadSwap = 366,
   // atomic float add (SPV_EXT_shader_atomic_float_add)
   OpAtomicFAddEXT = 6035,
   // atomic float min/max (SPV_EXT_shader_atomic_float_min_max). The numbers are
@@ -1934,7 +1935,8 @@ bool Emitter::emit_one(const Instr& ins) {
     case OpGroupNonUniformAllEqual: case OpGroupNonUniformBroadcast:
     case OpGroupNonUniformBroadcastFirst: case OpGroupNonUniformShuffle:
     case OpGroupNonUniformShuffleXor: case OpGroupNonUniformShuffleUp:
-    case OpGroupNonUniformShuffleDown: {
+    case OpGroupNonUniformShuffleDown:
+    case OpGroupNonUniformQuadBroadcast: case OpGroupNonUniformQuadSwap: {
       subgroup_ = true;
       // a[0]=type a[1]=result a[2]=execution scope, then the operands
       std::string payload;
@@ -1950,13 +1952,23 @@ bool Emitter::emit_one(const Instr& ins) {
         if (op == OpGroupNonUniformBroadcast || op == OpGroupNonUniformBroadcastFirst)
           src = op == OpGroupNonUniformBroadcastFirst ? "0u" : "(" + V(4) + ") & 31u";
         else if (op == OpGroupNonUniformShuffle) src = "(" + V(4) + ") & 31u";
+        else if (op == OpGroupNonUniformQuadBroadcast) src = "(" + V(4) + ") & 3u";
+        else if (op == OpGroupNonUniformQuadSwap)
+          src = "((ctx.lid & 3u) ^ (((" + V(4) + ") == 2u) ? 3u : (1u << ((" + V(4) +
+                ") & 3u))))";
         else if (op == OpGroupNonUniformShuffleXor) src = "((ctx.lid & 31u) ^ (" + V(4) + ")) & 31u";
         else if (op == OpGroupNonUniformShuffleUp)
           src = "((ctx.lid & 31u) >= (" + V(4) + ") ? (ctx.lid & 31u) - (" + V(4) + ") : (ctx.lid & 31u))";
         else
           src = "((ctx.lid & 31u) + (" + V(4) + ") < 32u ? (ctx.lid & 31u) + (" + V(4) + ") : (ctx.lid & 31u))";
+        // A quad operation addresses four lanes, so its base is the quad's; the rest
+        // address the warp's 32. A swap direction names a lane to XOR — 1, 2, then 3
+        // for the diagonal — rather than being used as one.
+        const bool quad =
+            op == OpGroupNonUniformQuadBroadcast || op == OpGroupNonUniformQuadSwap;
+        const std::string base = quad ? "(ctx.lid & ~3u)" : "(ctx.lid & ~31u)";
         std::string read;
-        if (!wide_shfl(rt, V(3), "(ctx.lid & ~31u) + (" + src + ")", read)) return false;
+        if (!wide_shfl(rt, V(3), base + " + (" + src + ")", read)) return false;
         set(read);
         return true;
       }
