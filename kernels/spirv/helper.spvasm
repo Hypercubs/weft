@@ -1,0 +1,65 @@
+; A helper function, written as SPIR-V writes one and as a compiler emits it.
+;
+; A module may define more than one function, and the entry point may call the other
+; one. Until now that was refused by name — "call to a defined function ... is not
+; supported (inline it)" — and this is the fixture that says it is inlined now.
+;
+;   twice(v) = v * 2 + 1
+;   a1[2i+0] = twice(x)
+;   a1[2i+1] = twice(twice(x))
+;
+; The second call goes through the same helper ids again, which is the case a
+; straight inline gets wrong if it assumes one call site: the fields the body
+; computes are rewritten, and the value each call was made for still lands where the
+; call said it would. `52.0` for `x = 12.5` is the hand answer, so a run can be read
+; without a reference implementation at all.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Float64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "helper" %gid
+               OpName %main "helper"
+               OpName %twice "twice"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+        %u64 = OpTypeInt 64 0
+        %f32 = OpTypeFloat 32
+        %f64 = OpTypeFloat 64
+       %f32p = OpTypePointer CrossWorkgroup %f32
+       %f64p = OpTypePointer CrossWorkgroup %f64
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %fnrd = OpTypeFunction %f64 %f64
+       %fnty = OpTypeFunction %void %f32p %f64p
+        %gid = OpVariable %pin Input
+         %c1 = OpConstant %f64 1
+         %c2 = OpConstant %f64 2
+       %c1u = OpConstant %u64 1
+       %c2u = OpConstant %u64 2
+     %twice = OpFunction %f64 None %fnrd
+          %v = OpFunctionParameter %f64
+     %hentry = OpLabel
+         %d2 = OpFMul %f64 %v %c2
+         %p1 = OpFAdd %f64 %d2 %c1
+                OpReturnValue %p1
+                OpFunctionEnd
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f64p
+     %mentry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %pa0 = OpPtrAccessChain %f32p %a0 %gi
+         %xf = OpLoad %f32 %pa0
+          %x = OpFConvert %f64 %xf
+         %r1 = OpFunctionCall %f64 %twice %x
+         %r2 = OpFunctionCall %f64 %twice %r1
+       %base = OpIMul %u64 %gi %c2u
+         %p0 = OpPtrAccessChain %f64p %a1 %base
+                OpStore %p0 %r1
+        %i1 = OpIAdd %u64 %base %c1u
+         %p1o = OpPtrAccessChain %f64p %a1 %i1
+                OpStore %p1o %r2
+                OpReturn
+                OpFunctionEnd

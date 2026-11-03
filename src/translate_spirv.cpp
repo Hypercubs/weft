@@ -811,6 +811,12 @@ class Emitter {
   bool chain(const Instr& ins);
   bool emit_one(const Instr& ins);
   bool emit_import(const Instr& ins, const std::string& sym);
+  // A defined function is inlined where it is called: these are the call's own state,
+  // saved and restored around the body it splices in.
+  bool in_call_ = false;    // a `return` here ends the call, not the kernel
+  bool call_done_ = false;  // the inlined body reached its return
+  uint32_t call_ret_ = 0;   // the id the call's value lands in, or 0 for a void call
+  int call_depth_ = 0;      // nested inlining, and the recursion guard
   std::string edge_copies(uint32_t from, uint32_t to) const;
 };
 
@@ -1337,6 +1343,15 @@ bool Emitter::emit_one(const Instr& ins) {
     return val(a[k]);
   };
   auto set = [&](const std::string& e) { body_ += "  " + fref(rd) + " = " + e + ";\n"; };
+
+  // Inside an inlined call a `return` ends the call: the value goes to the id the call
+  // was made for and the rest of the helper's body is skipped. The kernel's own return
+  // is the same instruction with no call open, and falls through to its handler below.
+  if (in_call_ && (op == OpReturn || op == OpReturnValue)) {
+    if (op == OpReturnValue) body_ += "  " + fref(call_ret_) + " = " + val(a[0]) + ";\n";
+    call_done_ = true;
+    return true;
+  }
 
   // ---- 64-bit floats ----
   //
@@ -2918,11 +2933,79 @@ bool Emitter::emit_one(const Instr& ins) {
       const uint32_t callee = a[2];
       auto fn = m_.funcs.find(callee);
       if (fn == m_.funcs.end()) { err = "call to an unknown function"; return false; }
-      if (fn->second.defined) {
-        err = "call to a defined function '" + m_.names[callee] + "' is not supported (inline it)";
+      const std::string cname = m_.names.count(callee) ? m_.names[callee] : std::to_string(callee);
+      if (!fn->second.defined) return emit_import(ins, cname);
+
+      // A helper function is inlined where it is called, and its values keep the
+      // module's own ids — unique across the module — so a second call site simply
+      // recomputes the same fields and nothing has to be renamed.
+      const Function& cf = fn->second;
+      if (call_depth_ >= 8) {
+        err = "a call chain deeper than eight, through '" + cname +
+              "': a helper that calls itself has no inlined form";
         return false;
       }
-      return emit_import(ins, m_.names.count(callee) ? m_.names[callee] : "");
+      std::vector<const Instr*> params, body, results;
+      int labels = 0;
+      for (const Instr& ci : cf.body) {
+        if (ci.op == OpFunctionParameter) { params.push_back(&ci); continue; }
+        if (ci.op == OpLabel) { labels++; continue; }
+        switch (ci.op) {
+          // Each of these suspends the caller mid-call or hands off to the other
+          // lanes, and an inlined body has nowhere to resume to.
+          case OpControlBarrier: case OpMemoryBarrier: case OpVariable:
+          case OpGroupNonUniformBallot: case OpGroupNonUniformAll: case OpGroupNonUniformAny:
+          case OpGroupNonUniformAllEqual: case OpGroupNonUniformBroadcast:
+          case OpGroupNonUniformBroadcastFirst: case OpGroupNonUniformShuffle:
+          case OpGroupNonUniformShuffleXor: case OpGroupNonUniformShuffleUp:
+          case OpGroupNonUniformShuffleDown: case OpAtomicLoad: case OpAtomicStore:
+          case OpAtomicExchange: case OpAtomicIAdd: case OpAtomicISub:
+          case OpAtomicCompareExchange:
+            err = "a call to '" + cname +
+                  "' whose body has a barrier, a shuffle, an atomic or a local variable: "
+                  "that is a suspension point, and a call has nowhere to resume to";
+            return false;
+          default: break;
+        }
+        body.push_back(&ci);
+      }
+      if (labels > 1) {
+        err = "a call to '" + cname + "' whose body has " + std::to_string(labels) +
+              " blocks: only a straight-line helper is inlined";
+        return false;
+      }
+      if (params.size() != a.size() - 3) {
+        err = "a call to '" + cname + "' with " + std::to_string(a.size() - 3) +
+              " arguments and " + std::to_string(params.size()) + " parameters";
+        return false;
+      }
+      // The parameters are the helper's own fields: assign them, run the body, read the
+      // value out of the id the call was made for.
+      for (size_t k = 0; k < params.size(); k++) {
+        std::string pty;
+        if (!ctype(params[k]->a[0], pty)) { err = "a helper parameter of an unsupported type"; return false; }
+        body_ += "  " + fref(params[k]->a[1]) + " = (" + pty + ")(" + val(a[3 + k]) + ");\n";
+      }
+      const bool save_call = in_call_;
+      const uint32_t save_ret = call_ret_;
+      in_call_ = true;
+      call_done_ = false;
+      call_ret_ = res ? a[1] : 0;
+      call_depth_++;
+      bool ok = true;
+      for (const Instr* ci : body) {
+        if (call_done_) break;
+        if (!emit_one(*ci)) { ok = false; break; }
+      }
+      call_depth_--;
+      in_call_ = save_call;
+      call_ret_ = save_ret;
+      if (!ok) return false;
+      if (!call_done_) {
+        err = "a helper that never returns: '" + cname + "' has no OpReturn in its body";
+        return false;
+      }
+      return true;
     }
 
     default:
@@ -3413,6 +3496,19 @@ bool Emitter::run() {
   for (const Instr& ins : B) {
     if (no_result(ins.op) || ins.a.size() < 2 || ins.op == OpFunctionParameter) continue;
     vt_[ins.a[1]] = ins.a[0];
+  }
+  // A helper function is inlined where it is called, so its values are fields of this
+  // kernel too. The ids are the module's and unique across it, so they are collected
+  // here beside the entry's — including each parameter, which is a plain field the call
+  // assigns before the body runs rather than a local of the entry point.
+  for (const auto& fn_it : m_.funcs) {
+    const Function& f = fn_it.second;
+    if (!f.defined || &f.body == &B) continue;
+    for (const Instr& ins : f.body) {
+      if (ins.op == OpFunctionParameter) { vt_[ins.a[1]] = ins.a[0]; continue; }
+      if (no_result(ins.op) || ins.a.size() < 2) continue;
+      vt_[ins.a[1]] = ins.a[0];
+    }
   }
 
   // ---- blocks ----

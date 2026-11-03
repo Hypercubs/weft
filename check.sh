@@ -736,6 +736,11 @@ spvgpu fp64       fp64       --grid 32 --threads 32 --buffers 32,320,64,32
 # call the fp64 helper rather than apply the operator to the two 64-bit words, and
 # an operator there adds significands as integers — a wrong number, not a refusal.
 spvgpu dvec       dvec       --grid 32 --threads 32 --buffers 32,128
+# A helper function: the entry point calls a defined function twice, so the module has
+# two functions rather than one and the call is inlined where it is made. The second
+# call goes through the same helper ids again — the case a one-call-site inliner gets
+# wrong — and the values are hand-checkable: twice(x) = 2x + 1.
+spvgpu helper     helper     --grid 32 --threads 32 --buffers 32,64
 # The fold in floats: reduce add/min/max and an inclusive and an exclusive scan,
 # over half-integers so every partial sum is exact and every answer can be worked
 # out by hand in the module. The residual slots catch a wrong shift (an exclusive
