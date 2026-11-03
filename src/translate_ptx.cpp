@@ -2857,6 +2857,57 @@ std::string Emitter::emit(const std::string& raw) {
            "), " + bytes + ");";
   }
 
+  // cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [dst], [src], size
+  //
+  // The bulk store's reduce form: the threadgroup values are combined into the buffer
+  // instead of overwriting it. It is the same descriptor-free shape as the plain store
+  // — the size is written in the instruction and the group commit is a no-op — so the
+  // only new thing is the combining step.
+  if (op == "cp" && parts.size() >= 3 && parts[1] == "reduce" && parts[2] == "async") {
+    std::string opname, ty;
+    for (const auto& p : parts) {
+      if (p == "add" || p == "min" || p == "max" || p == "and" || p == "or" || p == "xor")
+        opname = p;
+      else if (p == "f32" || p == "u32" || p == "s32" || p == "u64" || p == "s64" ||
+               p == "f16" || p == "bf16" || p == "f64")
+        ty = p;
+    }
+    if (args.size() < 3) { err = "a reduce copy names a destination, a source and a size"; return ""; }
+    const std::string cty = ty == "f32" ? "float"
+                          : ty == "u32" ? "uint32_t"
+                          : ty == "s32" ? "int32_t"
+                          : ty == "u64" ? "uint64_t"
+                          : ty == "s64" ? "int64_t"
+                                        : std::string();
+    if (cty.empty()) {
+      err = "unsupported reduction type in '" + opcode +
+            "': f32 and the 32- and 64-bit integers have a bulk reduction here";
+      return "";
+    }
+    const bool bitwise = (opname == "and" || opname == "or" || opname == "xor");
+    if (bitwise && cty == "float") {
+      err = "a floating-point bulk store has no '" + opname + "': it is a bitwise reduction";
+      return "";
+    }
+    std::string combine;
+    if (opname == "add") combine = "weft_d[k] = weft_d[k] + weft_s[k];";
+    else if (opname == "min") combine = "weft_d[k] = (weft_d[k] < weft_s[k]) ? weft_d[k] : weft_s[k];";
+    else if (opname == "max") combine = "weft_d[k] = (weft_d[k] > weft_s[k]) ? weft_d[k] : weft_s[k];";
+    else if (opname == "and") combine = "weft_d[k] = weft_d[k] & weft_s[k];";
+    else if (opname == "or") combine = "weft_d[k] = weft_d[k] | weft_s[k];";
+    else if (opname == "xor") combine = "weft_d[k] = weft_d[k] ^ weft_s[k];";
+    else { err = "unsupported reduction in '" + opcode + "'"; return ""; }
+    std::string dst, dname, src, sname;
+    if (!mem_operand(args[0], dst, dname)) return "";
+    if (!mem_operand(args[1], src, sname)) return "";
+    const std::string bytes = "((uint32_t)(" + operand_as(args[2], "uint32_t") + "))";
+    const std::string sq = msl ? "threadgroup const " : "const ";
+    return guard + "{ " + cty + "* weft_d = (" + cty + "*)(uintptr_t)(" + dst + "); " + sq +
+           cty + "* weft_s = (" + sq + cty + "*)(sh + (" + src + ")); "
+           "for (uint32_t k = 0; k < (" + bytes + ") / sizeof(" + cty + "); k++) { " + combine +
+           " } }";
+  }
+
   // cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [dst], [src], bytes, [mbr]
   //
   // The bulk copy is the one that reports itself: the bytes it moves are subtracted
@@ -2882,9 +2933,13 @@ std::string Emitter::emit(const std::string& raw) {
       // guessed layout would take a real descriptor's fields wrong and copy the wrong
       // tile, silently, which is the one failure this project does not allow.
       err = "a tensor-map bulk copy ('" + opcode +
-            "') is driven by the 128-byte descriptor the CUDA driver encodes, whose layout "
-            "is not part of PTX, so it cannot be decoded faithfully here; the linear "
-            "cp.async.bulk copies name their bytes and are translated";
+            "') is driven by the 128-byte descriptor the CUDA driver encodes. That layout "
+            "is not published: under CUDA 12 the type is opaque, CUTLASS treats it that way "
+            "and only edits fields through tensormap.replace, which indexes them rather "
+            "than giving offsets. Decoding a guessed layout would read a real descriptor "
+            "wrong and copy the wrong tile without saying so, so the shape is reported "
+            "instead. The linear cp.async.bulk copies name their bytes and are "
+            "translated, including the reduce form";
       return "";
     }
     if (!from_global || !to_shared || args.size() < 3) {

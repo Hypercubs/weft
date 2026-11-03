@@ -1,0 +1,52 @@
+// `cp.reduce.async.bulk`: the bulk store that combines instead of overwriting.
+//
+//     buffer = { 1, 2, 3, 4 }
+//     tile   = { 10, 20, 30, 40 }
+//     reduce.add into the buffer, 16 bytes
+//     buffer = { 11, 22, 33, 44 }
+//
+// Descriptor-free like the plain bulk store: the size is in the instruction and the
+// group commit is a no-op. A copy that overwrote instead of adding would read
+// 10, 20, 30, 40, and one that added the wrong address would not land on 11, 22, 33, 44.
+.version 7.0
+.target sm_90
+.address_size 64
+
+.visible .entry mbarred(
+    .param .u64 mbarred_param_0
+)
+{
+    .shared .align 4 .b32 tile[4];
+
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [mbarred_param_0];
+    mov.u32 %r1, %tid.x;
+
+    mov.u32 %r2, 1;
+    st.global.b32 [%rd1], %r2;
+    add.s64 %rd3, %rd1, 4;
+    mov.u32 %r4, 2;
+    st.global.b32 [%rd3], %r4;
+    add.s64 %rd5, %rd1, 8;
+    mov.u32 %r6, 3;
+    st.global.b32 [%rd5], %r6;
+    add.s64 %rd7, %rd1, 12;
+    mov.u32 %r8, 4;
+    st.global.b32 [%rd7], %r8;
+
+    mov.u32 %r9, 10;
+    st.shared.b32 [tile], %r9;
+    mov.u32 %r10, 20;
+    st.shared.b32 [tile + 4], %r10;
+    mov.u32 %r11, 30;
+    st.shared.b32 [tile + 8], %r11;
+    mov.u32 %r12, 40;
+    st.shared.b32 [tile + 12], %r12;
+
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.add.u32 [%rd1], [tile], 16;
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+    ret;
+}

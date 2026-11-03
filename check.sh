@@ -237,6 +237,18 @@ else
   echo "FAIL  mbarbulkst read $st0 $st1 $st2 $st3; wanted 11 12 13 14"; fail=1
 fi
 
+# The bulk store that combines instead of overwriting: 1, 2, 3, 4 in the buffer,
+# 10, 20, 30, 40 in threadgroup memory, added to 11, 22, 33, 44.
+runf kernels/mbarred.ptx mbarred --grid 1 --threads 1 --buffers 4
+"$WEFT" run kernels/mbarred.ptx --kernel mbarred --grid 1 --threads 1 --buffers 4 \
+    --cpu-only --dump 0="$TMP/reduced.bin" >/dev/null
+read -r red0 red1 red2 red3 <<< "$(od -An -tu4 -v "$TMP/reduced.bin")"
+if [ "$red0" = "11" ] && [ "$red1" = "22" ] && [ "$red2" = "33" ] && [ "$red3" = "44" ]; then
+  echo "ok    mbarred  the reduce copy added 10, 20, 30, 40 to 1, 2, 3, 4"
+else
+  echo "FAIL  mbarred  read $red0 $red1 $red2 $red3; wanted 11 22 33 44"; fail=1
+fi
+
 # The value is the point: 42 is what the group wrote before the last arrival, so a lane
 # released early reads the arena instead. The store is `.b32`, so the word is the
 # integer 42 rather than a float's bits.
