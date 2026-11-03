@@ -622,6 +622,33 @@ PY
 else
   echo "FAIL  spvgpu:subbool  the fixture did not run"; fail=1
 fi
+
+# A ballot of lanes 0..4 is 0x1F; the rotate takes the value from lane (lane+1) in a
+# cluster of 32, or inside its own 8. The weighted sum below is recomputed from the
+# lane id, so a rotate in the other direction, or one that ignored the cluster, moves
+# it instead of agreeing with itself.
+if "$WEFT" run kernels/spirv/ballot.spv --kernel ballot --cpu-only --grid 32 --threads 32 --buffers 32 --dump 0="$TMP/ballot.bin" >/dev/null 2>&1; then
+  if python3 - "$TMP/ballot.bin" <<'PY'
+import struct, sys
+v = struct.unpack("<32f", open(sys.argv[1], "rb").read(128))
+bad = []
+for i in range(32):
+    want = (0 + 2 * 4 + 4 * 0 + 8 * 1 + 16 * (1 if i < 5 else 0)
+            + 32 * ((i + 1) & 31) + 64 * ((i & ~7) + ((i + 1) & 7)))
+    if v[i] != float(want):
+        bad.append((i, v[i], want))
+for i, got, want in bad[:4]:
+    print("  lane %d wrote %g, wanted %d" % (i, got, want))
+sys.exit(0 if not bad else 1)
+PY
+  then
+    echo "ok    spvgpu:ballot  lsb, msb, bit extract, inverse, and a rotation of 32 and of 8"
+  else
+    echo "FAIL  spvgpu:ballot  a ballot question or a rotation direction is wrong"; fail=1
+  fi
+else
+  echo "FAIL  spvgpu:ballot  the fixture did not run"; fail=1
+fi
 # `.a2d`: a layered sample whose third coordinate is the slice, and `txq.depth`
 # answering with the slice count both readings are folded into the output.
 gpucol kernels/ptxarray.ptx           64 4096 --textures '64x64*4' --samplers nearest/clamp
@@ -743,6 +770,8 @@ spvgpu submul      submul     --grid 32 --threads 32 --buffers 32
 # A boolean folded three ways, plus an xor scan: the identities are true for `and`
 # and false for the others, which is what the fixture's sum pins.
 spvgpu subbool     subbool    --grid 32 --threads 32 --buffers 32
+# The four questions about a ballot, and a rotation with and without a cluster.
+spvgpu ballot      ballot     --grid 32 --threads 32 --buffers 32
 spvgpu serial_sum   llvm      --grid 1 --threads 1 --buffers 1000,1 --arg 0=1000
 spvgpu globk        global    --grid 1048576 --buffers 1048576,1048576
 # An image read and a filtered sample; then a storage image written, barriered,

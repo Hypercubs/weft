@@ -925,6 +925,20 @@ using weft_f4x4 = weft_mat<4, 4>;
 // pointer so no address space has to be named.
 struct weft_n { float v[4]; };
 
+// The bit a ballot says is there: the lowest and the highest one that is set.
+// A loop rather than a builtin — `ctz` is spelled differently on the two targets and
+// this runs once per ballot, not once per lane.
+static inline uint32_t weft_lsb(uint32_t v) {
+  for (uint32_t i = 0; i < 32u; i++)
+    if (v & (1u << i)) return i;
+  return 0xFFFFFFFFu;
+}
+static inline uint32_t weft_msb(uint32_t v) {
+  for (int i = 31; i >= 0; i--)
+    if (v & (1u << (uint32_t)i)) return (uint32_t)i;
+  return 0xFFFFFFFFu;
+}
+
 // The width of a vector type, so a matrix can name the vector it multiplies and the
 // loops below are written once for all nine shapes instead of once per shape.
 template <int N> struct weft_vt;
@@ -1898,3 +1912,4 @@ static inline void copy_shared(threadgroup uint8_t* dst, const device void* src,
 
 }  // namespace weft
 )WEFMSL";
+

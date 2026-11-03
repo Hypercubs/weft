@@ -95,6 +95,7 @@ enum : uint32_t {
   OpGroupNonUniformBitwiseAnd = 359, OpGroupNonUniformBitwiseOr = 360,
   OpGroupNonUniformBitwiseXor = 361, OpGroupNonUniformLogicalAnd = 362,
   OpGroupNonUniformLogicalOr = 363, OpGroupNonUniformLogicalXor = 364,
+  OpGroupNonUniformRotateKHR = 4431,
   // atomic float add (SPV_EXT_shader_atomic_float_add)
   OpAtomicFAddEXT = 6035,
   // atomic float min/max (SPV_EXT_shader_atomic_float_min_max). The numbers are
@@ -2834,6 +2835,49 @@ bool Emitter::emit_one(const Instr& ins) {
                                        (action == 2 ? "exclusive_" : "inclusive_") + kind);
     }
 
+    // ---- ballots: the bit a lane's own word holds ----
+    //
+    // A ballot is one word here, so every question about it is local arithmetic on
+    // that word and needs no rendezvous. The four were refused as unsupported
+    // opcodes while BallotBitCount was handled; only the first of the 128-bit form's
+    // four words can be set for a 32-wide subgroup, so the extra ones are dropped.
+    case OpGroupNonUniformInverseBallot: case OpGroupNonUniformBallotBitExtract:
+    case OpGroupNonUniformBallotFindLSB: case OpGroupNonUniformBallotFindMSB: {
+      if (a.size() < 4) { err = "a ballot operation is missing its ballot"; return false; }
+      std::string bw = V(3);
+      uint32_t ben = 0, bnn = 0;
+      if (vector_of(vtype(a[3]), ben, bnn) && bnn == 4) bw = "(" + V(3) + ").x";
+      if (op == OpGroupNonUniformBallotFindLSB) { set("weft_lsb(" + bw + ")"); return true; }
+      if (op == OpGroupNonUniformBallotFindMSB) { set("weft_msb(" + bw + ")"); return true; }
+      if (op == OpGroupNonUniformBallotBitExtract) {
+        if (a.size() < 5) { err = "a ballot bit extract is missing its index"; return false; }
+        set("((((" + bw + ") >> ((" + V(4) + ") & 31u)) & 1u) != 0u)");
+        return true;
+      }
+      set("((((" + bw + ") >> (ctx.lid & 31u)) & 1u) != 0u)");
+      return true;
+    }
+
+    // ---- a rotation of the group ----
+    //
+    // `subgroupRotate` names a lane to take the value from, `Delta` lanes along and
+    // wrapped inside the cluster of `ClusterSize` lanes (32 when it is not given, and
+    // always a power of two, which is what makes the wrap a mask). A negative Delta
+    // wraps the same way through unsigned arithmetic.
+    case OpGroupNonUniformRotateKHR: {
+      if (a.size() < 5) { err = "a rotation is missing its value or its delta"; return false; }
+      const std::string cl = a.size() > 5 ? ("((uint32_t)(" + V(5) + "))") : std::string("32u");
+      const std::string mask = "(" + cl + " - 1u)";
+      std::string read;
+      if (!wide_shfl(rt, V(3),
+                     "((ctx.lid & ~" + mask + ") + ((ctx.lid + (uint32_t)(" + V(4) + ")) & " +
+                         mask + "))",
+                     read))
+        return false;
+      set(read);
+      return true;
+    }
+
     // ---- extended instructions (OpenCL.std) ----
     case OpExtInst: {
       const uint32_t set_id = a[2];
@@ -4303,6 +4347,19 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       "// The components of a row on their way into a vector, as a value rather than a\n"
       "// pointer so no address space has to be named.\n"
       "struct weft_n { float v[4]; };\n"
+      "// The bit a ballot says is there: the lowest and the highest one that is set.\n"
+      "// A loop rather than a builtin — `ctz` is spelled differently on the two targets and\n"
+      "// this runs once per ballot, not once per lane.\n"
+      "static inline uint32_t weft_lsb(uint32_t v) {\n"
+      "  for (uint32_t i = 0; i < 32u; i++)\n"
+      "    if (v & (1u << i)) return i;\n"
+      "  return 0xFFFFFFFFu;\n"
+      "}\n"
+      "static inline uint32_t weft_msb(uint32_t v) {\n"
+      "  for (int i = 31; i >= 0; i--)\n"
+      "    if (v & (1u << (uint32_t)i)) return (uint32_t)i;\n"
+      "  return 0xFFFFFFFFu;\n"
+      "}\n"
       "\n"
       "// The width of a vector type, so a matrix can name the vector it multiplies and the\n"
       "// loops below are written once for all nine shapes instead of once per shape.\n"

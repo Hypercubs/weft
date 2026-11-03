@@ -1,0 +1,94 @@
+; The questions a ballot answers, and a rotation of the group.
+;
+;     b    = ballot(lane < 5)                    0x0000001F in the first word
+;     lsb  = FindLSB(b)                          0
+;     msb  = FindMSB(b)                          4
+;     be5  = BitExtract(b, 5)                    false
+;     be3  = BitExtract(b, 3)                    true
+;     inv  = InverseBallot(b)                    true on lanes 0..4
+;     r32  = Rotate(x, 1)         x = (float)lane, cluster of 32: lane (lane+1) mod 32
+;     r8   = Rotate(x, 1, 8)                     lane (lane+1) mod 8, inside its own 8
+;     out[gid] = lsb + 2 msb + 4 be5 + 8 be3 + 16 inv + 32 r32 + 64 r8
+;
+; Every term is a small integer, so the sum is exact and check.sh recomputes it. A
+; rotate that took the value from lane (lane-1) moves every term, and one that
+; ignored the cluster size reads across an 8-lane boundary.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformBallot
+               OpCapability GroupNonUniformShuffle
+               OpCapability GroupNonUniformRotateKHR
+               OpExtension "SPV_KHR_subgroup_rotate"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "ballot" %gid %lid
+               OpName %main "ballot"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %lid BuiltIn LocalInvocationId
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+     %v4u32 = OpTypeVector %u32 4
+       %u64 = OpTypeInt 64 0
+    %v3u64 = OpTypeVector %u64 3
+       %ptr = OpTypePointer CrossWorkgroup %f32
+       %inp = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ptr
+       %gid = OpVariable %inp Input
+       %lid = OpVariable %inp Input
+       %sub = OpConstant %u32 3
+        %c1 = OpConstant %u32 1
+        %c3 = OpConstant %u32 3
+        %c5 = OpConstant %u32 5
+        %c8 = OpConstant %u32 8
+       %c31 = OpConstant %u32 31
+       %f00 = OpConstant %f32 0
+       %f01 = OpConstant %f32 1
+       %f02 = OpConstant %f32 2
+       %f04 = OpConstant %f32 4
+       %f08 = OpConstant %f32 8
+       %f16 = OpConstant %f32 16
+       %f32c = OpConstant %f32 32
+       %f64 = OpConstant %f32 64
+      %main = OpFunction %void None %fnty
+         %o = OpFunctionParameter %ptr
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+         %l = OpLoad %v3u64 %lid
+       %li0 = OpCompositeExtract %u64 %l 0
+        %li = OpUConvert %u32 %li0
+      %lane = OpBitwiseAnd %u32 %li %c31
+      %pred = OpULessThan %bool %lane %c5
+         %b = OpGroupNonUniformBallot %v4u32 %sub %pred
+       %lsb = OpGroupNonUniformBallotFindLSB %u32 %sub %b
+       %msb = OpGroupNonUniformBallotFindMSB %u32 %sub %b
+       %be5 = OpGroupNonUniformBallotBitExtract %bool %sub %b %c5
+       %be3 = OpGroupNonUniformBallotBitExtract %bool %sub %b %c3
+       %inv = OpGroupNonUniformInverseBallot %bool %sub %b
+         %x = OpConvertUToF %f32 %lane
+       %r32 = OpGroupNonUniformRotateKHR %f32 %sub %x %c1
+        %r8 = OpGroupNonUniformRotateKHR %f32 %sub %x %c1 %c8
+      %lsbF = OpConvertUToF %f32 %lsb
+      %msbF = OpConvertUToF %f32 %msb
+       %p5 = OpSelect %f32 %be5 %f01 %f00
+       %p3 = OpSelect %f32 %be3 %f01 %f00
+       %pi = OpSelect %f32 %inv %f01 %f00
+        %q1 = OpFMul %f32 %msbF %f02
+        %q2 = OpFMul %f32 %p5 %f04
+        %q3 = OpFMul %f32 %p3 %f08
+        %q4 = OpFMul %f32 %pi %f16
+        %q5 = OpFMul %f32 %r32 %f32c
+        %q6 = OpFMul %f32 %r8 %f64
+        %s0 = OpFAdd %f32 %lsbF %q1
+        %s1 = OpFAdd %f32 %s0 %q2
+        %s2 = OpFAdd %f32 %s1 %q3
+        %s3 = OpFAdd %f32 %s2 %q4
+        %s4 = OpFAdd %f32 %s3 %q5
+        %s5 = OpFAdd %f32 %s4 %q6
+        %po = OpPtrAccessChain %ptr %o %gi
+               OpStore %po %s5
+               OpReturn
+               OpFunctionEnd
