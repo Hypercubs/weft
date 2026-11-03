@@ -48,7 +48,12 @@ runf() {
   local file="$1" name="$2"; shift 2
   local out
   out="$("$WEFT" run "$file" --kernel "$name" "$@" --bench 5 $CPUMODE)"
-  if echo "$out" | grep -q DISAGREE; then
+  # A kernel that failed to compile, or a dispatch that never finished, prints no
+  # comparison line and no DISAGREE either — so "not DISAGREE" is not the same as
+  # "agrees", and a row could go green on an empty summary. Both are failures.
+  local need_cmp=1
+  case "$CPUMODE" in *--cpu-only*) need_cmp=0 ;; esac
+  if echo "$out" | grep -qE "DISAGREE|^weft: " || { [ "$need_cmp" = "1" ] && ! echo "$out" | grep -q "compare"; }; then
     echo "FAIL  $name"
     echo "$out" | sed 's/^/      /'
     fail=1

@@ -2901,9 +2901,13 @@ std::string Emitter::emit(const std::string& raw) {
     if (!mem_operand(args[0], dst, dname)) return "";
     if (!mem_operand(args[1], src, sname)) return "";
     const std::string bytes = "((uint32_t)(" + operand_as(args[2], "uint32_t") + "))";
+    // Metal has no unqualified pointers: the destination is a `device` one and the
+    // source is a `threadgroup` one, and a cast that leaves the space off does not
+    // compile at all.
+    const std::string dq = msl ? "device " : "";
     const std::string sq = msl ? "threadgroup const " : "const ";
-    return guard + "{ " + cty + "* weft_d = (" + cty + "*)(uintptr_t)(" + dst + "); " + sq +
-           cty + "* weft_s = (" + sq + cty + "*)(sh + (" + src + ")); "
+    return guard + "{ " + dq + cty + "* weft_d = (" + dq + cty + "*)(uintptr_t)(" + dst +
+           "); " + sq + cty + "* weft_s = (" + sq + cty + "*)(sh + (" + src + ")); "
            "for (uint32_t k = 0; k < (" + bytes + ") / sizeof(" + cty + "); k++) { " + combine +
            " } }";
   }
