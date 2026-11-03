@@ -1,0 +1,50 @@
+// An offset inside a shared array: `[buf + 4]` names the second word, not the first.
+//
+//     buf[0] = 7; buf[1] = 9; buf[2] = 5
+//     out[3*gid+0] = buf[0]     7
+//     out[3*gid+1] = buf[1]     9
+//     out[3*gid+2] = buf[2]     5
+//
+// Three different answers, so an offset that is swallowed reads 9, 9, 9 instead of
+// 7, 9, 5 — the failure is a number, not a shape. Every slot is written: threadgroup
+// memory starts with whatever was there, so a slot nothing writes cannot be compared.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry sharedofs(
+    .param .u64 sharedofs_param_0
+)
+{
+    .shared .align 4 .b32 buf[16];
+
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [sharedofs_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    mov.u32 %r5, 7;
+    st.shared.b32 [buf], %r5;
+    mov.u32 %r6, 9;
+    st.shared.b32 [buf + 4], %r6;
+    mov.u32 %r10, 5;
+    st.shared.b32 [buf + 8], %r10;
+
+    ld.shared.b32 %r7, [buf];
+    ld.shared.b32 %r8, [buf + 4];
+    ld.shared.b32 %r9, [buf + 8];
+
+    mul.wide.s32 %rd3, %r4, 12;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd5, %rd4, 4;
+    st.global.b32 [%rd5], %r8;
+    add.s64 %rd6, %rd5, 4;
+    st.global.b32 [%rd6], %r9;
+    ret;
+}

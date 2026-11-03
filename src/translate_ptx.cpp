@@ -534,8 +534,21 @@ struct Emitter {
     s = trim(s.substr(1, s.size() - 2));
     if (base_reg) base_reg->clear();
     if (!s.empty() && s[0] != '%') {
-      param_name = s;  // a symbol: param or shared array name
-      addr = "0";
+      // A symbol, and possibly an offset into it: `[tile]` or `[tile + 4]`. The name
+      // has to stay the array's, because that is the key the arena is laid out by,
+      // and the offset belongs in the address every access adds to that base.
+      // Keeping both inside the name put every `[tile + n]` at the array's first
+      // byte, so the second word of anything read as its first.
+      const size_t cut = s.find_first_of("+-");
+      if (cut == std::string::npos) {
+        param_name = s;  // a symbol: param or shared array name
+        addr = "0";
+        return true;
+      }
+      param_name = trim(s.substr(0, cut));
+      std::string off = trim(s.substr(cut + 1));
+      if (!off.empty() && off[0] == '%') off = reg_expr(off);
+      addr = s[cut] == '-' ? ("(0 - " + off + ")") : ("(0 + " + off + ")");
       return true;
     }
     std::string base;
@@ -899,7 +912,12 @@ std::string Emitter::emit(const std::string& raw) {
         if (param) {
           auto b = params.find(name);
           auto sc = scalars.find(name);
-          if (b != params.end()) return buf_base_as(ty, b->second);
+          // `[buf + 8]` is a field inside what the binding points at, so the offset
+          // is part of the address rather than part of the name.
+          if (b != params.end()) {
+            const std::string at_base = buf_base_as(ty, b->second);
+            return addr == "0" ? at_base : ("(" + at_base + " + " + addr + ")");
+          }
           if (sc != scalars.end()) return "(" + ty + ")" + param_of(sc->second);
           err = "unknown parameter '" + name + "'";
           return "0";

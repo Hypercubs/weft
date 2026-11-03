@@ -195,6 +195,21 @@ run swizzle    --grid 65536 --buffers 262144,524288
 # folded into the answer, so a binding of the wrong shape lands on a different
 # number instead of on a sample that quietly agrees.
 runf kernels/ptx1d.ptx ptx1d --grid 65536 --buffers 65536 --textures 64x1
+runf kernels/sharedofs.ptx sharedofs --grid 256 --buffers 768
+
+# Three words, three answers: 7, 9 and 5. An offset that is swallowed reads one of
+# them three times, so counting each value says whether the address moved.
+"$WEFT" run kernels/sharedofs.ptx --kernel sharedofs --grid 256 --buffers 768 \
+    --dump 0="$TMP/sharedofs.bin" >/dev/null
+words=$(od -An -tu4 -v "$TMP/sharedofs.bin" | tr -s ' ' '\n')
+sevens=$(echo "$words" | grep -c '^7$')
+nines=$(echo "$words" | grep -c '^9$')
+fives=$(echo "$words" | grep -c '^5$')
+if [ "$sevens" = "256" ] && [ "$nines" = "256" ] && [ "$fives" = "256" ]; then
+  echo "ok    sharedofs  [buf], [buf+4], [buf+8] read 7, 9, 5 (256 each)"
+else
+  echo "FAIL  sharedofs  $sevens sevens, $nines nines, $fives fives; wanted 256 of each"; fail=1
+fi
 runf kernels/hard.metal raymarch --grid 65536 --buffers 65536,65536     # SDF raymarch, 64 steps
 runf kernels/hard.metal fft --grid 2048 --threads 256 --buffers 4096,4096  # 256-point radix-2, 9 barriers
 
