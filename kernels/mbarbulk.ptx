@@ -1,0 +1,49 @@
+// `cp.async.bulk` completing an mbarrier, which is the pair to `expect_tx`.
+//
+//     init  [mbr], 1              one arrival owed
+//     expect_tx [mbr], 16         and sixteen bytes
+//     cp.async.bulk ... 16        the copy moves them and completes the transaction
+//     arrive                      the one arrival
+//     try_wait.parity [mbr], 0    until the phase flips
+//     out[0] = tile[0]            the first word the copy moved
+//
+// One lane: the count is the group size and every lane copies, so thirty-two lanes
+// would expect thirty-two times. `tile[0]` is the input buffer's first float, so a copy
+// that never happened reads the arena and a copy that moved the wrong address reads the
+// wrong word — both show up in the number.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry mbarbulk(
+    .param .u64 mbarbulk_param_0,      // out
+    .param .u64 mbarbulk_param_1       // in
+)
+{
+    .shared .align 8 .b64 mbr[1];
+    .shared .align 4 .b32 tile[4];
+
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [mbarbulk_param_0];
+    ld.param.u64 %rd2, [mbarbulk_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mbarrier.init.shared.b64 [mbr], 1;
+    bar.sync 0;
+
+    mbarrier.expect_tx.shared.b64 [mbr], 16;
+    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [tile], [%rd2], 16, [mbr];
+    mbarrier.arrive.shared.b64 %rd3, [mbr];
+
+WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
+    @!%p2 bra WAIT;
+
+    ld.shared.b32 %r7, [tile];
+    mul.wide.s32 %rd4, %r1, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    st.global.b32 [%rd5], %r7;
+    ret;
+}

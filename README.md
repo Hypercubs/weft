@@ -40,6 +40,8 @@ ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 |---|---|---|---|
 | buffers, scalar parameters | yes | yes | yes |
 | `threadgroup` / `.shared` memory, barriers | yes | yes | yes |
+| `mbarrier`: arrivals, phases, expected bytes | — | `init`, `arrive`, `expect_tx`, parity waits | — |
+| bulk copies that complete an `mbarrier` | — | `cp.async.bulk` | — |
 | warp shuffles, votes, folds and quads | `simd_*` | `shfl`, `vote`, `redux` | subgroup ops, folds and quads |
 | 32-bit atomics | yes | yes | yes |
 | 64-bit atomics: fetch, compare-exchange, load, store | yes | yes | yes |

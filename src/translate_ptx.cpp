@@ -2828,7 +2828,10 @@ std::string Emitter::emit(const std::string& raw) {
   // has to wait for them gains nothing by waiting later. So the copy is issued
   // as a memcpy and the commit/wait instructions are no-ops — which is exactly
   // the ordering the GPU promises once the wait has been reached.
-  if (op == "cp" && parts.size() >= 2 && parts[1] == "async") {
+  // The bulk form below is a different instruction with a different shape: it reports
+  // its own completion rather than joining a commit/wait group, so it is not this one.
+  if (op == "cp" && parts.size() >= 2 && parts[1] == "async" &&
+      !(parts.size() >= 3 && parts[2] == "bulk")) {
     for (size_t i = 2; i < parts.size(); i++) {
       const std::string& p = parts[i];
       if (p == "commit_group" || p == "wait_group" || p == "wait_all") return guard + ";";
@@ -2852,6 +2855,80 @@ std::string Emitter::emit(const std::string& raw) {
              src + "), " + bytes + ");";
     return guard + "std::memcpy((void*)(sh + " + dst + "), (const void*)(uintptr_t)(" + src +
            "), " + bytes + ");";
+  }
+
+  // cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [dst], [src], bytes, [mbr]
+  //
+  // The bulk copy is the one that reports itself: the bytes it moves are subtracted
+  // from what the barrier was told to expect, and the phase flips when that sum runs
+  // out. So it is a copy followed by the completion — the same two words the arrive
+  // touches — rather than a commit/wait group. `expect_tx` is the other half of the
+  // pair, and a kernel that uses one without the other either never flips its phase
+  // or flips it on bytes that never moved, exactly as on the hardware.
+  if (op == "cp" && parts.size() >= 3 && parts[2] == "bulk") {
+    for (size_t i = 3; i < parts.size(); i++)
+      if (parts[i] == "commit_group" || parts[i] == "wait_group" || parts[i] == "wait_all")
+        return guard + ";";
+    bool from_global = false, to_shared = false, completes = false;
+    for (const auto& p : parts) {
+      if (p == "global") from_global = true;
+      if (p.rfind("shared", 0) == 0) to_shared = true;
+      if (p.rfind("mbarrier", 0) == 0 && p.find("complete_tx") != std::string::npos) completes = true;
+    }
+    if (!from_global || !to_shared || !completes || args.size() < 4) {
+      err = "unsupported bulk copy '" + opcode +
+            "': only global to threadgroup, completing an mbarrier, is translated";
+      return "";
+    }
+    std::string dst, dname, src, sname;
+    if (!mem_operand(args[0], dst, dname)) return "";
+    if (!mem_operand(args[1], src, sname)) return "";
+    const std::string bytes = "((uint32_t)(" + operand_as(args[2], "uint32_t") + "))";
+    // The barrier the copy reports to, as the object's offset in the window.
+    std::string mo = trim(args[3]);
+    const size_t lb = mo.find('['), rb2 = mo.rfind(']');
+    if (lb == std::string::npos || rb2 == std::string::npos || rb2 < lb) {
+      err = "a bulk copy needs the mbarrier it completes, in brackets";
+      return "";
+    }
+    std::string inner = trim(mo.substr(lb + 1, rb2 - lb - 1));
+    std::string mname = inner, mextra;
+    const size_t plus = inner.find('+');
+    if (plus != std::string::npos) {
+      mname = trim(inner.substr(0, plus));
+      mextra = trim(inner.substr(plus + 1));
+    }
+    auto so = shared_offsets.find(mname);
+    if (so == shared_offsets.end()) {
+      err = "'" + mname + "' is not a shared array: a bulk copy completes an mbarrier";
+      return "";
+    }
+    std::string bad = std::to_string(so->second);
+    if (!mextra.empty()) bad += " + " + operand_as(mextra, "uint64_t");
+    const std::string copy = msl
+        ? ("weft::copy_shared(sh + (" + dst + "), (const device void*)(uintptr_t)(" + src +
+           "), " + bytes + ");")
+        : ("std::memcpy((void*)(sh + (" + dst + ")), (const void*)(uintptr_t)(" + src + "), " +
+           bytes + ");");
+    // The bytes are in the window before this runs, which is the order the hardware
+    // promises once the transaction completes.
+    std::string done;
+    if (msl) {
+      done = "{ threadgroup atomic_uint* weft_a = (threadgroup atomic_uint*)(sh + " + bad +
+             "); const uint32_t weft_left = atomic_fetch_sub_explicit(weft_a, " + bytes +
+             ", memory_order_relaxed); if (weft_left == " + bytes +
+             ") { atomic_store_explicit(weft_a, (uint32_t)(*((volatile threadgroup const "
+             "uint32_t*)(sh + " + bad + " + 4u)) >> 1u), memory_order_relaxed); "
+             "*((volatile threadgroup uint32_t*)(sh + " + bad + " + 4u)) = "
+             "(*((volatile threadgroup const uint32_t*)(sh + " + bad + " + 4u)) ^ 1u); } }";
+    } else {
+      done = "{ const uint32_t weft_tx = " + bytes + "; " + "*((uint32_t*)(sh + " + bad +
+             ")) = (*((uint32_t*)(sh + " + bad + ")) >= weft_tx) ? (*((uint32_t*)(sh + " + bad +
+             ")) - weft_tx) : 0u; if (*((uint32_t*)(sh + " + bad + ")) == 0u) { "
+             "*((uint32_t*)(sh + " + bad + ")) = *((uint32_t*)(sh + " + bad + " + 4u)) >> 1; "
+             "*((uint32_t*)(sh + " + bad + " + 4u)) ^= 1u; } }";
+    }
+    return guard + "{ " + copy + " " + done + " }";
   }
 
   // ---- textures and surfaces ----
@@ -3448,9 +3525,13 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
         s = trim(s);
         if (s.empty()) continue;
 
-        // A label glued to its instruction: "$L_1: add.f32 ..."
+        // A label glued to its instruction: "$L_1: add.f32 ...". A label is a name, so
+        // it has no dot and no second colon — otherwise `cp.async.bulk.shared::cluster`
+        // reads as a label called `cp.async.bulk.shared` followed by an instruction
+        // beginning `:cluster`.
         size_t colon = s.find(':');
-        if (colon != std::string::npos && s.substr(0, colon).find_first_of(" \t") == std::string::npos) {
+        if (colon != std::string::npos && colon > 0 &&
+            s.substr(0, colon).find_first_of(" \t.:") == std::string::npos) {
           flush_lanes();
           const std::string lab = trim(s.substr(0, colon));
           if (e.vec)

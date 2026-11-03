@@ -211,6 +211,20 @@ else
   echo "FAIL  mbartx   read $tx_owed, $tx_arrived, $tx_count; wanted 16, 23, 8"; fail=1
 fi
 
+# A bulk copy completes the transaction it was expected to: the four floats below are
+# 1, 2, 3 and 4, so a copy that moved the right sixteen bytes leaves 1.0f in tile[0],
+# which is 0x3F800000 in the output word.
+printf '\x00\x00\x80\x3f\x00\x00\x00\x40\x00\x00\x40\x40\x00\x00\x80\x40' > "$TMP/bulk_in.bin"
+runf kernels/mbarbulk.ptx mbarbulk --grid 1 --threads 1 --buffers 1,4 --load 1="$TMP/bulk_in.bin"
+"$WEFT" run kernels/mbarbulk.ptx --kernel mbarbulk --grid 1 --threads 1 --buffers 1,4 \
+    --load 1="$TMP/bulk_in.bin" --cpu-only --dump 0="$TMP/bulk_out.bin" >/dev/null
+read -r bulk_word <<< "$(od -An -tu4 -v "$TMP/bulk_out.bin")"
+if [ "$bulk_word" = "1065353216" ]; then
+  echo "ok    mbarbulk the copy moved the bytes the barrier was expecting (1.0f)"
+else
+  echo "FAIL  mbarbulk tile[0] was $bulk_word bits; wanted 1.0f"; fail=1
+fi
+
 # The value is the point: 42 is what the group wrote before the last arrival, so a lane
 # released early reads the arena instead. The store is `.b32`, so the word is the
 # integer 42 rather than a float's bits.
