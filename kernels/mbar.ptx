@@ -11,10 +11,10 @@
 // with the phase still where it started, so the wait has to hold it until the last
 // arrival, and the value it reads afterwards was written by another lane.
 //
-// The extents below are the arena's own: every `.shared` array is laid out by the byte
-// count in its brackets, so `mbr[8]` reserves the eight bytes an mbarrier is (the owed
-// count and the phase word) and `data[16]` starts after them. Spelling it `mbr[1]`
-// would put `data` at offset four, on top of the phase.
+// The brackets count elements, so `mbr[1]` is one `.b64` — the eight bytes the object
+// is, the owed count and the phase word — and `data[4]` is sixteen bytes after them.
+// Spelling it `.b32 mbr[8]` would reserve the same bytes but read them in the wrong
+// width, and the phase lives in the object's second word.
 .version 7.0
 .target sm_70
 .address_size 64
@@ -24,8 +24,8 @@
 )
 {
     // Declared inside the body, which is where the arena scan reads them.
-    .shared .align 8 .b64 mbr[8];
-    .shared .align 4 .b32 data[16];
+    .shared .align 8 .b64 mbr[1];
+    .shared .align 4 .b32 data[4];
 
     .reg .b32 %r<16>;
     .reg .b64 %rd<8>;

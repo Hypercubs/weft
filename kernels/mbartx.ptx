@@ -1,0 +1,47 @@
+// `mbarrier.expect_tx`: the byte count a bulk copy will complete the phase with.
+//
+//     init  [mbr], 4              four arrivals owed
+//     bar.sync 0
+//     expect_tx [mbr], 12         the phase now also waits for 12 bytes   -> 16
+//     arrive.expect_tx %rd, [mbr], 8   8 more bytes, and one arrival      -> 23
+//     read the two words          owed 23, count 4 with phase 0 (4 << 1 = 8)
+//
+// A single lane, so the numbers are the instructions' own: the count is the group
+// size, and thirty-two lanes expecting would add thirty-two times.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry mbartx(
+    .param .u64 mbartx_param_0
+)
+{
+    .shared .align 8 .b64 mbr[1];
+
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [mbartx_param_0];
+    mov.u32 %r1, %tid.x;
+
+    mbarrier.init.shared.b64 [mbr], 4;
+    bar.sync 0;
+
+    mbarrier.expect_tx.shared.b64 [mbr], 12;
+    ld.shared.b32 %r8, [mbr];
+
+    mbarrier.arrive.expect_tx.shared.b64 %rd2, [mbr], 8;
+    ld.shared.b32 %r9, [mbr];
+
+    ld.shared.b32 %r10, [mbr + 4];
+
+    mul.wide.s32 %rd3, %r1, 12;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd5, %rd4, 4;
+    st.global.b32 [%rd5], %r9;
+    add.s64 %rd6, %rd5, 4;
+    st.global.b32 [%rd6], %r10;
+    ret;
+}

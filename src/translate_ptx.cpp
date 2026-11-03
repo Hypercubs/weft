@@ -1417,7 +1417,34 @@ std::string Emitter::emit(const std::string& raw) {
       return guard + "{ const uint32_t weft_n = " + n + "; " + w0 + " = weft_n; " + w1 +
              " = (weft_n << 1); }";
     }
-    if (mode == "arrive") {
+    // `mbarrier.expect_tx` says how many bytes the phase is also waiting for: the copy
+    // that moves them completes that part of the same count, and the phase flips when
+    // the sum reaches zero. `arrive.expect_tx` does both in one instruction, which is
+    // the form a TMA load emits.
+    bool also_arrive = false;
+    for (const auto& p : parts)
+      if (p == "arrive") also_arrive = true;
+    auto expect_tx_code = [&]() -> std::string {
+      if ((int)args.size() <= ai + 1) {
+        err = "an mbarrier expect_tx without a byte count";
+        return "";
+      }
+      const std::string tx = "((uint32_t)(" + operand_as(args[ai + 1], "uint32_t") + "))";
+      // Two lanes can expect at once on the GPU, so the add is one atomic there too.
+      if (msl)
+        return "{ threadgroup atomic_uint* weft_x = (threadgroup atomic_uint*)(sh + " + addr +
+               "); atomic_fetch_add_explicit(weft_x, " + tx + ", memory_order_relaxed); }";
+      return "{ const uint32_t weft_tx = " + tx + "; " + w0 + " = " + w0 + " + weft_tx; }";
+    };
+    if (mode == "expect_tx" && !also_arrive) {
+      const std::string code = expect_tx_code();
+      if (code.empty()) return "";
+      if (vec) { vec_side = true; return "{ " + lane + ") " + code + " }"; }
+      return guard + code;
+    }
+    if (mode == "arrive" || mode == "expect_tx") {
+      // Only the fused form carries an expectation; a bare arrive has none.
+      const std::string pre = (mode == "expect_tx") ? (expect_tx_code() + " ") : std::string();
       // The lanes of a group arrive at the same instant, so on the GPU the decrement
       // is one atomic. A read, a subtract and a write let two arrivals see the same
       // count and one of them never be counted, which is a wait that never ends —
@@ -1448,9 +1475,10 @@ std::string Emitter::emit(const std::string& raw) {
       }
       if (vec) {
         vec_side = true;
-        return "{ " + lane + ") { " + body + (have_state ? " " + state : std::string()) + " } }";
+        return "{ " + lane + ") { " + pre + body + (have_state ? " " + state : std::string()) +
+               " } }";
       }
-      std::string out = guard + "{ " + body;
+      std::string out = guard + "{ " + pre + body;
       if (have_state) out += " " + state;
       return out + " }";
     }
@@ -3355,9 +3383,18 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
           externs.emplace_back(nm, true);
           continue;
         }
+        // The bracket is a count of elements, not of bytes: `.b32 tile[1024]` is four
+        // kilobytes, which is what CUDA means by it and what the kernel writes. Sizing
+        // it as 1024 bytes put the array after it inside this one.
+        uint64_t esz = 4;
+        for (const auto& t : split_top(d, ' ')) {
+          if (t.empty() || t[0] != '.') continue;
+          const std::string et = cpp_type(t);
+          if (!et.empty() && cpp_size(et)) { esz = (uint64_t)cpp_size(et); break; }
+        }
         off = (off + 15) & ~(uint64_t)15;
         em.shared_offsets[nm] = off;
-        off += std::strtoull(extent.c_str(), nullptr, 10);
+        off += std::strtoull(extent.c_str(), nullptr, 10) * esz;
         shared_decl += extent + " ";
       }
       // The dynamic array starts where the static ones end.

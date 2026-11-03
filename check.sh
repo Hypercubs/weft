@@ -197,6 +197,19 @@ run swizzle    --grid 65536 --buffers 262144,524288
 runf kernels/ptx1d.ptx ptx1d --grid 65536 --buffers 65536 --textures 64x1
 runf kernels/sharedofs.ptx sharedofs --grid 256 --buffers 768
 runf kernels/mbar.ptx mbar --grid 32 --threads 32 --buffers 32
+runf kernels/mbartx.ptx mbartx --grid 1 --threads 1 --buffers 3
+
+# One lane, so the arithmetic is the instructions' own: 4 owed + 12 expected bytes is
+# 16, then eight more expected and one arrival is 23, and the count word is 4 with the
+# phase in its low bit.
+"$WEFT" run kernels/mbartx.ptx --kernel mbartx --grid 1 --threads 1 --buffers 3 \
+    --cpu-only --dump 0="$TMP/mbartx.bin" >/dev/null
+read -r tx_owed tx_arrived tx_count <<< "$(od -An -tu4 -v "$TMP/mbartx.bin")"
+if [ "$tx_owed" = "16" ] && [ "$tx_arrived" = "23" ] && [ "$tx_count" = "8" ]; then
+  echo "ok    mbartx   4 + 12 expected bytes is 16, then 8 more and an arrival is 23"
+else
+  echo "FAIL  mbartx   read $tx_owed, $tx_arrived, $tx_count; wanted 16, 23, 8"; fail=1
+fi
 
 # The value is the point: 42 is what the group wrote before the last arrival, so a lane
 # released early reads the arena instead. The store is `.b32`, so the word is the
