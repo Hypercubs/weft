@@ -2875,9 +2875,39 @@ std::string Emitter::emit(const std::string& raw) {
       if (p.rfind("shared", 0) == 0) to_shared = true;
       if (p.rfind("mbarrier", 0) == 0 && p.find("complete_tx") != std::string::npos) completes = true;
     }
-    if (!from_global || !to_shared || !completes || args.size() < 4) {
+    if (parts.size() >= 4 && parts[3] == "tensor") {
+      // A tensor copy is driven by a 128-byte descriptor the CUDA driver encodes, and
+      // NVIDIA does not define that as a byte layout: from CUDA 12 the type is opaque and
+      // CUTLASS only ever fills it through cuTensorMapEncodeTiled. Reading one from a
+      // guessed layout would take a real descriptor's fields wrong and copy the wrong
+      // tile, silently, which is the one failure this project does not allow.
+      err = "a tensor-map bulk copy ('" + opcode +
+            "') is driven by the 128-byte descriptor the CUDA driver encodes, whose layout "
+            "is not part of PTX, so it cannot be decoded faithfully here; the linear "
+            "cp.async.bulk copies name their bytes and are translated";
+      return "";
+    }
+    if (!from_global || !to_shared || args.size() < 3) {
       err = "unsupported bulk copy '" + opcode +
-            "': only global to threadgroup, completing an mbarrier, is translated";
+            "': global to threadgroup (completing an mbarrier) and threadgroup to global "
+            "are translated";
+      return "";
+    }
+    if (!completes) {
+      // The other direction: threadgroup memory back out to the buffer, reported through
+      // a bulk group rather than an mbarrier, so the commit and wait are no-ops.
+      std::string sdst, sdname, ssrc, ssname;
+      if (!mem_operand(args[0], sdst, sdname)) return "";
+      if (!mem_operand(args[1], ssrc, ssname)) return "";
+      const std::string sbytes = "((uint32_t)(" + operand_as(args[2], "uint32_t") + "))";
+      if (msl)
+        return guard + "weft::copy_global((device void*)(uintptr_t)(" + sdst + "), sh + (" +
+               ssrc + "), " + sbytes + ");";
+      return guard + "std::memcpy((void*)(uintptr_t)(" + sdst + "), (const void*)(sh + (" +
+             ssrc + ")), " + sbytes + ");";
+    }
+    if (args.size() < 4) {
+      err = "a bulk copy that completes an mbarrier names the barrier";
       return "";
     }
     std::string dst, dname, src, sname;

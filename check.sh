@@ -225,6 +225,18 @@ else
   echo "FAIL  mbarbulk tile[0] was $bulk_word bits; wanted 1.0f"; fail=1
 fi
 
+# The same copy going the other way, through a bulk group instead of an mbarrier: four
+# written words, four read back.
+runf kernels/mbarbulkst.ptx mbarbulkst --grid 1 --threads 1 --buffers 4
+"$WEFT" run kernels/mbarbulkst.ptx --kernel mbarbulkst --grid 1 --threads 1 --buffers 4 \
+    --cpu-only --dump 0="$TMP/bulkst.bin" >/dev/null
+read -r st0 st1 st2 st3 <<< "$(od -An -tu4 -v "$TMP/bulkst.bin")"
+if [ "$st0" = "11" ] && [ "$st1" = "12" ] && [ "$st2" = "13" ] && [ "$st3" = "14" ]; then
+  echo "ok    mbarbulkst the store moved all four words out of threadgroup memory"
+else
+  echo "FAIL  mbarbulkst read $st0 $st1 $st2 $st3; wanted 11 12 13 14"; fail=1
+fi
+
 # The value is the point: 42 is what the group wrote before the last arrival, so a lane
 # released early reads the arena instead. The store is `.b32`, so the word is the
 # integer 42 rather than a float's bits.

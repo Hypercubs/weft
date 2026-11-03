@@ -1,0 +1,40 @@
+// `cp.async.bulk` the other way: threadgroup memory out to the buffer.
+//
+//     tile = { 11, 12, 13, 14 }
+//     cp.async.bulk.global.shared::cta.bulk_group [out], [tile], 16
+//     commit_group; wait_group 0
+//
+// This direction is reported through a bulk group rather than an mbarrier, so there is
+// no descriptor and no transaction count: the size is written in the instruction. Four
+// different words, so a copy that moved the wrong address — or none of them — reads a
+// different set rather than the same one.
+.version 7.0
+.target sm_90
+.address_size 64
+
+.visible .entry mbarbulkst(
+    .param .u64 mbarbulkst_param_0
+)
+{
+    .shared .align 4 .b32 tile[4];
+
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [mbarbulkst_param_0];
+    mov.u32 %r1, %tid.x;
+
+    mov.u32 %r2, 11;
+    st.shared.b32 [tile], %r2;
+    mov.u32 %r3, 12;
+    st.shared.b32 [tile + 4], %r3;
+    mov.u32 %r4, 13;
+    st.shared.b32 [tile + 8], %r4;
+    mov.u32 %r5, 14;
+    st.shared.b32 [tile + 12], %r5;
+
+    cp.async.bulk.global.shared::cta.bulk_group [%rd1], [tile], 16;
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+    ret;
+}

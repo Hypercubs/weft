@@ -1910,6 +1910,14 @@ static inline void copy_shared(threadgroup uint8_t* dst, const device void* src,
   for (uint32_t i = 0; i < n; i++) dst[i] = s[i];
 }
 
+// The bulk store's direction: threadgroup memory back out to the buffer. The GPU
+// has a real asynchronous store, but the bytes in the buffer after the wait are the
+// same ones, so it is issued inline and the group commit stays a no-op.
+static inline void copy_global(device void* dst, threadgroup const uint8_t* src, uint32_t n) {
+  device uint8_t* d = (device uint8_t*)dst;
+  for (uint32_t i = 0; i < n; i++) d[i] = src[i];
+}
+
 }  // namespace weft
 )WEFMSL";
 
