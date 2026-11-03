@@ -1212,4 +1212,296 @@ T* shared_mem(Ctx& c, int k) {
   return reinterpret_cast<T*>(const_cast<unsigned char*>(c.shared) + c.slots->off[k]);
 }
 
+// ---- tensor maps ----
+//
+// `cp.async.bulk.tensor` takes its description of the tensor from a 128-byte object
+// rather than from its operands: the instruction names a box and the corner that box
+// starts at, and the object says where the tensor begins and how it is laid out.
+// NVIDIA's driver encodes that object and does not publish the byte layout — under
+// CUDA 12 the type is opaque, and CUTLASS only ever edits fields through
+// `tensormap.replace`, which indexes them instead of giving offsets — so weft defines
+// the layout, and both engines read it with the decode below (`src/weft_msl.hpp` is the
+// same code in Metal). The tag word is what keeps that honest: an object without it is
+// not decoded at all, so a blob from `cuTensorMapEncodeTiled` ends on a message instead
+// of on a tile copied from wherever its bytes happened to point.
+//
+//   off   0  u64  address of element (0, 0)
+//   off   8  u8   rank, 1 to 5; then the kind, then the swizzle, then a spare byte
+//   off  12  u32  element size in bytes: 1, 2, 4, 8 or 16
+//   off  16  u32  extent[5]         the tensor's length along each dimension
+//   off  40  u64  stride[5]         bytes between neighbours; [0] is one element
+//   off 124  u32  tag               0x41544657, 'WFTA'
+//
+// What the rest means depends on the kind. A box (kind 0) is a rectangular tile:
+//
+//   off  80  u32  box[5]            how many elements a copy moves
+//   off 100  u32  elementStride[5]  the step through the box; 0 or 1 is contiguous
+//
+// A column (kind 1) is what `.im2col` copies: `channelsPerPixel` channels of each of
+// `pixelsPerColumn` pixels, which is the tile a convolution's implicit GEMM wants. The
+// instruction names the corner and the filter window's position; the object says how a
+// pixel index walks the tensor, for as many spatial dimensions as the rank leaves
+// between the channels and the batch:
+//
+//   off  80  u32  channelsPerPixel
+//   off  84  u32  pixelsPerColumn
+//   off  88  u32  traversal[3]      elements one pixel step moves along W, H, D
+//   off 100  i32  lowerCorner[3]    the window's base offset along W, H, D
+//   off 112  u32  dilation[3]       elements one filter step moves along W, H, D
+//
+// The swizzle is 0, 32, 64 or 128 and applies to the threadgroup destination either
+// way, so it lives in the header byte both kinds share.
+//
+// Dimension 0 is the contiguous one, so an element sits at
+//
+//   base + coordinate[0] * element size + the rest as coordinate * stride
+//
+// An element whose coordinate falls outside `extent` is written as zero rather than
+// skipped: that is what the hardware's out-of-bounds fill does, and it is why a box may
+// hang off the edge of a tensor.
+constexpr uint32_t kTmaTag = 0x41544657u;
+
+// The object is 64-byte aligned on the GPU and nothing here needs that: every field is
+// read a byte at a time, so a descriptor at the front of a buffer of any alignment is
+// the same one.
+inline uint32_t tma_word(const unsigned char* d, uint32_t off) {
+  return (uint32_t)d[off] | ((uint32_t)d[off + 1u] << 8) | ((uint32_t)d[off + 2u] << 16) |
+         ((uint32_t)d[off + 3u] << 24);
+}
+
+inline uint64_t tma_dword(const unsigned char* d, uint32_t off) {
+  return (uint64_t)tma_word(d, off) | ((uint64_t)tma_word(d, off + 4u) << 32);
+}
+
+// The swizzle XORs the sixteen-byte unit an element lands in with its row's index inside
+// a block, which is the order a `wgmma` fragment read expects to find.
+inline uint32_t tma_swizzled(uint32_t o, uint32_t mode) {
+  if (mode != 32u && mode != 64u && mode != 128u) return o;
+  const uint32_t shift = (mode == 128u) ? 7u : (mode == 64u) ? 6u : 5u;
+  return o ^ (((o >> shift) & ((mode >> 4) - 1u)) << 4);
+}
+
+constexpr uint32_t kTmaBox = 0u;     // a rectangular tile
+constexpr uint32_t kTmaColumn = 1u;  // a convolution column, for `.im2col`
+
+struct TmaBox {
+  uint64_t base = 0;
+  uint32_t rank = 0, kind = 0, elem = 0, total = 1, swizzle = 0;
+  uint64_t stride[5] = {0, 0, 0, 0, 0};
+  uint32_t extent[5] = {0, 0, 0, 0, 0};
+  // kind 0: how many elements the box moves, and the step through it.
+  uint32_t box[5] = {0, 0, 0, 0, 0};
+  uint32_t step[5] = {0, 0, 0, 0, 0};
+  // kind 1: channels by pixels, and how a pixel and a filter step move.
+  uint32_t channels = 0, pixels = 0;
+  uint32_t traversal[3] = {1, 1, 1};
+  uint32_t dilation[3] = {1, 1, 1};
+  int32_t corner[3] = {0, 0, 0};
+};
+
+inline bool tma_decode(const unsigned char* d, TmaBox& m) {
+  if (tma_word(d, 124u) != kTmaTag) return false;
+  const uint32_t head = tma_word(d, 8u);
+  m.rank = head & 0xFFu;
+  m.kind = (head >> 8) & 0xFFu;
+  m.swizzle = (head >> 16) & 0xFFu;
+  m.elem = tma_word(d, 12u);
+  if (m.rank == 0u || m.rank > 5u || m.elem == 0u || m.elem > 16u) return false;
+  m.base = tma_dword(d, 0u);
+  m.total = 1u;
+  m.stride[0] = m.elem;
+  for (uint32_t i = 0; i < m.rank; i++) {
+    m.extent[i] = tma_word(d, 16u + 4u * i);
+    if (m.extent[i] == 0u) return false;
+    if (i > 0u) m.stride[i] = tma_dword(d, 40u + 8u * i);
+  }
+  if (m.kind == kTmaBox) {
+    for (uint32_t i = 0; i < m.rank; i++) {
+      m.box[i] = tma_word(d, 80u + 4u * i);
+      m.step[i] = tma_word(d, 100u + 4u * i);
+      if (m.box[i] == 0u) return false;
+      m.total *= m.box[i];
+    }
+    return true;
+  }
+  if (m.kind == kTmaColumn) {
+    m.channels = tma_word(d, 80u);
+    m.pixels = tma_word(d, 84u);
+    if (m.channels == 0u || m.pixels == 0u) return false;
+    for (uint32_t i = 0; i < 3u; i++) {
+      m.traversal[i] = tma_word(d, 88u + 4u * i);
+      m.corner[i] = (int32_t)tma_word(d, 100u + 4u * i);
+      m.dilation[i] = tma_word(d, 112u + 4u * i);
+      if (m.traversal[i] == 0u) m.traversal[i] = 1u;
+      if (m.dilation[i] == 0u) m.dilation[i] = 1u;
+    }
+    m.total = m.channels * m.pixels;
+    return true;
+  }
+  return false;
+}
+
+// The byte a box element starts at, and whether that element is inside the tensor.
+inline bool tma_element(const TmaBox& m, const int32_t* co, uint32_t k, uint64_t& addr) {
+  uint64_t off = 0;
+  uint32_t rest = k;
+  bool inside = true;
+  for (uint32_t i = 0; i < m.rank; i++) {
+    const uint32_t e = rest % m.box[i];
+    rest /= m.box[i];
+    const int64_t c = (int64_t)co[i] + (int64_t)e * (int64_t)(m.step[i] ? m.step[i] : 1u);
+    if (c < 0 || c >= (int64_t)m.extent[i]) {
+      inside = false;
+      break;
+    }
+    off += (uint64_t)c * m.stride[i];
+  }
+  addr = m.base + off;
+  return inside;
+}
+
+// An object that is not one of ours: the tile is left alone and the transaction reports
+// the same "nothing moved" sentinel on both engines, so a descriptor of the wrong kind
+// shows up as a message and a number instead of as a copy of whatever its bytes said.
+inline void tma_not_ours() {
+  static bool said = false;
+  if (said) return;
+  said = true;
+  std::fprintf(stderr,
+               "weft: a tensor copy was handed an object with no weft tag at offset 124. "
+               "The layout the driver encodes is not published, so weft defines its own and "
+               "decodes only that; the tile was left as it was\n");
+}
+
+// threadgroup memory <- the tensor. Returns the bytes the box covers, which is what the
+// barrier an `expect_tx` sized on is completed with, outside-of-bounds elements and all.
+inline uint32_t tma_load(unsigned char* dst, const void* map, int32_t c0, int32_t c1,
+                         int32_t c2, int32_t c3, int32_t c4) {
+  const unsigned char* d = (const unsigned char*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != kTmaBox) {
+    tma_not_ours();
+    return 0xFFFFFFFFu;
+  }
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  for (uint32_t k = 0; k < m.total; k++) {
+    uint64_t addr = 0;
+    const bool inside = tma_element(m, co, k, addr);
+    const unsigned char* s = (const unsigned char*)(uintptr_t)addr;
+    const uint32_t o = tma_swizzled(k * m.elem, m.swizzle);
+    for (uint32_t b = 0; b < m.elem; b++) dst[o + b] = inside ? s[b] : (unsigned char)0;
+  }
+  return m.total * m.elem;
+}
+
+// The tensor <- threadgroup memory. A store writes nothing outside the tensor, so an
+// element whose coordinate is out of bounds is skipped rather than zero-filled.
+inline void tma_store(const void* map, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                      int32_t c4, const unsigned char* src) {
+  const unsigned char* d = (const unsigned char*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != kTmaBox) {
+    tma_not_ours();
+    return;
+  }
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  for (uint32_t k = 0; k < m.total; k++) {
+    uint64_t addr = 0;
+    if (!tma_element(m, co, k, addr)) continue;
+    unsigned char* t = (unsigned char*)(uintptr_t)addr;
+    const uint32_t o = tma_swizzled(k * m.elem, m.swizzle);
+    for (uint32_t b = 0; b < m.elem; b++) t[b] = src[o + b];
+  }
+}
+
+// Where pixel `p` of a column lands: the corner advanced by `traversal` in each spatial
+// dimension, the first fastest, plus the filter step's `dilation`. False means the pixel
+// fell outside the tensor, which is the edge a padded convolution is made of.
+inline bool tma_column_at(const TmaBox& m, const int32_t* co, const int32_t* of,
+                          const uint32_t* fit, uint32_t p, uint64_t& at) {
+  const uint32_t spatial = m.rank - 2u;  // the batch is the last dimension
+  const int64_t batch = co[spatial + 1u];
+  if (batch < 0 || batch >= (int64_t)m.extent[spatial + 1u]) return false;
+  at = (uint64_t)batch * m.stride[spatial + 1u];
+  uint32_t q = p;
+  for (uint32_t i = 0; i < spatial; i++) {
+    const uint32_t step = q % fit[i];
+    q /= fit[i];
+    const int64_t at_i = (int64_t)co[i + 1u] * (int64_t)m.traversal[i] + m.corner[i] +
+                         (int64_t)step * (int64_t)m.traversal[i] +
+                         (int64_t)of[i] * (int64_t)m.dilation[i];
+    if (at_i < 0 || at_i >= (int64_t)m.extent[i + 1u]) return false;
+    at += (uint64_t)at_i * m.stride[i + 1u];
+  }
+  return true;
+}
+
+// The convolution form: threadgroup memory <- a column of the tensor. The coordinate
+// names the corner and `off` the filter window's position, one per spatial dimension.
+// A pixel that lands outside the tensor is zero, which is what makes padding work.
+inline uint32_t tma_im2col(unsigned char* dst, const void* map, int32_t c0, int32_t c1,
+                           int32_t c2, int32_t c3, int32_t c4, int32_t o0, int32_t o1,
+                           int32_t o2) {
+  const unsigned char* d = (const unsigned char*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != kTmaColumn) {
+    tma_not_ours();
+    return 0xFFFFFFFFu;
+  }
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  const int32_t of[3] = {o0, o1, o2};
+  const uint32_t spatial = m.rank - 2u;  // the batch is the last dimension
+  // How many pixels fit along each spatial dimension at this traversal.
+  uint32_t fit[3] = {1u, 1u, 1u};
+  for (uint32_t i = 0; i < spatial; i++)
+    fit[i] = (m.extent[i + 1u] + m.traversal[i] - 1u) / m.traversal[i];
+  for (uint32_t p = 0; p < m.pixels; p++) {
+    uint64_t at = 0;
+    const bool inside = tma_column_at(m, co, of, fit, p, at);
+    for (uint32_t e = 0; e < m.channels; e++) {
+      const uint32_t o = tma_swizzled((p * m.channels + e) * m.elem, m.swizzle);
+      const int64_t c = (int64_t)co[0] + (int64_t)e;
+      if (!inside || c < 0 || c >= (int64_t)m.extent[0]) {
+        for (uint32_t b = 0; b < m.elem; b++) dst[o + b] = 0;
+        continue;
+      }
+      const unsigned char* s =
+          (const unsigned char*)(uintptr_t)(m.base + at + (uint64_t)c * m.stride[0]);
+      for (uint32_t b = 0; b < m.elem; b++) dst[o + b] = s[b];
+    }
+  }
+  return m.channels * m.pixels * m.elem;
+}
+
+// The same column going back out: threadgroup memory is scattered into the window. An
+// element whose place fell outside the tensor writes nothing — a store has nothing to
+// zero-fill — so a column that hangs off the edge changes only the part that fits.
+inline void tma_im2col_store(const void* map, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                             int32_t c4, int32_t o0, int32_t o1, int32_t o2,
+                             const unsigned char* src) {
+  const unsigned char* d = (const unsigned char*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != kTmaColumn) {
+    tma_not_ours();
+    return;
+  }
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  const int32_t of[3] = {o0, o1, o2};
+  const uint32_t spatial = m.rank - 2u;
+  uint32_t fit[3] = {1u, 1u, 1u};
+  for (uint32_t i = 0; i < spatial; i++)
+    fit[i] = (m.extent[i + 1u] + m.traversal[i] - 1u) / m.traversal[i];
+  for (uint32_t p = 0; p < m.pixels; p++) {
+    uint64_t at = 0;
+    if (!tma_column_at(m, co, of, fit, p, at)) continue;
+    for (uint32_t e = 0; e < m.channels; e++) {
+      const int64_t c = (int64_t)co[0] + (int64_t)e;
+      if (c < 0 || c >= (int64_t)m.extent[0]) continue;
+      unsigned char* t = (unsigned char*)(uintptr_t)(m.base + at + (uint64_t)c * m.stride[0]);
+      const uint32_t o = tma_swizzled((p * m.channels + e) * m.elem, m.swizzle);
+      for (uint32_t b = 0; b < m.elem; b++) t[b] = src[o + b];
+    }
+  }
+}
+
 }  // namespace weft

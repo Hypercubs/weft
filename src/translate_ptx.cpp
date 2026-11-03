@@ -1402,7 +1402,10 @@ std::string Emitter::emit(const std::string& raw) {
         : w1;
     // One warp body runs a statement for all 32 lanes at once, so every mode that
     // touches the object says which lanes it applies to.
-    const std::string lane = "for (uint32_t l = 0; l < 32u; l++) if (am[l]";
+    // The predicate of `@%p mbarrier...` narrows which lanes act, so it belongs in the
+    // loop condition: a warp body runs the statement for all 32 lanes otherwise, and
+    // thirty-two arrivals on a barrier that was told to expect one never completes.
+    const std::string lane = "for (uint32_t l = 0; l < 32u; l++) if (" + lane_cond() + ")";
 
     if (mode == "init") {
       if ((int)args.size() <= ai + 1) { err = "an mbarrier init without a count"; return ""; }
@@ -1411,7 +1414,7 @@ std::string Emitter::emit(const std::string& raw) {
         // `vec_side` rather than `vec_control`: the lane loop is written here, and the
         // statement still has to sit under the predicate of `@%p` if it carries one.
         vec_side = true;
-        return "{ " + lane + ") { const uint32_t weft_n = " + n + "; " + w0 + " = weft_n; " +
+        return "{ " + lane + " { const uint32_t weft_n = " + n + "; " + w0 + " = weft_n; " +
                w1 + " = (weft_n << 1); } }";
       }
       return guard + "{ const uint32_t weft_n = " + n + "; " + w0 + " = weft_n; " + w1 +
@@ -1439,7 +1442,7 @@ std::string Emitter::emit(const std::string& raw) {
     if (mode == "expect_tx" && !also_arrive) {
       const std::string code = expect_tx_code();
       if (code.empty()) return "";
-      if (vec) { vec_side = true; return "{ " + lane + ") " + code + " }"; }
+      if (vec) { vec_side = true; return "{ " + lane + " " + code + " }"; }
       return guard + code;
     }
     if (mode == "arrive" || mode == "expect_tx") {
@@ -1475,7 +1478,7 @@ std::string Emitter::emit(const std::string& raw) {
       }
       if (vec) {
         vec_side = true;
-        return "{ " + lane + ") { " + pre + body + (have_state ? " " + state : std::string()) +
+        return "{ " + lane + " { " + pre + body + (have_state ? " " + state : std::string()) +
                " } }";
       }
       std::string out = guard + "{ " + pre + body;
@@ -2925,26 +2928,208 @@ std::string Emitter::emit(const std::string& raw) {
       if (parts[i] == "commit_group" || parts[i] == "wait_group" || parts[i] == "wait_all")
         return guard + ";";
     bool from_global = false, to_shared = false, completes = false;
-    for (const auto& p : parts) {
-      if (p == "global") from_global = true;
-      if (p.rfind("shared", 0) == 0) to_shared = true;
+    int gq = -1, sq = -1;  // where each space qualifier sits: the order is the direction
+    for (size_t i = 3; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "global") { from_global = true; gq = (int)i; }
+      if (p.rfind("shared", 0) == 0) { to_shared = true; if (sq < 0) sq = (int)i; }
       if (p.rfind("mbarrier", 0) == 0 && p.find("complete_tx") != std::string::npos) completes = true;
     }
+    // The mnemonic writes destination first, so a threadgroup qualifier ahead of a global
+    // one is a load and the other way round is a store.
+    const bool tensor_load = sq >= 0 && gq >= 0 && sq < gq;
+
+    // The barrier a copy reports to, as the object's offset in the window.
+    auto mbar_slot = [&](const std::string& operand, std::string& bad) -> bool {
+      std::string mo = trim(operand);
+      const size_t lb = mo.find('['), rb2 = mo.rfind(']');
+      if (lb == std::string::npos || rb2 == std::string::npos || rb2 < lb) {
+        err = "a bulk copy needs the mbarrier it completes, in brackets";
+        return false;
+      }
+      std::string inner = trim(mo.substr(lb + 1, rb2 - lb - 1));
+      std::string mname = inner, mextra;
+      const size_t plus = inner.find('+');
+      if (plus != std::string::npos) {
+        mname = trim(inner.substr(0, plus));
+        mextra = trim(inner.substr(plus + 1));
+      }
+      auto so = shared_offsets.find(mname);
+      if (so == shared_offsets.end()) {
+        err = "'" + mname + "' is not a shared array: a bulk copy completes an mbarrier";
+        return false;
+      }
+      bad = std::to_string(so->second);
+      if (!mextra.empty()) bad += " + " + operand_as(mextra, "uint64_t");
+      return true;
+    };
+
+    // What a copy that reports itself does to the barrier: the bytes it moved come off
+    // what the phase was told to expect, and when that sum runs out the count is restored
+    // and the phase flips. One text serves the linear copy, whose size is written in the
+    // instruction, and the tensor copy, whose size is the box the descriptor names — a box
+    // that hangs off the tensor still transfers all of it, with the outside zero-filled.
+    auto complete = [&](const std::string& bad, const std::string& tx) -> std::string {
+      if (msl)
+        return std::string("{ threadgroup atomic_uint* weft_a = (threadgroup atomic_uint*)(sh + ") +
+               bad + "); const uint32_t weft_tx = " + tx +
+               "; const uint32_t weft_left = atomic_fetch_sub_explicit(weft_a, weft_tx, "
+               "memory_order_relaxed); if (weft_left == weft_tx) { atomic_store_explicit(weft_a, "
+               "(uint32_t)(*((volatile threadgroup const uint32_t*)(sh + " + bad +
+               " + 4u)) >> 1u), memory_order_relaxed); *((volatile threadgroup uint32_t*)(sh + " +
+               bad + " + 4u)) = (*((volatile threadgroup const uint32_t*)(sh + " + bad +
+               " + 4u)) ^ 1u); } }";
+      return std::string("{ const uint32_t weft_tx = ") + tx + "; *((uint32_t*)(sh + " + bad +
+             ")) = (*((uint32_t*)(sh + " + bad + ")) >= weft_tx) ? (*((uint32_t*)(sh + " + bad +
+             ")) - weft_tx) : 0u; if (*((uint32_t*)(sh + " + bad + ")) == 0u) { "
+             "*((uint32_t*)(sh + " + bad + ")) = *((uint32_t*)(sh + " + bad + " + 4u)) >> 1; "
+             "*((uint32_t*)(sh + " + bad + " + 4u)) ^= 1u; } }";
+    };
     if (parts.size() >= 4 && parts[3] == "tensor") {
-      // A tensor copy is driven by a 128-byte descriptor the CUDA driver encodes, and
-      // NVIDIA does not define that as a byte layout: from CUDA 12 the type is opaque and
-      // CUTLASS only ever fills it through cuTensorMapEncodeTiled. Reading one from a
-      // guessed layout would take a real descriptor's fields wrong and copy the wrong
-      // tile, silently, which is the one failure this project does not allow.
-      err = "a tensor-map bulk copy ('" + opcode +
-            "') is driven by the 128-byte descriptor the CUDA driver encodes. That layout "
-            "is not published: under CUDA 12 the type is opaque, CUTLASS treats it that way "
-            "and only edits fields through tensormap.replace, which indexes them rather "
-            "than giving offsets. Decoding a guessed layout would read a real descriptor "
-            "wrong and copy the wrong tile without saying so, so the shape is reported "
-            "instead. The linear cp.async.bulk copies name their bytes and are "
-            "translated, including the reduce form";
-      return "";
+      // A tensor copy takes its geometry from a 128-byte object instead of from its
+      // operands: `[map, {cx, cy}]` names the map and the corner of the box, and the map
+      // says where the tensor is and how far apart its elements sit. The layout of that
+      // object is weft's own — see the note over the decoder in `src/weft_msl.hpp` — so
+      // both engines read the same bytes and a descriptor that is not one of ours is
+      // refused by its tag instead of being decoded from a guess.
+      // `.im2col` is the convolution form of the same instruction: the object describes
+      // a column of the implicit GEMM — channels by pixels — and the copy names the
+      // corner, so the filter window's position rides alongside it as a second list.
+      const bool column = has_part(parts, "im2col");
+      // One copy serves the whole threadgroup, so on the warp back end it is issued once,
+      // by the thread that owns the whole warp — which is lane 0 of that warp. The loop
+      // below runs a single lane for that reason: it binds `l` to 0, so a value the copy
+      // is aimed with and the predicate it carries are the leader's, and the copy is one
+      // statement per warp rather than one per lane.
+      auto one_copy = [&](const std::string& body) -> std::string {
+        if (!vec) return guard + body;
+        return "{ for (uint32_t l = 0; l < 1u; l++) { if (" + lane_cond() + ") " + body + " } }";
+      };
+      // The operand carrying the map is the one with the braces in it.
+      int mi = -1;
+      for (size_t i = 0; i < args.size(); i++)
+        if (args[i].find('{') != std::string::npos) { mi = (int)i; break; }
+      if (mi < 0) {
+        err = "a tensor copy names the map and a box coordinate: '" + opcode + "'";
+        return "";
+      }
+      std::string spec = trim(args[(size_t)mi]);
+      if (!spec.empty() && spec[0] == '[') spec.erase(0, 1);
+      if (!spec.empty() && spec[spec.size() - 1] == ']') spec.pop_back();
+      size_t cut = std::string::npos;
+      int depth = 0;
+      for (size_t i = 0; i < spec.size(); i++) {
+        if (spec[i] == '{') depth++;
+        else if (spec[i] == '}') depth--;
+        else if (spec[i] == ',' && depth == 0) { cut = i; break; }
+      }
+      if (cut == std::string::npos) {
+        err = "a tensor copy names the map and a box coordinate: '" + opcode + "'";
+        return "";
+      }
+      const std::string mapname = trim(spec.substr(0, cut));
+      std::string cspec = trim(spec.substr(cut + 1));
+      if (!cspec.empty() && cspec[0] == '{') cspec.erase(0, 1);
+      if (!cspec.empty() && cspec[cspec.size() - 1] == '}') cspec.pop_back();
+      // A descriptor is an address in the constant, parameter or global space — that is
+      // where the instruction takes it — so a threadgroup object here is reported rather
+      // than handed a window offset that is not a pointer.
+      {
+        std::string nm = mapname;
+        const size_t plus = mapname.find('+');
+        if (plus != std::string::npos) nm = trim(mapname.substr(0, plus));
+        if (!nm.empty() && nm[0] != '%' && shared_offsets.find(nm) != shared_offsets.end()) {
+          err = "'" + nm + "' is threadgroup memory: a tensor map is an address in the "
+                "constant, parameter or global space, which is where a descriptor is kept";
+          return "";
+        }
+      }
+      const std::string map = "(const " + std::string(msl ? "device " : "") +
+                              "void*)(uintptr_t)(" + operand_as(mapname, "uint64_t") + ")";
+      std::vector<std::string> co;
+      {
+        std::string cur;
+        for (char ch : cspec) {
+          if (ch == ',') { co.push_back(trim(cur)); cur.clear(); }
+          else cur.push_back(ch);
+        }
+        if (!trim(cur).empty()) co.push_back(trim(cur));
+      }
+      if (co.empty()) {
+        err = "a tensor copy names the box corner: '" + opcode + "' has no coordinate";
+        return "";
+      }
+      if (co.size() > 5) {
+        err = "a tensor copy has at most five coordinates, one per dimension: '" + opcode +
+              "' has " + std::to_string(co.size());
+        return "";
+      }
+      // A rank carries fewer coordinates than five, and the decode reads the rank; the
+      // ones the instruction does not name are zero so the call has one shape.
+      std::string cargs;
+      for (int i = 0; i < 5; i++)
+        cargs += ", " + ((size_t)i < co.size()
+                             ? ("(int32_t)(" + operand_as(co[(size_t)i], "int32_t") + ")")
+                             : std::string("0"));
+      // `.im2col` carries the filter window's position beside the corner: one entry per
+      // spatial dimension, and any the instruction does not name are zero.
+      auto filter_offsets = [&](int at) -> std::string {
+        if (at >= (int)args.size()) {
+          err = "an im2col copy names its filter offsets: '" + opcode + "'";
+          return "";
+        }
+        std::string ospec = trim(args[(size_t)at]);
+        if (!ospec.empty() && ospec[0] == '{') ospec.erase(0, 1);
+        if (!ospec.empty() && ospec[ospec.size() - 1] == '}') ospec.pop_back();
+        const std::vector<std::string> of = split_top(ospec, ',');
+        std::string oargs;
+        for (int i = 0; i < 3; i++)
+          oargs += ", " + (((size_t)i < of.size() && !of[(size_t)i].empty())
+                               ? ("(int32_t)(" + operand_as(of[(size_t)i], "int32_t") + ")")
+                               : std::string("0"));
+        return oargs;
+      };
+      if (tensor_load) {
+        if (args.size() < 3) {
+          err = "a tensor copy that completes an mbarrier names the barrier";
+          return "";
+        }
+        const int di = (mi == 0) ? 1 : 0;
+        std::string dst, dname;
+        if (!mem_operand(args[(size_t)di], dst, dname)) return "";
+        std::string bad;
+        if (!mbar_slot(args[args.size() - 1], bad)) return "";
+        // The tile lands in threadgroup memory and the copy reports the box's bytes to the
+        // barrier, which is the half `expect_tx` was sized on.
+        // `vec_side` says this statement owns its own placement rather than joining the
+        // lane loop the arithmetic around it is batched into.
+        vec_side = true;
+        if (column) {
+          const std::string oargs = filter_offsets(mi + 1);
+          if (oargs.empty()) return "";
+          const std::string call =
+              "weft::tma_im2col(sh + (" + dst + "), " + map + cargs + oargs + ")";
+          return one_copy("{ const uint32_t weft_moved = " + call + "; " +
+                          complete(bad, "weft_moved") + " }");
+        }
+        const std::string call = "weft::tma_load(sh + (" + dst + "), " + map + cargs + ")";
+        return one_copy("{ const uint32_t weft_moved = " + call + "; " +
+                        complete(bad, "weft_moved") + " }");
+      }
+      // The other direction: the column comes out of threadgroup memory and is scattered
+      // into the window, reported through a bulk group rather than an mbarrier, so the
+      // commit and the wait stay no-ops. The shared source is the last operand either way —
+      // the filter offsets sit between the map and it.
+      std::string src, sname;
+      if (!mem_operand(args.back(), src, sname)) return "";
+      vec_side = true;
+      if (column) {
+        const std::string oargs = filter_offsets(mi + 1);
+        if (oargs.empty()) return "";
+        return one_copy("weft::tma_im2col_store(" + map + cargs + oargs + ", sh + (" + src +
+                        "));");
+      }
+      return one_copy("weft::tma_store(" + map + cargs + ", sh + (" + src + "));");
     }
     if (!from_global || !to_shared || args.size() < 3) {
       err = "unsupported bulk copy '" + opcode +
@@ -2973,27 +3158,8 @@ std::string Emitter::emit(const std::string& raw) {
     if (!mem_operand(args[0], dst, dname)) return "";
     if (!mem_operand(args[1], src, sname)) return "";
     const std::string bytes = "((uint32_t)(" + operand_as(args[2], "uint32_t") + "))";
-    // The barrier the copy reports to, as the object's offset in the window.
-    std::string mo = trim(args[3]);
-    const size_t lb = mo.find('['), rb2 = mo.rfind(']');
-    if (lb == std::string::npos || rb2 == std::string::npos || rb2 < lb) {
-      err = "a bulk copy needs the mbarrier it completes, in brackets";
-      return "";
-    }
-    std::string inner = trim(mo.substr(lb + 1, rb2 - lb - 1));
-    std::string mname = inner, mextra;
-    const size_t plus = inner.find('+');
-    if (plus != std::string::npos) {
-      mname = trim(inner.substr(0, plus));
-      mextra = trim(inner.substr(plus + 1));
-    }
-    auto so = shared_offsets.find(mname);
-    if (so == shared_offsets.end()) {
-      err = "'" + mname + "' is not a shared array: a bulk copy completes an mbarrier";
-      return "";
-    }
-    std::string bad = std::to_string(so->second);
-    if (!mextra.empty()) bad += " + " + operand_as(mextra, "uint64_t");
+    std::string bad;
+    if (!mbar_slot(args[3], bad)) return "";
     const std::string copy = msl
         ? ("weft::copy_shared(sh + (" + dst + "), (const device void*)(uintptr_t)(" + src +
            "), " + bytes + ");")
@@ -3001,23 +3167,7 @@ std::string Emitter::emit(const std::string& raw) {
            bytes + ");");
     // The bytes are in the window before this runs, which is the order the hardware
     // promises once the transaction completes.
-    std::string done;
-    if (msl) {
-      done = "{ threadgroup atomic_uint* weft_a = (threadgroup atomic_uint*)(sh + " + bad +
-             "); const uint32_t weft_left = atomic_fetch_sub_explicit(weft_a, " + bytes +
-             ", memory_order_relaxed); if (weft_left == " + bytes +
-             ") { atomic_store_explicit(weft_a, (uint32_t)(*((volatile threadgroup const "
-             "uint32_t*)(sh + " + bad + " + 4u)) >> 1u), memory_order_relaxed); "
-             "*((volatile threadgroup uint32_t*)(sh + " + bad + " + 4u)) = "
-             "(*((volatile threadgroup const uint32_t*)(sh + " + bad + " + 4u)) ^ 1u); } }";
-    } else {
-      done = "{ const uint32_t weft_tx = " + bytes + "; " + "*((uint32_t*)(sh + " + bad +
-             ")) = (*((uint32_t*)(sh + " + bad + ")) >= weft_tx) ? (*((uint32_t*)(sh + " + bad +
-             ")) - weft_tx) : 0u; if (*((uint32_t*)(sh + " + bad + ")) == 0u) { "
-             "*((uint32_t*)(sh + " + bad + ")) = *((uint32_t*)(sh + " + bad + " + 4u)) >> 1; "
-             "*((uint32_t*)(sh + " + bad + " + 4u)) ^= 1u; } }";
-    }
-    return guard + "{ " + copy + " " + done + " }";
+    return guard + "{ " + copy + " " + complete(bad, bytes) + " }";
   }
 
   // ---- textures and surfaces ----
@@ -3755,7 +3905,13 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       return r;
     }
     if (!lane_ok && !warp_only && !wide_gpu) {
+      // Both bodies failed, and the per-lane one stops at the same instruction the
+      // warp one is needed for — so the message has to carry the warp body's own
+      // reason, or it names the one error that is not the problem.
       r.error = "kernel " + name + ": " + em.err;
+      if (have_vec) r.error += "; the warp body could not be used either";
+      else if (!emv.err.empty()) r.error += " (warp body: " + emv.err + ")";
+      else r.error += " (the warp body translated to nothing)";
       return r;
     }
 

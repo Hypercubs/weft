@@ -1,0 +1,612 @@
+// `cp.async.bulk.tensor` — the tensor form of the bulk copy.
+//
+// A linear bulk copy is told its address and its size. The tensor form is told neither:
+// it names a box and the corner that box starts at, and everything else comes from a
+// 128-byte descriptor the kernel is handed. NVIDIA's driver encodes that descriptor and
+// its byte layout is not published, so weft defines one (see `runtime/weft_runtime.hpp`
+// and the same decode in `src/weft_msl.hpp`), and this kernel writes one into a buffer
+// the way a host would.
+//
+// The tensor is three rows by four columns with `src[4 * row + col] = col + 4 * row`:
+//
+//      0  1  2  3
+//      4  5  6  7
+//      8  9 10 11
+//
+// Two copies, one in each direction:
+//
+//   load   a 3x3 box at column 2, row 1. Four of its nine elements hang off the right and
+//          three off the bottom, so the transaction is 36 bytes and the tile it lands is
+//          6, 7, 0, 10, 11, 0, 0, 0, 0: the outside is filled with zero, which is what the
+//          hardware's out-of-bounds fill does.
+//   store  a 2x2 box at column 1, row 1 holding 101, 102, 103, 104. Those land on elements
+//          5, 6, 9 and 10, so the tensor afterwards reads
+//          0, 1, 2, 3, 4, 101, 102, 7, 8, 103, 104, 11 — a store that moved the wrong box
+//          leaves a different set.
+//
+// Every number out is one of those, so a copy that read the wrong address, walked a
+// dimension in the wrong order, or wrote past the box instead of zero-filling changes the
+// answer. The tensor is refilled on every run, so a benchmark pass repeats exactly.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry tensormap(
+    .param .u64 tensormap_param_0,      // out
+    .param .u64 tensormap_param_1,      // the tensor
+    .param .u64 tensormap_param_2       // the 128-byte map
+)
+{
+    .shared .align 8 .b64 mbr[1];
+    .shared .align 4 .b32 tile[9];
+    .shared .align 4 .b32 box2[4];
+
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<20>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [tensormap_param_0];
+    ld.param.u64 %rd2, [tensormap_param_1];
+    ld.param.u64 %rd3, [tensormap_param_2];
+
+    // ---- the tensor, filled so the copy has something it did not have to be given ----
+    mov.u32 %r7, 0;
+FILL: setp.ge.u32 %p1, %r7, 12;
+    @%p1 bra FILLED;
+    mul.wide.s32 %rd7, %r7, 4;
+    add.s64 %rd8, %rd2, %rd7;
+    st.global.b32 [%rd8], %r7;
+    add.u32 %r7, %r7, 1;
+    bra FILL;
+FILLED:
+
+    // ---- the map ----
+    mov.b64 {%r2, %r3}, %rd2;              // address of element (0, 0)
+    st.global.b32 [%rd3], %r2;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 8;                 // rank
+    mov.u32 %r4, 2;
+    st.global.b32 [%rd4], %r4;
+    add.s64 %rd4, %rd3, 12;                // element size
+    mov.u32 %r5, 4;
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 16;                // four columns along dimension 0
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 20;                // three rows along dimension 1
+    mov.u32 %r6, 3;
+    st.global.b32 [%rd4], %r6;
+    add.s64 %rd4, %rd3, 48;                // stride[1]: sixteen bytes between rows
+    mov.u64 %rd9, 16;
+    st.global.b64 [%rd4], %rd9;
+    add.s64 %rd4, %rd3, 80;                // three columns in the box
+    mov.u32 %r10, 3;
+    st.global.b32 [%rd4], %r10;
+    add.s64 %rd4, %rd3, 84;                // and three rows
+    st.global.b32 [%rd4], %r10;
+    add.s64 %rd4, %rd3, 100;               // contiguous in both dimensions
+    mov.u32 %r11, 1;
+    st.global.b32 [%rd4], %r11;
+    add.s64 %rd4, %rd3, 104;
+    st.global.b32 [%rd4], %r11;
+    add.s64 %rd4, %rd3, 120;               // no swizzle
+    mov.u32 %r12, 0;
+    st.global.b32 [%rd4], %r12;
+    add.s64 %rd4, %rd3, 124;               // the tag
+    mov.u32 %r13, 0x41544657;
+    st.global.b32 [%rd4], %r13;
+
+    // ---- threadgroup memory <- the tensor ----
+    mbarrier.init.shared.b64 [mbr], 1;
+    bar.sync 0;
+
+    mbarrier.expect_tx.shared.b64 [mbr], 36;
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [tile], [%rd3, {2, 1}], [mbr];
+    mbarrier.arrive.shared.b64 %rd10, [mbr];
+
+WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
+    @!%p2 bra WAIT;
+
+    ld.shared.b32 %r14, [tile];
+    st.global.b32 [%rd1], %r14;
+    ld.shared.b32 %r14, [tile + 4];
+    add.s64 %rd4, %rd1, 4;
+    st.global.b32 [%rd4], %r14;
+    ld.shared.b32 %r14, [tile + 8];
+    add.s64 %rd4, %rd1, 8;
+    st.global.b32 [%rd4], %r14;
+    ld.shared.b32 %r14, [tile + 12];
+    add.s64 %rd4, %rd1, 12;
+    st.global.b32 [%rd4], %r14;
+    ld.shared.b32 %r14, [tile + 16];
+    add.s64 %rd4, %rd1, 16;
+    st.global.b32 [%rd4], %r14;
+    ld.shared.b32 %r14, [tile + 20];
+    add.s64 %rd4, %rd1, 20;
+    st.global.b32 [%rd4], %r14;
+    ld.shared.b32 %r14, [tile + 24];
+    add.s64 %rd4, %rd1, 24;
+    st.global.b32 [%rd4], %r14;
+    ld.shared.b32 %r14, [tile + 28];
+    add.s64 %rd4, %rd1, 28;
+    st.global.b32 [%rd4], %r14;
+    ld.shared.b32 %r14, [tile + 32];
+    add.s64 %rd4, %rd1, 32;
+    st.global.b32 [%rd4], %r14;
+
+    // ---- threadgroup memory -> the tensor, and the box that lands ----
+    // A host rewrites the box for a second copy, or builds a second map: the box is a
+    // field of the descriptor, so a smaller one is asked for here rather than implied.
+    add.s64 %rd4, %rd3, 80;
+    mov.u32 %r10, 2;
+    st.global.b32 [%rd4], %r10;
+    add.s64 %rd4, %rd3, 84;
+    st.global.b32 [%rd4], %r10;
+
+    mov.u32 %r15, 101;
+    st.shared.b32 [box2], %r15;
+    mov.u32 %r16, 102;
+    st.shared.b32 [box2 + 4], %r16;
+    mov.u32 %r17, 103;
+    st.shared.b32 [box2 + 8], %r17;
+    mov.u32 %r18, 104;
+    st.shared.b32 [box2 + 12], %r18;
+
+    cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%rd3, {1, 1}], [box2];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+
+    // ---- the tensor as the store left it ----
+    mov.u32 %r19, 0;
+COPY: setp.ge.u32 %p3, %r19, 12;
+    @%p3 bra COPIED;
+    mul.wide.s32 %rd11, %r19, 4;
+    add.s64 %rd12, %rd2, %rd11;
+    ld.global.b32 %r20, [%rd12];
+    add.s64 %rd13, %rd1, %rd11;
+    add.s64 %rd13, %rd13, 36;
+    st.global.b32 [%rd13], %r20;
+    add.u32 %r19, %r19, 1;
+    bra COPY;
+COPIED:
+    // The address word is the one field the two engines cannot share — a host pointer
+    // against a device one — so it is cleared once the copies are done: the map is
+    // scratch, and what a run has to agree on is the tile and the tensor.
+    mov.u32 %r21, 0;
+    st.global.b32 [%rd3], %r21;
+    add.s64 %rd14, %rd3, 4;
+    st.global.b32 [%rd14], %r21;
+    ret;
+}
+
+// The same instruction with a 128-byte swizzle, which is the pattern a `wgmma` fragment
+// read is laid out in. The tensor is two rows of thirty-two, so the box is 256 bytes and
+// its second row starts at byte 128 — which the swizzle moves sixteen bytes along, to
+// 144. Reading there has to give element (1, 0), which is 32; a decode that ignored the
+// swizzle would leave element 32 at 128 and hand back 36 instead.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry tensorswz(
+    .param .u64 tensorswz_param_0,      // out
+    .param .u64 tensorswz_param_1,      // the tensor
+    .param .u64 tensorswz_param_2       // the 128-byte map
+)
+{
+    .shared .align 16 .b64 mbr[1];
+    .shared .align 16 .b32 tile[64];
+
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [tensorswz_param_0];
+    ld.param.u64 %rd2, [tensorswz_param_1];
+    ld.param.u64 %rd3, [tensorswz_param_2];
+
+    mov.u32 %r6, 0;
+FILL: setp.ge.u32 %p1, %r6, 64;
+    @%p1 bra FILLED;
+    mul.wide.s32 %rd6, %r6, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    st.global.b32 [%rd7], %r6;
+    add.u32 %r6, %r6, 1;
+    bra FILL;
+FILLED:
+
+    mov.b64 {%r1, %r2}, %rd2;
+    st.global.b32 [%rd3], %r1;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r2;
+    add.s64 %rd4, %rd3, 8;                 // rank
+    mov.u32 %r3, 2;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 12;                // element size
+    mov.u32 %r4, 4;
+    st.global.b32 [%rd4], %r4;
+    add.s64 %rd4, %rd3, 16;                // thirty-two columns
+    mov.u32 %r5, 32;
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 20;                // two rows
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 48;                // 128 bytes between rows
+    mov.u64 %rd8, 128;
+    st.global.b64 [%rd4], %rd8;
+    add.s64 %rd4, %rd3, 80;                // the whole first dimension in the box
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 84;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 100;
+    mov.u32 %r7, 1;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 104;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 8;                 // rank 2, a box, and a 128-byte swizzle
+    mov.u32 %r8, 0x800002;                 // 2 | (128 << 16)
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 124;
+    mov.u32 %r9, 0x41544657;
+    st.global.b32 [%rd4], %r9;
+
+    mbarrier.init.shared.b64 [mbr], 1;
+    bar.sync 0;
+
+    mbarrier.expect_tx.shared.b64 [mbr], 256;
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [tile], [%rd3, {0, 0}], [mbr];
+    mbarrier.arrive.shared.b64 %rd9, [mbr];
+
+WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
+    @!%p2 bra WAIT;
+
+    // Byte 0 is its own place; byte 128 is the second row, which the swizzle moved to
+    // 144, so 148 is the element after it.
+    ld.shared.b32 %r10, [tile];
+    st.global.b32 [%rd1], %r10;
+    ld.shared.b32 %r11, [tile + 144];
+    add.s64 %rd4, %rd1, 4;
+    st.global.b32 [%rd4], %r11;
+    ld.shared.b32 %r12, [tile + 148];
+    add.s64 %rd4, %rd1, 8;
+    st.global.b32 [%rd4], %r12;
+
+    // Same as the box kernel: the address cannot agree across the two engines, and it is
+    // not part of the answer.
+    mov.u32 %r13, 0;
+    st.global.b32 [%rd3], %r13;
+    add.s64 %rd10, %rd3, 4;
+    st.global.b32 [%rd10], %r13;
+    ret;
+}
+
+// The convolution form: `.im2col` copies a *column* of the implicit GEMM rather than a
+// box. The object is the same 128 bytes; what changes is that it describes a tile of
+// `channelsPerPixel` by `pixelsPerColumn`, and the instruction names the filter window's
+// position beside the corner.
+//
+// The tensor is channels by width by height with `[c][w][h] = c + 2 * (w + 3 * h)`, so
+// channel 0 runs 0 to 8 across the width and height and channel 1 is one word further
+// along. A column of two channels by three pixels at the corner, filter offset (0, 0),
+// is 0, 1, 2, 3, 4, 5 — three pixels along the width, both channels of each. The same
+// column at offset (1, 0) starts one pixel further along, so it reads 2, 3, 4, 5 and then
+// the pixel past the right edge, which is zero: what a padded convolution's edge looks
+// like, and the one thing a column copy cannot fake.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry tensorim2col(
+    .param .u64 tensorim2col_param_0,   // out: twelve words
+    .param .u64 tensorim2col_param_1,   // the tensor
+    .param .u64 tensorim2col_param_2    // the map
+)
+{
+    .shared .align 8 .b64 mbr[1];
+    .shared .align 4 .b32 tile[12];
+
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [tensorim2col_param_0];
+    ld.param.u64 %rd2, [tensorim2col_param_1];
+    ld.param.u64 %rd3, [tensorim2col_param_2];
+
+    // ---- the tensor: eighteen words ----
+    mov.u32 %r1, 0;
+FILL: setp.ge.u32 %p1, %r1, 18;
+    @%p1 bra FILLED;
+    mul.wide.s32 %rd4, %r1, 4;
+    add.s64 %rd5, %rd2, %rd4;
+    st.global.b32 [%rd5], %r1;
+    add.u32 %r1, %r1, 1;
+    bra FILL;
+FILLED:
+
+    // ---- the map: a column of two channels by three pixels ----
+    mov.b64 {%r2, %r3}, %rd2;
+    st.global.b32 [%rd3], %r2;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 8;                 // rank 4, a column, no swizzle
+    mov.u32 %r4, 0x00000104;
+    st.global.b32 [%rd4], %r4;
+    add.s64 %rd4, %rd3, 12;                // element size
+    mov.u32 %r5, 4;
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 16;                // two channels
+    mov.u32 %r6, 2;
+    st.global.b32 [%rd4], %r6;
+    add.s64 %rd4, %rd3, 20;                // three across the width
+    mov.u32 %r7, 3;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 24;                // three down the height
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 28;                // and one batch
+    mov.u32 %r8, 1;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 48;                // a step along the width is two channels
+    mov.u64 %rd9, 8;
+    st.global.b64 [%rd4], %rd9;
+    add.s64 %rd4, %rd3, 56;                // and down the height, three of those
+    mov.u64 %rd10, 24;
+    st.global.b64 [%rd4], %rd10;
+    add.s64 %rd4, %rd3, 64;                // a batch after the whole image
+    mov.u64 %rd11, 72;
+    st.global.b64 [%rd4], %rd11;
+    add.s64 %rd4, %rd3, 80;                // two channels in the column
+    st.global.b32 [%rd4], %r6;
+    add.s64 %rd4, %rd3, 84;                // three pixels
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 88;                // a pixel steps once along the width
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 92;                // and once down the height
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 96;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 100;               // the window starts at the corner
+    mov.u32 %r9, 0;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 104;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 108;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 112;               // and a filter step is one element too
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 116;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 120;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 124;
+    mov.u32 %r10, 0x41544657;
+    st.global.b32 [%rd4], %r10;
+
+    // ---- two columns: the window's first position, then one pixel to the right ----
+    mbarrier.init.shared.b64 [mbr], 1;
+    bar.sync 0;
+
+    mov.u32 %r12, 0;
+    mov.u32 %r13, 0;
+    mbarrier.expect_tx.shared.b64 [mbr], 48;
+    cp.async.bulk.tensor.4d.shared::cluster.global.im2col.mbarrier::complete_tx::bytes
+        [tile], [%rd3, {0, 0, 0, 0}], {%r12, %r13}, [mbr];
+    mov.u32 %r14, 1;
+    mov.u32 %r15, 0;
+    cp.async.bulk.tensor.4d.shared::cluster.global.im2col.mbarrier::complete_tx::bytes
+        [tile + 24], [%rd3, {0, 0, 0, 0}], {%r14, %r15}, [mbr];
+    mbarrier.arrive.shared.b64 %rd6, [mbr];
+
+WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
+    @!%p2 bra WAIT;
+
+    // ---- the twelve words, in the order the two columns landed ----
+    ld.shared.b32 %r16, [tile];
+    st.global.b32 [%rd1], %r16;
+    ld.shared.b32 %r16, [tile + 4];
+    add.s64 %rd4, %rd1, 4;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 8];
+    add.s64 %rd4, %rd1, 8;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 12];
+    add.s64 %rd4, %rd1, 12;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 16];
+    add.s64 %rd4, %rd1, 16;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 20];
+    add.s64 %rd4, %rd1, 20;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 24];
+    add.s64 %rd4, %rd1, 24;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 28];
+    add.s64 %rd4, %rd1, 28;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 32];
+    add.s64 %rd4, %rd1, 32;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 36];
+    add.s64 %rd4, %rd1, 36;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 40];
+    add.s64 %rd4, %rd1, 40;
+    st.global.b32 [%rd4], %r16;
+    ld.shared.b32 %r16, [tile + 44];
+    add.s64 %rd4, %rd1, 44;
+    st.global.b32 [%rd4], %r16;
+
+    mov.u32 %r17, 0;
+    st.global.b32 [%rd3], %r17;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r17;
+    ret;
+}
+
+// The column going back the other way: `.im2col` in the store direction scatters
+// threadgroup memory into the window it describes. The same tensor and the same column
+// shape are used as above, and two columns are written in turn:
+//
+//   101..106 at the corner, which land on elements 0 to 5 — the window's first three
+//           pixels, both channels of each;
+//   201..206 one pixel to the right, which land on elements 2 to 5 and then run past the
+//           edge on their third pixel, where a store has nothing to write and so writes
+//           nothing rather than spilling into the next row.
+//
+// The tensor is read back afterwards, so a scatter that moved the wrong element, walked
+// the column in the wrong order, or wrapped instead of stopping changes the eighteen
+// numbers. Elements 6 to 17 were never inside a window and have to be untouched, which
+// is the half of the answer a scatter that wrote past its box would spoil.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry tensorim2st(
+    .param .u64 tensorim2st_param_0,    // out: the tensor afterwards
+    .param .u64 tensorim2st_param_1,    // the tensor
+    .param .u64 tensorim2st_param_2     // the map
+)
+{
+    .shared .align 4 .b32 col[12];
+
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [tensorim2st_param_0];
+    ld.param.u64 %rd2, [tensorim2st_param_1];
+    ld.param.u64 %rd3, [tensorim2st_param_2];
+
+    // ---- the tensor: eighteen words ----
+    mov.u32 %r1, 0;
+FILL: setp.ge.u32 %p1, %r1, 18;
+    @%p1 bra FILLED;
+    mul.wide.s32 %rd4, %r1, 4;
+    add.s64 %rd5, %rd2, %rd4;
+    st.global.b32 [%rd5], %r1;
+    add.u32 %r1, %r1, 1;
+    bra FILL;
+FILLED:
+
+    // ---- two columns, twelve words, side by side in threadgroup memory ----
+    mov.u32 %r6, 101;
+    st.shared.b32 [col], %r6;
+    mov.u32 %r7, 102;
+    st.shared.b32 [col + 4], %r7;
+    mov.u32 %r8, 103;
+    st.shared.b32 [col + 8], %r8;
+    mov.u32 %r9, 104;
+    st.shared.b32 [col + 12], %r9;
+    mov.u32 %r10, 105;
+    st.shared.b32 [col + 16], %r10;
+    mov.u32 %r11, 106;
+    st.shared.b32 [col + 20], %r11;
+    mov.u32 %r6, 201;
+    st.shared.b32 [col + 24], %r6;
+    mov.u32 %r7, 202;
+    st.shared.b32 [col + 28], %r7;
+    mov.u32 %r8, 203;
+    st.shared.b32 [col + 32], %r8;
+    mov.u32 %r9, 204;
+    st.shared.b32 [col + 36], %r9;
+    mov.u32 %r10, 205;
+    st.shared.b32 [col + 40], %r10;
+    mov.u32 %r11, 206;
+    st.shared.b32 [col + 44], %r11;
+
+    // ---- the same map as the load kernel: two channels by three pixels ----
+    mov.b64 {%r2, %r3}, %rd2;
+    st.global.b32 [%rd3], %r2;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 8;                 // rank 4, a column, no swizzle
+    mov.u32 %r4, 0x00000104;
+    st.global.b32 [%rd4], %r4;
+    add.s64 %rd4, %rd3, 12;                // element size
+    mov.u32 %r5, 4;
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 16;                // two channels
+    mov.u32 %r6, 2;
+    st.global.b32 [%rd4], %r6;
+    add.s64 %rd4, %rd3, 20;                // three across the width
+    mov.u32 %r7, 3;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 24;                // three down the height
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 28;                // and one batch
+    mov.u32 %r8, 1;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 48;                // a step along the width is two channels
+    mov.u64 %rd9, 8;
+    st.global.b64 [%rd4], %rd9;
+    add.s64 %rd4, %rd3, 56;                // and down the height, three of those
+    mov.u64 %rd10, 24;
+    st.global.b64 [%rd4], %rd10;
+    add.s64 %rd4, %rd3, 64;                // a batch after the whole image
+    mov.u64 %rd11, 72;
+    st.global.b64 [%rd4], %rd11;
+    add.s64 %rd4, %rd3, 80;                // two channels in the column
+    st.global.b32 [%rd4], %r6;
+    add.s64 %rd4, %rd3, 84;                // three pixels
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 88;                // a pixel steps once along the width
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 92;                // and once down the height
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 96;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 100;               // the window starts at the corner
+    mov.u32 %r9, 0;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 104;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 108;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 112;               // and a filter step is one element too
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 116;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 120;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 124;
+    mov.u32 %r10, 0x41544657;
+    st.global.b32 [%rd4], %r10;
+
+    bar.sync 0;
+
+    // ---- threadgroup memory -> the tensor, twice ----
+    mov.u32 %r12, 0;
+    mov.u32 %r13, 0;
+    cp.async.bulk.tensor.4d.global.shared::cta.bulk_group.im2col
+        [%rd3, {0, 0, 0, 0}], {%r12, %r13}, [col];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+
+    mov.u32 %r14, 1;
+    mov.u32 %r15, 0;
+    cp.async.bulk.tensor.4d.global.shared::cta.bulk_group.im2col
+        [%rd3, {0, 0, 0, 0}], {%r14, %r15}, [col + 24];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+
+    // ---- the tensor as the two scatters left it ----
+    mov.u32 %r16, 0;
+BACK: setp.ge.u32 %p3, %r16, 18;
+    @%p3 bra BACKED;
+    mul.wide.s32 %rd7, %r16, 4;
+    add.s64 %rd8, %rd2, %rd7;
+    ld.global.b32 %r17, [%rd8];
+    add.s64 %rd6, %rd1, %rd7;
+    st.global.b32 [%rd6], %r17;
+    add.u32 %r16, %r16, 1;
+    bra BACK;
+BACKED:
+
+    mov.u32 %r17, 0;
+    st.global.b32 [%rd3], %r17;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r17;
+    ret;
+}

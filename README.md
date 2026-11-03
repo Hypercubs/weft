@@ -31,7 +31,7 @@ ok    raymarch         65,536 values     ·  max |diff| 0  — agree
 ok    spirv:atom64     4,096 lanes: add/max olds sum exactly, signed compare included,
 ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 ...
-294 ok, 0 fail, 0 skip
+328 ok, 0 fail, 0 skip
 ```
 
 ## What runs
@@ -42,6 +42,8 @@ ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 | `threadgroup` / `.shared` memory, barriers | yes | yes | yes |
 | `mbarrier`: arrivals, phases, expected bytes | — | `init`, `arrive`, `expect_tx`, parity waits | — |
 | bulk copies: into threadgroup (completing an `mbarrier`), back out, and reduced in | — | `cp.async.bulk`, `cp.reduce.async.bulk` | — |
+| tensor-map copies: a box of a laid-out tensor, in and back out, swizzled or not | — | `cp.async.bulk.tensor`, 1d to 5d | — |
+| tensor-map columns: a convolution's channels by pixels, with the filter window, in and back out | — | `cp.async.bulk.tensor` `.im2col` | — |
 | warp shuffles, votes, folds and quads | `simd_*` | `shfl`, `vote`, `redux` | subgroup ops, folds and quads |
 | 32-bit atomics | yes | yes | yes |
 | 64-bit atomics: fetch, compare-exchange, load, store | yes | yes | yes |
@@ -58,6 +60,18 @@ ok    spvgpu:atom64k   the emitted metal matches the cpu byte for byte
 | matrices: products, transpose, scale | `simdgroup_matrix` | `mma`, `wgmma` | every shape: 2–4 columns of 2–4 rows |
 | Triton `tl.dot`: f16, tf32, bf16, fp8 | — | yes | — |
 | portable math (`sqrt`, `pow`, `sin`, …) | yes | yes | yes |
+
+The tensor-map row is the one place where weft defines the format rather than reads
+one: a `cp.async.bulk.tensor` copy takes its geometry from a 128-byte descriptor,
+NVIDIA's driver encodes that object without publishing the byte layout, and CUTLASS
+only edits its fields through `tensormap.replace` — which indexes them rather than
+giving offsets. So the layout is documented in `runtime/weft_runtime.hpp`, both
+engines decode the same bytes, and an object without weft's tag at offset 124 is
+reported instead of decoded. A kernel builds its descriptor the way a host would, in
+a buffer, and two fixtures show it: `kernels/tensormap.ptx` for the box copies in both
+directions, the swizzles and the `.im2col` column in both directions, and
+`kernels/tmadot.ptx`, where A and B arrive through a map and go straight into `ldmatrix`
+and `mma`.
 
 A kernel that cannot be expressed in a form this engine runs is **refused by
 name** at translation time. A wrong answer is worse than a refusal, and the

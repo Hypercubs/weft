@@ -254,6 +254,84 @@ else
   echo "FAIL  mbarred  read $red0 $red1 $red2 $red3; wanted 11 22 33 44"; fail=1
 fi
 
+# `cp.async.bulk.tensor`: the copy takes its geometry from a 128-byte descriptor instead
+# of from its operands, so the kernel writes one and both engines decode the same bytes.
+# A 3x3 box at column 2, row 1 of a 4x3 tensor hangs four elements off the right and
+# three off the bottom, and the outside reads back as zero; the store then puts 101 to
+# 104 on elements 5, 6, 9 and 10, which the tensor read back afterwards shows.
+runf kernels/tensormap.ptx tensormap --grid 1 --threads 1 --buffers 21,12,32
+"$WEFT" run kernels/tensormap.ptx --kernel tensormap --grid 1 --threads 1 --buffers 21,12,32 \
+    --cpu-only --dump 0="$TMP/tensormap.bin" >/dev/null
+# One word per four bytes, and the words flattened: od wraps at sixteen bytes a line,
+# so reading them as a line takes only the first four.
+tm_got="$(od -An -tu4 -v "$TMP/tensormap.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+tm_want="6 7 0 10 11 0 0 0 0 0 1 2 3 4 101 102 7 8 103 104 11"
+if [ "$tm_got" = "$tm_want" ]; then
+  echo "ok    tensormap the box loaded zero where it hung off and the store landed on 5, 6, 9, 10"
+else
+  echo "FAIL  tensormap read $tm_got; wanted $tm_want"; fail=1
+fi
+
+# The same instruction with a 128-byte swizzle, which is the layout a `wgmma` fragment
+# read expects: the second row of a 256-byte tile is XORed sixteen bytes along, so
+# element (1, 0) sits at 144 rather than at 128. Ignoring the swizzle reads 36 there.
+runf kernels/tensormap.ptx tensorswz --grid 1 --threads 1 --buffers 3,64,32
+"$WEFT" run kernels/tensormap.ptx --kernel tensorswz --grid 1 --threads 1 --buffers 3,64,32 \
+    --cpu-only --dump 0="$TMP/tensorswz.bin" >/dev/null
+sw_got="$(od -An -tu4 -v "$TMP/tensorswz.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+if [ "$sw_got" = "0 32 33" ]; then
+  echo "ok    tensorswz the 128-byte swizzle moved row 1 sixteen bytes along"
+else
+  echo "FAIL  tensorswz read $sw_got; wanted 0 32 33"; fail=1
+fi
+
+# The convolution form of the same instruction: `.im2col` copies a column of the
+# implicit GEMM — channels by pixels — with the filter window's position carried beside
+# the corner. Two channels by three pixels at the window's origin gives 0 to 5; the same
+# column one pixel to the right runs off the edge, so its third pixel is padded with zero
+# rather than read from the next row.
+runf kernels/tensormap.ptx tensorim2col --grid 1 --threads 1 --buffers 12,18,32
+"$WEFT" run kernels/tensormap.ptx --kernel tensorim2col --grid 1 --threads 1 --buffers 12,18,32 \
+    --cpu-only --dump 0="$TMP/tensorim2col.bin" >/dev/null
+im_got="$(od -An -tu4 -v "$TMP/tensorim2col.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+if [ "$im_got" = "0 1 2 3 4 5 2 3 4 5 0 0" ]; then
+  echo "ok    tensorim2col the column walked the width and the padded edge came back zero"
+else
+  echo "FAIL  tensorim2col read $im_got; wanted 0 1 2 3 4 5 2 3 4 5 0 0"; fail=1
+fi
+
+# The same column written back. 101 to 106 at the window's corner land on elements 0 to
+# 5; 201 to 206 one pixel to the right land on 2 to 5 and stop at the edge, where a store
+# writes nothing. The tensor is read back afterwards, so what has to agree is both the
+# elements the scatters changed and the twelve they must have left alone.
+runf kernels/tensormap.ptx tensorim2st --grid 1 --threads 1 --buffers 18,18,32
+"$WEFT" run kernels/tensormap.ptx --kernel tensorim2st --grid 1 --threads 1 --buffers 18,18,32 \
+    --cpu-only --dump 0="$TMP/tensorim2st.bin" >/dev/null
+is_got="$(od -An -tu4 -v "$TMP/tensorim2st.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+is_want="101 102 201 202 203 204 6 7 8 9 10 11 12 13 14 15 16 17"
+if [ "$is_got" = "$is_want" ]; then
+  echo "ok    tensorim2st the scatter landed where the column said and stopped at the edge"
+else
+  echo "FAIL  tensorim2st read $is_got; wanted $is_want"; fail=1
+fi
+
+# The descriptor feeding the matrix path: A (16x16 halves) and B (16x8) arrive through
+# `cp.async.bulk.tensor`, `ldmatrix` reads the fragments out of the tiles it filled, and
+# `mma.m16n8k16` multiplies them. A is lower-triangular in halves and B is 1 in column
+# 0, so row r of the product is r+1 in column 0 and zero everywhere else — a tile that
+# arrived a row or a column off cannot produce that.
+runf kernels/tmadot.ptx tmadot --grid 32 --threads 32 --buffers 128,256,128,64 \
+    --buffer-bytes 1=2,2=2
+"$WEFT" run kernels/tmadot.ptx --kernel tmadot --grid 32 --threads 32 --buffers 128,256,128,64 \
+    --buffer-bytes 1=2,2=2 --cpu-only --dump 0="$TMP/tmadot.bin" >/dev/null
+if od -An -tf4 -v "$TMP/tmadot.bin" | awk '{ for (i = 1; i <= NF; i++) { n++; v = $i + 0;
+      if ((n - 1) % 8 == 0) { if (v != int((n - 1) / 8) + 1) bad++ }
+      else if (v != 0) bad++ } } END { exit(bad ? 1 : 0) }'; then
+  echo "ok    tmadot  row r of the product is r+1, from tiles that came through the map"
+else
+  echo "FAIL  tmadot  the product is not the lower-triangular one"; fail=1
+fi
+
 # The value is the point: 42 is what the group wrote before the last arrival, so a lane
 # released early reads the arena instead. The store is `.b32`, so the word is the
 # integer 42 rather than a float's bits.

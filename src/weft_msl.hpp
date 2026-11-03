@@ -1918,6 +1918,230 @@ static inline void copy_global(device void* dst, threadgroup const uint8_t* src,
   for (uint32_t i = 0; i < n; i++) d[i] = src[i];
 }
 
+// ---- tensor maps ----
+//
+// The same decode as `runtime/weft_runtime.hpp`, for the other back end. The object a
+// `cp.async.bulk.tensor` copy reads is 128 bytes and its layout is weft's own: NVIDIA's
+// driver encodes it and does not publish the byte layout, so this side and the CPU side
+// read one documented format, and the tag at offset 124 is what says an object is one of
+// them (a blob from `cuTensorMapEncodeTiled` does not carry it and is not decoded).
+//
+//   off   0  u64  address of element (0, 0)
+//   off   8  u8   rank, 1 to 5; then the kind, then the swizzle, then a spare byte
+//   off  12  u32  element size in bytes: 1, 2, 4, 8 or 16
+//   off  16  u32  extent[5]         the tensor's length along each dimension
+//   off  40  u64  stride[5]         bytes between neighbours; [0] is one element
+//   off 124  u32  tag               0x41544657, 'WFTA'
+//
+// A box (kind 0) is a rectangular tile: `box[5]` at 80 and `elementStride[5]` at 100.
+// A column (kind 1) is what `.im2col` copies — `channelsPerPixel` at 80,
+// `pixelsPerColumn` at 84, a pixel's `traversal[3]` at 88, the window's
+// `lowerCorner[3]` at 100 and a filter step's `dilation[3]` at 112 — and the swizzle
+// byte applies to the threadgroup destination either way.
+static inline uint32_t tma_word(const device uint8_t* d, uint32_t off) {
+  return (uint32_t)d[off] | ((uint32_t)d[off + 1u] << 8) | ((uint32_t)d[off + 2u] << 16) |
+         ((uint32_t)d[off + 3u] << 24);
+}
+
+static inline uint64_t tma_dword(const device uint8_t* d, uint32_t off) {
+  return (uint64_t)tma_word(d, off) | ((uint64_t)tma_word(d, off + 4u) << 32);
+}
+
+static inline uint32_t tma_swizzled(uint32_t o, uint32_t mode) {
+  if (mode != 32u && mode != 64u && mode != 128u) return o;
+  const uint32_t shift = (mode == 128u) ? 7u : (mode == 64u) ? 6u : 5u;
+  return o ^ (((o >> shift) & ((mode >> 4) - 1u)) << 4);
+}
+
+struct TmaBox {
+  uint64_t base;
+  uint32_t rank, kind, elem, total, swizzle;
+  uint64_t stride[5];
+  uint32_t extent[5];
+  uint32_t box[5];
+  uint32_t step[5];
+  uint32_t channels, pixels;
+  uint32_t traversal[3];
+  uint32_t dilation[3];
+  int32_t corner[3];
+};
+
+static inline bool tma_decode(const device uint8_t* d, thread TmaBox& m) {
+  if (tma_word(d, 124u) != 0x41544657u) return false;
+  const uint32_t head = tma_word(d, 8u);
+  m.rank = head & 0xFFu;
+  m.kind = (head >> 8) & 0xFFu;
+  m.swizzle = (head >> 16) & 0xFFu;
+  m.elem = tma_word(d, 12u);
+  if (m.rank == 0u || m.rank > 5u || m.elem == 0u || m.elem > 16u) return false;
+  m.base = tma_dword(d, 0u);
+  m.total = 1u;
+  m.stride[0] = m.elem;
+  for (uint32_t i = 0; i < m.rank; i++) {
+    m.extent[i] = tma_word(d, 16u + 4u * i);
+    if (m.extent[i] == 0u) return false;
+    if (i > 0u) m.stride[i] = tma_dword(d, 40u + 8u * i);
+  }
+  if (m.kind == 0u) {
+    for (uint32_t i = 0; i < m.rank; i++) {
+      m.box[i] = tma_word(d, 80u + 4u * i);
+      m.step[i] = tma_word(d, 100u + 4u * i);
+      if (m.box[i] == 0u) return false;
+      m.total *= m.box[i];
+    }
+    return true;
+  }
+  if (m.kind == 1u) {
+    m.channels = tma_word(d, 80u);
+    m.pixels = tma_word(d, 84u);
+    if (m.channels == 0u || m.pixels == 0u) return false;
+    for (uint32_t i = 0; i < 3u; i++) {
+      m.traversal[i] = tma_word(d, 88u + 4u * i);
+      m.corner[i] = (int32_t)tma_word(d, 100u + 4u * i);
+      m.dilation[i] = tma_word(d, 112u + 4u * i);
+      if (m.traversal[i] == 0u) m.traversal[i] = 1u;
+      if (m.dilation[i] == 0u) m.dilation[i] = 1u;
+    }
+    m.total = m.channels * m.pixels;
+    return true;
+  }
+  return false;
+}
+
+static inline bool tma_element(thread const TmaBox& m, thread const int32_t* co, uint32_t k,
+                               thread uint64_t& addr) {
+  uint64_t off = 0;
+  uint32_t rest = k;
+  bool inside = true;
+  for (uint32_t i = 0; i < m.rank; i++) {
+    const uint32_t e = rest % m.box[i];
+    rest /= m.box[i];
+    const int64_t c = (int64_t)co[i] + (int64_t)e * (int64_t)(m.step[i] ? m.step[i] : 1u);
+    if (c < 0 || c >= (int64_t)m.extent[i]) {
+      inside = false;
+      break;
+    }
+    off += (uint64_t)c * m.stride[i];
+  }
+  addr = m.base + off;
+  return inside;
+}
+
+// threadgroup memory <- the tensor, reporting the box's bytes the way the CPU side does.
+static inline uint32_t tma_load(threadgroup uint8_t* dst, const device void* map, int32_t c0,
+                                int32_t c1, int32_t c2, int32_t c3, int32_t c4) {
+  const device uint8_t* d = (const device uint8_t*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != 0u) return 0xFFFFFFFFu;
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  for (uint32_t k = 0; k < m.total; k++) {
+    uint64_t addr = 0;
+    const bool inside = tma_element(m, co, k, addr);
+    const device uint8_t* s = (const device uint8_t*)(uintptr_t)addr;
+    const uint32_t o = tma_swizzled(k * m.elem, m.swizzle);
+    for (uint32_t b = 0; b < m.elem; b++) dst[o + b] = inside ? s[b] : (uint8_t)0;
+  }
+  return m.total * m.elem;
+}
+
+static inline void tma_store(const device void* map, int32_t c0, int32_t c1, int32_t c2,
+                             int32_t c3, int32_t c4, threadgroup const uint8_t* src) {
+  const device uint8_t* d = (const device uint8_t*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != 0u) return;
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  for (uint32_t k = 0; k < m.total; k++) {
+    uint64_t addr = 0;
+    if (!tma_element(m, co, k, addr)) continue;
+    device uint8_t* t = (device uint8_t*)(uintptr_t)addr;
+    const uint32_t o = tma_swizzled(k * m.elem, m.swizzle);
+    for (uint32_t b = 0; b < m.elem; b++) t[b] = src[o + b];
+  }
+}
+
+// Where pixel `p` of a column lands: the corner advanced by `traversal` in each spatial
+// dimension, the first fastest, plus the filter step's `dilation`. False means the pixel
+// fell outside the tensor, which is the edge a padded convolution is made of.
+static inline bool tma_column_at(thread const TmaBox& m, thread const int32_t* co,
+                                 thread const int32_t* of, thread const uint32_t* fit,
+                                 uint32_t p, thread uint64_t& at) {
+  const uint32_t spatial = m.rank - 2u;  // the batch is the last dimension
+  const int64_t batch = co[spatial + 1u];
+  if (batch < 0 || batch >= (int64_t)m.extent[spatial + 1u]) return false;
+  at = (uint64_t)batch * m.stride[spatial + 1u];
+  uint32_t q = p;
+  for (uint32_t i = 0; i < spatial; i++) {
+    const uint32_t step = q % fit[i];
+    q /= fit[i];
+    const int64_t at_i = (int64_t)co[i + 1u] * (int64_t)m.traversal[i] + m.corner[i] +
+                         (int64_t)step * (int64_t)m.traversal[i] +
+                         (int64_t)of[i] * (int64_t)m.dilation[i];
+    if (at_i < 0 || at_i >= (int64_t)m.extent[i + 1u]) return false;
+    at += (uint64_t)at_i * m.stride[i + 1u];
+  }
+  return true;
+}
+
+// The convolution form: the column a `.im2col` copy asks for. A pixel that lands outside
+// the tensor is written as zero, which is what makes padding work.
+static inline uint32_t tma_im2col(threadgroup uint8_t* dst, const device void* map,
+                                  int32_t c0, int32_t c1, int32_t c2, int32_t c3, int32_t c4,
+                                  int32_t o0, int32_t o1, int32_t o2) {
+  const device uint8_t* d = (const device uint8_t*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != 1u) return 0xFFFFFFFFu;
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  const int32_t of[3] = {o0, o1, o2};
+  const uint32_t spatial = m.rank - 2u;
+  uint32_t fit[3] = {1u, 1u, 1u};
+  for (uint32_t i = 0; i < spatial; i++)
+    fit[i] = (m.extent[i + 1u] + m.traversal[i] - 1u) / m.traversal[i];
+  for (uint32_t p = 0; p < m.pixels; p++) {
+    uint64_t at = 0;
+    const bool inside = tma_column_at(m, co, of, fit, p, at);
+    for (uint32_t e = 0; e < m.channels; e++) {
+      const uint32_t o = tma_swizzled((p * m.channels + e) * m.elem, m.swizzle);
+      const int64_t c = (int64_t)co[0] + (int64_t)e;
+      if (!inside || c < 0 || c >= (int64_t)m.extent[0]) {
+        for (uint32_t b = 0; b < m.elem; b++) dst[o + b] = 0;
+        continue;
+      }
+      const device uint8_t* s =
+          (const device uint8_t*)(uintptr_t)(m.base + at + (uint64_t)c * m.stride[0]);
+      for (uint32_t b = 0; b < m.elem; b++) dst[o + b] = s[b];
+    }
+  }
+  return m.channels * m.pixels * m.elem;
+}
+
+// The same column going back out: threadgroup memory is scattered into the window, and an
+// element whose place fell outside the tensor writes nothing.
+static inline void tma_im2col_store(const device void* map, int32_t c0, int32_t c1, int32_t c2,
+                                    int32_t c3, int32_t c4, int32_t o0, int32_t o1, int32_t o2,
+                                    threadgroup const uint8_t* src) {
+  const device uint8_t* d = (const device uint8_t*)map;
+  TmaBox m;
+  if (!tma_decode(d, m) || m.kind != 1u) return;
+  const int32_t co[5] = {c0, c1, c2, c3, c4};
+  const int32_t of[3] = {o0, o1, o2};
+  const uint32_t spatial = m.rank - 2u;
+  uint32_t fit[3] = {1u, 1u, 1u};
+  for (uint32_t i = 0; i < spatial; i++)
+    fit[i] = (m.extent[i + 1u] + m.traversal[i] - 1u) / m.traversal[i];
+  for (uint32_t p = 0; p < m.pixels; p++) {
+    uint64_t at = 0;
+    if (!tma_column_at(m, co, of, fit, p, at)) continue;
+    for (uint32_t e = 0; e < m.channels; e++) {
+      const int64_t c = (int64_t)co[0] + (int64_t)e;
+      if (c < 0 || c >= (int64_t)m.extent[0]) continue;
+      device uint8_t* t =
+          (device uint8_t*)(uintptr_t)(m.base + at + (uint64_t)c * m.stride[0]);
+      const uint32_t o = tma_swizzled((p * m.channels + e) * m.elem, m.swizzle);
+      for (uint32_t b = 0; b < m.elem; b++) t[b] = src[o + b];
+    }
+  }
+}
+
 }  // namespace weft
 )WEFMSL";
 
