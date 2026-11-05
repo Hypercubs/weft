@@ -14,20 +14,86 @@ fail=0
 # kernel here: translation, launch and the byte comparisons between front ends.
 # What it has no hardware for is the diff against the GPU, so that line says so
 # instead of reporting an agreement nobody checked.
+# Metal is a macOS column. No other host has a build of it, so a Metal kernel
+# that does not compare elsewhere is a CPU-only host, while the same answer on
+# macOS is a failure. A missing comparison is not proof of a missing column: a
+# shader the Metal compiler rejects, or a CUDA driver that refuses a module,
+# produces the same `no column for this kernel` line as a host with no GPU.
+# Inferring the CPU-only mode from that would turn a broken column into a green
+# suite.
 NOSHADOW=""
-if ! "$WEFT" run kernels/basic.metal --kernel saxpy --grid 16 --buffers 16,16,16 \
-     --bench 1 2>/dev/null | grep -q '^compare'; then
+CPUMODE=""
+GPUCOL=""
+GPUREF=""
+host_os="$(uname -s)"
+if [ "$host_os" = Darwin ]; then
+  probe=""
+  if ! probe="$("$WEFT" run kernels/basic.metal --kernel saxpy --grid 16 \
+        --buffers 16,16,16 --bench 1 2>&1)"; then
+    echo "FAIL  the metal column exited nonzero on the probe kernel"
+    printf '%s\n' "$probe" | sed 's/^/      /'
+    exit 1
+  fi
+  if ! printf '%s\n' "$probe" | grep -q '^compare'; then
+    echo "FAIL  the metal column did not compare the probe kernel"
+    printf '%s\n' "$probe" | sed 's/^/      /'
+    exit 1
+  fi
+else
   CPUMODE="--cpu-only"
   NOSHADOW="  (no gpu on this host, ran on the cpu)"
-else
-  CPUMODE=""
 fi
 
-# The PTX column is the CUDA driver on Linux and Windows, so it is asked separately.
-GPUCOL=""
-if ! "$WEFT" run kernels/cuda/saxpy.ptx --grid 16 --threads 16 --buffers 16,16,16 \
-     --bench 1 2>/dev/null | grep -q '^compare'; then
-  GPUCOL=1
+# The PTX column is Metal's PTX back end on macOS and the CUDA driver on Linux
+# and Windows. A comparison is the answer that it ran. Without one, the reason
+# says whether there was no driver to ask (a named skip) or a driver that
+# refused the module (a named skip carrying the driver's own words); anything
+# else is a failure, not a quiet CPU pass.
+ptx_state() {
+  case "$1" in
+    *"no CUDA driver"*|*"no compute entry points"*|*"no CUDA device"*) echo absent;;
+    "gpu"*"no column for this kernel"*) echo refused;;
+    *) echo unknown;;
+  esac
+}
+if [ "$host_os" = Darwin ]; then
+  probe=""
+  if ! probe="$("$WEFT" run kernels/cuda/saxpy.ptx --grid 16 --threads 16 \
+        --buffers 16,16,16 --bench 1 2>&1)"; then
+    echo "FAIL  the metal ptx column exited nonzero on the probe kernel"
+    printf '%s\n' "$probe" | sed 's/^/      /'
+    exit 1
+  fi
+  if ! printf '%s\n' "$probe" | grep -q '^compare'; then
+    echo "FAIL  the metal ptx column did not compare the probe kernel"
+    printf '%s\n' "$probe" | sed 's/^/      /'
+    exit 1
+  fi
+else
+  probe=""
+  probe_st=0
+  probe="$("$WEFT" run kernels/cuda/saxpy.ptx --grid 16 --threads 16 \
+        --buffers 16,16,16 --bench 1 2>&1)" || probe_st=$?
+  if [ "$probe_st" -ne 0 ]; then
+    echo "FAIL  the ptx column exited $probe_st on the probe kernel"
+    printf '%s\n' "$probe" | sed 's/^/      /'
+    exit 1
+  fi
+  if ! printf '%s\n' "$probe" | grep -q '^compare'; then
+    gpu_line="$(printf '%s\n' "$probe" | grep '^gpu' | head -1 || true)"
+    case "$(ptx_state "$gpu_line")" in
+      absent) GPUCOL=1;;
+      refused)
+        GPUREF="${gpu_line#*no column for this kernel}"
+        GPUREF="${GPUREF# }"
+        ;;
+      *)
+        echo "FAIL  the ptx column printed neither a comparison nor a reason"
+        printf '%s\n' "$gpu_line" | sed 's/^/      /'
+        exit 1
+        ;;
+    esac
+  fi
 fi
 
 # The `compare` line exists only when there was a GPU run to compare against.
@@ -988,6 +1054,10 @@ gpucol() {
   key="${file#kernels/}"
   if [ -n "$GPUCOL" ]; then
     echo "skip  gpu:$key  no ptx column on this host"
+    return
+  fi
+  if [ -n "$GPUREF" ]; then
+    echo "skip  gpu:$key  ptx column refused: $GPUREF"
     return
   fi
   local st=0
@@ -2280,6 +2350,8 @@ spvatom64() {
   # PTX, so this is the CUDA column's answer, not Metal's.
   if [ -n "$GPUCOL" ]; then
     gskip="no ptx column on this host"
+  elif [ -n "$GPUREF" ]; then
+    gskip="ptx column refused: $GPUREF"
   else
     # Both sizes are exact, byte for byte, on every run measured: a wide kernel is
     # one thread walking every warp, so the pair has one writer and nothing spins.
