@@ -930,6 +930,24 @@ int main(int argc, char** argv) {
     // the system C++ compiler otherwise, which on a Linux box is often the only
     // one there is, and gcc is what `c++` means there.
     const char* cxx_env = std::getenv("WEFT_CXX");
+#if !defined(_WIN32)
+    // A host can have an older clang++ first on PATH and a newer gcc that does
+    // compile the module. Ask a two-line probe instead of trusting the name.
+    auto compiler_ok = [&](const std::string& c) {
+      const std::string probe = build + "/compiler_probe." + std::to_string(proc_id()) + ".cpp";
+      if (!write_file(probe, "_Float16 h = (_Float16)1.5f;\n"
+                             "struct P { int x, y; };\n"
+                             "int main() { P p(1, 2); return (int)h + p.x; }\n"))
+        return false;
+      const bool ok = std::system((c + " -std=c++20 -fsyntax-only \"" + probe +
+                                   "\" >/dev/null 2>&1").c_str()) == 0;
+      std::remove(probe.c_str());
+      return ok;
+    };
+    auto on_path = [](const char* c) {
+      return std::system((std::string("command -v ") + c + " >/dev/null 2>&1").c_str()) == 0;
+    };
+#endif
 #if defined(_WIN32)
     // cmd.exe runs the probe, so ask the compiler for its own version.
     const std::string cxx =
@@ -940,9 +958,16 @@ int main(int argc, char** argv) {
     const char* kSharedFlag = "-shared -Wl,--export-all-symbols";
     const char* kLibExt = ".dll";
 #else
-    const std::string cxx =
-        cxx_env ? std::string(cxx_env)
-                : (std::system("command -v clang++ >/dev/null 2>&1") == 0 ? "clang++" : "c++");
+    std::string cxx = cxx_env ? std::string(cxx_env) : "";
+    if (cxx.empty()) {
+      cxx = on_path("clang++") ? "clang++" : "c++";
+      if (!compiler_ok(cxx)) {
+        for (const char* c : {"c++", "clang++", "g++-13", "g++-12"}) {
+          if (cxx == c || !on_path(c)) continue;
+          if (compiler_ok(c)) { cxx = c; break; }
+        }
+      }
+    }
 #if WEFT_METAL
     const char* kSharedFlag = "-dynamiclib";
     const char* kLibExt = ".dylib";

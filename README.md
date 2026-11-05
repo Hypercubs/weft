@@ -202,7 +202,8 @@ Fixtures compare bytes, not tolerances.
 | Windows, x86-64 | MSYS2, clang 16+ or gcc 13+ | PTX through the CUDA driver |
 
 The generated module needs `_Float16` and parenthesized aggregate initialisation, so clang 16
-or newer, or gcc 13 or newer. On macOS the GPU column is Metal's. Elsewhere the PTX a front
+or newer, or gcc 12 or newer. The launcher probes the compilers on PATH and uses the first one
+that accepts that module, so an older clang++ ahead of a newer gcc is not a problem. On macOS the GPU column is Metal's. Elsewhere the PTX a front
 end was given goes to the CUDA driver as written, buffers and scalars included, so no toolkit
 is needed at build time: the driver is opened at run time and a host without one runs the CPU
 column. Textures are bound through CUDA arrays, with the same texel bytes, filter and
