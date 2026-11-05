@@ -47,7 +47,8 @@ all: $(BIN) $(GEN) spirv
 
 $(BIN): src/main.mm src/translate.cpp src/translate_ptx.cpp src/translate_spirv.cpp src/translate.hpp \
            src/translate_ptx.hpp src/translate_spirv.hpp src/weft_msl.hpp src/weft_warp_msl.hpp \
-           src/weft_f64.hpp src/soft_math.hpp runtime/weft_runtime.hpp runtime/weft_runtime.cpp
+           src/weft_f64.hpp src/soft_math.hpp src/cuda_gpu.hpp runtime/weft_runtime.hpp \
+           runtime/weft_runtime.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -DWEFT_ROOT='"$(ROOT)"' $(MAIN) src/translate.cpp src/translate_ptx.cpp \
 	      src/translate_spirv.cpp $(FW) -o $(BIN).n && mv $(BIN).n $(BIN)
@@ -61,6 +62,25 @@ $(GEN): src/gen.cpp src/translate.cpp src/translate_ptx.cpp src/translate_spirv.
 	@mkdir -p build
 	$(CXX) -std=c++20 -O2 -I include src/gen.cpp src/translate.cpp src/translate_ptx.cpp \
 	      src/translate_spirv.cpp -o $(GEN).n && mv $(GEN).n $(GEN)
+
+# The launcher's non-Metal column, built on a host that has Metal anyway. It is the
+# code Linux and Windows compile, so this target is how that path is compiled and
+# run where no such host is at hand.
+build/weft-nometal: src/main.mm src/translate.cpp src/translate_ptx.cpp src/translate_spirv.cpp \
+                    src/translate.hpp src/translate_ptx.hpp src/translate_spirv.hpp \
+                    src/weft_msl.hpp src/weft_warp_msl.hpp src/weft_f64.hpp src/soft_math.hpp \
+                    src/cuda_gpu.hpp runtime/weft_runtime.hpp runtime/weft_runtime.cpp
+	@mkdir -p build
+	$(CXX) -std=c++20 -O2 -DWEFT_NO_METAL -x c++ -I runtime -I include \
+	      -DWEFT_ROOT='"$(ROOT)"' src/main.mm src/translate.cpp src/translate_ptx.cpp \
+	      src/translate_spirv.cpp -o build/weft-nometal.n && mv build/weft-nometal.n build/weft-nometal
+
+nometal: build/weft-nometal
+
+# The CUDA column against the stand-in driver in tools/fake_cuda.cpp: every call
+# it makes is recorded and checked, so the binding is tested without CUDA.
+cuda-calls: build/weft-nometal
+	@sh tools/cuda_calls.sh
 
 gen: $(GEN)
 
@@ -145,7 +165,7 @@ spirv:
 clean:
 	rm -rf build
 
-.PHONY: all demo ptx spirv gen embed clean
+.PHONY: all demo ptx spirv gen embed nometal cuda-calls clean
 
 # Regenerate the README Numbers table from a measurement rather than memory.
 # BENCH=5 for a quick pass; the default is the best of 30.

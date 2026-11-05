@@ -4329,6 +4329,7 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
   // numbered in order, and that order is the order `--textures` fills, so a
   // kernel and its binding agree without the caller being handed an index.
   std::map<std::string, int> tex_index;
+  std::vector<std::string> tex_names;  // index -> the declared name
   int ntex = 0;
   {
     const size_t first = src.find(".entry");
@@ -4353,6 +4354,7 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       nm = trim(nm.substr(0, nm.find(',')));
       if (nm.empty() || tex_index.count(nm)) continue;
       tex_index[nm] = ntex++;
+      tex_names.push_back(nm);
     }
   }
 
@@ -4469,15 +4471,30 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     // caller invent a buffer for a slot nothing reads, so buffer indices are
     // assigned over the pointers that are actually used, which is the order
     // Triton's own launcher binds them in.
-    std::vector<std::pair<std::string, bool>> pdecl;  // name, is a pointer
+    struct PtxParam {
+      std::string name;
+      bool ptr = false;
+      std::string type;  // the value's own token, without its dot
+    };
+    auto value_token = [](const std::string& t) {
+      static const char* kTypes[] = {".u8",  ".s8",  ".b8",  ".u16", ".s16", ".b16",
+                                     ".f16", ".u32", ".s32", ".b32", ".f32", ".u64",
+                                     ".s64", ".b64", ".f64", ".pred"};
+      for (const char* k : kTypes)
+        if (t == k) return true;
+      return false;
+    };
+    std::vector<PtxParam> pdecl;
     for (const std::string& p : split_top(src.substr(paren + 1, close - paren - 1), ',')) {
       if (p.empty()) continue;
       std::vector<std::string> toks = split_top(p, ' ');
-      std::string pname = toks.back();
-      bool is_ptr = false;
-      for (const auto& t : toks)
-        if (t == ".u64" || t == ".b64" || t == ".s64" || t == ".ptr") is_ptr = true;
-      pdecl.emplace_back(pname, is_ptr);
+      PtxParam pd;
+      pd.name = toks.back();
+      for (const auto& t : toks) {
+        if (t == ".u64" || t == ".b64" || t == ".s64" || t == ".ptr") pd.ptr = true;
+        if (pd.type.empty() && value_token(t)) pd.type = t.substr(1);
+      }
+      pdecl.push_back(pd);
     }
 
     std::string body = src.substr(brace + 1, end - brace - 1);
@@ -4508,14 +4525,14 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     }
 
     for (const auto& pd : pdecl) {
-      if (!pd.second) {
+      if (!pd.ptr) {
         // Scalars keep their declared positions: `--arg I` names the I-th scalar
         // the kernel declares, whether or not this build reads it.
-        em.scalars[pd.first] = (int)em.scalars.size();
-      } else if (mentions(body, pd.first)) {
-        em.params[pd.first] = (int)em.params.size();
+        em.scalars[pd.name] = (int)em.scalars.size();
+      } else if (mentions(body, pd.name)) {
+        em.params[pd.name] = (int)em.params.size();
       } else {
-        em.unused.push_back(pd.first);
+        em.unused.push_back(pd.name);
       }
     }
     std::string shared_decl;
@@ -5054,6 +5071,17 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     tk.name = name;
     tk.nargs = (int)em.params.size();
     tk.nbufs = tk.nargs;  // a PTX kernel has no render stages: its own buffers
+    // The signature's own order, so a driver that takes the PTX as written is
+    // handed the slots in the order the declaration lists them.
+    for (const auto& pd : pdecl) {
+      TranslatedKernel::Param gp;
+      gp.type = pd.type;
+      auto b = em.params.find(pd.name);
+      if (b != em.params.end()) gp.buf = b->second;
+      auto sl = em.scalars.find(pd.name);
+      if (sl != em.scalars.end()) gp.scalar = sl->second;
+      tk.params.push_back(gp);
+    }
     // Each binding's element width, from the instructions that reach it. A
     // parameter with no typed access keeps 0, unknown, not four bytes.
     tk.buf_type.assign((size_t)tk.nbufs, std::string("0"));
@@ -5065,6 +5093,7 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     tk.warp = have_vec;
     tk.tg_hint = tg_hint;
     tk.ntex = em.ntex;
+    tk.tex_name = tex_names;
     // What each binding is, by name. PTX's `.tex` says nothing about the shape, so
     // the instruction that reads it is what names it, and a 1-D texture lowers
     // onto a plane one row high, so its binding is a 2-D one.

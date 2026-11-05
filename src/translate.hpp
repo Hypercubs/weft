@@ -14,6 +14,19 @@ struct TranslatedKernel {
   // knows it. The module turns these into `sizeof(...)` so a caller can size a
   // buffer from the declaration instead of being told the layout out of band.
   std::vector<std::string> buf_type;
+  // The kernel's parameter list as its signature declares it, for a back end
+  // that hands the source to a driver as written. `buf` is the buffer the
+  // launcher binds at that slot and `scalar` the index `--arg` names; either is
+  // -1 when the slot is the other kind, or a pointer the body never reads.
+  struct Param {
+    std::string type;  // the PTX type token without its dot: "u64", "f32"
+    int buf = -1;
+    int scalar = -1;
+  };
+  std::vector<Param> params;
+  // The texture bindings in the order `--textures` fills them, as the names the
+  // module declares, so a driver that binds by name can find each one.
+  std::vector<std::string> tex_name;
   int ntex = 0;         // textures the kernel reads, bound with --textures
   int nsamp = 0;        // samplers it reads through, chosen with --samplers
   bool sync = false;

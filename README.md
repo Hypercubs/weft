@@ -179,6 +179,9 @@ Fixtures compare bytes, not tolerances.
   under the OpenCL and Kernel capabilities. A GLCompute module can declare them, and then its
   entry point takes no parameters, so buffers, images, and samplers are module-scope
   variables bound by declaration order.
+- The CUDA column has been checked against a stand-in driver (`make cuda-calls`), which
+  records the calls it makes, but not against a real one: its timings and agreements are
+  unproven until a machine with a driver has run it.
 - Translation is textual, not a compiler. It handles the shapes it was built for and refuses
   the rest by name.
 
@@ -186,16 +189,20 @@ Fixtures compare bytes, not tolerances.
 
 | host | build | GPU column |
 |---|---|---|
-| macOS, Apple silicon | `make` | yes |
-| macOS, x86-64 | `make` | yes, under Rosetta |
-| Linux, aarch64 | gcc or clang | no |
-| Linux, x86-64 | same | no |
-| Windows, x86-64 | MSYS2, clang 16+ or gcc 13+ | no |
+| macOS, Apple silicon | `make` | yes, Metal |
+| macOS, x86-64 | `make` | yes, Metal, under Rosetta |
+| Linux, aarch64 | gcc or clang | PTX through the CUDA driver |
+| Linux, x86-64 | same | PTX through the CUDA driver |
+| Windows, x86-64 | MSYS2, clang 16+ or gcc 13+ | PTX through the CUDA driver |
 
 The generated module needs `_Float16` and parenthesized aggregate initialisation, so clang 16
-or newer, or gcc 13 or newer. The GPU column is Metal's, so only macOS has one; elsewhere the
-launcher runs the CPU column and reports the GPU one as unavailable. The guard page that names
-an overrun is POSIX-only, so on Windows the host reports the fault.
+or newer, or gcc 13 or newer. On macOS the GPU column is Metal's. Elsewhere the PTX a front
+end was given goes to the CUDA driver as written, buffers and scalars included, so no toolkit
+is needed at build time: the driver is opened at run time and a host without one runs the CPU
+column. Textures are bound through CUDA arrays, with the same texel bytes, filter and
+address mode the CPU column reads; render passes and SPIR-V kernels have no CUDA run and say
+so. The guard page that names an overrun is POSIX-only, so on Windows the host reports the
+fault.
 
 ## License
 

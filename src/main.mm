@@ -2,7 +2,16 @@
 // this file, the three front ends, the generated module, the CPU launch, the
 // comparison and the image writer, is plain C++ and compiles on any host with a
 // C++20 compiler and a loader for the module it builds.
-#if defined(__APPLE__)
+// The Metal column belongs to the Apple build. `WEFT_NO_METAL` selects the other
+// one on a host that has Metal anyway, which is how the Linux and Windows launcher
+// is compiled and run where no such host exists.
+#if defined(__APPLE__) && !defined(WEFT_NO_METAL)
+#define WEFT_METAL 1
+#else
+#define WEFT_METAL 0
+#endif
+
+#if WEFT_METAL
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #endif
@@ -39,6 +48,7 @@
 // portable math call it, so the Metal source for a .metal kernel carries both.
 #include "weft_f64.hpp"
 #include "translate_ptx.hpp"
+#include "cuda_gpu.hpp"
 #include "translate_spirv.hpp"
 #include <weft/weft.h>
 
@@ -295,7 +305,7 @@ void set_env(const char* k, const std::string& v) {
 #endif
 }
 
-#if defined(__APPLE__)
+#if WEFT_METAL
 // The vertex stage of every render pass: one triangle that covers the whole
 // target, so each pixel gets exactly one fragment invocation. It is appended to
 // the source the GPU compiles and never reaches the CPU translation.
@@ -466,7 +476,7 @@ std::string fmt_uint(size_t v) {
 }  // namespace
 
 int main(int argc, char** argv) {
-#if defined(__APPLE__)
+#if WEFT_METAL
   @autoreleasepool {
 #endif
     if (argc < 2) { std::fputs(kUsage, stderr); return 2; }
@@ -896,7 +906,7 @@ int main(int argc, char** argv) {
     const std::string cxx =
         cxx_env ? std::string(cxx_env)
                 : (std::system("command -v clang++ >/dev/null 2>&1") == 0 ? "clang++" : "c++");
-#if defined(__APPLE__)
+#if WEFT_METAL
     const char* kSharedFlag = "-dynamiclib";
     const char* kLibExt = ".dylib";
 #else
@@ -1383,7 +1393,7 @@ int main(int argc, char** argv) {
     std::string gpu_name = "unavailable";
     bool gpu_ran = false;
 
-#if defined(__APPLE__)
+#if WEFT_METAL
     // A kernel the Metal back end cannot build has no GPU column, and saying so
     // here, before the launch is set up, keeps the run a CPU one instead of
     // aborting it. Two things land here: a kernel with no GPU form at all (a
@@ -1941,13 +1951,65 @@ int main(int argc, char** argv) {
       gpu_ran = gpu_refusal.empty();
     }
 #else
+    // PTX is the CUDA driver's own input, so the kernel that runs here is the one
+    // CUDA would run rather than a second translation of it. A host without a
+    // driver, and a kernel the column cannot bind, say so and stay CPU-only.
     if (!o.cpu_only) {
-      std::printf("%-9s %-34s %s\n", "gpu", "unavailable",
-                  "this build has no gpu backend: Metal is Apple-only, so there is "
-                  "nothing to diff against");
-      std::printf("%-9s %-34s %s\n", "", "",
-                  "the kernel still ran on the cpu: compare a second front end's dump "
-                  "with --dump and cmp");
+      if (spv) {
+        gpu_refusal = "the cuda column runs ptx, not spir-v";
+      } else if (!o.ptx) {
+        // Only PTX is the driver's own input: handing it Metal source would fail in
+        // the driver's parser and blame the module rather than the front end.
+        gpu_refusal = "the cuda column runs ptx, not " + o.front;
+      } else if (o.render) {
+        gpu_refusal = "the cuda column has no render stage";
+      } else if (kern.tex_name.size() > o.textures.size()) {
+        gpu_refusal = "a texture the kernel declares was not bound";
+      } else {
+        // The buffer the CPU column has just run in holds its result, not the
+        // kernel's input: the launch is fed the pristine copy, the same bytes
+        // every CPU run started from, or the two columns would agree by
+        // construction on any kernel that writes what it reads.
+        std::vector<std::vector<unsigned char>> in(nbuf);
+        for (size_t b = 0; b < nbuf; b++) {
+          in[b].resize(pristine[b].size() * sizeof(float));
+          std::memcpy(in[b].data(), pristine[b].data(), in[b].size());
+        }
+        // The same bytes, shape and sampler state the CPU column reads, so the
+        // two columns sample the same texels through the same filter.
+        std::vector<weft_cuda::Texture> tex(kern.tex_name.size());
+        for (size_t t = 0; t < tex.size(); t++) {
+          tex[t].name = kern.tex_name[t];
+          tex[t].bytes = texbytes[t];
+          tex[t].w = o.textures[t].w;
+          tex[t].h = o.textures[t].h;
+          tex[t].layers = o.textures[t].layers;
+          tex[t].depth = o.textures[t].d;
+          tex[t].texel = o.texel_bytes;
+          tex[t].one_d = o.textures[t].one_d;
+          tex[t].cube = o.textures[t].cube;
+          if (t < o.samplers.size()) {
+            tex[t].filter = o.samplers[t].first;
+            tex[t].addr = o.samplers[t].second;
+          }
+        }
+        weft_cuda::Column cu = weft_cuda::run(src, kern.name, kern.params, in, tex, o.args,
+                                              o.grid, o.threads, o.bench);
+        if (!cu.ok) {
+          gpu_refusal = cu.why;
+        } else {
+          gpu_name = cu.device + " (" + std::to_string(o.threads) + " threads/block)";
+          gpu_avg = cu.avg_ms;
+          gpu_best = cu.best_ms;
+          for (size_t b = 0; b < nbuf; b++) {
+            const size_t bytes = host[b].size() * sizeof(float);
+            gpu_out[b].resize(host[b].size());
+            if (b < cu.out.size() && cu.out[b].size() >= bytes)
+              std::memcpy(gpu_out[b].data(), cu.out[b].data(), bytes);
+          }
+          gpu_ran = true;
+        }
+      }
     }
 #endif
 
@@ -2047,7 +2109,7 @@ int main(int argc, char** argv) {
     }
     std::printf("\n");
     return 0;
-#if defined(__APPLE__)
+#if WEFT_METAL
   }
 #endif
 }
