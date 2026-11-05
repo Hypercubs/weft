@@ -91,7 +91,7 @@ build/embed_kernel.cpp: $(GEN) kernels/basic.metal
 # program calls it through include/weft/weft.h. No subprocess, no dylib, no device.
 build/embed: examples/embed/embed.cpp build/embed_kernel.cpp runtime/weft_runtime.cpp
 	@mkdir -p build
-	$(CXX) -std=c++20 -O2 -fsigned-char -I include -I runtime examples/embed/embed.cpp \
+	$(CXX) -std=c++20 -O2 -fno-strict-aliasing -fsigned-char -I include -I runtime examples/embed/embed.cpp \
 	      build/embed_kernel.cpp runtime/weft_runtime.cpp -o build/embed
 
 embed: build/embed

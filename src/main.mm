@@ -31,6 +31,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 #include <chrono>
@@ -270,6 +273,40 @@ const char* kUsage =
     "\n"
     "The same kernel source is compiled twice: once by Metal for the GPU, once\n"
     "translated to C++ for the CPU. Both outputs are compared and both are timed.\n";
+
+// The directory the running binary is in. A downloaded tarball keeps runtime/ and
+// include/ beside it, so this is what makes the build relocatable.
+std::string exe_dir() {
+#if defined(_WIN32)
+  char buf[4096];
+  const DWORD n = GetModuleFileNameA(nullptr, buf, (DWORD)sizeof buf);
+  if (n == 0 || n >= sizeof buf) return std::string();
+  std::string p(buf, (size_t)n);
+#elif defined(__APPLE__)
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  std::string p(size ? size : 1, '\0');
+  if (_NSGetExecutablePath(&p[0], &size) != 0) return std::string();
+  p.resize(std::strlen(p.c_str()));
+#else
+  char buf[4096];
+  const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+  if (n <= 0) return std::string();
+  std::string p(buf, (size_t)n);
+#endif
+  const size_t slash = p.find_last_of("/\\");
+  return slash == std::string::npos ? std::string() : p.substr(0, slash);
+}
+
+// Where runtime/ and include/ live. A build from this tree has them at WEFT_ROOT.
+// A downloaded tarball does not have that path, so the directory of the binary is
+// tried next; WEFT_ROOT names a different layout when neither fits.
+std::string runtime_root() {
+  if (const char* env = std::getenv("WEFT_ROOT")) return env;
+  const std::string dir = exe_dir();
+  if (!dir.empty() && file_readable((dir + "/runtime/weft_runtime.hpp").c_str())) return dir;
+  return WEFT_ROOT;
+}
 
 std::string read_file(const std::string& path, bool& ok) {
   FILE* f = std::fopen(path.c_str(), "rb");
@@ -866,7 +903,7 @@ int main(int argc, char** argv) {
       if (tr.kernels[i].task) task_kidx = (int)i;
     if (o.bufs.empty()) o.bufs.assign((size_t)kern.nbufs, (size_t)o.grid);
 
-    const char* root = WEFT_ROOT;
+    const std::string root = runtime_root();
     std::string build = std::string(root) + "/build";
     make_dir(build.c_str());
     // The generated translation unit is a pure function of the kernel source, so
@@ -914,7 +951,7 @@ int main(int argc, char** argv) {
     const char* kLibExt = ".so";
 #endif
 #endif
-    hash = fnv(cxx + " -std=c++20 -O2 -fsigned-char " + kSharedFlag + " -fPIC " + root, hash);
+    hash = fnv(cxx + " -std=c++20 -O2 -fno-strict-aliasing -fsigned-char " + kSharedFlag + " -fPIC " + root, hash);
     char hexkey[32];
     std::snprintf(hexkey, sizeof hexkey, "%016llx", (unsigned long long)hash);
     const std::string cache = build + "/cache";
@@ -939,7 +976,7 @@ int main(int argc, char** argv) {
       // `(char)-2` would be 254 and would not fit an `int8_t`, so the module is
       // built with the signedness the shader means. It is a no-op where `char`
       // is already signed.
-      const std::string base = cxx + " -std=c++20 -O2 -fsigned-char " + kSharedFlag + " -fPIC -I\"" + root +
+      const std::string base = cxx + " -std=c++20 -O2 -fno-strict-aliasing -fsigned-char " + kSharedFlag + " -fPIC -I\"" + root +
                                "/runtime\" -I\"" + root + "/include\" \"" + root +
                                "/runtime/weft_runtime.cpp\" \"" + gen + "\" -o \"" + tmp + "\"";
       const std::string logpath = build + "/clang.log";

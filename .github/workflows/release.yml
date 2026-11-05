@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: linux-x86_64
+          - os: macos-latest
+            asset: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the two binaries
+        run: make build/weft build/weft-gen
+      - name: package
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          name="weft-${GITHUB_REF_NAME}-${ASSET}"
+          mkdir -p "dist/$name"
+          cp build/weft build/weft-gen README.md LICENSE "dist/$name/"
+          cp -R runtime include "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weft-${{ matrix.asset }}
+          path: dist/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: attach the tarballs to the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Unpack a tarball and keep runtime/ and include/ beside the binaries.
+
+          \`weft\` compiles the kernel it translates with the host's \`clang++\` or \`c++\`, so install one of those first. The Linux build is x86-64 and was made on Ubuntu 22.04; the macOS build is Apple silicon."

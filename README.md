@@ -76,8 +76,13 @@ buffer, its length, and the launch, then exits 2.
 ```
 make gen
 ./build/weft-gen kernels/basic.metal --kernel saxpy -o build/saxpy.cpp
-clang++ -std=c++20 -O2 -I include app.cpp build/saxpy.cpp runtime/weft_runtime.cpp
+clang++ -std=c++20 -O2 -fno-strict-aliasing -I include app.cpp build/saxpy.cpp runtime/weft_runtime.cpp
 ```
+
+Compile with `-fno-strict-aliasing`: a generated module casts a buffer between the element
+types its kernel accesses, which is what the GPU does, and a compiler that assumes those
+casts cannot alias can drop the writes. clang 18 on Linux did exactly that to the half and
+bf16 reduction kernels; clang 17 on macOS did not.
 
 ```cpp
 #include <weft/weft.h>
@@ -174,7 +179,7 @@ Fixtures compare bytes, not tolerances.
   ran; at 24 lanes a butterfly read a sum 82 off.
 - A 64-bit atomic that returns the old value is exact but serial on the GPU, since the
   comparison is against the order the CPU's lanes ran in. It is two 32-bit words dispatched
-  as one thread walking every warp: 61 ms for 1,048,576 lanes against the CPU's 10.3 ms.
+  as one thread walking every warp: 585 ms for 1,048,576 lanes against the CPU's 10.5 ms.
   Everything else does its subgroup work at full width in hardware.
 - A cube and a 1-D image need a Shader module on SPIR-V, since `spirv-val` rejects a cube
   under the OpenCL and Kernel capabilities. A GLCompute module can declare them, and then its

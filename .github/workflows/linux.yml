@@ -1,0 +1,28 @@
+name: linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the SPIR-V assembler and validator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spirv-tools
+      - name: build
+        run: make -j"$(nproc)"
+      - name: run the suite
+        run: ./check.sh
+      - name: exercise the CUDA column against the stand-in driver
+        run: make cuda-calls
+      - name: build the linked example and run the demo
+        run: make embed demo
