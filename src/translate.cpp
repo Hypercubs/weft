@@ -5858,10 +5858,12 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   code += "using std::min;\n"
       "using std::max;\n"
       "using std::abs;\n"
+      "using std::fabs;\n"
       "using std::sqrt;\n"
       "using std::exp;\n"
       "using std::log;\n"
       "using std::pow;\n"
+      "using std::fmod;\n"
       "using std::fma;\n"
       "\n" +
       body_out + "static const weft::KernelDef weft_table[] = {\n";

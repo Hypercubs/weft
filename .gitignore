@@ -1,0 +1,3 @@
+build/
+kernels/spirv/*.spv
+__pycache__/
