@@ -2248,6 +2248,10 @@ unset WEFT_WARP
 # cannot be mistaken for a mistake in the translator.
 spvcross() {
   local kernel="$1" file="$2" idx="$3"; shift 3
+  if [ ! -f "kernels/spirv/$file.spv" ]; then
+    echo "skip  spvcross:$kernel  no kernels/spirv/$file.spv on this host"
+    return
+  fi
   "$WEFT" run kernels/basic.metal --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/msl.bin" "$@" >/dev/null
   "$WEFT" run "kernels/spirv/$file.spv" --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/spv.bin" "$@" >/dev/null
   if same_dumps "spirv:$kernel" "$TMP/msl.bin" "$TMP/spv.bin"; then

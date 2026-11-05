@@ -102,7 +102,7 @@ demo: $(BIN)
 	@./$(BIN) run kernels/basic.metal --kernel stencil5   --grid 1048576 --buffers 1048576,1048576
 	@./$(BIN) run kernels/basic.metal --kernel reduce_sum --grid 1048576 --threads 256 --buffers 1048576,4096
 
-LLC ?= $(shell command -v llc 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llc)
+LLC ?= $(shell command -v llc 2>/dev/null || command -v llc-18 2>/dev/null || command -v llc-17 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llc)
 
 # Regenerate the PTX samples from LLVM IR with the NVPTX backend.
 ptx:
@@ -125,19 +125,15 @@ SPIRV_AS  ?= $(shell command -v spirv-as 2>/dev/null || echo /opt/homebrew/bin/s
 SPIRV_VAL ?= $(shell command -v spirv-val 2>/dev/null || echo /opt/homebrew/bin/spirv-val)
 
 spirv:
-	# Both tools are external, so this is best effort: with them, every module is
-	# rebuilt and validated; without, the files already on disk stand and the
-	# message says which one was missing. `|| exit 1` inside the loops because a
-	# for loop's status is its last command, so a module that failed to assemble
-	# was being reported by nothing.
+	# The assembler is external: without it the modules on disk stand. llc only
+	# adds the one sample from LLVM's backend, so a host without its SPIR-V
+	# target still assembles the hand-written modules.
 	# Each module is written under a temporary name and moved into place only after
 	# it validates, so a module the tools reject cannot replace the good one that
 	# was already there, a failed build leaves the tree as it found it and says
 	# which file it stopped on, rather than half-writing the module it was on.
 	@if ! command -v $(SPIRV_AS) >/dev/null 2>&1 && [ ! -x "$(SPIRV_AS)" ]; then \
 	  echo "spirv: no spirv-as, so the modules already here are the ones used"; \
-	elif ! command -v $(LLC) >/dev/null 2>&1 && [ ! -x "$(LLC)" ]; then \
-	  echo "spirv: no llc, so the modules already here are the ones used"; \
 	else \
 	  val=""; \
 	  if command -v $(SPIRV_VAL) >/dev/null 2>&1 || [ -x "$(SPIRV_VAL)" ]; then val=$(SPIRV_VAL); fi; \
@@ -151,12 +147,15 @@ spirv:
 	    mv -f $$tmp.bin $${f%.spvasm}.spv; \
 	  done; \
 	  if [ $$ok = 1 ]; then \
-	    $(LLC) -march=spirv64 -filetype=obj -O2 kernels/cuda/spvloop.ll -o $$tmp.llvm || { \
-	      echo "spirv: llc did not emit a module from kernels/cuda/spvloop.ll" >&2; ok=0; }; \
-	    if [ $$ok = 1 ] && [ -n "$$val" ] && ! $$val --target-env spv1.4 $$tmp.llvm; then \
-	      echo "spirv: llc's module did not validate, so kernels/spirv/llvm.spv keeps its last good copy" >&2; ok=0; \
+	    if ! command -v $(LLC) >/dev/null 2>&1 && [ ! -x "$(LLC)" ]; then \
+	      echo "spirv: no llc, so kernels/spirv/llvm.spv is not rebuilt" >&2; \
+	    elif ! $(LLC) -march=spirv64 -filetype=obj -O2 kernels/cuda/spvloop.ll -o $$tmp.llvm; then \
+	      echo "spirv: llc has no SPIR-V target here, so kernels/spirv/llvm.spv is not rebuilt" >&2; \
+	    elif [ -n "$$val" ] && ! $$val --target-env spv1.4 $$tmp.llvm; then \
+	      echo "spirv: llc's module did not validate, so kernels/spirv/llvm.spv keeps its last good copy" >&2; \
+	    else \
+	      mv -f $$tmp.llvm kernels/spirv/llvm.spv; \
 	    fi; \
-	    if [ $$ok = 1 ]; then mv -f $$tmp.llvm kernels/spirv/llvm.spv; fi; \
 	  fi; \
 	  rm -f $$tmp.bin $$tmp.llvm; \
 	  if [ $$ok = 0 ]; then exit 1; fi; \

@@ -16,13 +16,20 @@ jobs:
         include:
           - os: ubuntu-22.04
             asset: linux-x86_64
+            cxx: g++-12
           - os: macos-latest
             asset: macos-arm64
+            cxx: /usr/bin/clang++
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: install a compiler that accepts _Float16 on x86
+        if: matrix.asset == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-12
       - name: build the two binaries
-        run: make build/weft build/weft-gen
+        run: make CXX="${{ matrix.cxx }}" build/weft build/weft-gen
       - name: package
         env:
           ASSET: ${{ matrix.asset }}
