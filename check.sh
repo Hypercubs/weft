@@ -15,12 +15,19 @@ fail=0
 # What it has no hardware for is the diff against the GPU, so that line says so
 # instead of reporting an agreement nobody checked.
 NOSHADOW=""
-if "$WEFT" run kernels/basic.metal --kernel saxpy --grid 16 --buffers 16,16,16 \
-     --bench 1 2>/dev/null | grep -q '^gpu *unavailable'; then
+if ! "$WEFT" run kernels/basic.metal --kernel saxpy --grid 16 --buffers 16,16,16 \
+     --bench 1 2>/dev/null | grep -q '^compare'; then
   CPUMODE="--cpu-only"
   NOSHADOW="  (no gpu on this host, ran on the cpu)"
 else
   CPUMODE=""
+fi
+
+# The PTX column is the CUDA driver on Linux and Windows, so it is asked separately.
+GPUCOL=""
+if ! "$WEFT" run kernels/cuda/saxpy.ptx --grid 16 --threads 16 --buffers 16,16,16 \
+     --bench 1 2>/dev/null | grep -q '^compare'; then
+  GPUCOL=1
 fi
 
 # The `compare` line exists only when there was a GPU run to compare against.
@@ -979,8 +986,8 @@ gpucol() {
   # The path under kernels/, not the basename: two fixtures are both named
   # `reduce.ptx`, and one line of output should not stand for two runs.
   key="${file#kernels/}"
-  if [ -n "$CPUMODE" ]; then
-    echo "skip  gpu:$key  no gpu on this host"
+  if [ -n "$GPUCOL" ]; then
+    echo "skip  gpu:$key  no ptx column on this host"
     return
   fi
   local st=0
@@ -1638,7 +1645,10 @@ spvgpu subfold:ragged=subfold subfold --grid 24 --threads 32 --buffers 256
 # conversions in both directions, including the ones the specification leaves
 # undefined and which are therefore not compared. The reference is this machine's
 # own binary64, and the comparison is of the bits.
-if fp64_out="$(python3 tools/f64_check.py 2>&1)"; then
+if [ -n "$CPUMODE" ]; then
+  # It drives Metal, so there is no second answer to read here.
+  echo "skip  fp64:exact  no metal on this host"
+elif fp64_out="$(python3 tools/f64_check.py 2>&1)"; then
   echo "ok    fp64:exact  $(printf '%s\n' "$fp64_out" | tail -1)"
 else
   echo "FAIL  fp64:exact"
@@ -2266,9 +2276,10 @@ spvatom64() {
   # increments is a 7.7e-43 difference in that view, so it said "agree" about a
   # wrong answer. This one compares integers, and compares them because the answer
   # is known, not because two engines were asked the same question.
-  local gbad=""
-  if [ -n "$CPUMODE" ]; then
-    gbad="no gpu on this host"
+  local gbad="" gskip=""
+  # PTX, so this is the CUDA column's answer, not Metal's.
+  if [ -n "$GPUCOL" ]; then
+    gskip="no ptx column on this host"
   else
     # Both sizes are exact, byte for byte, on every run measured: a wide kernel is
     # one thread walking every warp, so the pair has one writer and nothing spins.
@@ -2293,7 +2304,10 @@ spvatom64() {
       [ -z "$go" ] || gbad="$gbad ${gn}lanes:$go"
     done
   fi
-  if [ -z "$bad" ] && [ -z "$gbad" ]; then
+  if [ -z "$bad" ] && [ -z "$gbad" ] && [ -n "$gskip" ]; then
+    echo "ok    spirv:atom64  $n lanes: add/max olds sum exactly, signed compare included"
+    echo "      ($gskip, so the gpu's six counters were not read)"
+  elif [ -z "$bad" ] && [ -z "$gbad" ]; then
     echo "ok    spirv:atom64  $n lanes: add/max olds sum exactly, signed compare included,"
     echo "      and the gpu's six counters are the same integers at 4,096 and 65,536"
   else
@@ -2450,7 +2464,8 @@ import struct, sys
 # with no Metal backend has no GPU column, and says so instead, that is the one
 # case where the model alone is the check.
 log = open(sys.argv[4], encoding='utf-8').read()
-if 'unavailable' not in log and ': agree' not in log:
+if ('unavailable' not in log and ': agree' not in log
+        and 'no column for this kernel' not in log):
     sys.exit(1)
 inp = open(sys.argv[1], 'rb').read()
 v = open(sys.argv[2], 'rb').read()
@@ -2507,7 +2522,8 @@ if "$WEFT" run kernels/taskmesh.metal --kernel meshuse --grid 96 --buffers 8 \
               "$TMP/tm.log" <<'TASKPY'
 import struct, sys
 tlog = open(sys.argv[5], encoding='utf-8').read()
-if 'unavailable' not in tlog and ': agree' not in tlog:
+if ('unavailable' not in tlog and ': agree' not in tlog
+        and 'no column for this kernel' not in tlog):
     sys.exit(1)
 res = open(sys.argv[1], 'rb').read()
 v = open(sys.argv[2], 'rb').read()

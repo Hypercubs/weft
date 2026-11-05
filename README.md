@@ -52,9 +52,10 @@ make
     --threads 256 --buffers 1048576,4096
 ./build/weft run kernels/triton/add.ptx --kernel add_kernel --grid 1024 \
     --buffers 1024,1024,1024 --arg 0=1000
-./build/weft run kernels/basic.metal --kernel tex2d --grid 65536 --buffers 65536 \
+./build/weft run kernels/basic.metal --kernel texmix --grid 65536 --buffers 65536 \
     --textures 64x64                  # also 64x64*4 arrays, 64x64x8 volumes
-./build/weft run kernels/basic.metal --kernel fragshade --render 64x64 --buffers 4096
+./build/weft run kernels/basic.metal --kernel fragshade --render 64x64 --buffers 4096 \
+    --textures 64x64
 ./build/weft run my.metal --emit      # the generated C++
 ./build/weft run my.metal --emit-gpu  # the Metal source the GPU compiles
 ./build/weft run my.metal --cpu-only  # no Metal device needed
