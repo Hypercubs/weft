@@ -1,4 +1,4 @@
-; Tree reduction in threadgroup memory, one barrier per level — the same
+; Tree reduction in threadgroup memory, one barrier per level, the same
 ; algorithm as reduce_sum in basic.metal, but emitted by LLVM.
 target triple = "nvptx64-nvidia-cuda"
 

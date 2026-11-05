@@ -1,6 +1,6 @@
 ; The four extended instructions that compute two numbers. SPIR-V carries the
-; second one through a pointer the instruction takes as its last operand — the
-; validator is explicit, `frexp: expected the last operand to be a pointer` — so
+; second one through a pointer the instruction takes as its last operand, the
+; validator is explicit, `frexp: expected the last operand to be a pointer`, so
 ; each of these is checked on both halves:
 ;
 ;     fr = frexp(a, &e)        fraction in [0.5,1) and the exponent e
@@ -16,7 +16,7 @@
 ; values checkable at once: sin^2 + cos^2 is 1 only if neither is a substitute.
 ;
 ; The exponent and the quotient are `uint` because `Kernel` has no signed
-; integers — the model's rule, not the maths'.
+; integers, the model's rule, not the maths'.
                OpCapability Kernel
                OpCapability Addresses
                OpCapability Int64

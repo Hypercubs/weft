@@ -3,7 +3,7 @@
 ; LLVM's SPIR-V backend leaves the subgroup builtins as calls to imported
 ; functions (`sub_group_ballot` and friends) rather than instructions, so a module
 ; out of a real compiler reaches this runtime through the import path. One thread
-; owns all 32 lanes here, so a vote is a relay through the warp's slot array —
+; owns all 32 lanes here, so a vote is a relay through the warp's slot array,
 ; publish, let the sweep bring the lanes back, fold the window.
 ;
 ; Every answer below can be worked out by hand, and the last three buffers carry
@@ -12,7 +12,7 @@
 ;
 ;   ballot(gid even)        lanes are 0..31, so the mask is 0x55555555 in every lane.
 ;   reduce_add(gid & 31)    0 + 1 + ... + 31 = 496, in every lane.
-;   broadcast(counter, 0)   lane 0's 64-bit load, in every lane — and because every
+;   broadcast(counter, 0)   lane 0's 64-bit load, in every lane, and because every
 ;                           lane loads after the barrier, that is the counter itself,
 ;                           which has moved by exactly 32.
 ;   reduce_add(gid + 1, 64) 1 + 2 + ... + 32 = 528.

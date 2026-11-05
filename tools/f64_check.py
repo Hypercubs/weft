@@ -93,7 +93,7 @@ for _ in range(240):
 
 # Every case carries a third operand as well: the fused multiply-add takes three, and
 # the two-operand operations ignore it. For `fma` the third value is picked to make the
-# addition do work — most often the exact negation of the product, which is the shape
+# addition do work, most often the exact negation of the product, which is the shape
 # that cancels to nothing and needs all 106 bits of it.
 def _third(a, b, i):
     p = a * b
@@ -233,7 +233,7 @@ def expect_to_u64(a, _b):
 
 
 def _round_f64(fr):
-    """Round an exact rational to binary64, nearest even — what float() would do."""
+    """Round an exact rational to binary64, nearest even, what float() would do."""
     if fr == 0:
         return 0.0
     sign = -1.0 if fr < 0 else 1.0

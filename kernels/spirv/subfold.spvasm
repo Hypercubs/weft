@@ -1,7 +1,7 @@
 ; The OpenCL.std fold builtins over a float: the tree the two engines share.
 ;
 ; A reduce and a scan are one doubling tree, written out rather than called as
-; `simd_sum` — the hardware's own fold would add in its own order, and for floats
+; `simd_sum`, the hardware's own fold would add in its own order, and for floats
 ; a different order of additions is a different answer. This module is the case
 ; that measures it: the lane's value is (l+1)/2, a half-integer, so every partial
 ; sum is exact in binary32 and every hand-worked answer below is exact too.

@@ -91,7 +91,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

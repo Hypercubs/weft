@@ -1,6 +1,6 @@
 ; A vector of `double` on a GPU that has no fp64.
 ;
-; A scalar double is already carried in software — its bits in a `uint64_t`, every
+; A scalar double is already carried in software, its bits in a `uint64_t`, every
 ; operation an exact IEEE-754 helper. A vector of them is the same thing 2, 3 or 4
 ; times over, and the only question this module asks is whether the per-component
 ; path calls that helper or falls back to an operator on the 64-bit words.
@@ -15,7 +15,7 @@
 ;
 ; Every value is exact: a float converted up, plus a half, times 2.5 and back. An
 ; operator applied to the two 64-bit words instead of the helper is not a small
-; difference — it adds the significands as integers — so the comparison in
+; difference, it adds the significands as integers, so the comparison in
 ; check.sh is a bit-for-bit one against the host's own doubles.
                OpCapability Kernel
                OpCapability Addresses

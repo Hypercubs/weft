@@ -6,7 +6,7 @@
 //
 // Every sample lands on a texel centre, so a filter, a plane that is off by one, or
 // a depth reported as 1 all show up as a wrong number instead of hiding in a
-// register. `.tex` says nothing about dimensionality — the `.3d` suffix on the
+// register. `.tex` says nothing about dimensionality, the `.3d` suffix on the
 // instruction is what makes the binding a volume.
 .version 7.0
 .target sm_70

@@ -1,4 +1,4 @@
-; A module-scope `__global` buffer (OpenCL 2.0 program scope) — the one kind of
+; A module-scope `__global` buffer (OpenCL 2.0 program scope), the one kind of
 ; global a kernel can name without it being a parameter. The host still has to
 ; supply the storage, so it takes the buffer index after the explicit arguments:
 ; bufs[0] is `in`, bufs[1] is `out`.

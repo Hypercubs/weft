@@ -1,4 +1,4 @@
-; Warp-level inclusive scan — the standard CUDA idiom (Harris's scan), written
+; Warp-level inclusive scan, the standard CUDA idiom (Harris's scan), written
 ; as LLVM IR so the NVPTX backend emits the shuffles the way a compiler does.
 target triple = "nvptx64-nvidia-cuda"
 

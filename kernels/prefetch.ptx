@@ -1,0 +1,46 @@
+// The prefetch hints, which are the one family of instruction whose translation
+// cannot be wrong: `prefetch.global.L2`, `prefetchu.L1` and the bulk tensor prefetch
+// ask for a line to be brought up and report nothing back, so a copy kernel that
+// interleaves them with its arithmetic has to answer exactly as it would without.
+//
+//     out[gid] = in[gid]
+//
+// and check.sh compares the output buffer against the input one byte for byte, so an
+// implementation that "did something" with a hint, read the address, zeroed a line,
+// hung on a size, shows up as a different buffer rather than as a silent no-op that
+// happened to look fine.
+//
+// `cp.async.bulk.prefetch.L2.global` takes an address and a size, no barrier and no
+// bulk group: nothing waits on it, which is why it is a hint too.
+.version 8.0
+.target sm_90
+.address_size 64
+
+.visible .entry prefetch(
+    .param .u64 prefetch_param_0,   // out
+    .param .u64 prefetch_param_1    // in
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [prefetch_param_0];
+    ld.param.u64 %rd2, [prefetch_param_1];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;           // out
+    add.s64 %rd5, %rd2, %rd3;           // in
+
+    prefetch.global.L2 [%rd5];
+    prefetchu.L1 [%rd5];
+    cp.async.bulk.prefetch.L2.global [%rd5], 128;
+
+    ld.global.b32 %r5, [%rd5];
+    st.global.b32 [%rd4], %r5;
+    ret;
+}

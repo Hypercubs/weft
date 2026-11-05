@@ -1,5 +1,6 @@
 #include "translate.hpp"
 #include "soft_math.hpp"
+#include "weft_f64.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -110,7 +111,7 @@ std::string strip_comments(const std::string& s) {
 // Split a translation unit into top-level items: a `struct { ... };`, a function
 // `f(...) { ... }`, a `#define` line, a lone declaration. Everything a kernel
 // file defines for itself lives in one of these, and none of it belongs to a
-// kernel — it has to be carried over to the generated C++ too, or a kernel that
+// kernel, it has to be carried over to the generated C++ too, or a kernel that
 // names its own struct type compiles on the GPU and not here.
 std::vector<std::string> top_level_items(const std::string& s) {
   std::vector<std::string> out;
@@ -322,8 +323,8 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
   std::string out;
   size_t copied = 0, i = 0;
   // Where each emitted rewrite sits in `out`, so an operand that a *previous*
-  // rewrite already covers — the `bump(a[g].xyz).zy` shape, a swizzle of a call
-  // whose argument was itself swizzled — can be cut out of the text that was
+  // rewrite already covers, the `bump(a[g].xyz).zy` shape, a swizzle of a call
+  // whose argument was itself swizzled, can be cut out of the text that was
   // emitted rather than out of the source, where it no longer exists.
   std::vector<std::pair<size_t, size_t>> map{{0, 0}};
   while (i < body.size()) {
@@ -457,7 +458,7 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
         }
         rhs_end = q + 1;
       }
-      // The right-hand side can hold reads of its own — `a.xy = b.zyx * 2` — so it
+      // The right-hand side can hold reads of its own, `a.xy = b.zyx * 2`, so it
       // goes through this same rewrite rather than being copied raw.
       const size_t rhs_from = after + (compound ? 2 : 1);
       std::string rhs = body.substr(rhs_from, rhs_end - rhs_from);
@@ -532,7 +533,7 @@ std::string rename_word(const std::string& s, const std::string& from, const std
 
 // A helper function the kernel file defines for itself. Most of them are
 // translated as written; one that waits on its warp or its threadgroup cannot be,
-// because the wait is a suspension of the *caller's* coroutine — so those are
+// because the wait is a suspension of the *caller's* coroutine, so those are
 // expanded at each call site instead, as a statement expression. That keeps the
 // rendezvous inside the kernel body where the resume point lives.
 struct HelperFn {
@@ -592,8 +593,8 @@ HelperFn parse_helper(const std::string& item, size_t name_start, size_t paren) 
     std::string decl = p;
     std::vector<std::string> attrs;
     decl = strip_attributes(decl, attrs);
-    // A parameter's type names the address space it lives in — `threadgroup
-    // float* tile` — but an expanded helper is handed an argument that already
+    // A parameter's type names the address space it lives in, `threadgroup
+    // float* tile`, but an expanded helper is handed an argument that already
     // names the storage, so the qualifier has to go or it lands in the C++.
     for (bool again = true; again;) {
       again = false;
@@ -653,7 +654,7 @@ std::string helper_returns(const std::string& body, const std::string& retname) 
 // Where the statement holding this offset begins: after the last `;`, `{` or `}`
 // outside parentheses. A body is rewritten in place, so the offset is into the
 // text built so far, and the statement that call sits in has not been written
-// yet — the boundary is therefore the tail of that text.
+// yet, the boundary is therefore the tail of that text.
 size_t statement_start(const std::string& s, size_t at) {
   size_t start = 0;
   int paren = 0;
@@ -751,7 +752,7 @@ std::string expand_helper_calls(const std::string& in, const HelperFn& f, bool& 
     // A helper that waits on the block cannot be a call: the rendezvous has to end
     // up inside the kernel body, where the resume point is. Its body is placed as a
     // plain block before the statement that called it, which keeps the wait at
-    // statement level — a statement expression would put it inside an expression,
+    // statement level, a statement expression would put it inside an expression,
     // where a lane resuming half way through has no defined value to carry. An
     // early `return` leaves that block through a label after it.
     std::string repl;
@@ -820,7 +821,7 @@ CarriedDecls carry_decls(const std::string& src) {
     if (starts_with(item, "fragment")) continue;  // rewritten as a per-pixel body
     if (starts_with(item, "#include") || starts_with(item, "#pragma")) continue;
     // The other pipeline stages are not compute: the vertex function is supplied
-    // by the launcher, and a tile function never gets this far — a render pass
+    // by the launcher, and a tile function never gets this far, a render pass
     // that has one is refused before any kernel is translated.
     if (starts_with(item, "vertex")) continue;
     if (item.compare(0, 8, "[[tile]]") == 0) continue;
@@ -828,7 +829,7 @@ CarriedDecls carry_decls(const std::string& src) {
     if (looks_like_function(item, ns, par)) {
       HelperFn f = parse_helper(item, ns, par);
       // A function that names a threadgroup waits on it, owns storage in it, or
-      // both — and either way the block belongs to the kernel, so the body has to
+      // both, and either way the block belongs to the kernel, so the body has to
       // be inside the kernel body, where the shared window and the resume point
       // are. Those are expanded at each call site, as a block before the calling
       // statement, so the wait stays at statement level.
@@ -967,7 +968,7 @@ std::string rewrite_textures(const std::string& in, const std::vector<TexParam>&
       auto args = split_top_level(in.substr(p + 1, close - p - 1));
       // Metal's texture reads always hand back four channels: a single-channel
       // format comes back as (value, 0, 0, 1), and kernels take `.x` of it. That
-      // shape matters — `float v = img.read(...)` does not compile on the GPU
+      // shape matters, `float v = img.read(...)` does not compile on the GPU
       // either.
       const std::string vec = (t.value == "float")   ? "float4"
                               : (t.value == "half") ? "half4"
@@ -1440,7 +1441,7 @@ static_assert(sizeof(weft_layout_probe) == 32 && alignof(weft_layout_probe) == 1
 
 // The packed vectors: the same element types with no tail padding, so a
 // packed_float3 is the 12 bytes a device buffer of xyz triples actually holds.
-// That is the whole point of the type — it is a layout, and the alignments are
+// That is the whole point of the type, it is a layout, and the alignments are
 // the element's, which is why char3-packed is 3 bytes and not 4.
 #define WEFT_PACKED_VECS(S, P)                                                     \
   struct packed_##P##2 { S x, y; };                                               \
@@ -1544,7 +1545,7 @@ WEFT_VEC2(uint2, uint32_t)
 WEFT_VEC3(uint3, uint32_t)
 WEFT_VEC4(uint4, uint32_t)
 // The 8- and 16-bit vectors compute too, and the result is the same narrow
-// type — which is what makes an overflow wrap where the hardware wraps.
+// type, which is what makes an overflow wrap where the hardware wraps.
 WEFT_VEC2(char2, int8_t)
 WEFT_VEC3(char3, int8_t)
 WEFT_VEC4(char4, int8_t)
@@ -1718,7 +1719,7 @@ static inline bool4 operator!=(bool4 a, bool4 b) { return !(a == b); }
 // A swizzle is a *read*: `.xy` of a float4 is a float2 built from two fields, and
 // `.zyx` is a float3 in the other order. C++ has no such syntax for a struct, so
 // the translator turns the read into one call whose overload decides the result
-// type from the receiver — `weft_swz(v, 2, 1, 0)`. The indices are literals by
+// type from the receiver, `weft_swz(v, 2, 1, 0)`. The indices are literals by
 // construction, so the compiler folds the picks and the rewrite costs nothing.
 #define WEFT_SWZ(T2, T3, T4, S)                                                    \
   static inline S weft_pick(T2 v, int i) { return i == 0 ? v.x : v.y; }             \
@@ -1837,7 +1838,7 @@ static inline float3& operator*=(float3& a, float b) { a = a * b; return a; }
 // The bitwise operators on integer vectors, which MSL has and C++ does not: a
 // kernel that writes `q |= m` or `q <<= 2` is ordinary Metal. Every one is built
 // through weft_pick and weft_put, the same pair the swizzle helpers use, so a
-// struct's padding is neither read nor written — `T r{}` zeroes it once.
+// struct's padding is neither read nor written, `T r{}` zeroes it once.
 #define WEFT_BITS2(T)                                                                  \
   static inline T operator&(T a, T b) {                                                \
     T r{};                                                                             \
@@ -1991,14 +1992,13 @@ WEFT_BITS4(int4)
 WEFT_BITS2(uint2)
 WEFT_BITS3(uint3)
 WEFT_BITS4(uint4)
-// ---- simdgroup matrices ----
 //
 // On a GPU an 8x8 simdgroup matrix is distributed across the 32 lanes, and the
 // three operations are collective: every lane passes the same pointers and gets
 // its own fragment. Here the whole matrix is the value every lane holds, and the
 // operations do the whole load, store and product. That is the same answer for
 // every program the hardware accepts, because a collective call by definition
-// has the same arguments in all 32 lanes — only where the pieces live differs.
+// has the same arguments in all 32 lanes, only where the pieces live differs.
 // The element order of a load/store is Metal's: row-major in memory with
 // `elements_per_row`, with an optional uint2 origin and transpose.
 template <class T, int Cols, int Rows> struct simdgroup_matrix {
@@ -2105,13 +2105,13 @@ static inline bool atomic_compare_exchange_weak_explicit(std::atomic<T>* p, T* e
 // `blk.c` is Metal's tile-memory member access: the value of this pixel's
 // slice. Lowered, it is a member of one element of an array, so it becomes
 // `blk->c` for the CPU (a pointer at this pixel) and `blk[pixel].c` for the GPU
-// (the same array indexed by the pixel) — one piece of memory, two spellings.
+// (the same array indexed by the pixel), one piece of memory, two spellings.
 // `.slice(n)` is the n-th slice at this pixel, which is an index.
 // `indexed` (optional) is used when the access carries a subscript: it is a
 // template whose `@` becomes that subscript, so `imblk[p].c` can become
 // `blk[p - gid].c` instead of collapsing to `blk->c`. Dropping the subscript
 // would silently turn a read of a neighbouring pixel into a read of your own,
-// which is not the same program — see the tile-memory note in translate_msl.
+// which is not the same program, see the tile-memory note in translate_msl.
 std::string rewrite_member_access(const std::string& body, const std::string& name,
                                   const std::string& prefix, std::string& err,
                                   const std::string& indexed = std::string()) {
@@ -2199,8 +2199,8 @@ std::string rewrite_frag_return(const std::string& body, const std::string& ret,
     }
     // The target is RGBA32Float: the four channels the fragment returns, at this
     // invocation's pixel. A narrower return fills what it has and leaves the rest
-    // at the value the GPU gives a channel the shader never wrote — alpha 1,
-    // colour 0 — so a float3 colour is an opaque pixel rather than a black one.
+    // at the value the GPU gives a channel the shader never wrote, alpha 1,
+    // colour 0, so a float3 colour is an opaque pixel rather than a black one.
     // The width comes from the declared return type, because an expression's type
     // is not known here and guessing it would be the translator inventing a
     // layout out of the spelling of a variable.
@@ -2227,12 +2227,12 @@ std::string rewrite_frag_return(const std::string& body, const std::string& ret,
 // The source Metal compiles: the file as written, with tile memory lowered. Tile
 // memory is an imageblock, and this host's Metal compiler cannot compile one in
 // any spelling, so the parameter becomes a device buffer of one element per pixel
-// and `blk.c` becomes `blk[pixel].c` — the same memory the CPU binds, at the same
+// and `blk.c` becomes `blk[pixel].c`, the same memory the CPU binds, at the same
 // index. This runs for every translation, because a compute run hands Metal the
 // whole file too and would otherwise fail on a tile stage it never runs.
 std::string lower_imageblocks(std::string src, uint32_t width) {
-  // Tile memory is a 32x32 block per tile — the unit the hardware hands a tile
-  // stage — not one slot per pixel of the target. A pixel's slot is its tile's
+  // Tile memory is a 32x32 block per tile, the unit the hardware hands a tile
+  // stage, not one slot per pixel of the target. A pixel's slot is its tile's
   // block plus its position inside it, and the same expression is emitted for the
   // GPU and for the CPU translation, so both address the same slot.
   const std::string wpix = std::to_string(width) + "u";
@@ -2348,11 +2348,10 @@ std::string lower_imageblocks(std::string src, uint32_t width) {
 
 // The module ABI (include/weft/weft.h), emitted after the kernels. Element widths
 // are `sizeof` of each buffer's declared C++ type, evaluated by the compiler that
-// builds this file — so a `float4*` is 16 bytes and a `packed_float3*` is 12, with
+// builds this file, so a `float4*` is 16 bytes and a `packed_float3*` is 12, with
 // no layout engine here. A front end that cannot type its pointers (PTX binds
 // addresses, SPIR-V pointer values) reports nothing, and 4 bytes is assumed.
 static const char* kMslMathText = R"WEFT(
-// ---- the vector half of Metal's math library --------------------------------
 //
 // `using std::` above covers the scalar functions; std has nothing for float3, so
 // these are the component-wise definitions Metal's specification gives, in the
@@ -2360,7 +2359,6 @@ static const char* kMslMathText = R"WEFT(
 // not (1 - a) * x + a * y, and the two round differently.
 inline float saturate(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
 
-// ---- fp16, the operations that have no rounding freedom --------------------
 //
 // Metal defines these for `half` and std does not, so without the exact overload
 // `abs(h)` is ambiguous between the int and float ones. Each is a comparison or a
@@ -2574,11 +2572,10 @@ inline float4 smoothstep(float e0, float e1, float4 v) {
 }
 )WEFT";
 
-// ---- mesh and task stages, as compute, for the GPU ----
 //
 // A mesh pipeline is hardware this device may not implement (MTLGPUFamilyApple9,
 // M3 and later). What a mesh *stage* produces is not a pipeline feature though:
-// it is two buffers — vertices and triangles — written by the lanes of a
+// it is two buffers, vertices and triangles, written by the lanes of a
 // threadgroup, and a task stage produces a payload and a meshgrid. Both are
 // ordinary memory, so the GPU side is lowered to a compute kernel that writes the
 // same buffers the CPU writes, and the two are compared like any other kernel.
@@ -2599,8 +2596,8 @@ struct weft_gpu_mesh {
   };
   struct prow {
     // A primitive is a uint3, and Metal pads it to 16 bytes. Storing a uint4
-    // whose fourth word is zero makes the padding defined — the CPU mirror writes
-    // the same zero — so the two primitive blocks compare byte for byte instead
+    // whose fourth word is zero makes the padding defined, the CPU mirror writes
+    // the same zero, so the two primitive blocks compare byte for byte instead
     // of agreeing only in their first three words.
     device uint4* b;
     uint o;
@@ -2643,7 +2640,7 @@ struct weft_gpu_mgp {
 std::string lower_gpu_stages(std::string src) {
   bool used = false;
   // The parameter list that contains `at` (its own `(` and the matching `)`), and
-  // the highest `[[buffer(N)]]` index in it — the stage's outputs bind above it,
+  // the highest `[[buffer(N)]]` index in it, the stage's outputs bind above it,
   // exactly where the CPU translation puts them.
   auto enclosing = [&](size_t at) -> size_t {
     int depth = 0;
@@ -2673,8 +2670,8 @@ std::string lower_gpu_stages(std::string src) {
   };
   // Every stage needs the threadgroup index: it is what a mesh's slice and a
   // task's payload element are addressed by. A stage that already declares
-  // [[threadgroup_position_in_grid]] uses that parameter — declaring a second one
-  // is a redeclaration error — and one that does not gets a fresh one.
+  // [[threadgroup_position_in_grid]] uses that parameter, declaring a second one
+  // is a redeclaration error, and one that does not gets a fresh one.
   auto tg_expr_for = [&](size_t par, size_t par_end) -> std::string {
     const std::string ps = src.substr(par, par_end - par);
     const size_t a = ps.find("threadgroup_position_in_grid");
@@ -2703,7 +2700,6 @@ std::string lower_gpu_stages(std::string src) {
     return w;
   };
 
-  // ---- mesh stages ----
   for (size_t at = 0; (at = src.find("[[mesh]]", at)) != std::string::npos;) {
     const size_t open = src.rfind("mesh<", at);
     const size_t close = open == std::string::npos ? std::string::npos : src.find('>', open);
@@ -2733,7 +2729,6 @@ std::string lower_gpu_stages(std::string src) {
     at = open + repl.size();
     used = true;
   }
-  // ---- task stages ----
   for (size_t at = 0; (at = src.find("[[object]]", at)) != std::string::npos;) {
     const size_t par = src.find('(', at);
     const size_t par_end = par == std::string::npos ? std::string::npos : closing(par);
@@ -2745,9 +2740,8 @@ std::string lower_gpu_stages(std::string src) {
     used = true;
   }
 
-  // ---- the payload, in either stage ----
   // `object_data T& p [[payload]]` becomes a binding plus a reference to this
-  // group's element — the same element the CPU binds.
+  // group's element, the same element the CPU binds.
   for (size_t at = 0; (at = src.find("[[payload]]", at)) != std::string::npos;) {
     const size_t par = enclosing(at);
     const size_t par_end = par == std::string::npos ? std::string::npos : closing(par);
@@ -2770,7 +2764,6 @@ std::string lower_gpu_stages(std::string src) {
     used = true;
   }
 
-  // ---- the meshgrid handle, in a task stage ----
   for (size_t at = 0; (at = src.find("mesh_grid_properties", at)) != std::string::npos;) {
     const size_t par = enclosing(at);
     const size_t par_end = par == std::string::npos ? std::string::npos : closing(par);
@@ -2851,7 +2844,7 @@ std::string emit_module_abi(const std::vector<TranslatedKernel>& kernels) {
 // A warp prefix scan is the CPU's tree, on the GPU as well.
 //
 // `simd_prefix_*` there is the hardware's own fold, and for floats a different
-// order of additions is a different answer — 6.1e-05 apart over 65,536 lanes. The
+// order of additions is a different answer, 6.1e-05 apart over 65,536 lanes. The
 // CPU runtime already runs the doubling (Kogge-Stone) tree, so the shader's calls
 // are pointed at that tree too (`weft::warp_prefix` in src/weft_msl.hpp) and both
 // engines then perform the identical sequence of additions.
@@ -2915,7 +2908,7 @@ std::string weft_math_preamble() {
          "using uint = unsigned int;\n"
          "using ushort = unsigned short;\n"
          "using uchar = unsigned char;\n" +
-         kMslMathText + kWSoftMath;
+         kMslMathText + kWSoftMath + weft_f64_cpp_text();
 }
 
 std::string rewrite_math_calls(const std::string& text) {
@@ -2981,7 +2974,6 @@ std::string rewrite_math_calls(const std::string& text) {
   return out;
 }
 
-// ---- a Metal kernel as a state machine --------------------------------------
 //
 // A kernel that suspends used to be a coroutine: the compiler owns the frame, so
 // the body's locals survive a barrier. That is right, and it costs a frame resume
@@ -2993,7 +2985,7 @@ std::string rewrite_math_calls(const std::string& text) {
 //
 // Splitting a body needs its locals to survive the return, so every local the body
 // declares moves into the state blob and every use is renamed to `s->name`. That
-// is a whole-body rename on purpose — a local left behind would be the one thing
+// is a whole-body rename on purpose, a local left behind would be the one thing
 // that quietly keeps a stale value across a barrier.
 //
 // It bails rather than guesses. A construct this does not model leaves the kernel
@@ -3027,7 +3019,7 @@ std::vector<std::string> split_semis(const std::string& s) {
 }
 
 // Split a suspension's arguments on top-level commas. Only brackets count as
-// nesting here: an argument can hold a comparison — `(lane < 32u) != 0` — and a
+// nesting here: an argument can hold a comparison, `(lane < 32u) != 0`, and a
 // splitter that reads that `<` as a template stops splitting every comma after it,
 // which is how a three-argument vote arrived as two.
 std::vector<std::string> split_args(const std::string& s) {
@@ -3074,7 +3066,7 @@ struct Nd {
 // A `break` or `continue` written inside a statement that is emitted verbatim is
 // only legal if the loop it names is still a loop in the generated C++. A lowered
 // loop is a label and a `goto`, so a jump inside a block or an `if` that came
-// along unchanged would be outside any loop at all — the compiler says so. Those
+// along unchanged would be outside any loop at all, the compiler says so. Those
 // nodes are lowered instead, and one that has no suspension of its own costs only
 // a label.
 bool node_has_jump(const Nd& n) {
@@ -3290,7 +3282,7 @@ struct BodyParser {
       n.text = t.substr(first, pos - first);
       return true;
     }
-    // A label: `name:`. It is its own statement, and a `goto` may name it — both
+    // A label: `name:`. It is its own statement, and a `goto` may name it, both
     // are emitted where they were written, so a jump that crosses a wait is a jump
     // to a label further down the same function, which is what C++ means by it.
     {
@@ -3428,8 +3420,8 @@ struct StepEmitter {
       while (j < text.size() && std::isspace((unsigned char)text[j])) j++;
       if (j >= text.size() || text[j] != '(') return bad("a suspension without a call");
       const size_t close = find_matching(text, j, '(', ')');
-      // The front end always wraps a suspension as one expression — `(co_await
-      // weft::shfl(...))` — and a vote's `!= 0u` sits outside that.
+      // The front end always wraps a suspension as one expression, `(co_await
+      // weft::shfl(...))`, and a vote's `!= 0u` sits outside that.
       if (close == std::string::npos || close + 1 >= text.size() || text[close + 1] != ')')
         return bad("a suspension that is not one expression");
       const std::string inner = text.substr(j + 1, close - j - 1);
@@ -3596,7 +3588,7 @@ struct StepEmitter {
 };
 
 // Point a local's uses at the blob. A member that happens to share the name is
-// somebody else's field — `float4(..).x` is not the local `x` — so `.` and `->`
+// somebody else's field, `float4(..).x` is not the local `x`, so `.` and `->`
 // end a match before it starts.
 std::string rename_blob_local(const std::string& s, const std::string& name) {
   const std::string to = "weft_s->" + name;
@@ -3696,7 +3688,7 @@ bool freshen_lambda_params(std::string& body, const std::vector<std::string>& na
   }
 }
 
-// A capture list that names a local — `[v]`, `[&v]`, `[=]` — has to name
+// A capture list that names a local, `[v]`, `[&v]`, `[=]`, has to name
 // something that exists, and after the blob rename those names are `weft_s->v`,
 // which a capture list's grammar has no room for. Each one becomes an
 // init-capture of its own: `[weft_c_v = weft_s->v]` copies the value at the point
@@ -3847,7 +3839,7 @@ bool rebuild_captures(std::string& body, const std::vector<std::string>& names,
 
 // Move every local the body declares into the state blob and point its uses at
 // it. Returns false, with a reason, for a body whose declarations this cannot
-// read — which leaves the kernel on its coroutine rather than on a blob that is
+// read, which leaves the kernel on its coroutine rather than on a blob that is
 // missing a field.
 // A statement start, with the extent of the scope it sits in.
 struct Start {
@@ -3855,8 +3847,8 @@ struct Start {
 };
 
 // Every statement start in a body, and where each brace pair closes. A name
-// declared in two sibling scopes is two variables that never overlap — `d` in one
-// `for` and `d` in the next — so they can share a field. One nested inside the
+// declared in two sibling scopes is two variables that never overlap, `d` in one
+// `for` and `d` in the next, so they can share a field. One nested inside the
 // other cannot, which is what `unshadow` deals with.
 void scan_starts(const std::string& body, std::vector<Start>& starts,
                  std::map<size_t, size_t>& closes) {
@@ -3889,14 +3881,14 @@ void scan_starts(const std::string& body, std::vector<Start>& starts,
       note(i + 1, scope_end());
     } else if (ch == ':') {
       // A declaration can follow a `case`/`default` label, and the switch lowering
-      // jumps past it — which C++ refuses for a variable with an initializer, and
+      // jumps past it, which C++ refuses for a variable with an initializer, and
       // which would leave the local unrenamed. Treat a `:` as a boundary so those
       // declarations become blob fields like every other local. A ternary's `:`
       // only ever offers a candidate start that the ident-ident test rejects.
       note(i + 1, scope_end());
     }
     // A `for` header declares its induction variable for the length of the loop,
-    // so the loop is the scope of its init — which is what makes two `for (uint d
+    // so the loop is the scope of its init, which is what makes two `for (uint d
     // = ...)` in a row two variables rather than one declared twice.
     if (ch == 'f' && i + 3 <= body.size() && body.compare(i, 3, "for") == 0 &&
         (i == 0 || !is_ident(body[i - 1]))) {
@@ -3978,7 +3970,7 @@ bool place_braces(const std::string& text, const std::vector<long>& ext, size_t 
 // One name declared again while an earlier one is still in scope is two live
 // variables, and the blob holds one field per name. So the inner declaration and
 // every use of it inside its own scope are given a name of their own, which makes it
-// an ordinary local again — it is the same object, under a name nothing else has.
+// an ordinary local again, it is the same object, under a name nothing else has.
 // Each rename changes the body's length, so the scan is taken again; the pass ends
 // when no declaration overlaps a live one.
 void unshadow(std::string& body) {
@@ -4065,8 +4057,8 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
   // Structs a `decltype` field is read against, written ahead of the blob.
   std::vector<std::string> type_helpers;
   // A kernel parameter is recomputed at every entry and is not part of a closure.
-  // Its name is the identifier each declaration in `reserved` binds — the one
-  // before the `=`, so a type is never mistaken for one — and its declared type is
+  // Its name is the identifier each declaration in `reserved` binds, the one
+  // before the `=`, so a type is never mistaken for one, and its declared type is
   // the spelling a copy of it needs.
   std::vector<std::string> kparams;
   std::map<std::string, std::string> kparam_types;
@@ -4087,7 +4079,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     const std::string decl = trim(reserved.substr(
         line0, (line_end == std::string::npos ? reserved.size() : line_end) - line0));
     // The occurrence that is the declaration: a whole word the `=` follows. The
-    // name also turns up inside the initialiser — `uint lid = (uint)ctx.lid` — and a
+    // name also turns up inside the initialiser, `uint lid = (uint)ctx.lid`, and a
     // letter of the type, and neither is where the type ends.
     size_t cut = std::string::npos;
     for (size_t w = decl.find(pname); w != std::string::npos; w = decl.find(pname, w + 1)) {
@@ -4116,7 +4108,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
   std::vector<Start> starts;
   std::map<size_t, size_t> closes;
   scan_starts(body, starts, closes);
-  // A type the body declares for itself — `struct Tap { float w, v; };` — is what
+  // A type the body declares for itself, `struct Tap { float w, v; };`, is what
   // a local of that type needs in order to become a blob field, and the blob lives
   // at file scope where the body's own declaration does not reach. So the
   // declaration is lifted out whole, under a name keyed to this kernel, and every
@@ -4153,7 +4145,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     const size_t sc = body.find(';', nm);
     const size_t close =
         brace == std::string::npos ? std::string::npos : find_matching(body, brace, '{', '}');
-    // A forward declaration — `struct P;` — names a type without bodying it, and
+    // A forward declaration, `struct P;`, names a type without bodying it, and
     // the brace after it belongs to the next statement.
     if (sc != std::string::npos && (brace == std::string::npos || sc < brace)) {
       why = "a " + kw + " declaration with no body";
@@ -4169,7 +4161,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     }
     // A method is not a problem: C++ already forbids a *local* class's member
     // functions from naming the enclosing function's variables, so a body-declared
-    // type's methods only ever see its own members and file scope — which is what
+    // type's methods only ever see its own members and file scope, which is what
     // they see after the lift too. The declaration is moved verbatim.
     for (const TypeDecl& t : types_decl) {
       if (t.name == tname) {
@@ -4179,7 +4171,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     }
     types_decl.push_back({st0.at, semi + 1, tname, body.substr(st0.at, semi + 1 - st0.at)});
   }
-  // A lambda stored in a local has a type with no name, so no field can hold it —
+  // A lambda stored in a local has a type with no name, so no field can hold it , 
   // but it does not need one. Its declaration is a value the entry point can simply
   // re-make: the closure binds to whatever the blob holds, so building it again on
   // the next entry is the same object, exactly as the parameter setup above is
@@ -4204,7 +4196,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     }
     return false;
   };
-  // An initialised capture — `[x = v * 2.0f]` — declares a variable nothing
+  // An initialised capture, `[x = v * 2.0f]`, declares a variable nothing
   // outside the lambda can name, so the blob never needs a field for it: the value
   // the closure keeps is a member of the closure, taken where the lambda stands.
   for (const Start& st0 : starts) {
@@ -4237,8 +4229,8 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     skip_ws_k(k);
     if (k >= body.size() || body[k] != '[') continue;
     // The declaration has to be a statement of its own: one written where only a
-    // single statement fits — the body of an `if` with no braces, or a `for`
-    // header — cannot become the two statements a copied capture needs.
+    // single statement fits, the body of an `if` with no braces, or a `for`
+    // header, cannot become the two statements a copied capture needs.
     size_t back = st0.at;
     while (back > 0 && std::isspace((unsigned char)body[back - 1])) back--;
     if (back > 0 && body[back - 1] != '{' && body[back - 1] != ';' && body[back - 1] != ':' &&
@@ -4351,7 +4343,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     // A type with no name after it is not a declaration: `a[i] = ...`, `a += b`,
     // and every other statement that happens to start with an identifier.
     if (i >= body.size() || !is_ident(body[i])) continue;
-    // One declaration can name several locals — `uint x = a, y = b;` — and each of
+    // One declaration can name several locals, `uint x = a, y = b;`, and each of
     // them is its own field, in its own order: `s->x = a; s->y = b;`.
     struct Decl {
       std::string name, init, suffix;  // suffix is an array's `[N]`
@@ -4368,8 +4360,8 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       Decl d;
       d.name = body.substr(name0, i - name0);
       skip_ws(i);
-      // An array local is a field like any other — `float taps[4]` is four floats the
-      // blob holds — so its extent is part of the declaration rather than a reason
+      // An array local is a field like any other, `float taps[4]` is four floats the
+      // blob holds, so its extent is part of the declaration rather than a reason
       // to give up. Only a brace initialiser is left out: an array cannot be
       // assigned, and filling it element by element is a different rewrite.
       // `float m[2][3]` is a field like any other: every extent is part of the
@@ -4397,7 +4389,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
             break;
           } else if (ch == ',' && depth == 0) {
             // A comma that names another local separates declarators; the one in a
-            // template argument list — `shared_mem<float, 256>(ctx)` — is part of
+            // template argument list, `shared_mem<float, 256>(ctx)`, is part of
             // the initializer, and a digit after it says so.
             size_t la = k + 1;
             while (la < body.size() && std::isspace((unsigned char)body[la])) la++;
@@ -4517,7 +4509,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       if (!repl.empty()) repl += " ";
       if (!d.suffix.empty() && !d.init.empty()) {
         // An array cannot be assigned as a whole, so a brace initialiser becomes one
-        // statement per element, in the order they are written — which is the order
+        // statement per element, in the order they are written, which is the order
         // the source evaluates them in. Elements the list leaves out are zero, as in
         // C++; the blob is zeroed before the first pass either way.
         if (d.init.front() != '{' || d.init.back() != '}') {
@@ -4581,8 +4573,8 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
   // where the declaration stands; the entry prologue re-makes the lambda from those
   // fields, which is the same object with the same values after a resume.
   // A lambda kept in a local becomes a value with a name, so the blob can hold it.
-  // Its captures are members — a copy for `[=]`/`[v]`, a pointer into the blob for
-  // `[&]`/`[&v]`, which is what a capture means — and its call operator is the
+  // Its captures are members, a copy for `[=]`/`[v]`, a pointer into the blob for
+  // `[&]`/`[&v]`, which is what a capture means, and its call operator is the
   // lambda's own body. Constructing it where the declaration stands records the
   // copies once, so after a resume the closure is the one the lane made, with the
   // values it saw; and a member function is the one shape that can be a field,
@@ -4664,13 +4656,13 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     // for a reference is spelled `(*weft_c_v)` in the body and a capture list has no
     // room for a dereference.
     std::string inner = t.substr(brace + 1, close - brace - 1);
-    // What it captures: the list's own items, or — for `[&]` and `[]` — the locals
+    // What it captures: the list's own items, or, for `[&]` and `[]`, the locals
     // its body names.
     std::vector<std::pair<std::string, bool>> items;  // name, by reference
     std::vector<std::pair<std::string, std::string>> capinits;  // name, initialiser
     std::vector<std::pair<std::string, std::string>> capalias;  // name, the local it binds
     // `[&x = a[i]]`: the name, the lvalue it names, and the local the lvalue starts
-    // from — the pointer is to an element of that.
+    // from, the pointer is to an element of that.
     struct CapRef {
       std::string name, expr, base;
     };
@@ -4737,7 +4729,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
               continue;
             }
             why = "'" + l.name + "', a by-reference capture of '" + cexpr +
-                  "' — only a local or an element of one can be bound";
+                  "': only a local or an element of one can be bound";
             return false;
           }
           capinits.push_back({cname, cexpr});
@@ -4844,7 +4836,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     // `[x = expr]` declares a variable only the lambda's body can see, so no blob
     // field has to hold the name and no argument list has to carry it: the value the
     // closure keeps is a member, taken where the lambda stands. Its type is the type
-    // of `expr`, which C++ would deduce — and since the struct is written at file
+    // of `expr`, which C++ would deduce, and since the struct is written at file
     // scope, where neither `weft_s` nor the entry's own locals exist, `decltype` of
     // the expression is taken against a stand-in struct with the same names and the
     // same types. Every part of it is unevaluated, so nothing is read.
@@ -4900,7 +4892,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       rbody = rename_word(rbody, iname, "weft_c_" + iname);
     }
     // A bound element holds its address, so a resume restores the pointer and the
-    // object it names is whatever the blob holds at the time — which is what a
+    // object it names is whatever the blob holds at the time, which is what a
     // reference capture means.
     for (const CapRef& cr : capref) {
       members += "  " + seen_type[cr.base] + "* weft_c_" + cr.name + ";\n";
@@ -4922,13 +4914,13 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         if (pn == word) kernel_param = true;
       if (kernel_param) {
         why = "'" + l.name + "', a lambda local that reads the kernel parameter '" + word +
-              "' — a closure has no argument list for it";
+              "': a closure has no argument list for it";
         return false;
       }
     }
     // A nested lambda's capture list cannot hold `(*weft_c_v)`: the member stands
     // for a reference, so the list names the pointer and the nested body's own use
-    // dereferences it — which is the same object, and what a reference capture
+    // dereferences it, which is the same object, and what a reference capture
     // means one level in.
     for (size_t b = rbody.find('['); b != std::string::npos; b = rbody.find('[', b + 1)) {
       if (b > 0 && (is_ident(rbody[b - 1]) || rbody[b - 1] == ']' || rbody[b - 1] == ')'))
@@ -4950,7 +4942,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
           out = it.substr(2, it.size() - 3);
           deref = true;
         }
-        // A member cannot be captured by name — only an automatic variable can —
+        // A member cannot be captured by name, only an automatic variable can , 
         // so it becomes an init-capture of itself, which copies the value the
         // member holds where the nested lambda stands.
         bool member = out.rfind("weft_c_", 0) == 0;
@@ -4980,7 +4972,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
   }
   std::sort(edits.begin(), edits.end(),
             [](const Edit& a, const Edit& b) { return a.from < b.from; });
-  // Applied from the end, so an edit can only move text to its right — which is
+  // Applied from the end, so an edit can only move text to its right, which is
   // already rewritten. Two edits may not nest: the inner lambda of a stored one is
   // not a lambda local of the kernel, so its declaration is never an edit of its own.
   for (size_t e = edits.size(); e-- > 0;)
@@ -5014,7 +5006,7 @@ bool lower_step(const std::string& body_in, const std::string& kname, const std:
   std::string body = body_in;
   // An address space says where a variable lives on the GPU. On the host every one of
   // them is the same memory: `device` and `thread` say nothing a blob field does not
-  // already do, and `constant` is a read-only view — `const`. The words are rewritten
+  // already do, and `constant` is a read-only view, `const`. The words are rewritten
   // out before a type is read from the body, which also covers a cast: `(device
   // float*)` would otherwise reach the generated C++ and not compile there.
   auto drop_space = [](std::string s, const std::string& w, const std::string& to) {
@@ -5092,8 +5084,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       at += 10;
     }
   }
-  // An object stage is a kernel over one mesh's slots — vertices and primitives
-  // written by the lanes of the group together — so it is spelled `kernel` from
+  // An object stage is a kernel over one mesh's slots, vertices and primitives
+  // written by the lanes of the group together, so it is spelled `kernel` from
   // here on and translated like one. Only the *stage* attribute is rewritten:
   // the `[[mesh]]` on a `mesh<V, NV, NP>` parameter is a binding, and the
   // parameter loop below binds the two blocks it names.
@@ -5120,8 +5112,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   }
   decl_src = replace_all(decl_src, "using namespace metal;", "");
 
-  // Everything the file defines for itself — structs, enums, constants, helper
-  // functions — is carried over as written. Only a kernel is rewritten.
+  // Everything the file defines for itself, structs, enums, constants, helper
+  // functions, is carried over as written. Only a kernel is rewritten.
   const CarriedDecls carried = carry_decls(decl_src);
 
   std::string body_out;
@@ -5131,8 +5123,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   // a fragment's grid is the target's pixels, so it is the same shape of
   // translation with a different way of naming the thread.
   //
-  // A `[[tile]]` function is a render pass's first stage — it fills tile memory
-  // before any fragment of that tile runs — and it is shaped exactly like a
+  // A `[[tile]]` function is a render pass's first stage, it fills tile memory
+  // before any fragment of that tile runs, and it is shaped exactly like a
   // kernel over the same pixels, so it is translated as one and run first.
   std::vector<std::string> tile_fns;
   if (render) {
@@ -5207,7 +5199,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       continue;
     }
 
-    // ---- parameters -> locals bound to buffers and thread indices ----
     std::string locals;      // everything, for the per-thread form
     std::string buf_locals;  // buffers only, for the loop form
     std::vector<TexParam> textures;
@@ -5226,8 +5217,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     bool is_mesh = false;
     int mesh_nv = 0, mesh_np = 0;
     std::string mesh_vtype;
-    // Buffers the launcher creates rather than the caller — the mesh blocks, a
-    // task payload, the meshgrid handle — and the binding each one was given.
+    // Buffers the launcher creates rather than the caller, the mesh blocks, a
+    // task payload, the meshgrid handle, and the binding each one was given.
     int extra_bufs = 0;
     int payload_idx = -1, props_idx = -1;
     std::string payload_type;
@@ -5280,7 +5271,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       std::string name_field, type_field;
 
       // A mesh stage's output: `mesh<V, NV, NP> out [[mesh]]`. It is not a buffer
-      // the caller passes — a mesh is a threadgroup, so the launcher creates one
+      // the caller passes, a mesh is a threadgroup, so the launcher creates one
       // vertex block and one triangle block per group and the view below is this
       // invocation's slice of them. `out.vertices[i]`, `out.set_vertex(i, v)`,
       // `out.set_primitive(i, uint3)` and `out.get_vertex(i)` are the members a
@@ -5338,7 +5329,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
 
       // The task payload: `object_data T& p [[payload]]`. One element per task
       // threadgroup, written by the task stage and read by the mesh stage that
-      // group spawned — which is why the module indexes it by `tgid % groups`
+      // group spawned, which is why the module indexes it by `tgid % groups`
       // rather than by the mesh index alone.
       if (attr == "payload") {
         std::vector<std::string> pw;
@@ -5435,7 +5426,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         }
         // Tile memory: `imageblock<T> blk`. It is lowered to a buffer of T, one
         // element per pixel, so it binds after the kernel's own buffers and is
-        // addressed by the pixel — the same memory the GPU source below hands
+        // addressed by the pixel, the same memory the GPU source below hands
         // Metal.
         if (attr == "imageblock_data") {
           if (!render) {
@@ -5562,7 +5553,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     }
     if (unsupported) { r.error = "kernel '" + name + "': " + why; return r; }
 
-    // ---- body rewrites ----
     bool shared_found = false, barrier_found = false;
     std::string berr;
     int tile_idx = -1, colour_idx = -1;
@@ -5666,7 +5656,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       std::string fields, types, code, cases, why;
       const bool step_ok = lower_step(body, name, locals, fields, types, code, cases, why);
       // A kernel that stays on its coroutine is still correct, only slower, so the
-      // reason is not worth a line in every run — `WEFT_STEP_WHY=1` asks for it.
+      // reason is not worth a line in every run, `WEFT_STEP_WHY=1` asks for it.
       if (!step_ok && std::getenv("WEFT_STEP_WHY"))
         std::fprintf(stderr, "weft: %s stays on its coroutine: %s\n", name.c_str(), why.c_str());
       if (step_ok) {
@@ -5679,7 +5669,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         // call and prologue a visit, against nine of work, the call was most of a
         // barrier segment (measured in the generated assembly, not assumed).
         // `return` in a lambda leaves the lambda, which is exactly what a segment
-        // boundary means — that is the whole trick.
+        // boundary means, that is the whole trick.
         std::string inner;
         inner += "    weft_st_" + name + "* weft_s = (weft_st_" + name + "*)st;\n";
         inner += "    (void)bufs; (void)sh;\n";
@@ -5778,7 +5768,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     tk.payload_idx = payload_idx;
     tk.props_idx = props_idx;
     tk.ntex = (int)textures.size();
-    // What each binding is, by name, from the parameter's own type — the same
+    // What each binding is, by name, from the parameter's own type, the same
     // answer the launcher has to give it from the command line.
     for (const TexParam& tp : textures)
       tk.tex_shape.push_back(tp.cube ? "cube"
@@ -5830,7 +5820,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   }
 
   std::string code =
-      "// generated by weft — do not edit\n"
+      "// generated by weft, do not edit\n"
       "#include \"weft_runtime.hpp\"\n"
       "#include <algorithm>\n"
       "#include <atomic>\n"
@@ -5838,6 +5828,10 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       "#include <cstdint>\n"
       "#include <cstring>\n";
   code += kMslPreamble;
+  // The software double, for a kernel that carries one: the host's own double is
+  // used for the arithmetic, which IEEE pins, and these functions for the calls it
+  // does not, the same text the GPU runs, so both columns answer alike.
+  code += weft_f64_cpp_text();
   // Metal's short integer names are part of the language, so they have to exist
   // before the file's own declarations: a `struct Payload { uint n; }` is written
   // above the kernel that uses it and must compile there, not only inside a body.
@@ -5847,8 +5841,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   // glibc and the BSDs declare `ulong` themselves, in <sys/types.h> and as
   // `unsigned long`. Declaring it again as `unsigned long long` is a conflicting
   // declaration rather than the same alias twice, so those hosts keep the
-  // library's name — under LP64 it is the same 64-bit unsigned integer Metal
-  // means — and the assertion turns a 32-bit target into a message instead of a
+  // library's name, under LP64 it is the same 64-bit unsigned integer Metal
+  // means, and the assertion turns a 32-bit target into a message instead of a
   // silently narrow `ulong`.
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
   code += "static_assert(sizeof(ulong) == 8, \"weft: ulong is not 64 bits on this target\");\n";

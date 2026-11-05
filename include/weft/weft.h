@@ -1,4 +1,4 @@
-// weft — a GPU compute kernel, running on CPU cores.
+// weft, a GPU compute kernel, running on CPU cores.
 //
 // A kernel file is translated once, at build time, into a C++ translation unit
 // (`weft-gen my.metal -o my_kernel.cpp`). Compile that file and
@@ -19,7 +19,7 @@
 // and the CLI checks that claim against real hardware for every sample.
 //
 // The order of arguments is the order the kernel declares `[[buffer(N)]]`, and a
-// buffer's element width is `buf_bytes[i]` — the size of the C++ type the kernel
+// buffer's element width is `buf_bytes[i]`, the size of the C++ type the kernel
 // declared, so a `float4*` binding is 16 bytes and a `packed_float3*` is 12.
 #pragma once
 
@@ -31,8 +31,8 @@ extern "C" {
 #endif
 
 // One kernel in a translated module. `nbufs` counts the `[[buffer(N)]]`
-// parameters the kernel declares — the entries of the `void*` array `weft_run`
-// takes — and not the tile memory or colour attachment a render pass adds, which
+// parameters the kernel declares, the entries of the `void*` array `weft_run`
+// takes, and not the tile memory or colour attachment a render pass adds, which
 // the module allocates for itself.
 typedef struct weft_kernel_info {
   const char* name;
@@ -59,7 +59,7 @@ uint64_t weft_tile_violations(void);
 
 // Bytes a buffer of `elems` elements needs, from the kernel's own declaration.
 // A Metal kernel states the type, and the other front ends state the width the
-// instructions that reach the buffer address it at — `ld.global.f32` is four
+// instructions that reach the buffer address it at, `ld.global.f32` is four
 // bytes, `ld.global.u8` one, a SPIR-V pointer's pointee is its own size. Four
 // bytes is the fallback only when nothing typed reaches the buffer at all, as
 // with a Triton tile copied by `cp.async` at a width the module never names.

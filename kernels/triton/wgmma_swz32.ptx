@@ -3,7 +3,7 @@
 //
 // Same instruction and the same reference as the 128-byte fixture, a different
 // descriptor field: mode 3 in bits 62-63 instead of 1. An atom is eight rows of
-// 32 bytes, so the pattern is Swizzle<1,4,3> — bit 7 of the byte offset, which is
+// 32 bytes, so the pattern is Swizzle<1,4,3>, bit 7 of the byte offset, which is
 // the row's position within four rows, flips the 16-byte chunk index:
 // `off ^ (((off >> 7) & 1) << 4)`. The tile is exactly one atom wide, so a row of
 // A is the 32 bytes of K and the two chunks of each row swap places every four
@@ -59,7 +59,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: one value — row n = lane / 16, column k = lane % 16 ----
+	// ---- B: one value, row n = lane / 16, column k = lane % 16 ----
 	shr.u32 	%r14, %r1, 4;			// n
 	and.b32 	%r15, %r1, 15;			// k
 	shl.b32 	%r16, %r15, 3;			// B's rows are eight columns wide
@@ -96,7 +96,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

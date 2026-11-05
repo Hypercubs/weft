@@ -1,4 +1,4 @@
-// `cp.async.bulk.tensor` — the tensor form of the bulk copy.
+// `cp.async.bulk.tensor`, the tensor form of the bulk copy.
 //
 // A linear bulk copy is told its address and its size. The tensor form is told neither:
 // it names a box and the corner that box starts at, and everything else comes from a
@@ -21,7 +21,7 @@
 //          hardware's out-of-bounds fill does.
 //   store  a 2x2 box at column 1, row 1 holding 101, 102, 103, 104. Those land on elements
 //          5, 6, 9 and 10, so the tensor afterwards reads
-//          0, 1, 2, 3, 4, 101, 102, 7, 8, 103, 104, 11 — a store that moved the wrong box
+//          0, 1, 2, 3, 4, 101, 102, 7, 8, 103, 104, 11, a store that moved the wrong box
 //          leaves a different set.
 //
 // Every number out is one of those, so a copy that read the wrong address, walked a
@@ -170,8 +170,8 @@ COPY: setp.ge.u32 %p3, %r19, 12;
     add.u32 %r19, %r19, 1;
     bra COPY;
 COPIED:
-    // The address word is the one field the two engines cannot share — a host pointer
-    // against a device one — so it is cleared once the copies are done: the map is
+    // The address word is the one field the two engines cannot share, a host pointer
+    // against a device one, so it is cleared once the copies are done: the map is
     // scratch, and what a run has to agree on is the tile and the tensor.
     mov.u32 %r21, 0;
     st.global.b32 [%rd3], %r21;
@@ -182,7 +182,7 @@ COPIED:
 
 // The same instruction with a 128-byte swizzle, which is the pattern a `wgmma` fragment
 // read is laid out in. The tensor is two rows of thirty-two, so the box is 256 bytes and
-// its second row starts at byte 128 — which the swizzle moves sixteen bytes along, to
+// its second row starts at byte 128, which the swizzle moves sixteen bytes along, to
 // 144. Reading there has to give element (1, 0), which is 32; a decode that ignored the
 // swizzle would leave element 32 at 128 and hand back 36 instead.
 .version 8.3
@@ -289,7 +289,7 @@ WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
 // The tensor is channels by width by height with `[c][w][h] = c + 2 * (w + 3 * h)`, so
 // channel 0 runs 0 to 8 across the width and height and channel 1 is one word further
 // along. A column of two channels by three pixels at the corner, filter offset (0, 0),
-// is 0, 1, 2, 3, 4, 5 — three pixels along the width, both channels of each. The same
+// is 0, 1, 2, 3, 4, 5, three pixels along the width, both channels of each. The same
 // column at offset (1, 0) starts one pixel further along, so it reads 2, 3, 4, 5 and then
 // the pixel past the right edge, which is zero: what a padded convolution's edge looks
 // like, and the one thing a column copy cannot fake.
@@ -449,7 +449,7 @@ WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
 // threadgroup memory into the window it describes. The same tensor and the same column
 // shape are used as above, and two columns are written in turn:
 //
-//   101..106 at the corner, which land on elements 0 to 5 — the window's first three
+//   101..106 at the corner, which land on elements 0 to 5, the window's first three
 //           pixels, both channels of each;
 //   201..206 one pixel to the right, which land on elements 2 to 5 and then run past the
 //           edge on their third pixel, where a store has nothing to write and so writes

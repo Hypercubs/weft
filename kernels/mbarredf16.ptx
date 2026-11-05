@@ -1,0 +1,66 @@
+// `cp.reduce.async.bulk` with 16-bit float elements.
+//
+//     buffer = { 1, 2, 3, 4, 5, 6, 7, 8 }      as eight halves
+//     tile   = { 10, 11, 12, 13, 14, 15, 16, 17 }
+//     reduce.add.f16 into the buffer, 16 bytes
+//     buffer = { 11, 13, 15, 17, 19, 21, 23, 25 }
+//
+// Every sum is exact in a half, so the expected bytes are a constant. The halves
+// are written two to a word rather than as `b16` stores, which is also how a real
+// kernel fills a tile: 0x3C00 is 1.0 and the pairs run from there. A reduce that
+// added the words as 32-bit integers, or that walked four elements instead of
+// eight, lands somewhere else entirely.
+.version 7.0
+.target sm_90
+.address_size 64
+
+.visible .entry mbarredf16(
+    .param .u64 mbarredf16_param_0,   // the eight halves the reduce adds into
+    .param .u64 mbarredf16_param_1    // the same four words, copied out for the check
+)
+{
+    .shared .align 4 .b32 tile[4];
+
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [mbarredf16_param_0];
+    ld.param.u64 %rd2, [mbarredf16_param_1];
+
+    // 1..8 as four half pairs
+    mov.u32 %r1, 0x40003C00;
+    st.global.u32 [%rd1], %r1;
+    mov.u32 %r1, 0x44004200;
+    st.global.u32 [%rd1+4], %r1;
+    mov.u32 %r1, 0x46004500;
+    st.global.u32 [%rd1+8], %r1;
+    mov.u32 %r1, 0x48004700;
+    st.global.u32 [%rd1+12], %r1;
+
+    // 10..17 as four half pairs
+    mov.u32 %r2, 0x49804900;
+    st.shared.u32 [tile], %r2;
+    mov.u32 %r2, 0x4A804A00;
+    st.shared.u32 [tile + 4], %r2;
+    mov.u32 %r2, 0x4B804B00;
+    st.shared.u32 [tile + 8], %r2;
+    mov.u32 %r2, 0x4C404C00;
+    st.shared.u32 [tile + 12], %r2;
+    bar.sync 0;
+
+    // The ISA requires the `.noftz` form for the 16-bit element types: it keeps
+    // subnormals rather than flushing them, and adding two halves keeps them too.
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [%rd1], [tile], 16;
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+
+    ld.global.u32 %r3, [%rd1];
+    st.global.u32 [%rd2], %r3;
+    ld.global.u32 %r3, [%rd1+4];
+    st.global.u32 [%rd2+4], %r3;
+    ld.global.u32 %r3, [%rd1+8];
+    st.global.u32 [%rd2+8], %r3;
+    ld.global.u32 %r3, [%rd1+12];
+    st.global.u32 [%rd2+12], %r3;
+    ret;
+}

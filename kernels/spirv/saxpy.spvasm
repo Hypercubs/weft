@@ -1,4 +1,4 @@
-; out[i] = 2*a[i] + 0.5*b[i] — the same math as basic.metal's saxpy, so the two
+; out[i] = 2*a[i] + 0.5*b[i], the same math as basic.metal's saxpy, so the two
 ; front ends must produce byte-identical output.
                OpCapability Kernel
                OpCapability Addresses

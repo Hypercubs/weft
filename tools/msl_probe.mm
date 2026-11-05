@@ -1,7 +1,7 @@
 // Which MSL constructs can a generated kernel use?
 //
-// The PTX and SPIR-V front ends emit a resumable state machine — `switch (pc)`,
-// labels, `goto`, and untyped temporaries — and a Metal emitter has to keep the
+// The PTX and SPIR-V front ends emit a resumable state machine, `switch (pc)`,
+// labels, `goto`, and untyped temporaries, and a Metal emitter has to keep the
 // same shape to stay a mechanical rewrite instead of a second backend. That is
 // only possible if the compiler accepts those constructs, so this probe asks it
 // directly with the runtime compiler weft hands its source to.

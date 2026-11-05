@@ -1,4 +1,4 @@
-; A storage image: one lane writes a texel, the next lane reads it back — the
+; A storage image: one lane writes a texel, the next lane reads it back, the
 ; SPIR-V twin of basic.metal's texrw:
 ;     img.write(float4(in[gid], 0, 0, 0), uint2(x, y));
 ;     barrier(mem_texture);

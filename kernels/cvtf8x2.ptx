@@ -1,0 +1,157 @@
+// The packed narrow converts in both directions, and the four-lane arithmetic.
+//
+// `cvt.rn.f16x2.<packed>` reads two narrow values out into two halves and
+// `cvt.rn.satfinite.<packed>.f16x2` packs two halves into them: the last type in the
+// modifier list is the destination, so one branch reads the pair.
+//
+//   e4m3x2 0x3C38 (1.5, 1.0)      -> 3e003c00  high value in the high half
+//   e2m1x2 0xB2 with .relu        -> 00003c00  -1.5 is zeroed, 1.0 is kept
+//   e2m3x2 0x1F02 (7.5, 0.25)     -> 47803400  MAX_NORM, and a subnormal of M/8
+//   e3m2x2 0x1F01 (28, 0.0625)    -> 4f002c00  MAX_NORM, and the M/16 subnormal
+//   e5m2x2 0x3C3C (1.0, 1.0)      -> 3c003c00
+//   e2m1x2 0x40 (2.0, 0.0)        -> 40000000
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry cvtdown(
+    .param .u64 cvtdown_param_0     // six words
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtdown_param_0];
+
+    mov.u32 %r1, 0x3C38;
+    cvt.rn.f16x2.e4m3x2 %r2, %r1;
+    st.global.u32 [%rd1], %r2;
+
+    mov.u32 %r1, 0xB2;
+    cvt.rn.relu.f16x2.e2m1x2 %r3, %r1;
+    st.global.u32 [%rd1+4], %r3;
+
+    mov.u32 %r1, 0x1F02;
+    cvt.rn.f16x2.e2m3x2 %r4, %r1;
+    st.global.u32 [%rd1+8], %r4;
+
+    mov.u32 %r1, 0x1F01;
+    cvt.rn.f16x2.e3m2x2 %r5, %r1;
+    st.global.u32 [%rd1+12], %r5;
+
+    mov.u32 %r1, 0x3C3C;
+    cvt.rn.f16x2.e5m2x2 %r6, %r1;
+    st.global.u32 [%rd1+16], %r6;
+
+    mov.u32 %r1, 0x40;
+    cvt.rn.f16x2.e2m1x2 %r7, %r1;
+    st.global.u32 [%rd1+20], %r7;
+    ret;
+}
+
+// The other direction, from two halves. `.pzo` is the one modifier without a
+// numeric equivalent: it asks for positive zeros only, so the last word packs a
+// -0.0 into the same bits as +0.0 where it would otherwise keep the sign.
+//
+//   2.0, 1.0                    -> 00000042
+//   -2.0, 1.0 with .relu        -> 00000002
+//   7.5, 1.5 as e2m3x2          -> 00001f0c
+//   28, 0.25 as e3m2x2          -> 00001f04
+//   1.5, 1.0 as e4m3x2          -> 00003c38
+//   -0.0, 0.0 with .pzo         -> 00000000
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry cvtup(
+    .param .u64 cvtup_param_0       // six words
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtup_param_0];
+
+    mov.u32 %r1, 0x40003C00;
+    cvt.rn.satfinite.e2m1x2.f16x2 %r2, %r1;
+    st.global.u32 [%rd1], %r2;
+
+    mov.u32 %r1, 0xC0003C00;
+    cvt.rn.satfinite.relu.e2m1x2.f16x2 %r3, %r1;
+    st.global.u32 [%rd1+4], %r3;
+
+    mov.u32 %r1, 0x47803E00;
+    cvt.rn.satfinite.e2m3x2.f16x2 %r4, %r1;
+    st.global.u32 [%rd1+8], %r4;
+
+    mov.u32 %r1, 0x4F003400;
+    cvt.rn.satfinite.e3m2x2.f16x2 %r5, %r1;
+    st.global.u32 [%rd1+12], %r5;
+
+    mov.u32 %r1, 0x3E003C00;
+    cvt.rn.satfinite.e4m3x2.f16x2 %r6, %r1;
+    st.global.u32 [%rd1+16], %r6;
+
+    mov.u32 %r1, 0x80000000;
+    cvt.rn.satfinite.pzo.e2m1x2.f16x2 %r7, %r1;
+    st.global.u32 [%rd1+20], %r7;
+    ret;
+}
+
+// The four-lane arithmetic. Every case is exact in the destination so a wrong decode
+// or a wrong lane offset shows up as a wrong byte, and each one uses a different pair
+// of formats:
+//
+//   1.5 + 1.5 as e4m3x4                     -> 44444444  3.0 in every lane
+//   1.5 - 1.0 as e4m3x4 into e5m2x4          -> 38383838  0.5 in every lane
+//   1.5 * 1.5 as e2m3x4 into e4m3x4          -> 41414141  2.25
+//   2.0 * 2.0 + 1.5 as e4m3x4                -> 4b4b4b4b  5.5
+//   448 + 448 with .satfinite                -> 7e7e7e7e  896 clamps to MAX_NORM
+//   1.5 * 2^1, the scale from ue8m0 0x80     -> 44444444  3.0
+//   1.5 * 2.0, the fp4 operand padded a byte -> 44444444  a nibble per byte
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry cvtsimd(
+    .param .u64 cvtsimd_param_0     // seven words
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtsimd_param_0];
+
+    mov.u32 %r1, 0x3C3C3C3C;
+    add.rn.satfinite.e4m3x4.e4m3x4 %r2, %r1, %r1;
+    st.global.u32 [%rd1], %r2;
+
+    mov.u32 %r1, 0x3C3C3C3C;
+    mov.u32 %r3, 0x38383838;
+    sub.rn.satfinite.e5m2x4.e4m3x4 %r4, %r1, %r3;
+    st.global.u32 [%rd1+4], %r4;
+
+    mov.u32 %r1, 0x0C0C0C0C;
+    mul.rn.satfinite.e4m3x4.e2m3x4.e2m3x4 %r5, %r1, %r1;
+    st.global.u32 [%rd1+8], %r5;
+
+    mov.u32 %r1, 0x40404040;
+    mov.u32 %r3, 0x3C3C3C3C;
+    fma.rn.satfinite.e4m3x4.e4m3x4.e4m3x4 %r6, %r1, %r1, %r3;
+    st.global.u32 [%rd1+12], %r6;
+
+    mov.u32 %r1, 0x7E7E7E7E;
+    add.rn.satfinite.e4m3x4.e4m3x4 %r7, %r1, %r1;
+    st.global.u32 [%rd1+16], %r7;
+
+    mov.u32 %r1, 0x3C3C3C3C;
+    mov.u32 %r3, 0x80808080;
+    mul.rn.satfinite.e4m3x4.e4m3x4.ue8m0x4 %r8, %r1, %r3;
+    st.global.u32 [%rd1+20], %r8;
+
+    mov.u32 %r1, 0x03030303;
+    mov.u32 %r3, 0x40404040;
+    mul.rn.satfinite.e4m3x4.e2m1p4x4.e4m3x4 %r9, %r1, %r3;
+    st.global.u32 [%rd1+24], %r9;
+    ret;
+}

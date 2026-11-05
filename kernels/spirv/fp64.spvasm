@@ -1,6 +1,6 @@
 ; A `double` on a GPU that has no fp64.
 ;
-; Metal rejects the type outright — this is not a missing lowering — so the only way
+; Metal rejects the type outright, this is not a missing lowering, so the only way
 ; a kernel carrying one runs at all is software, and the runtime does it: a double is
 ; its bits in a `uint64_t`, and every operation on it is exact IEEE-754 binary64,
 ; round-to-nearest-even, subnormals included. That is what makes the comparison in
@@ -25,7 +25,7 @@
 ;
 ; The last of the doubles is the whole test of the fused form: a float times 1e300
 ; needs more than the 53 bits a double has, so the product is rounded and this
-; answer is that rounding's residue — a tiny number whose bits are the test. A
+; answer is that rounding's residue, a tiny number whose bits are the test. A
 ; multiply followed by an add returns exactly zero in every lane, because the
 ; addend is that same rounded product.
 ;

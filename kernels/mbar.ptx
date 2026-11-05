@@ -11,8 +11,8 @@
 // with the phase still where it started, so the wait has to hold it until the last
 // arrival, and the value it reads afterwards was written by another lane.
 //
-// The brackets count elements, so `mbr[1]` is one `.b64` — the eight bytes the object
-// is, the owed count and the phase word — and `data[4]` is sixteen bytes after them.
+// The brackets count elements, so `mbr[1]` is one `.b64`, the eight bytes the object
+// is, the owed count and the phase word, and `data[4]` is sixteen bytes after them.
 // Spelling it `.b32 mbr[8]` would reserve the same bytes but read them in the wrong
 // width, and the phase lives in the object's second word.
 .version 7.0

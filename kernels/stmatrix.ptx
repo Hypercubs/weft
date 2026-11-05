@@ -1,0 +1,76 @@
+// `stmatrix`: the fragment `ldmatrix` builds, put back in shared memory.
+//
+// The tile is 8 rows by 8 halves holding 0..63 in row-major order, so the value a
+// register carries is itself the position it came from. Lane l holds row l>>2 and
+// the two halves at columns 2(l&3) and 2(l&3)+1, the map `ldmatrix.ptx` pins down
+// from the other side, so a store of that fragment has to land the word back on
+// byte 4l of the tile it came from:
+//
+//     back[4l..4l+3] == tile[4l..4l+3]  ==  (2l) | (2l+1) << 16
+//
+// and that is the first thirty-two words out. A fragment map that took a column
+// for a row, or a lane group for a column pair, lands the halves somewhere else and
+// the tile read back is a permutation of what it should be.
+//
+// The `.trans` store is the same fragment written transposed: element (c, r) of the
+// result for element (r, c) of the tile, which puts the two halves on two different
+// rows at the column this lane owns. Reading that tile back with a plain
+// `ldmatrix` has to give the word a `.trans` load of the original gives:
+//
+//     (8 (2(l&3)) + (l>>2)) | (8 (2(l&3) + 1) + (l>>2)) << 16
+//
+// so the second thirty-two words pin the transposed map the same way.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry stmatrix(
+    .param .u64 stmatrix_param_0    // out: sixty-four words
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+
+    .shared .align 128 .b8 tile[128];
+    .shared .align 128 .b8 back[128];
+    .shared .align 128 .b8 flipped[128];
+
+    ld.param.u64 %rd1, [stmatrix_param_0];
+
+    mov.u32 %r1, %tid.x;
+
+    // ---- the tile: halves 0..63, two a lane, built here so the pattern the launcher
+    // filled the buffers with cannot be mistaken for the fragment ----
+    shl.b32 %r2, %r1, 1;                   // 2l
+    add.s32 %r3, %r2, 1;                   // 2l + 1
+    shl.b32 %r3, %r3, 16;
+    or.b32 %r10, %r2, %r3;
+    mul.wide.s32 %rd3, %r1, 4;
+    mov.u64 %rd5, tile;
+    add.s64 %rd6, %rd5, %rd3;
+    st.shared.u32 [%rd6], %r10;
+
+    bar.sync 0;
+
+    // ---- the fragment, and the two stores ----
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r11}, [tile];
+    stmatrix.sync.aligned.m8n8.x1.shared.b16 [back], {%r11};
+    stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [flipped], {%r11};
+
+    bar.sync 0;
+
+    // What a plain load of the transposed tile gives: the word the `.trans` load
+    // below is checked against, read through the store rather than the original.
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r12}, [flipped];
+
+    // ---- out: the tile the store rebuilt, four bytes a lane ----
+    mov.u64 %rd7, back;
+    add.s64 %rd8, %rd7, %rd3;
+    ld.shared.b32 %r13, [%rd8];
+    add.s64 %rd9, %rd1, %rd3;
+    st.global.b32 [%rd9], %r13;
+
+    // ---- and the word the transposed store left on the face of it ----
+    st.global.b32 [%rd9+128], %r12;
+    ret;
+}

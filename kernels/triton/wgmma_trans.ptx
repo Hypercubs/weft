@@ -12,7 +12,7 @@
 // which is the mirror of `wgmma.ptx`.
 //
 // A is 64x16 f16: eight M groups of 8, each owning both K groups, so SBO = 256 and
-// LBO = 128 — 2048 bytes. B is 16x8, N contiguous, so a chunk holds the eight
+// LBO = 128, 2048 bytes. B is 16x8, N contiguous, so a chunk holds the eight
 // columns and the four K positions... two K groups of eight, LBO = 128, 256 bytes.
 //
 // The tiles are the same logical matrices as `wgmma.ptx`, staged the other way up,

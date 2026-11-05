@@ -1,5 +1,5 @@
 //
-// Triton: the conversion that builds an fp8 operand — `cvt.rn.satfinite.e4m3x2.f32`
+// Triton: the conversion that builds an fp8 operand, `cvt.rn.satfinite.e4m3x2.f32`
 // for two floats at a time, then `prmt` to join two such pairs into the four bytes
 // one fragment register holds. LLVM emits exactly this sequence for a `tl.dot`
 // whose operands are floated through `to(tl.float8e4nv)`.

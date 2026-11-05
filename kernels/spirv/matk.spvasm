@@ -8,8 +8,8 @@
 ;     out[gid] = (M*c1).x + 10*(c1*M).y + 100*(M*M).col[2].w
 ;              + 1000*transpose(M).col[0].y + 1000*(M*2*c1).w
 ;
-; Every product is weighed differently, so a transposed layout — a column taken
-; for a row, or a product applied to the wrong operand — lands on a different
+; Every product is weighed differently, so a transposed layout, a column taken
+; for a row, or a product applied to the wrong operand, lands on a different
 ; number instead of on the same one. The scale is folded in last, which is what
 ; catches a scalar that reached only one column.
                OpCapability Kernel

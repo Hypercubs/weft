@@ -6,7 +6,7 @@
 ;     out[gid] = a * 2 + b + float(l)
 ; `Arrayed` is the fourth operand of OpTypeImage, and it is what makes every
 ; coordinate three components wide. The layer is in the value, so a slice read
-; from the wrong index — or the whole array read from slice 0 — answers wrong.
+; from the wrong index, or the whole array read from slice 0, answers wrong.
                OpCapability Kernel
                OpCapability Addresses
                OpCapability ImageBasic

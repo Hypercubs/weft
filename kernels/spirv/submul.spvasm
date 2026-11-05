@@ -9,7 +9,7 @@
 ;     out[gid] = r + ri + si
 ;
 ; Inclusive scan of `i` is lane+1 before lane 5 and lane+7 from it, so every answer is
-; 11.5 + lane before 5 and 17.5 + lane from 5 on — exact, and recomputed by check.sh.
+; 11.5 + lane before 5 and 17.5 + lane from 5 on, exact, and recomputed by check.sh.
 ; A fold seeded with the addition's identity answers 0, one that reads the bits of a
 ; double answers garbage, and one that ignores the group action answers the reduce
 ; three times; none of those can pass while agreeing with itself.

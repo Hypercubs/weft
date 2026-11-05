@@ -8,7 +8,7 @@
 // Every sample lands on a texel centre, so the answer is the texel itself: a
 // filter, an address mode, or a size that is off by one all show up as a wrong
 // number instead of hiding in a register. `.tex` declares the binding, and the
-// declarations are numbered in order — the order `--textures` fills.
+// declarations are numbered in order, the order `--textures` fills.
 .version 7.0
 .target sm_70
 .address_size 64

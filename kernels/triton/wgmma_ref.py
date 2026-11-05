@@ -11,7 +11,7 @@ core-matrix row is 16 bytes and holds 16/element_size values, and how many
 columns of the result the tile covers.
 
   (nothing)  f16,  K = 16, two bytes an element, eight columns
-  f16n16            the same element over sixteen columns — two N groups, so B's
+  f16n16            the same element over sixteen columns, two N groups, so B's
                     SBO term is a real address and a lane holds eight
                     accumulators instead of four
   f16acc            the same tile accumulated twice, so the expected value is two
@@ -19,13 +19,13 @@ columns of the result the tile covers.
   f16chain          issued three times, which is where an accumulator that is read
                     once and then dropped still has to carry: three products
   bf16              the same width and layout as f16, different numbers for the
-                    same bits — how one translator reading either is told from
+                    same bits, how one translator reading either is told from
                     one that assumes f16
   tf32       K = 8, four bytes: the instruction truncates to 19 bits, and the
                     inputs are integers, so truncation changes nothing
   e4m3       K = 32, one byte: mantissa 3, exponent 4, saturating at 448
   e5m2              the same width, mantissa 2, exponent 5, with infinities
-  s8         K = 32, one byte, signed — the same bytes as a u8 tile are
+  s8         K = 32, one byte, signed, the same bytes as a u8 tile are
   u8                different numbers, so one reference tells the two apart even
                     though the layout is byte-for-byte identical
   s8acc      the same bytes with an s32 accumulator, the other pair the

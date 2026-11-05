@@ -3,7 +3,7 @@
 //
 // Every other wgmma fixture issues once, or the accumulate one twice, and a
 // translator that read the accumulator on the second issue and dropped it on the
-// third would still agree with all of them — three is where "D = A*B + D" has to
+// third would still agree with all of them, three is where "D = A*B + D" has to
 // be true every time and the answer is exactly three products.
 //
 // The tiles are the unswizzled core-matrix layout, which is what a K loop
@@ -99,7 +99,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

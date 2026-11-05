@@ -1,13 +1,13 @@
-// A mesh object stage: the 32 lanes of a threadgroup fill one mesh — 16 vertices
-// and 16 triangles — and two groups never touch the same slot, because a group's
+// A mesh object stage: the 32 lanes of a threadgroup fill one mesh, 16 vertices
+// and 16 triangles, and two groups never touch the same slot, because a group's
 // block is its own mesh.
 //
 // There is no GPU answer to compare against (mesh pipelines need
 // MTLGPUFamilyApple9, M3 and later; the machine this was written on is an M1), so
 // the check is a reference model: `check.sh` recomputes these 16 vertices and 16
 // triangles independently and compares the bytes. Everything here is exact in
-// float32 — an integer, the input, twice the integer, and the integer plus a half,
-// all of which are representable — so the comparison can be byte for byte.
+// float32, an integer, the input, twice the integer, and the integer plus a half,
+// all of which are representable, so the comparison can be byte for byte.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -37,7 +37,7 @@ struct Vtx {
         }
     }
     // A mesh is threadgroup-visible: a lane reads what another lane wrote, so the
-    // group has to arrive here between the write and the read — on the hardware
+    // group has to arrive here between the write and the read, on the hardware
     // that is what makes the read defined at all.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 16u) {

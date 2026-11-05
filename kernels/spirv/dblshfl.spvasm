@@ -6,7 +6,7 @@
 ; With x = lane every term is an integer, so the sum is exact in a float and check.sh
 ; recomputes it from the lane id: 5 + (i ^ 3) + (i >= 1 ? i - 1 : i) + (i + 2 < 32 ? i
 ; + 2 : i). The four modes reach four different lanes, so a relay that takes the value
-; apart arithmetically instead of the bits — `(uint64_t)1.0` is 1, not the mantissa —
+; apart arithmetically instead of the bits, `(uint64_t)1.0` is 1, not the mantissa,
 ; collapses every term and writes zero, which is what this fixture was written after
 ; seeing.
                OpCapability Kernel

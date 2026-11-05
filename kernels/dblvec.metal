@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// `double` is not supported on Apple GPUs — the Metal compiler rejects it — so
+// `double` is not supported on Apple GPUs, the Metal compiler rejects it, so
 // the double vectors are checked on the CPU only, against the same arithmetic
 // written out with scalars. What that covers is the operators and the layout,
 // which is all this front end can get wrong.

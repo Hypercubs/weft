@@ -15,7 +15,7 @@
 // The floats are rounded to integers before they become halves, so every product
 // is an exact integer and every sum of sixteen is exact in f32: the result is the
 // same bits however the additions are scheduled, which is what makes it a test of
-// the *layouts* — ldmatrix's address→register map and mma's fragment map — rather
+// the *layouts*, ldmatrix's address→register map and mma's fragment map, rather
 // than of floating point.
 .version 8.1
 .target sm_80

@@ -1,4 +1,4 @@
-// Hand-written PTX for bar.red — the barrier whose result is a fold over the
+// Hand-written PTX for bar.red, the barrier whose result is a fold over the
 // whole threadgroup (`__syncthreads_count` and friends). Every answer here is a
 // constant that depends only on the thread's index, so check.sh compares them
 // against arithmetic rather than against another implementation:
@@ -59,7 +59,7 @@ LOOP:
 
     // One record per threadgroup, written by that group's thread 0. Each group's
     // answer depends only on how many threads it actually has, so a grid whose
-    // last group is short records a different — and checkable — value.
+    // last group is short records a different, and checkable, value.
     setp.eq.s32 %p7, %r1, 0;
     @!%p7 bra.uni DONE;
 

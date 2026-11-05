@@ -1,9 +1,9 @@
 ; A loop around a 64-bit fetch-and-add.
 ;
 ; `atom64.spvasm` is one block: every lane does the same three pair updates and
-; returns. This is the shape a compiler actually emits — a counted loop whose
+; returns. This is the shape a compiler actually emits, a counted loop whose
 ; induction variable and running sum are OpPhi values, and whose result is written
-; to a slot per lane — and it used to be the shape the pair could not reach. The
+; to a slot per lane, and it used to be the shape the pair could not reach. The
 ; per-lane back end cannot host a contending section (a warp has one program
 ; counter, so lanes waiting on each other never finish), and the warp target used
 ; to accept one block only, so a loop fell through to the refusal. Now the warp
@@ -12,9 +12,9 @@
 ;
 ; The arithmetic makes a wrong answer visible rather than just making the two
 ; engines agree. Every lane adds four to the counter, so after the launch the
-; counter has moved by exactly 4*grid from whatever it started at — the harness
+; counter has moved by exactly 4*grid from whatever it started at, the harness
 ; fills its buffers with a deterministic pattern, so the starting value is not
-; zero — and no old value can be lost or repeated without moving that number. Each
+; zero, and no old value can be lost or repeated without moving that number. Each
 ; lane's own sum is the sum of its four old values, written to a slot of its own,
 ; and those slots are compared against the CPU's lane for lane.
                OpCapability Kernel

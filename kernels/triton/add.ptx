@@ -7,8 +7,8 @@
 //
 //   * `.maxntid` is the launch size Triton derives from `num_warps`, and it is
 //     the only place the geometry the kernel was compiled for is recorded;
-//   * the parameters are the raw pointers, then `global_scratch` — a pointer the
-//     kernel here never touches, so it is declared and not bound — then the
+//   * the parameters are the raw pointers, then `global_scratch`, a pointer the
+//     kernel here never touches, so it is declared and not bound, then the
 //     scalar arguments;
 //   * the thread's element is `%ctaid.x * %ntid.x + %tid.x`, and both accesses
 //     are predicated on it being below `n_elements`.

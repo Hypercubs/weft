@@ -42,27 +42,27 @@ struct TranslatedKernel {
   // operand is another lane's register (a tensor-core fragment), so it runs on
   // the warp backend and the module emits no lane entry for it.
   bool warp_only = false;
-  // The GPU form of this kernel is the warp back end — one Metal thread per
-  // 32-lane warp — so the launcher dispatches a thirty-second of the grid.
+  // The GPU form of this kernel is the warp back end, one Metal thread per
+  // 32-lane warp, so the launcher dispatches a thirty-second of the grid.
   bool gpu_warp = false;
   // How many words of threadgroup memory one warp's relay needs, and how many
   // warps may share a threadgroup with one slice each. Both are fixed when the
   // kernel is translated, so the array the shader declares and the group the
-  // launcher dispatches cannot disagree — a warp reading another warp's slots is
+  // launcher dispatches cannot disagree, a warp reading another warp's slots is
   // a wrong answer, not a slow one.
   uint32_t slot_words = 0;
   uint32_t slot_per = 0;
   // The kernel uses a 64-bit atomic. There is no such instruction here, so the
   // warp back end builds one out of 32-bit atomics under a device-scope lock,
-  // and the launcher has to hand the kernel a zeroed table of lock words — the
+  // and the launcher has to hand the kernel a zeroed table of lock words, the
   // same dispatch width as any other warp kernel.
   bool wide = false;
   // The threadgroup size the module itself declares, when it declares one. Triton
   // writes `.maxntid` from `num_warps`, and that is the only place the launch
-  // geometry a kernel was compiled for is recorded — a caller that guesses a
+  // geometry a kernel was compiled for is recorded, a caller that guesses a
   // different one gets a kernel indexed over a different number of blocks.
   uint32_t tg_hint = 0;
-  // A group size the module states without depending on it — SPIR-V's `LocalSize`.
+  // A group size the module states without depending on it, SPIR-V's `LocalSize`.
   // It is the launch's default and nothing more: a GLCompute kernel is indexed by
   // its global invocation id, which does not depend on the group, so a different
   // one is a different launch of the same program rather than a mislaunch. That is
@@ -77,7 +77,7 @@ struct TranslatedKernel {
   uint32_t fixed_threads = 0;
   // What each texture binding has to be, in binding order: `2d`, `1d`, `array`,
   // `3d` or `cube`. Empty when the front end does not say. A cube kernel handed a
-  // 2-D texture is not a slow run — it reads a texel nobody asked for — so the
+  // 2-D texture is not a slow run, it reads a texel nobody asked for, so the
   // launcher checks the shape it was given against this.
   std::vector<std::string> tex_shape;
   // Bindings the kernel writes as well as reads, in binding order. A write needs

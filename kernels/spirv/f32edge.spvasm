@@ -1,0 +1,369 @@
+; The float set at its edge: what each fp32 OpenCL.std instruction does at a zero, an
+; infinity, a NaN, a subnormal and the end of the exponent range, on both columns.
+;
+; It runs under `--exact`, which compares the two buffers as words rather than as
+; numbers, and it has to: `max |diff|` cannot see a NaN, because a NaN difference is
+; not greater than anything, and it cannot see the sign of a zero, because
+; 0 - (-0) is 0. Every column writes the result itself, no test, no select, no
+; sentinel, so a payload, an infinity, a signed zero or a subnormal that one column
+; produces and the other does not is a difference in the words.
+;
+; What it covers is the part a tolerance hides: 1/0 and -1/0 and 0/0, 0*inf,
+; inf-inf, fmax+fmax, sqrt of -1 and of -0, (-0)+(-0), log of 0 and of -1, exp past
+; the range, tgamma at a pole, sin of an infinity, fdim and minmag and maxmag at
+; their edges, nextafter at the top of the range and off both zeros, fmod and
+; remainder by zero, powr of a negative base, rootn of a negative radicand at both
+; parities, and ldexp past both ends. The five that widen to the fp64 text get their
+; edges too, `erf` of an infinity, `erfc` of -1, `cbrt` of -0, `hypot` of an
+; infinity, `log1p` of -0, beside `acosh` below its domain, `asinh` of -infinity and
+; `exp10` past the range.
+;
+; Fifteen of the columns are the five instructions that answer twice. Each takes a
+; pointer for its second value, so the module carries the same two buffers the sweep
+; does: a2 for the `float` halves and a3 for the integers. A `frexp` that disagrees
+; about the exponent of the smallest subnormal, a `modf` that loses the sign of
+; -0.0's whole part, a `sincos` whose cosine of an infinity is a number rather than
+; a NaN, a `remquo` whose quotient of a zero divisor is a number, or a `fract` whose
+; floor is the wrong number, is a difference in the words. `fract` is the fifth of
+; them: instruction 30 returns `fmin(x - floor(x), 0x1.fffffep-1f)` and writes
+; `floor(x)` through its pointer, so it is asked at an infinity, at -0.0, at 1e30, at
+; 1.5 and at -3, and both halves of each answer are compared.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+       %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "f32edge" %gid
+               OpName %main "f32edge"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %u64 = OpTypeInt 64 0
+       %u32 = OpTypeInt 32 0
+       %f32 = OpTypeFloat 32
+      %f32p = OpTypePointer CrossWorkgroup %f32
+      %u32p = OpTypePointer CrossWorkgroup %u32
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %f32p %f32p %f32p %u32p
+        %gid = OpVariable %pin Input
+      %pzero = OpConstant %f32 0
+      %nzero = OpConstant %f32 -0
+        %one = OpConstant %f32 1
+      %n_one = OpConstant %f32 -1
+       %half = OpConstant %f32 0.5
+    %onehalf = OpConstant %f32 1.5
+    %n_three = OpConstant %f32 -3
+    %n_eight = OpConstant %f32 -8
+        %big = OpConstant %f32 1e30
+       %fmax = OpConstant %f32 3.4028234663852886e+38
+        %sub = OpConstant %f32 0x0.000002p-126
+        %c1i = OpConstant %u32 1
+        %c2i = OpConstant %u32 2
+        %c3i = OpConstant %u32 3
+    %cM150i = OpConstant %u32 4294967146
+       %cNu = OpConstant %u64 53
+      %c00u = OpConstant %u64 0
+      %c01u = OpConstant %u64 1
+      %c02u = OpConstant %u64 2
+      %c03u = OpConstant %u64 3
+      %c04u = OpConstant %u64 4
+      %c05u = OpConstant %u64 5
+      %c06u = OpConstant %u64 6
+      %c07u = OpConstant %u64 7
+      %c08u = OpConstant %u64 8
+      %c09u = OpConstant %u64 9
+      %c10u = OpConstant %u64 10
+      %c11u = OpConstant %u64 11
+      %c12u = OpConstant %u64 12
+      %c13u = OpConstant %u64 13
+      %c14u = OpConstant %u64 14
+      %c15u = OpConstant %u64 15
+      %c16u = OpConstant %u64 16
+      %c17u = OpConstant %u64 17
+      %c18u = OpConstant %u64 18
+      %c19u = OpConstant %u64 19
+      %c20u = OpConstant %u64 20
+      %c21u = OpConstant %u64 21
+      %c22u = OpConstant %u64 22
+      %c23u = OpConstant %u64 23
+      %c24u = OpConstant %u64 24
+      %c25u = OpConstant %u64 25
+      %c26u = OpConstant %u64 26
+      %c27u = OpConstant %u64 27
+      %c28u = OpConstant %u64 28
+      %c29u = OpConstant %u64 29
+      %c30u = OpConstant %u64 30
+      %c31u = OpConstant %u64 31
+      %c32u = OpConstant %u64 32
+      %c33u = OpConstant %u64 33
+      %c34u = OpConstant %u64 34
+      %c35u = OpConstant %u64 35
+      %c36u = OpConstant %u64 36
+      %c37u = OpConstant %u64 37
+      %c38u = OpConstant %u64 38
+      %c39u = OpConstant %u64 39
+      %c40u = OpConstant %u64 40
+      %c41u = OpConstant %u64 41
+      %c42u = OpConstant %u64 42
+      %c43u = OpConstant %u64 43
+      %c44u = OpConstant %u64 44
+      %c45u = OpConstant %u64 45
+      %c46u = OpConstant %u64 46
+      %c47u = OpConstant %u64 47
+      %c48u = OpConstant %u64 48
+      %c49u = OpConstant %u64 49
+      %c50u = OpConstant %u64 50
+      %c51u = OpConstant %u64 51
+      %c52u = OpConstant %u64 52
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f32p
+         %a2 = OpFunctionParameter %f32p
+         %a3 = OpFunctionParameter %u32p
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %inf = OpFDiv %f32 %one %pzero
+        %nan = OpFDiv %f32 %pzero %pzero
+       %ninf = OpFDiv %f32 %n_one %pzero
+       %base = OpIMul %u64 %gi %cNu
+        %r00 = OpFDiv %f32 %one %pzero
+        %r01 = OpFDiv %f32 %n_one %pzero
+        %r02 = OpFDiv %f32 %pzero %pzero
+        %r03 = OpFMul %f32 %pzero %inf
+        %r04 = OpFSub %f32 %inf %inf
+        %r05 = OpFAdd %f32 %fmax %fmax
+        %r06 = OpExtInst %f32 %ocl sqrt %n_one
+        %r07 = OpExtInst %f32 %ocl sqrt %nzero
+        %r08 = OpFAdd %f32 %nzero %nzero
+        %r09 = OpExtInst %f32 %ocl log %pzero
+        %r10 = OpExtInst %f32 %ocl log %n_one
+        %r11 = OpExtInst %f32 %ocl exp %big
+        %r12 = OpExtInst %f32 %ocl tgamma %n_three
+        %r13 = OpExtInst %f32 %ocl sin %inf
+        %r14 = OpExtInst %f32 %ocl fdim %inf %inf
+        %r15 = OpExtInst %f32 %ocl fdim %one %inf
+        %r16 = OpExtInst %f32 %ocl minmag %nan %one
+        %r17 = OpExtInst %f32 %ocl maxmag %nan %nan
+        %r18 = OpExtInst %f32 %ocl nextafter %fmax %inf
+        %r19 = OpExtInst %f32 %ocl nextafter %inf %one
+        %r20 = OpExtInst %f32 %ocl nextafter %pzero %n_one
+        %r21 = OpExtInst %f32 %ocl nextafter %one %one
+        %r22 = OpExtInst %f32 %ocl fmod %one %pzero
+        %r23 = OpExtInst %f32 %ocl remainder %inf %one
+        %r24 = OpExtInst %f32 %ocl powr %n_one %half
+        %r25 = OpExtInst %f32 %ocl rootn %n_eight %c3i
+        %r26 = OpExtInst %f32 %ocl rootn %n_eight %c2i
+        %r27 = OpExtInst %f32 %ocl ldexp %fmax %c1i
+        %r28 = OpExtInst %f32 %ocl ldexp %one %cM150i
+      %base2 = OpIMul %u64 %gi %c10u
+      %bs00 = OpIAdd %u64 %base2 %c00u
+      %bs01 = OpIAdd %u64 %base2 %c01u
+      %bs02 = OpIAdd %u64 %base2 %c02u
+      %bs03 = OpIAdd %u64 %base2 %c03u
+      %bs04 = OpIAdd %u64 %base2 %c04u
+      %bs05 = OpIAdd %u64 %base2 %c05u
+      %bs06 = OpIAdd %u64 %base2 %c06u
+      %bs07 = OpIAdd %u64 %base2 %c07u
+      %bs08 = OpIAdd %u64 %base2 %c08u
+      %bs09 = OpIAdd %u64 %base2 %c09u
+      %pf0 = OpPtrAccessChain %u32p %a3 %bs00
+      %pf1 = OpPtrAccessChain %u32p %a3 %bs01
+      %pf2 = OpPtrAccessChain %u32p %a3 %bs02
+      %pm3 = OpPtrAccessChain %f32p %a2 %bs03
+      %pm4 = OpPtrAccessChain %f32p %a2 %bs04
+      %pm5 = OpPtrAccessChain %f32p %a2 %bs05
+      %pc6 = OpPtrAccessChain %f32p %a2 %bs06
+      %pc7 = OpPtrAccessChain %f32p %a2 %bs07
+      %pq8 = OpPtrAccessChain %u32p %a3 %bs08
+      %pq9 = OpPtrAccessChain %u32p %a3 %bs09
+      %pfr0 = OpPtrAccessChain %f32p %a2 %bs00
+      %pfr1 = OpPtrAccessChain %f32p %a2 %bs01
+      %pfr2 = OpPtrAccessChain %f32p %a2 %bs02
+      %pfr3 = OpPtrAccessChain %f32p %a2 %bs08
+      %pfr4 = OpPtrAccessChain %f32p %a2 %bs09
+        %r29 = OpExtInst %f32 %ocl frexp %fmax %pf0
+        %r30 = OpExtInst %f32 %ocl frexp %nzero %pf1
+        %r31 = OpExtInst %f32 %ocl frexp %sub %pf2
+        %r32 = OpExtInst %f32 %ocl modf %nzero %pm3
+        %r33 = OpExtInst %f32 %ocl modf %inf %pm4
+        %r34 = OpExtInst %f32 %ocl modf %onehalf %pm5
+        %r35 = OpExtInst %f32 %ocl sincos %inf %pc6
+        %r36 = OpExtInst %f32 %ocl sincos %nzero %pc7
+        %r37 = OpExtInst %f32 %ocl remquo %one %pzero %pq8
+        %r38 = OpExtInst %f32 %ocl remquo %inf %one %pq9
+        %r39 = OpExtInst %f32 %ocl fract %inf %pfr0
+        %r40 = OpExtInst %f32 %ocl fract %nzero %pfr1
+        %r41 = OpExtInst %f32 %ocl fract %big %pfr2
+        %r51 = OpExtInst %f32 %ocl fract %onehalf %pfr3
+        %r52 = OpExtInst %f32 %ocl fract %n_three %pfr4
+        %r42 = OpExtInst %f32 %ocl erf %inf
+        %r43 = OpExtInst %f32 %ocl erfc %n_one
+        %r44 = OpExtInst %f32 %ocl cbrt %nzero
+        %r45 = OpExtInst %f32 %ocl hypot %inf %one
+        %r46 = OpExtInst %f32 %ocl log1p %nzero
+        %r47 = OpExtInst %f32 %ocl acosh %half
+        %r48 = OpExtInst %f32 %ocl asinh %ninf
+        %r49 = OpExtInst %f32 %ocl expm1 %nzero
+        %r50 = OpExtInst %f32 %ocl exp10 %big
+        %i00 = OpIAdd %u64 %base %c00u
+        %q00 = OpPtrAccessChain %f32p %a1 %i00
+                OpStore %q00 %r00
+        %i01 = OpIAdd %u64 %base %c01u
+        %q01 = OpPtrAccessChain %f32p %a1 %i01
+                OpStore %q01 %r01
+        %i02 = OpIAdd %u64 %base %c02u
+        %q02 = OpPtrAccessChain %f32p %a1 %i02
+                OpStore %q02 %r02
+        %i03 = OpIAdd %u64 %base %c03u
+        %q03 = OpPtrAccessChain %f32p %a1 %i03
+                OpStore %q03 %r03
+        %i04 = OpIAdd %u64 %base %c04u
+        %q04 = OpPtrAccessChain %f32p %a1 %i04
+                OpStore %q04 %r04
+        %i05 = OpIAdd %u64 %base %c05u
+        %q05 = OpPtrAccessChain %f32p %a1 %i05
+                OpStore %q05 %r05
+        %i06 = OpIAdd %u64 %base %c06u
+        %q06 = OpPtrAccessChain %f32p %a1 %i06
+                OpStore %q06 %r06
+        %i07 = OpIAdd %u64 %base %c07u
+        %q07 = OpPtrAccessChain %f32p %a1 %i07
+                OpStore %q07 %r07
+        %i08 = OpIAdd %u64 %base %c08u
+        %q08 = OpPtrAccessChain %f32p %a1 %i08
+                OpStore %q08 %r08
+        %i09 = OpIAdd %u64 %base %c09u
+        %q09 = OpPtrAccessChain %f32p %a1 %i09
+                OpStore %q09 %r09
+        %i10 = OpIAdd %u64 %base %c10u
+        %q10 = OpPtrAccessChain %f32p %a1 %i10
+                OpStore %q10 %r10
+        %i11 = OpIAdd %u64 %base %c11u
+        %q11 = OpPtrAccessChain %f32p %a1 %i11
+                OpStore %q11 %r11
+        %i12 = OpIAdd %u64 %base %c12u
+        %q12 = OpPtrAccessChain %f32p %a1 %i12
+                OpStore %q12 %r12
+        %i13 = OpIAdd %u64 %base %c13u
+        %q13 = OpPtrAccessChain %f32p %a1 %i13
+                OpStore %q13 %r13
+        %i14 = OpIAdd %u64 %base %c14u
+        %q14 = OpPtrAccessChain %f32p %a1 %i14
+                OpStore %q14 %r14
+        %i15 = OpIAdd %u64 %base %c15u
+        %q15 = OpPtrAccessChain %f32p %a1 %i15
+                OpStore %q15 %r15
+        %i16 = OpIAdd %u64 %base %c16u
+        %q16 = OpPtrAccessChain %f32p %a1 %i16
+                OpStore %q16 %r16
+        %i17 = OpIAdd %u64 %base %c17u
+        %q17 = OpPtrAccessChain %f32p %a1 %i17
+                OpStore %q17 %r17
+        %i18 = OpIAdd %u64 %base %c18u
+        %q18 = OpPtrAccessChain %f32p %a1 %i18
+                OpStore %q18 %r18
+        %i19 = OpIAdd %u64 %base %c19u
+        %q19 = OpPtrAccessChain %f32p %a1 %i19
+                OpStore %q19 %r19
+        %i20 = OpIAdd %u64 %base %c20u
+        %q20 = OpPtrAccessChain %f32p %a1 %i20
+                OpStore %q20 %r20
+        %i21 = OpIAdd %u64 %base %c21u
+        %q21 = OpPtrAccessChain %f32p %a1 %i21
+                OpStore %q21 %r21
+        %i22 = OpIAdd %u64 %base %c22u
+        %q22 = OpPtrAccessChain %f32p %a1 %i22
+                OpStore %q22 %r22
+        %i23 = OpIAdd %u64 %base %c23u
+        %q23 = OpPtrAccessChain %f32p %a1 %i23
+                OpStore %q23 %r23
+        %i24 = OpIAdd %u64 %base %c24u
+        %q24 = OpPtrAccessChain %f32p %a1 %i24
+                OpStore %q24 %r24
+        %i25 = OpIAdd %u64 %base %c25u
+        %q25 = OpPtrAccessChain %f32p %a1 %i25
+                OpStore %q25 %r25
+        %i26 = OpIAdd %u64 %base %c26u
+        %q26 = OpPtrAccessChain %f32p %a1 %i26
+                OpStore %q26 %r26
+        %i27 = OpIAdd %u64 %base %c27u
+        %q27 = OpPtrAccessChain %f32p %a1 %i27
+                OpStore %q27 %r27
+        %i28 = OpIAdd %u64 %base %c28u
+        %q28 = OpPtrAccessChain %f32p %a1 %i28
+                OpStore %q28 %r28
+        %i29 = OpIAdd %u64 %base %c29u
+        %q29 = OpPtrAccessChain %f32p %a1 %i29
+                OpStore %q29 %r29
+        %i30 = OpIAdd %u64 %base %c30u
+        %q30 = OpPtrAccessChain %f32p %a1 %i30
+                OpStore %q30 %r30
+        %i31 = OpIAdd %u64 %base %c31u
+        %q31 = OpPtrAccessChain %f32p %a1 %i31
+                OpStore %q31 %r31
+        %i32 = OpIAdd %u64 %base %c32u
+        %q32 = OpPtrAccessChain %f32p %a1 %i32
+                OpStore %q32 %r32
+        %i33 = OpIAdd %u64 %base %c33u
+        %q33 = OpPtrAccessChain %f32p %a1 %i33
+                OpStore %q33 %r33
+        %i34 = OpIAdd %u64 %base %c34u
+        %q34 = OpPtrAccessChain %f32p %a1 %i34
+                OpStore %q34 %r34
+        %i35 = OpIAdd %u64 %base %c35u
+        %q35 = OpPtrAccessChain %f32p %a1 %i35
+                OpStore %q35 %r35
+        %i36 = OpIAdd %u64 %base %c36u
+        %q36 = OpPtrAccessChain %f32p %a1 %i36
+                OpStore %q36 %r36
+        %i37 = OpIAdd %u64 %base %c37u
+        %q37 = OpPtrAccessChain %f32p %a1 %i37
+                OpStore %q37 %r37
+        %i38 = OpIAdd %u64 %base %c38u
+        %q38 = OpPtrAccessChain %f32p %a1 %i38
+                OpStore %q38 %r38
+        %i39 = OpIAdd %u64 %base %c39u
+        %q39 = OpPtrAccessChain %f32p %a1 %i39
+                OpStore %q39 %r39
+        %i40 = OpIAdd %u64 %base %c40u
+        %q40 = OpPtrAccessChain %f32p %a1 %i40
+                OpStore %q40 %r40
+        %i41 = OpIAdd %u64 %base %c41u
+        %q41 = OpPtrAccessChain %f32p %a1 %i41
+                OpStore %q41 %r41
+        %i42 = OpIAdd %u64 %base %c42u
+        %q42 = OpPtrAccessChain %f32p %a1 %i42
+                OpStore %q42 %r42
+        %i43 = OpIAdd %u64 %base %c43u
+        %q43 = OpPtrAccessChain %f32p %a1 %i43
+                OpStore %q43 %r43
+        %i44 = OpIAdd %u64 %base %c44u
+        %q44 = OpPtrAccessChain %f32p %a1 %i44
+                OpStore %q44 %r44
+        %i45 = OpIAdd %u64 %base %c45u
+        %q45 = OpPtrAccessChain %f32p %a1 %i45
+                OpStore %q45 %r45
+        %i46 = OpIAdd %u64 %base %c46u
+        %q46 = OpPtrAccessChain %f32p %a1 %i46
+                OpStore %q46 %r46
+        %i47 = OpIAdd %u64 %base %c47u
+        %q47 = OpPtrAccessChain %f32p %a1 %i47
+                OpStore %q47 %r47
+        %i48 = OpIAdd %u64 %base %c48u
+        %q48 = OpPtrAccessChain %f32p %a1 %i48
+                OpStore %q48 %r48
+        %i49 = OpIAdd %u64 %base %c49u
+        %q49 = OpPtrAccessChain %f32p %a1 %i49
+                OpStore %q49 %r49
+        %i50 = OpIAdd %u64 %base %c50u
+        %q50 = OpPtrAccessChain %f32p %a1 %i50
+                OpStore %q50 %r50
+        %i51 = OpIAdd %u64 %base %c51u
+        %q51 = OpPtrAccessChain %f32p %a1 %i51
+                OpStore %q51 %r51
+        %i52 = OpIAdd %u64 %base %c52u
+        %q52 = OpPtrAccessChain %f32p %a1 %i52
+                OpStore %q52 %r52
+                OpReturn
+                OpFunctionEnd

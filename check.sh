@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs each example kernel twice — once on the GPU, once on the CPU — and fails
+# Runs each example kernel twice, once on the GPU, once on the CPU, and fails
 # if the two disagree. Then checks the PTX front end against the Metal front end
 # by comparing their byte-for-byte output.
 set -euo pipefail
@@ -10,7 +10,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-# A build with no GPU column — anywhere that is not macOS — still runs every
+# A build with no GPU column, anywhere that is not macOS, still runs every
 # kernel here: translation, launch and the byte comparisons between front ends.
 # What it has no hardware for is the diff against the GPU, so that line says so
 # instead of reporting an agreement nobody checked.
@@ -49,7 +49,7 @@ runf() {
   local out
   out="$("$WEFT" run "$file" --kernel "$name" "$@" --bench 5 $CPUMODE)"
   # A kernel that failed to compile, or a dispatch that never finished, prints no
-  # comparison line and no DISAGREE either — so "not DISAGREE" is not the same as
+  # comparison line and no DISAGREE either, so "not DISAGREE" is not the same as
   # "agrees", and a row could go green on an empty summary. Both are failures.
   local need_cmp=1
   case "$CPUMODE" in *--cpu-only*) need_cmp=0 ;; esac
@@ -71,16 +71,16 @@ run tex1ds     --grid 65536   --buffers 65536 --textures 64x1d
 # Bilinear filtering: the weights are quantised the way the hardware quantises
 # them (round(f * 256) / 256, measured from the GPU) and blended with the fma the
 # hardware uses, which reproduces a one-axis sample exactly. Across both axes one
-# ulp of the final blend remains — 1.2e-07, where the unquantised weights were
+# ulp of the final blend remains, 1.2e-07, where the unquantised weights were
 # 1.4e-03. The run's `agree` is that bound; a regression shows up as DISAGREE.
 run texlin     --grid 65536   --buffers 65536 --textures 64x64   # bilinear, 8-bit weights + fma
 # A 2D array: `--textures 64x64*4` binds four slices, and the kernel reads and
 # samples the slice it names. The layer is folded into the value, so reading the
-# wrong slice — or the whole array from slice 0 — answers wrong rather than close.
+# wrong slice, or the whole array from slice 0, answers wrong rather than close.
 run texarray   --grid 65536   --buffers 65536 --textures '64x64*4'
 # A 3D texture: `--textures 64x64x8` binds a volume, and every read and sample
 # names a plane. The plane is folded into the answer, so reading plane 0 of the
-# volume — or taking the depth for a slice — answers wrong rather than close.
+# volume, or taking the depth for a slice, answers wrong rather than close.
 run tex3d      --grid 65536   --buffers 65536 --textures 64x64x8
 # A cube: `--textures 64x64c` binds six square faces, and a sample takes a
 # direction. Each lane rebuilds the direction that lands on the texel it wants, so
@@ -106,7 +106,7 @@ run fillscan   --grid 1048576 --threads 256 --buffers 1048576,1048576   # shuffl
 run prefixscan --grid 1048576 --threads 256 --buffers 1048576,1048576   # simd_prefix sums
 # A float prefix sum cannot be bit-identical: the hardware folds the warp in its
 # own tree and this folds it the doubling way, so the two differ by a few ulp of
-# the running sum. What must hold is that the gap stays that small — a wrong scan
+# the running sum. What must hold is that the gap stays that small, a wrong scan
 # would be off by the whole warp, not by 1e-7 relative.
 if [ -n "$CPUMODE" ]; then
   # The gap being measured is between this engine and the hardware's own fold
@@ -244,6 +244,264 @@ fi
 
 # The bulk store that combines instead of overwriting: 1, 2, 3, 4 in the buffer,
 # 10, 20, 30, 40 in threadgroup memory, added to 11, 22, 33, 44.
+# The same reduction with 16-bit float elements: `add.f16` combines two halves a
+# word, so eight sums live in four words. 1..8 into 10..17 is 11, 13, ... 25, every
+# one exact in a half, so the expected bytes are a constant, a reduce that added
+# the words as 32-bit integers, or walked four elements instead of eight, misses it.
+runf kernels/mbarredf16.ptx mbarredf16 --grid 1 --threads 1 --buffers 4,4
+"$WEFT" run kernels/mbarredf16.ptx --kernel mbarredf16 --grid 1 --threads 1 --buffers 4,4 \
+    --cpu-only --dump 1="$TMP/redf16.bin" >/dev/null
+if [ "$(od -An -tx4 -v "$TMP/redf16.bin" | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "4a804980 4c404b80 4d404cc0 4e404dc0 " ]; then
+  echo "ok    mbarredf16  the f16 reduce added 1..8 to 10..17 as halves"
+else
+  echo "FAIL  mbarredf16  read $(od -An -tx4 -v "$TMP/redf16.bin" | tr -s ' ' ' '); wanted 11 13 15 17 19 21 23 25 as halves"; fail=1
+fi
+
+# `.inc` and `.dec` are bounded by the source element, so the tile carries the
+# bounds. Counters 0,1,2,3 with bounds 2,2,5,0 increment to 1,2,3,0 and decrement
+# to 2,0,1,0: a plain +1 would answer 4 and 4, and an unbounded decrement would
+# wrap zero to 0xFFFFFFFF, so these eight numbers separate the forms.
+runf kernels/mbarredinc.ptx mbarredinc --grid 1 --threads 1 --buffers 4,4
+"$WEFT" run kernels/mbarredinc.ptx --kernel mbarredinc --grid 1 --threads 1 --buffers 4,4 \
+    --cpu-only --dump 0="$TMP/inc.bin" --dump 1="$TMP/dec.bin" >/dev/null
+if [ "$(od -An -tu4 -v "$TMP/inc.bin" | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = "1 2 3 0 " ] && \
+   [ "$(od -An -tu4 -v "$TMP/dec.bin" | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = "2 0 1 0 " ]; then
+  echo "ok    mbarredinc  the bounded inc and dec wrapped where the bound said"
+else
+  echo "FAIL  mbarredinc  read $(od -An -tu4 -v "$TMP/inc.bin" | tr -s ' ' ' ') / $(od -An -tu4 -v "$TMP/dec.bin" | tr -s ' ' ' ')"; fail=1
+fi
+
+# `.add.f64` into the buffer: 1.5 and 2.5 with 0.25, both exact doubles. On the GPU
+# the sum is the software double, on the CPU the host's own.
+runf kernels/mbarredf64.ptx mbarredf64 --grid 1 --threads 1 --buffers 4,4
+"$WEFT" run kernels/mbarredf64.ptx --kernel mbarredf64 --grid 1 --threads 1 --buffers 4,4 \
+    --cpu-only --dump 1="$TMP/redf64.bin" >/dev/null
+if [ "$(head -c 16 "$TMP/redf64.bin" | od -An -tx8 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "3ffc000000000000 4006000000000000 " ]; then
+  echo "ok    mbarredf64  the f64 reduce added 0.25 to 1.5 and 2.5"
+else
+  echo "FAIL  mbarredf64  read $(od -An -tx8 -v "$TMP/redf64.bin" | tr -s ' ' ' '); wanted 1.75 and 2.75"; fail=1
+fi
+
+# `.add.noftz.bf16`: eight bf16 counters with 0.5, 1, ... 4 added. Every sum needs
+# three significand bits, so it is exact in a bf16 and the words are constants.
+runf kernels/mbarredbf16.ptx mbarredbf16 --grid 1 --threads 1 --buffers 4,4
+"$WEFT" run kernels/mbarredbf16.ptx --kernel mbarredbf16 --grid 1 --threads 1 --buffers 4,4 \
+    --cpu-only --dump 1="$TMP/redbf16.bin" >/dev/null
+if [ "$(od -An -tx4 -v "$TMP/redbf16.bin" | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "40403fc0 40c04090 411040f0 41404128 " ]; then
+  echo "ok    mbarredbf16  the bf16 reduce added 1..8 to 0.5, 1, ... 4 as bf16"
+else
+  echo "FAIL  mbarredbf16  read $(od -An -tx4 -v "$TMP/redbf16.bin" | tr -s ' ' ' '); wanted 1.5 3 4.5 6 7.5 9 10.5 12"; fail=1
+fi
+
+# `cvt.{rna,rn,rz}.tf32.f32`: the eight lanes walk an exact value, a tie with an
+# even kept bit, an exact value with an odd kept bit, a tie with an odd one, and
+# four non-ties. `rna` and `rn` differ only where a tie lands and `rz` differs
+# wherever bits were dropped, so 24 constants pin the three modes apart.
+runf kernels/tf32cvt.ptx tf32cvt --grid 8 --threads 8 --buffers 24
+"$WEFT" run kernels/tf32cvt.ptx --kernel tf32cvt --grid 8 --threads 8 --buffers 24 \
+    --cpu-only --dump 0="$TMP/tf32.bin" >/dev/null
+if [ "$(head -c 96 "$TMP/tf32.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "3f800000 3f800000 3f800000 3f802000 3f800000 3f800000 3f802000 3f802000 3f802000 3f804000 3f804000 3f802000 3f804000 3f804000 3f804000 3f806000 3f804000 3f804000 3f806000 3f806000 3f806000 3f808000 3f808000 3f806000 " ]; then
+  echo "ok    tf32cvt  rna, rn and rz round the thirteen dropped bits as the isa says"
+else
+  echo "FAIL  tf32cvt  read $(head -c 96 "$TMP/tf32.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# `.relu` and `.satfinite` on the same convert: a negative becomes +0, an infinity
+# the largest finite tf32, a NaN zero, and a value neither touches stays.
+runf kernels/tf32cvt.ptx tf32sat --grid 1 --threads 1 --buffers 4
+"$WEFT" run kernels/tf32cvt.ptx --kernel tf32sat --grid 1 --threads 1 --buffers 4 \
+    --cpu-only --dump 0="$TMP/tf32sat.bin" >/dev/null
+if [ "$(head -c 16 "$TMP/tf32sat.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "00000000 7f7fe000 00000000 3f800000 " ]; then
+  echo "ok    tf32sat  relu zeroed a negative and satfinite clamped inf and nan"
+else
+  echo "FAIL  tf32sat  read $(head -c 16 "$TMP/tf32sat.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# The scalar 16-bit converts, what `__float2half` compiles to. The tie in the
+# second word must round to even, the third clamps to 65504, a NaN under
+# `.satfinite` is zero, `.relu` zeroes the negative the next word keeps, and the
+# bf16 pair pins the eight-significand-bit destination against the ten-bit one.
+runf kernels/cvtf16.ptx cvtf16 --grid 1 --threads 1 --buffers 8
+"$WEFT" run kernels/cvtf16.ptx --kernel cvtf16 --grid 1 --threads 1 --buffers 8 \
+    --cpu-only --dump 0="$TMP/cvtf16.bin" >/dev/null
+if [ "$(head -c 32 "$TMP/cvtf16.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "00003c00 00003c02 00007bff 00000000 00000000 0000c100 00003f80 00007f7f " ]; then
+  echo "ok    cvtf16  the 16-bit converts rounded, clamped and zeroed as the isa says"
+else
+  echo "FAIL  cvtf16  read $(head -c 32 "$TMP/cvtf16.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# `.rz` on the same converts: the tie that nearest-even takes upward truncates
+# down, an overflow lands on the largest finite value, an infinity has nothing to
+# truncate, and the bf16 cases show the eight-bit significand dropping its tail.
+runf kernels/cvtf16.ptx cvtf16rz --grid 1 --threads 1 --buffers 5
+"$WEFT" run kernels/cvtf16.ptx --kernel cvtf16rz --grid 1 --threads 1 --buffers 5 \
+    --cpu-only --dump 0="$TMP/cvtf16rz.bin" >/dev/null
+if [ "$(head -c 20 "$TMP/cvtf16rz.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "00003c03 00007bff 00007c00 00003f80 00007fc0 " ]; then
+  echo "ok    cvtf16rz  the truncating converts dropped the tail and kept the infinities"
+else
+  echo "FAIL  cvtf16rz  read $(head -c 20 "$TMP/cvtf16rz.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# `.sat` on a floating-point destination is [0, 1] with a NaN to +0, not the
+# destination's range: 2.0 clamps to 1, -0.5 to 0, a NaN to +0, and a value inside
+# the range is untouched.
+runf kernels/cvtf16.ptx cvtsat --grid 1 --threads 1 --buffers 6
+"$WEFT" run kernels/cvtf16.ptx --kernel cvtsat --grid 1 --threads 1 --buffers 6 \
+    --cpu-only --dump 0="$TMP/cvtsat.bin" >/dev/null
+if [ "$(head -c 24 "$TMP/cvtsat.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "3f800000 00000000 00000000 3e800000 00003c00 00000000 " ]; then
+  echo "ok    cvtsat  .sat clamped to [0,1] and flushed the nan to positive zero"
+else
+  echo "FAIL  cvtsat  read $(head -c 24 "$TMP/cvtsat.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# The MX converts: fp4 (e2m1) and fp6 (e2m3, e3m2), which have no infinity and no
+# NaN, so `.satfinite` is the whole range rule, a NaN is the positive MAX_NORM and
+# an infinity is MAX_NORM with its sign kept. The ties sit on grids whose subnormal
+# step is a fraction of a power of two, which is where a decode written from the
+# exponent alone gets the bottom of the range wrong.
+runf kernels/cvtmx.ptx cvtmx --grid 1 --threads 1 --buffers 6
+"$WEFT" run kernels/cvtmx.ptx --kernel cvtmx --grid 1 --threads 1 --buffers 6 \
+    --cpu-only --dump 0="$TMP/cvtmx.bin" >/dev/null
+if [ "$(head -c 24 "$TMP/cvtmx.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "00000055 00000000 00000072 00001f02 00001f01 00001f3f " ]; then
+  echo "ok    cvtmx  fp4 and fp6 rounded onto their own grids and saturated by sign"
+else
+  echo "FAIL  cvtmx  read $(head -c 24 "$TMP/cvtmx.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# The four-value forms: fp4 into a half-word and the f6 pair into a word, first
+# source in the high field. 0.25 as fp4 is a tie between 0 and 0.5, and 28 as e3m2
+# is MAX_NORM itself rather than a saturation.
+runf kernels/cvtmx.ptx cvtmx4 --grid 1 --threads 1 --buffers 3
+"$WEFT" run kernels/cvtmx.ptx --kernel cvtmx4 --grid 1 --threads 1 --buffers 3 \
+    --cpu-only --dump 0="$TMP/cvtmx4.bin" >/dev/null
+if [ "$(head -c 12 "$TMP/cvtmx4.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "0000250f 0c00001f 1f040f1f " ]; then
+  echo "ok    cvtmx4  four sources packed high first, with relu ahead of the convert"
+else
+  echo "FAIL  cvtmx4  read $(head -c 12 "$TMP/cvtmx4.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# Stochastic rounding: every value sits exactly half an ulp above its lower grid
+# point, so the random bits alone decide. Zero random bits truncate toward zero on
+# either side of the sign, all-ones carries away from it, exactly half the random
+# range carries, and the bf16 word shows the sixteen-bit split and `.satfinite`
+# taking an infinity to the largest finite bf16.
+runf kernels/cvtmx.ptx cvtrs --grid 1 --threads 1 --buffers 4
+"$WEFT" run kernels/cvtmx.ptx --kernel cvtrs --grid 1 --threads 1 --buffers 4 \
+    --cpu-only --dump 0="$TMP/cvtrs.bin" >/dev/null
+if [ "$(head -c 16 "$TMP/cvtrs.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "3c01c401 3c02c402 3f827f7f 3c023c01 " ]; then
+  echo "ok    cvtrs  the random bits carried into the discarded mantissa as the isa splits them"
+else
+  echo "FAIL  cvtrs  read $(head -c 16 "$TMP/cvtrs.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# `.sat` on a 64-bit float destination is the [0, 1] clamp, not the destination's
+# range: 2.0 saturates down to 1, -0.5 up to zero, a NaN to positive zero, 0.25 stays,
+# -0.0 keeps its sign because a zero is not a negative, and both infinities land on an
+# end of the range. This GPU has no fp64, so the software double over the bits has to
+# answer what the host's own arithmetic answers.
+runf kernels/f64sat.ptx f64sat --grid 1 --threads 1 --buffers 9
+# Twice the bytes the kernel writes, so the dump holds all eighteen halves of the
+# nine doubles whatever the host's own element size is; the row reads the first nine.
+"$WEFT" run kernels/f64sat.ptx --kernel f64sat --grid 1 --threads 1 --buffers 18 \
+    --cpu-only --dump 0="$TMP/f64sat.bin" >/dev/null
+if [ "$(head -c 72 "$TMP/f64sat.bin" | od -An -tx8 -v | tr -s ' ' '\n' | sed '/^$/d; s/^0$/0000000000000000/' | tr '\n' ' ')" = \
+    "3ff0000000000000 0000000000000000 0000000000000000 3fd0000000000000 8000000000000000 3ff0000000000000 0000000000000000 3ff0000000000000 3ff0000000000000 " ]; then
+  echo "ok    f64sat   the 64-bit clamp held [0,1], flushed the nan and kept the -0.0"
+else
+  echo "FAIL  f64sat   read $(head -c 72 "$TMP/f64sat.bin" | od -An -tx8 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# The qualifiers the narrow converts carry. Every e4m3 case is half an ulp above its
+# grid point, so the random byte alone decides whether it carries; the fp4 case shows
+# the nibble layout's own split of that word, where b's bits are the low byte of the
+# upper half. The f6 and e5m2 rows are the same carry on their own grids, and the
+# `.relu` row zeroes a negative before the convert sees it.
+runf kernels/cvtqual.ptx cvtrsx4 --grid 1 --threads 1 --buffers 5
+"$WEFT" run kernels/cvtqual.ptx --kernel cvtrsx4 --grid 1 --threads 1 --buffers 5 \
+    --cpu-only --dump 0="$TMP/cvtrsx4.bin" >/dev/null
+if [ "$(head -c 20 "$TMP/cvtrsx4.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "393840b0 0000324a 0d0c0c34 3d3cc034 00000651 " ]; then
+  echo "ok    cvtrsx4  the random word carried each of the four values on its own"
+else
+  echo "FAIL  cvtrsx4  read $(head -c 20 "$TMP/cvtrsx4.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# `.rz` truncates instead of rounding: 1.1875 is three eighths of an ulp into the
+# e4m3 grid, 1.75 is a tie between two fp4 values that nearest-even takes up, and the
+# half word shows rn's 3c04bc04 one step lower.
+runf kernels/cvtqual.ptx cvtrz2 --grid 1 --threads 1 --buffers 3
+"$WEFT" run kernels/cvtqual.ptx --kernel cvtrz2 --grid 1 --threads 1 --buffers 3 \
+    --cpu-only --dump 0="$TMP/cvtrz2.bin" >/dev/null
+if [ "$(head -c 12 "$TMP/cvtrz2.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "000039b9 0000003b 3c03bc03 " ]; then
+  echo "ok    cvtrz2  the truncating pair converts dropped the tail on both signs"
+else
+  echo "FAIL  cvtrz2  read $(head -c 12 "$TMP/cvtrz2.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# The ue8m0 scales and `.pzo`: 0x7e is 2^-1 so dividing by it doubles both sources,
+# the same convert at 1.0 flushes two subnormal sources to zeros of their own sign,
+# the f16x2 source form halves both halves, `.pzo` folds -0.0, and the n2 up-convert
+# multiplies 1.0 by 4 and by 2 into the two halves of a bf16x2.
+runf kernels/cvtqual.ptx cvtscaled --grid 1 --threads 1 --buffers 5
+"$WEFT" run kernels/cvtqual.ptx --kernel cvtscaled --grid 1 --threads 1 --buffers 5 \
+    --cpu-only --dump 0="$TMP/cvtscaled.bin" >/dev/null
+if [ "$(head -c 20 "$TMP/cvtscaled.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "00004840 00000080 00003830 00000000 40804000 " ]; then
+  echo "ok    cvtscaled  the scale divided, flushed, halved and multiplied, and pzo folded a zero"
+else
+  echo "FAIL  cvtscaled  read $(head -c 20 "$TMP/cvtscaled.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# The packed pair converts, both directions: `cvt.rn.f16x2.<packed>` reads a packed
+# word out into two halves and `cvt.rn.satfinite.<packed>.f16x2` packs two halves into
+# it. Which one it is comes from the order of the modifier list, so a row that swapped
+# them would land on two different kernels' answers.
+runf kernels/cvtf8x2.ptx cvtdown --grid 1 --threads 1 --buffers 6
+"$WEFT" run kernels/cvtf8x2.ptx --kernel cvtdown --grid 1 --threads 1 --buffers 6 \
+    --cpu-only --dump 0="$TMP/cvtdown.bin" >/dev/null
+if [ "$(head -c 24 "$TMP/cvtdown.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "3e003c00 00003c00 47803400 4f002c00 3c003c00 40000000 " ]; then
+  echo "ok    cvtdown  five packed formats read out into halves, relu zeroing one of them"
+else
+  echo "FAIL  cvtdown  read $(head -c 24 "$TMP/cvtdown.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+runf kernels/cvtf8x2.ptx cvtup --grid 1 --threads 1 --buffers 6
+"$WEFT" run kernels/cvtf8x2.ptx --kernel cvtup --grid 1 --threads 1 --buffers 6 \
+    --cpu-only --dump 0="$TMP/cvtup.bin" >/dev/null
+if [ "$(head -c 24 "$TMP/cvtup.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "00000042 00000002 00001f0c 00001f04 00003c38 00000000 " ]; then
+  echo "ok    cvtup  two halves packed down, relu and pzo doing what they say"
+else
+  echo "FAIL  cvtup  read $(head -c 24 "$TMP/cvtup.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# The four-lane narrow arithmetic. Every case is exact in its destination, so a wrong
+# decode, a wrong lane offset or a missing saturation shows in a byte of the word. The
+# last two are the operands that are not the obvious format: a ue8m0 scale and an fp4
+# tile padded one nibble a byte.
+runf kernels/cvtf8x2.ptx cvtsimd --grid 1 --threads 1 --buffers 7
+"$WEFT" run kernels/cvtf8x2.ptx --kernel cvtsimd --grid 1 --threads 1 --buffers 7 \
+    --cpu-only --dump 0="$TMP/cvtsimd.bin" >/dev/null
+if [ "$(head -c 28 "$TMP/cvtsimd.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "44444444 38383838 41414141 4b4b4b4b 7e7e7e7e 44444444 44444444 " ]; then
+  echo "ok    cvtsimd  four packed lanes added, subtracted, multiplied and fused"
+else
+  echo "FAIL  cvtsimd  read $(head -c 28 "$TMP/cvtsimd.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
 runf kernels/mbarred.ptx mbarred --grid 1 --threads 1 --buffers 4
 "$WEFT" run kernels/mbarred.ptx --kernel mbarred --grid 1 --threads 1 --buffers 4 \
     --cpu-only --dump 0="$TMP/reduced.bin" >/dev/null
@@ -286,7 +544,7 @@ else
 fi
 
 # The convolution form of the same instruction: `.im2col` copies a column of the
-# implicit GEMM — channels by pixels — with the filter window's position carried beside
+# implicit GEMM, channels by pixels, with the filter window's position carried beside
 # the corner. Two channels by three pixels at the window's origin gives 0 to 5; the same
 # column one pixel to the right runs off the edge, so its third pixel is padded with zero
 # rather than read from the next row.
@@ -315,10 +573,237 @@ else
   echo "FAIL  tensorim2st read $is_got; wanted $is_want"; fail=1
 fi
 
+# The prefetch hints: a copy kernel that interleaves them, compared against the input
+# buffer byte for byte. A hint that moved data, or one that hung on its size, is a
+# different buffer rather than a quiet nothing.
+runf kernels/prefetch.ptx prefetch --grid 1024 --threads 64 --buffers 1024,1024
+"$WEFT" run kernels/prefetch.ptx --kernel prefetch --grid 1024 --threads 64 --buffers 1024,1024 \
+    --cpu-only --dump 0="$TMP/pf0.bin" --dump 1="$TMP/pf1.bin" >/dev/null
+if cmp -s "$TMP/pf0.bin" "$TMP/pf1.bin"; then
+  echo "ok    prefetch   the three hints moved no data and changed no answer"
+else
+  echo "FAIL  prefetch   a hint changed what the kernel wrote"; fail=1
+fi
+
+# The byte shapes of `ldmatrix`/`stmatrix`, which are what a Blackwell kernel loads
+# fp8 and fp4 operands with. The tile holds 0..255, so each byte of each register is
+# a number that names its own place, and the map is written out in the fixture: a
+# lane's logical byte s of a 16x16 tile is row 2*(l&3) + (s&1) + 8*(s>>2), column
+# (l>>2) + 8*((s>>1)&1), and logical byte s is byte q of register r with
+# s = 2*r + (q&1) + 4*(q>>1). This pins the map; it cannot compare against hardware,
+# because these instructions are sm_100 and this host is not.
+runf kernels/ldmatrixb8.ptx ldmatrixb8 --grid 1 --threads 32 --buffers 64,64
+"$WEFT" run kernels/ldmatrixb8.ptx --kernel ldmatrixb8 --grid 1 --threads 32 --buffers 64,64 \
+    --cpu-only --dump 0="$TMP/lb8.bin" --dump 1="$TMP/lb8b.bin" >/dev/null
+if od -An -tu4 -v "$TMP/lb8.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++;
+      l = int(n / 2); r = n % 2; w = 0;
+      for (q = 0; q < 4; q++) { s = 2 * r + (q % 2) + 4 * int(q / 2);
+        a = s % 2; b = int(s / 2) % 2; c = int(s / 4);
+        row = 2 * (l % 4) + a + 8 * c; col = int(l / 4) + 8 * b;
+        w += (16 * row + col) * 256 ^ q }
+      if ($i != w) bad++ } } END { exit(bad ? 1 : 0) }'; then
+  echo "ok    ldmatrixb8  two registers a lane hold the bytes that map names"
+else
+  echo "FAIL  ldmatrixb8  the byte fragment is not that map"; fail=1
+fi
+# The store is the `m16n8` shape: one register a matrix, so the two the load built
+# are the two tiles. Every byte of the 256 must be written exactly once, which is what
+# a byte map that collided, or skipped, could not do.
+if [ "$(od -An -tu1 -v "$TMP/lb8b.bin" | tr -s ' ' '\n' | sed '/^$/d' | sort -n | tr '\n' ' ')" = \
+    "$(seq 0 255 | tr '\n' ' ')" ]; then
+  echo "ok    stmatrixb8  the two 16x8 stores cover the tile exactly once"
+else
+  echo "FAIL  stmatrixb8  the store left a duplicate or a gap"; fail=1
+fi
+
+# The sub-byte shapes: sixteen 6-bit (or 4-bit) elements in a 16-byte container,
+# widened to a byte each while they load. The fixture fills the containers itself, so
+# this recomputes the whole thing from the published rule, lane l holds row l>>2 at
+# columns 4*(l&3)..+3, and the second matrix sits 128 bytes on, rather than trusting
+# the fill. The signed form is the same map with a sign-extended byte.
+# `prmt` in each of its six named modes. The mode is a 2-bit selector and the table
+# is the ISA's, so this recomputes every output byte from that table instead of
+# trusting the helper both engines share. The fixture's eight source bytes run
+# consecutively from 4*(lane&63), which spans every selector and crosses 0x80.
+runf kernels/prmtmodes.ptx prmtmodes --grid 256 --threads 256 --buffers 1792
+"$WEFT" run kernels/prmtmodes.ptx --kernel prmtmodes --grid 256 --threads 256 --buffers 1792 \
+    --cpu-only --dump 0="$TMP/prmt.bin" >/dev/null
+if od -An -tu1 -v "$TMP/prmt.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; j = n % 4
+      lane = int(n / 28); w = int(n / 4) % 7; l = lane % 64; k = lane % 4
+      for (q = 0; q < 8; q++) src[q] = (4 * l + q) % 256
+      if (w == 0) idx = (k + j) % 8
+      else if (w == 1) idx = (k - j + 8) % 8
+      else if (w == 2) idx = k
+      else if (w == 3) idx = (k > j) ? k : j
+      else if (w == 4) idx = (k < j) ? k : j
+      else idx = 2 * (k % 2) + j % 2
+      if (w == 6) { sel = int(lane / 16 ^ j) % 16; byte = src[sel % 8]
+        want = (sel >= 8) ? ((byte >= 128) ? 255 : 0) : byte }
+      else want = src[idx]
+      if ($i != want) bad++ } } END { exit(bad ? 1 : 0) }'; then
+  echo "ok    prmtmodes  every named mode and the nibble form follow the isa table"
+else
+  echo "FAIL  prmtmodes  a mode's bytes are not the ones the table names"; fail=1
+fi
+
+runf kernels/ldmatrixsub.ptx ldmsub --grid 1 --threads 32 --buffers 160
+"$WEFT" run kernels/ldmatrixsub.ptx --kernel ldmsub --grid 1 --threads 32 --buffers 160 \
+    --cpu-only --dump 0="$TMP/lsub.bin" >/dev/null
+if od -An -tu4 -v "$TMP/lsub.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; w = 0;
+      if (n < 128) { m = n % 64; l = int(m / 2); c0 = 8 * (m % 2); row = int(l / 4)
+        for (q = 0; q < 4; q++) { col = 4 * (l % 4) + q; c = c0 + row
+          if (n < 64) v = (c < 8) ? (13 * c + 7 * col) % 64 : (29 * (c - 8) + 11 * col + 5) % 64
+          else v = (c < 8) ? (5 * c + 3 * col) % 16 : (11 * (c - 8) + 7 * col + 3) % 16
+          w += v * 256 ^ q } }
+      else { l = n - 128; row = int(l / 4)
+        for (q = 0; q < 4; q++) { col = 4 * (l % 4) + q
+          v = (5 * row + 3 * col) % 16 - 8; w += ((v + 256) % 256) * 256 ^ q } }
+      if ($i != w) bad++ } } END { exit(bad ? 1 : 0) }'; then
+  echo "ok    ldmatrixsub  the 6- and 4-bit containers widen to the bytes the map names"
+else
+  echo "FAIL  ldmatrixsub  a packed fragment is not the map the container describes"; fail=1
+fi
+
+# `stmatrix` is `ldmatrix` backwards. The tile is 0..63 in row-major halves, so the
+# word lane l's fragment holds is (2l) | (2l+1) << 16, and if the store lands it
+# back where the load found it, the tile read back is that word thirty-two times
+# over. The second half is the transposed store: a plain load of what it wrote has
+# to give the word a `.trans` load of the original gives, which is a different
+# closed form, so a store that ignored the transpose disagrees with both.
+runf kernels/stmatrix.ptx stmatrix --grid 1 --threads 32 --buffers 64
+"$WEFT" run kernels/stmatrix.ptx --kernel stmatrix --grid 1 --threads 32 --buffers 64 \
+    --cpu-only --dump 0="$TMP/stmatrix.bin" >/dev/null
+if od -An -tu4 -v "$TMP/stmatrix.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; l = n % 32;
+      if (n < 32) { want = 2 * l + (2 * l + 1) * 65536 }
+      else { a = 8 * (2 * (l % 4)) + int(l / 4); b = 8 * (2 * (l % 4) + 1) + int(l / 4);
+             want = a + b * 65536 }
+      if ($i != want) bad++ } } END { exit(bad ? 1 : 0) }'; then
+  echo "ok    stmatrix  the fragment went back where ldmatrix found it, and the transpose too"
+else
+  echo "FAIL  stmatrix  the round trip is not the tile that was loaded"; fail=1
+fi
+
+# Triton's integer dot: `mma.m16n8k32` with `.s8` operands. The fragments are built so
+# the product is 80 (r + 1) (n + 1) at every one of the 128 outputs, a different
+# number for each, so a map that took a row for a column or widened a byte without a
+# sign lands on a different value.
+runf kernels/triton/dots8.ptx dots8_kernel --grid 1 --threads 32 --buffers 128
+"$WEFT" run kernels/triton/dots8.ptx --kernel dots8_kernel --grid 1 --threads 32 --buffers 128 \
+    --cpu-only --dump 0="$TMP/dots8.bin" >/dev/null
+if od -An -tu4 -v "$TMP/dots8.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; r = int(n / 8); c = n % 8;
+      if ($i != 80 * (r + 1) * (c + 1)) bad++ } } END { exit(bad ? 1 : 0) }'; then
+  echo "ok    dots8  the integer dot is 80 (r + 1) (n + 1) at all 128 outputs"
+else
+  echo "FAIL  dots8  the integer product is not the one the fragments describe"; fail=1
+fi
+
+# The narrow shapes `mma.m16n8k8` (halves), `mma.m16n8k4` (tf32) and `mma.m8n8k16`
+# (bytes). Each is one warp-wide dot, and what is compared is the map from (lane,
+# register, element) to (row, column): `tools/mma_ref.py` multiplies the operands as
+# they are stored, so a fragment read out of the wrong lane lands on a different
+# number. Every input is a small integer, so each product and each sum of them is
+# exact in binary32 and a difference is a map bug, never a rounding one.
+MT="$TMP/mma"
+mkdir -p "$MT"
+if python3 - "$MT" <<'MMAIN'
+import random, struct, sys
+out = sys.argv[1]
+random.seed(7)
+half = {0: 0x0000, 1: 0x3C00, 2: 0x4000, -1: 0xBC00, -2: 0xC000}
+def write(name, vals, fmt):
+    open(out + '/' + name, 'wb').write(struct.pack('<%d%s' % (len(vals), fmt), *vals))
+write('k8a.bin',  [half[random.randint(-2, 2)] for _ in range(16 * 8)], 'H')
+write('k8bt.bin', [half[random.randint(-2, 2)] for _ in range(8 * 8)], 'H')
+write('k4a.bin',  [float(random.randint(-2, 2)) for _ in range(16 * 4)], 'f')
+write('k4b.bin',  [float(random.randint(-2, 2)) for _ in range(4 * 8)], 'f')
+write('s8a.bin',  [random.randint(-4, 4) for _ in range(8 * 16)], 'b')
+write('s8bt.bin', [random.randint(-4, 4) for _ in range(8 * 16)], 'b')
+def pack(vals):
+    return bytes(((vals[i] & 0xF) | ((vals[i + 1] & 0xF) << 4)) for i in range(0, len(vals), 2))
+open(out + '/s4a.bin', 'wb').write(pack([random.randint(-8, 7) for _ in range(16 * 64)]))
+open(out + '/s4bt.bin', 'wb').write(pack([random.randint(-8, 7) for _ in range(8 * 64)]))
+open(out + '/f4a.bin', 'wb').write(pack([random.randint(0, 15) for _ in range(16 * 32)]))
+open(out + '/f4bt.bin', 'wb').write(pack([random.randint(0, 15) for _ in range(8 * 32)]))
+open(out + '/f6a.bin', 'wb').write(bytes(random.randint(0, 63) for _ in range(16 * 32)))
+open(out + '/f6bt.bin', 'wb').write(bytes(random.randint(0, 63) for _ in range(8 * 32)))
+open(out + '/f4ka.bin', 'wb').write(pack([random.randint(0, 15) for _ in range(16 * 64)]))
+open(out + '/f4kbt.bin', 'wb').write(pack([random.randint(0, 15) for _ in range(8 * 64)]))
+MMAIN
+then
+  "$WEFT" run kernels/mma8.ptx --kernel mmak8f16 --grid 32 --threads 32 --buffers 64,32,128 \
+      --load 0="$MT/k8a.bin" --load 1="$MT/k8bt.bin" --cpu-only --dump 2="$MT/k8d.bin" >/dev/null
+  if python3 tools/mma_ref.py k8f16 "$MT/k8a.bin" "$MT/k8bt.bin" "$MT/k8d.bin" >/dev/null; then
+    echo "ok    mma8        m16n8k8 halves: every lane's A row and B column, both halves"
+  else
+    echo "FAIL  mma8        m16n8k8 halves are not the product the fragments describe"; fail=1
+  fi
+  "$WEFT" run kernels/mma8.ptx --kernel mmak4tf32 --grid 32 --threads 32 --buffers 64,32,128 \
+      --load 0="$MT/k4a.bin" --load 1="$MT/k4b.bin" --cpu-only --dump 2="$MT/k4d.bin" >/dev/null
+  if python3 tools/mma_ref.py k4tf32 "$MT/k4a.bin" "$MT/k4b.bin" "$MT/k4d.bin" >/dev/null; then
+    echo "ok    mma8        m16n8k4 tf32: one element a register, K of four"
+  else
+    echo "FAIL  mma8        m16n8k4 tf32 is not the product the fragments describe"; fail=1
+  fi
+  "$WEFT" run kernels/mma8.ptx --kernel mmas8 --grid 32 --threads 32 --buffers 32,32,64 \
+      --load 0="$MT/s8a.bin" --load 1="$MT/s8bt.bin" --cpu-only --dump 2="$MT/s8d.bin" >/dev/null
+  if python3 tools/mma_ref.py s8 "$MT/s8a.bin" "$MT/s8bt.bin" "$MT/s8d.bin" >/dev/null; then
+    echo "ok    mma8        m8n8k16 bytes: four bytes a register, s32 accumulators"
+  else
+    echo "FAIL  mma8        m8n8k16 bytes are not the product the fragments describe"; fail=1
+  fi
+  "$WEFT" run kernels/mma8.ptx --kernel mmak64s4 --grid 32 --threads 32 --buffers 128,64,128 \
+      --load 0="$MT/s4a.bin" --load 1="$MT/s4bt.bin" --cpu-only --dump 2="$MT/s4d.bin" >/dev/null
+  if python3 tools/mma_ref.py k64s4 "$MT/s4a.bin" "$MT/s4bt.bin" "$MT/s4d.bin" >/dev/null; then
+    echo "ok    mma8        m16n8k64 s4: eight nibbles a register, sign kept"
+  else
+    echo "FAIL  mma8        m16n8k64 s4 is not the product the fragments describe"; fail=1
+  fi
+  "$WEFT" run kernels/mma8.ptx --kernel mmak32e2m1 --grid 32 --threads 32 --buffers 128,64,128 \
+      --buffer-bytes 0=2,1=2 --load 0="$MT/f4a.bin" --load 1="$MT/f4bt.bin" \
+      --cpu-only --dump 2="$MT/f4d.bin" >/dev/null
+  if python3 tools/mma_ref.py k32e2m1 "$MT/f4a.bin" "$MT/f4bt.bin" "$MT/f4d.bin" >/dev/null; then
+    echo "ok    mma8        m16n8k32 e2m1: four fp4 codes a register, f32 accumulate"
+  else
+    echo "FAIL  mma8        m16n8k32 e2m1 is not the product the fragments describe"; fail=1
+  fi
+  "$WEFT" run kernels/mma8.ptx --kernel mmak32e3m2 --grid 32 --threads 32 --buffers 128,64,128 \
+      --load 0="$MT/f6a.bin" --load 1="$MT/f6bt.bin" --cpu-only --dump 2="$MT/f6d.bin" >/dev/null
+  if python3 tools/mma_ref.py k32e3m2 "$MT/f6a.bin" "$MT/f6bt.bin" "$MT/f6d.bin" >/dev/null; then
+    echo "ok    mma8        m16n8k32 e3m2: four fp6 codes a register, f32 accumulate"
+  else
+    echo "FAIL  mma8        m16n8k32 e3m2 is not the product the fragments describe"; fail=1
+  fi
+  "$WEFT" run kernels/mma8.ptx --kernel mmak64e2m1 --grid 32 --threads 32 --buffers 128,64,128 \
+      --load 0="$MT/f4ka.bin" --load 1="$MT/f4kbt.bin" --cpu-only --dump 2="$MT/f4kd.bin" >/dev/null
+  if python3 tools/mma_ref.py k64e2m1 "$MT/f4ka.bin" "$MT/f4kbt.bin" "$MT/f4kd.bin" >/dev/null; then
+    echo "ok    mma8        m16n8k64 e2m1: eight fp4 codes a register, k of 64"
+  else
+    echo "FAIL  mma8        m16n8k64 e2m1 is not the product the fragments describe"; fail=1
+  fi
+else
+  echo "FAIL  mma8        no python3 to generate the operands"; fail=1
+fi
+
+# The half read back as a float: `cvt.f32.f16` and `cvt.f32.bf16`, the widening
+# `__half2float` compiles to. Nine bit patterns in, nine words out, a tie, the
+# largest finite value of each type, an infinity, the smallest subnormal and a
+# negative, each the exact inverse of the encode `cvtf16.ptx` checks the other way.
+upwant="3f800000 3f804000 477fe000 c0200000 7f800000 33800000 3f800000 bf800000 7f7f0000"
+printf '\x00\x3C\x02\x3C\xFF\x7B\x00\xC1\x00\x7C\x01\x00\x80\x3F\x80\xBF\x7F\x7F\x00\x00' \
+    > "$TMP/upin.bin"
+"$WEFT" run kernels/cvtf16up.ptx --kernel cvtf16up --grid 1 --buffers 9,9 \
+    --buffer-bytes 0=2 --load 0="$TMP/upin.bin" --cpu-only --dump 1="$TMP/upout.bin" >/dev/null
+upgot=$(od -An -tx4 -v "$TMP/upout.bin" | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')
+if [ "$upgot" = "$upwant " ]; then
+  echo "ok    cvtf16up  a half and a bf16 widen to the float those bits name"
+else
+  echo "FAIL  cvtf16up  got[$upgot] wanted[$upwant ]"; fail=1
+fi
+
 # The descriptor feeding the matrix path: A (16x16 halves) and B (16x8) arrive through
 # `cp.async.bulk.tensor`, `ldmatrix` reads the fragments out of the tiles it filled, and
 # `mma.m16n8k16` multiplies them. A is lower-triangular in halves and B is 1 in column
-# 0, so row r of the product is r+1 in column 0 and zero everywhere else — a tile that
+# 0, so row r of the product is r+1 in column 0 and zero everywhere else, a tile that
 # arrived a row or a column off cannot produce that.
 runf kernels/tmadot.ptx tmadot --grid 32 --threads 32 --buffers 128,256,128,64 \
     --buffer-bytes 1=2,2=2
@@ -374,7 +859,7 @@ fi
 
 # Both sides of a twin comparison, with one extra rule: neither dump may be empty.
 # `cmp` treats two missing files as equal, so a comparison that silently produced
-# nothing would otherwise read as agreement. Defined before its first caller — a
+# nothing would otherwise read as agreement. Defined before its first caller, a
 # function called before its definition is just a missing command.
 same_dumps() {
   local tag="$1" a="$2" b="$3"
@@ -409,7 +894,7 @@ cross async_copy 1 --grid 1024 --threads 64 --buffers 1024,1024
 cross twotile 1 --grid 1024 --threads 64 --buffers 1024,1024
 
 # The same, but the PTX was emitted by LLVM's NVPTX backend (llc), not written
-# by hand — so the input is real compiler output, register allocation and all.
+# by hand, so the input is real compiler output, register allocation and all.
 nvptx() {
   local kernel="$1" idx="$2"; shift 2
   "$WEFT" run kernels/basic.metal      --kernel "$kernel" --cpu-only --dump "$idx"="$TMP/msl.bin" "$@" >/dev/null
@@ -452,8 +937,8 @@ nvptx block_reduce 1 --grid 1048576 --threads 256 --buffers 1048576,4096
 # particular shape: `.maxntid` from `num_warps`, the pointers then
 # `global_scratch` (declared, never read, so not bound) then the scalars, and for
 # `tl.dot` tensor-core instructions. The Metal twin is written from the fragment
-# layout the PTX instruction defines — each lane owns rows g and g+8, columns 2t
-# and 2t+1 — so a mismatch means the layout translation is wrong, not that the
+# layout the PTX instruction defines, each lane owns rows g and g+8, columns 2t
+# and 2t+1, so a mismatch means the layout translation is wrong, not that the
 # two disagree about rounding: the PTX rounds its inputs to integers first, so
 # every product and every sum of sixteen is exact.
 triton() {
@@ -481,7 +966,7 @@ triton() {
 #
 # PTX has a second back end: the same decode emitted as Metal (src/weft_msl.hpp is
 # the runtime behind it). This runs that module on the GPU and compares it with
-# the module the C++ target produced from the same input — so the two sides are
+# the module the C++ target produced from the same input, so the two sides are
 # the same generated code, and a disagreement points at a back end rather than at
 # two implementations that were written to agree.
 #
@@ -507,7 +992,7 @@ gpucol() {
   # occasionally takes the process down on a shader it builds (the same driver
   # that reports XPC_ERROR_CONNECTION_INTERRUPTED), which loses the whole report
   # with the stdout buffer. That is once in a few hundred runs, so the report is
-  # worth asking for three times before calling it a gap — a fault that is really
+  # worth asking for three times before calling it a gap, a fault that is really
   # there fails every attempt and is still named, with every exit status it gave.
   while [ "$attempt" -le 3 ]; do
     st=0
@@ -529,7 +1014,7 @@ gpucol() {
   # a named gap look like an unnamed one.
   local why
   # `LC_ALL=C`: the driver can leave bytes in the stream that are not text, and a
-  # UTF-8-aware sed refuses them — which would lose the reason rather than the
+  # UTF-8-aware sed refuses them, which would lose the reason rather than the
   # noise.
   why="$(printf '%s\n' "$out" | LC_ALL=C sed -n 's/.*no column for this kernel *//p' | head -1)"
   if [ -n "$why" ]; then
@@ -581,7 +1066,7 @@ gpucol kernels/triton/wgmma_tf32.ptx 128 4096 --buffers 32768,32768,32768
 # tile is written, so a larger buffer would have both engines compared over memory
 # neither of them set.
 gpucol kernels/triton/wgmma_fp8.ptx  128 4096 --buffers 2048,256,512 --buffer-bytes 0=1,1=1
-# 8-bit integers: the fp8 geometry byte for byte, so the same buffers — and the
+# 8-bit integers: the fp8 geometry byte for byte, so the same buffers, and the
 # decode alone has to tell signed from unsigned.
 gpucol kernels/triton/wgmma_s8.ptx   128 4096 --buffers 2048,256,512 --buffer-bytes 0=1,1=1
 # Sixteen columns: two N groups, so B's SBO is a real address and a lane holds
@@ -632,8 +1117,8 @@ gpucol kernels/ptxsrftmix.ptx         64 4096 --textures 64x64 --samplers neares
 # 64-bit floating point, which this GPU has no instruction for: the GPU column runs
 # the software double over the bits and the CPU column runs the host's own, so the
 # two are the same arithmetic and the comparison is byte for byte. The input is
-# written as raw doubles — the `0d` literals in the kernel used to have no GPU
-# spelling at all — and the answer comes back as one float a lane.
+# written as raw doubles, the `0d` literals in the kernel used to have no GPU
+# spelling at all, and the answer comes back as one float a lane.
 python3 - "$TMP/f64in.bin" <<'PY'
 import struct, sys
 vals = [0.0, 1.0, -1.0, 0.5, 3.0, 1e-300, 2.0**-1022, 2.0**60, -7.25, 1e300,
@@ -654,8 +1139,8 @@ gpucol kernels/ptxgather3d.ptx        64 4096 --textures 64x64x8
 gpucol kernels/ptxgather1d.ptx        64 4096 --textures 64x1
 gpucol kernels/ptxgathercube.ptx      64 4096 --textures 64x64c
 # `ldmatrix` hands each lane a row address that another lane supplied, so the tile
-# is only reachable from a backend that holds a whole warp. The two address forms —
-# a named shared symbol and the register a lane computed — must give the same word,
+# is only reachable from a backend that holds a whole warp. The two address forms , 
+# a named shared symbol and the register a lane computed, must give the same word,
 # and the transposed form must give the transpose; both are checked against the
 # position each value came from rather than against each other.
 python3 -c 'import struct,sys; open(sys.argv[1],"wb").write(struct.pack("<64H",*range(64)))' \
@@ -717,7 +1202,7 @@ fi
 
 # A double is 64 bits, so the relay carries it as two words. `(uint64_t)1.0` is 1 and
 # its pattern is 1, so a relay that packed the value instead of the bits wrote zero
-# here while both columns compiled — the sum is checked against the lane id instead.
+# here while both columns compiled, the sum is checked against the lane id instead.
 if "$WEFT" run kernels/spirv/dblshfl.spv --kernel dblshfl --cpu-only --grid 32 --threads 32 --buffers 32 --dump 0="$TMP/dblshfl.bin" >/dev/null 2>&1; then
   if python3 - "$TMP/dblshfl.bin" <<'PY'
 import struct, sys
@@ -824,7 +1309,7 @@ gpucol kernels/ptx3d.ptx             256 65536 --textures 64x64x8 --samplers nea
 # that happens to hold the same number.
 gpucol kernels/ptxcube.ptx          256 65536 --textures 64x64c --samplers nearest/clamp
 # The bit tricks: funnel shifts, `prmt`, `mul.hi` at 32 and 64 bits, and the
-# float-integer conversions. This one used to be a skip — the emitted source
+# float-integer conversions. This one used to be a skip, the emitted source
 # compiled and the pipeline step then killed the compiler, because a `mul.hi.u64`
 # was a `__int128` multiply and this host's back end cannot lower one in a kernel
 # this size. The high word is four 32x32 products now, so it has a GPU column of
@@ -841,7 +1326,7 @@ gpucol kernels/mufu.ptx             256 65536 --buffers 65536
 # mask stands in with the fold's identity, which keeps a partial mask exact.
 gpucol kernels/triton/reduce.ptx     128 4096 --buffers 4096,32768
 # A 64-bit `red` has no result, so an order-free operation is two 32-bit atomics
-# on the halves — the low half's carry into the high one for add/sub, a fold per
+# on the halves, the low half's carry into the high one for add/sub, a fold per
 # half for and/or/xor. Nothing is read back, so nothing needs the pair as one
 # value, and the answer is order-free either way.
 gpucol kernels/red64.ptx             256 4096 --buffers 8,8,8,8
@@ -849,12 +1334,12 @@ gpucol kernels/red64.ptx             256 4096 --buffers 8,8,8,8
 # the header, but every entry point that could read, write, exchange or compare one
 # is constrained to 32-bit types, and the two that are not (`atomic_max_explicit` /
 # `atomic_min_explicit`) compile and are then refused by the device at pipeline
-# creation — tools/atom64_probe.mm asks for each answer separately. So the emission
+# creation, tools/atom64_probe.mm asks for each answer separately. So the emission
 # builds one out of the 32-bit atomics the hardware does have: a lock on the word,
 # held while the pair is read and written as two 32-bit atomics. Its 32-bit
 # counters are `red`s by the dead-result rewrite, which is what ptxas emits for a
-# dropped result. The launch stays parallel — one warp per threadgroup, because a
-# thread that spins needs a SIMD group of its own — at 10 ms for 4,096 lanes and
+# dropped result. The launch stays parallel, one warp per threadgroup, because a
+# thread that spins needs a SIMD group of its own, at 10 ms for 4,096 lanes and
 # 150 ms for 262,144, against the CPU's 0.4 ms and 23 ms.
 gpucol kernels/atom.ptx              256 4096
 # The kernels whose GPU form this host has no answer for. Each is a named skip
@@ -961,6 +1446,11 @@ spvgpu tex3d        threed    --grid 65536 --buffers 65536 --textures 64x64x8 \
 spvgpu gl1d        gl1d    --grid 65536 --buffers 65536 --textures 64x1 --samplers nearest/clamp
 spvgpu gl2d        gl2d    --grid 65536 --buffers 65536 --textures 64x64 --samplers nearest/clamp
 spvgpu glcube      glcube  --grid 65536 --buffers 65536 --textures 64x64c --samplers nearest/clamp
+# A gather of the same cube: the direction picks the face, and the footprint is read
+# off it, because Metal has no `gather` on a `texturecube` bound for sampling. Four
+# words a lane, so the buffer is four times the lane count.
+spvgpu glcubegather glcubegather --grid 65536 --buffers 262144 --textures 64x64c \
+  --samplers nearest/clamp
 # `OpImageGather`: the four texels of a 2x2 footprint, one per channel, which is
 # the SPIR-V twin of PTX's `tld4`. It carries a component operand the sample
 # instructions do not, so its image operands start a word later.
@@ -970,7 +1460,7 @@ spvgpu glgather    glgather --grid 65536 --buffers 65536 --textures 64x64 --samp
 spvgpu glgatherarray glgatherarray --grid 65536 --buffers 65536 --textures '64x64*4' --samplers nearest/clamp
 # A 2-D group. `LocalSize 8 8 1` fixes how a lane id decomposes, so the kernel
 # rebuilds its own flat lane from `LocalInvocationId` and writes a 1 where that
-# equals the global id modulo the group, a 0 where it does not — which is what a
+# equals the global id modulo the group, a 0 where it does not, which is what a
 # wrong decomposition would produce.
 spvgpu glgroup     glgroup  --grid 65536 --buffers 65536
 spvgpu matk         matk      --grid 65536 --buffers 65536,65536
@@ -986,7 +1476,7 @@ spvgpu atomf        atomf     --grid 1024 --threads 1024 --buffers 1024,1024,2
 # refuses it outside a Shader module (`requires one of these capabilities: Shader`),
 # and this front end decodes OpenCL/Kernel modules. The PTX front end's `tld4` is the
 # only gather there is to translate, and it has a column above.
-# The 64-bit counter here reads nothing back — `%old64` is written and never used —
+# The 64-bit counter here reads nothing back, `%old64` is written and never used , 
 # and an atomic nobody reads the result of is a reduction, so it takes the form
 # that exists at 64 bits: two 32-bit atomics on the halves. That is what makes
 # this a column rather than a refusal.
@@ -1001,7 +1491,7 @@ spvgpu atom64k      atom64    --grid 4096 --threads 32 --buffers 1,1,1,1,1,1
 # warp target could carry them, and they take the same one-thread walk.
 spvgpu atom64rw     atom64rw  --grid 64 --threads 32 --buffers 1,1
 # A loop around the pair: an entry block, a loop block carrying two OpPhi values,
-# and an exit block. This is the shape the refusal used to name — the warp target
+# and an exit block. This is the shape the refusal used to name, the warp target
 # took one block only, so a loop could not reach it and the pair fell through to the
 # per-lane back end, which cannot host a contending section. Every lane adds four to
 # the counter and writes the sum of its four old values to its own slot.
@@ -1015,19 +1505,19 @@ spvgpu atom64bar   atom64bar  --grid 32 --threads 32 --buffers 1,32
 # The rendezvous family in one module: a ballot of the even lanes, a 64-bit
 # broadcast from lane 0, a barrier, and the pair. One thread owns the lanes, so the
 # vote is a relay through the warp's slot array and the sweep brings the lanes back
-# in order to read it — no hardware ballot is involved and none is available. Two
+# in order to read it, no hardware ballot is involved and none is available. Two
 # of those votes are `all-equal`, over a 64-bit value and over a `ulong2`, each one
 # that has to be true and one that has to be false, and each is written as a residual
 # so a wrong answer is a nonzero slot.
 spvgpu atom64vote  atom64vote --grid 32 --threads 32 --buffers 1,32,32,32,32,32,32
-# The OpenCL.std imports rather than the native instructions — what LLVM's SPIR-V
+# The OpenCL.std imports rather than the native instructions, what LLVM's SPIR-V
 # backend actually emits: `sub_group_ballot`, `sub_group_reduce_add`, a 64-bit
 # `sub_group_broadcast`, and a reduce and a scan over 64-bit values, beside a
 # barrier and the pair. The answers are worked out by hand in the module: 0x55555555,
 # 496, 528, the prefix (l+1)(l+2)/2, and the counter in every slot.
 spvgpu atom64sub   atom64sub  --grid 32 --threads 32 --buffers 1,32,32,32,32,32,32,32
 # A `double` on a GPU with no fp64. Metal rejects the type, so the runtime carries it
-# in software — exact IEEE-754 over the 64-bit integers that do exist — and this row
+# in software, exact IEEE-754 over the 64-bit integers that do exist, and this row
 # is the proof: the cpu column computes with the host's own doubles and the two are
 # compared bit for bit, over multiply, add, divide, a catastrophic subtraction, the
 # four roundings, a trip through binary32, a comparison, a cast and a subgroup
@@ -1036,15 +1526,97 @@ spvgpu fp64       fp64       --grid 32 --threads 32 --buffers 32,320,64,32
 # The same software double, two components at a time: a `double2` built, added,
 # multiplied, divided, subtracted and taken apart. The per-component path has to
 # call the fp64 helper rather than apply the operator to the two 64-bit words, and
-# an operator there adds significands as integers — a wrong number, not a refusal.
+# an operator there adds significands as integers, a wrong number, not a refusal.
 spvgpu dvec       dvec       --grid 32 --threads 32 --buffers 32,128
+# The transcendentals over that same software double: thirty-one of them, one a
+# column, `exp`, `log`, `sin`, `atan`, `asinh`, `hypot`, `pow`, `fmod`, `sinpi`, the
+# error and gamma functions and the rest, each one an OpenCL.std instruction the CPU
+# column used to answer with its host libm while the GPU column refused it for want
+# of fp64. Both columns now call the same integer-only library in
+# `src/weft_f64.hpp`, so the row is a bit comparison across 2,048 doubles, not an
+# agreement to within an ulp, an identity. Sixty-four lanes run it: the lower half the
+# number itself, the upper half the same number 2^-24 down, so every instruction is
+# answered across two exponents as well as across the input set. The last five answer
+# twice: `frexp`,
+# `modf`, `sincos`, `remquo` and `fract` write their second value through the pointer
+# the instruction carries, into a2 for the `double` halves and a3 for the integers, and
+# the row compares those too. `tools/f64_math.py` is the other half of the proof:
+# every one of them swept against a 1,200-digit decimal reference, correctly rounded, at
+# the ends of the range and on subnormals too.
+spvgpu f64math    f64math    --grid 64 --threads 32 --buffers 64,2048,192,128
+# The same set at its edge, and under `--exact`: zeros of both signs, infinities, a
+# NaN, a subnormal, the top of the exponent range, division by zero and every domain
+# error in the set. The comparison is word for word, because `max |diff|` cannot see a
+# NaN (a NaN difference is not greater than anything) and cannot see the sign of a zero
+# (0 - (-0) is 0), and those are the two things a software double is most likely to
+# disagree about. Ten of its columns are the four that answer twice, `frexp`, `modf`,
+# `sincos` and `remquo`, read through the pointers the instructions carry, the doubles
+# into a2 and the integers into a3, so a fraction whose exponent came from another
+# input, or a cosine that is a number where the sine is a NaN, cannot pass. Five
+# `fract` columns are there too: an infinity answers the largest value under one, -0.0
+# a positive zero, the smallest subnormal itself, 1.5 a half and -3 zero, and each
+# writes its floor through the pointer the instruction carries, where the comparison
+# reads it as a word of its own.
+spvgpu f64edge   f64edge   --grid 32 --threads 32 --buffers 32,1408,320,320 --exact
+# The same treatment for the float set. Every instruction is one `src/soft_math.hpp`
+# compiles into both columns rather than either engine's builtin: this GPU's `sqrt` is
+# bit-for-bit `x * rsqrt(x)` and its `log2` matches the correctly rounded value 1.7% of
+# the time, so the builtins were never the same program and no tolerance makes them so.
+# Word for word, over thirty-four single columns and the five that answer twice, on
+# sixty-four lanes, half at the value itself and half 2^-24 below it, so every column is
+# asked across two exponents and not just across the input set.
+spvgpu f32math    f32math    --grid 64 --threads 32 --buffers 64,2496,256,256 --exact
+# The float set at its edge, and under `--exact`: both signs of zero, an infinity, a
+# NaN, the smallest subnormal, the top of the range, division by zero and every domain
+# error in the set. Word for word, because `max |diff|` cannot see a NaN and cannot see
+# the sign of a zero. Ten of its columns are the four that answer twice, read through
+# the pointers the instructions carry, the floats into a2 and the integers into a3, so
+# a `frexp` that disagrees about the exponent of the smallest subnormal, a `modf` that
+# loses the sign of -0.0's whole part, a `sincos` whose cosine of an infinity is a
+# number, or a `remquo` whose quotient of a zero divisor is one, cannot pass.
+# Its five `fract` columns are instruction 30, which answers twice: the fraction is
+# returned and the floor is written through the pointer, so an infinity, a negative
+# zero, 1e30, 1.5 and -3 are asked for both halves. The ones that widen to the fp64
+# text are asked at their ends as well, `erf` of an infinity, `erfc` of -1, `cbrt` of -0,
+# `hypot` of an infinity, `log1p` of -0, beside `acosh` below its domain, `asinh` of
+# -infinity and `exp10` past the range, because a narrowing is where a sign goes.
+spvgpu f32edge   f32edge   --grid 32 --threads 32 --buffers 32,1696,320,320 --exact
+# Whether that program is *right* is a different question, and this is the row that
+# asks it: every function swept against a 1,200-digit reference and counted in float32
+# ulps, gated on `tools/f32_baseline.json` so a change cannot quietly cost accuracy.
+# Everything is correctly rounded, all forty-six at zero ulp: each function is evaluated
+# in a float pair, forty-eight bits, and Ziv's test decides whether the high word is
+# the float; when it cannot, the fp64 text answers instead (widen exactly, answer, narrow
+# once). The slow road is the exception the answer is certainly right on, not the price
+# of every call. The file
+# records where each one stands; `python3 tools/f32_math.py --write-baseline` is how it
+# is refreshed.
+if f32math_out="$(python3 tools/f32_math.py 2>&1)"; then
+  echo "ok    f32math:ulp  $(printf '%s\n' "$f32math_out" | grep 'functions swept')"
+else
+  echo "FAIL  f32math:ulp"
+  printf '%s\n' "$f32math_out" | tail -14 | sed 's/^/      /'
+  fail=1
+fi
+# The row above says the two engines answer the same number. This one says the
+# number is right: every transcendental swept against a 1,200-digit `decimal`
+# reference and counted in ulps, over the range, the ties, the subnormals and both
+# ends of it. It is the accuracy claim itself, not a fixed vector, so it fails the
+# day a change costs a bit anywhere in the library.
+if f64math_out="$(python3 tools/f64_math.py 2>&1)"; then
+  echo "ok    f64math:ulp  $(printf '%s\n' "$f64math_out" | grep 'functions swept')"
+else
+  echo "FAIL  f64math:ulp"
+  printf '%s\n' "$f64math_out" | tail -12 | sed 's/^/      /'
+  fail=1
+fi
 # A helper function: the entry point calls a defined function twice, so the module has
 # two functions rather than one and the call is inlined where it is made. The second
-# call goes through the same helper ids again — the case a one-call-site inliner gets
-# wrong — and the values are hand-checkable: twice(x) = 2x + 1.
+# call goes through the same helper ids again, the case a one-call-site inliner gets
+# wrong, and the values are hand-checkable: twice(x) = 2x + 1.
 spvgpu helper     helper     --grid 32 --threads 32 --buffers 32,64
 # A matrix that is not square: 2 rows by 3 columns, its 3x2 transpose, and a vector
-# each way. A square shape cannot tell a row from a column — they are the same size —
+# each way. A square shape cannot tell a row from a column, they are the same size , 
 # so the oblong ones are what pin the layout.
 spvgpu matns      matns      --grid 32 --threads 32 --buffers 32,128
 # The fold in floats: reduce add/min/max and an inclusive and an exclusive scan,
@@ -1058,10 +1630,10 @@ spvgpu subfold    subfold    --grid 32 --threads 32 --buffers 256
 # the grid goes wrong: only 24 of the 32 lanes ran, so the ones past the grid hold
 # nothing and a tree that reads them answers with whatever was there. The hand
 # numbers no longer fit, so this row compares the two engines rather than a
-# residual — that comparison is what caught the 82-off sum.
+# residual, that comparison is what caught the 82-off sum.
 spvgpu subfold:ragged=subfold subfold --grid 24 --threads 32 --buffers 256
 # The kernel row proves the path end to end; this one proves each operation on its
-# own, over a value set per operation — every rounding, every comparison against
+# own, over a value set per operation, every rounding, every comparison against
 # both signs and zero, subnormals, the extremes of the exponent range, and the
 # conversions in both directions, including the ones the specification leaves
 # undefined and which are therefore not compared. The reference is this machine's
@@ -1102,7 +1674,7 @@ else
 fi
 
 # wgmma is a warpgroup (128-lane) instruction whose operands come from shared
-# memory through a descriptor — so no lane reads another lane's register, and it
+# memory through a descriptor, so no lane reads another lane's register, and it
 # lowers on the per-lane backend where the threadgroup is the warpgroup. The
 # reference multiplies the input tiles directly, which is independent of both the
 # descriptor decode and the core-matrix walk the kernel itself uses.
@@ -1117,7 +1689,7 @@ else
 fi
 
 # The same instruction with bf16 operands. The element is 16 bits either way, so
-# the core-matrix layout is the one above and only the decode changes — and the
+# the core-matrix layout is the one above and only the decode changes, and the
 # reference can tell the two apart, because the same bits are different numbers
 # in f16 and in bf16.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/wab.bin" "$TMP/wbb.bin" bf16 2>"$TMP/wgb.log" \
@@ -1132,7 +1704,7 @@ fi
 
 # tf32: the same instruction and descriptor, one element size up. A 16-byte
 # core-matrix row holds four 32-bit values instead of eight halves, so K is 8 and
-# B's core matrix is four columns wide — the two places the geometry could have
+# B's core matrix is four columns wide, the two places the geometry could have
 # been written into the decode rather than derived from the element size.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/wa32.bin" "$TMP/wb32.bin" tf32 2>"$TMP/wg32.log" \
    && "$WEFT" run kernels/triton/wgmma_tf32.ptx --kernel wgmma_tf32_kernel --cpu-only \
@@ -1147,7 +1719,7 @@ fi
 # fp8: the widest geometry and the two formats. A one-byte element puts sixteen
 # to a core-matrix row, so K is 32 and B's whole 8 columns fit inside one core.
 # The two formats share that layout exactly and differ only in decode, so the e5m2
-# sample is the e4m3 one with the format swapped — the same instruction stream a
+# sample is the e4m3 one with the format swapped, the same instruction stream a
 # compiler emits for the other format, and a reference that can tell them apart.
 for f8 in e4m3 e5m2; do
   if [ "$f8" = e5m2 ]; then
@@ -1168,7 +1740,7 @@ done
 
 # The integer twins: the same bytes read as signed and as unsigned integers. The
 # layout is the fp8 one to the byte, so a disagreement here is a decode rather
-# than a walk — and the reference reads the same bytes as different numbers, which
+# than a walk, and the reference reads the same bytes as different numbers, which
 # is how a decode wired to the wrong signedness is caught.
 for i8 in s8 u8; do
   if [ "$i8" = u8 ]; then
@@ -1203,7 +1775,7 @@ else
 fi
 
 # MN-major operands: the same logical tiles staged the other way up, so the same
-# reference applies — and a walk that read the wrong direction inside the 16-byte
+# reference applies, and a walk that read the wrong direction inside the 16-byte
 # chunk would multiply the wrong pairs rather than fail to compile.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/wta.bin" "$TMP/wtb.bin" f16 2>"$TMP/wt.log" \
    && "$WEFT" run kernels/triton/wgmma_trans.ptx --kernel wgmma_trans_kernel --cpu-only \
@@ -1245,7 +1817,7 @@ fi
 # The narrow swizzle is the same instruction with a different mode in the
 # descriptor, and it separates the two masks: the XOR mask is one bit here and
 # seven for the wide atom, while the mask that holds a byte inside an atom is 31
-# either way — swapping them reads the wrong halves and only this fixture says so.
+# either way, swapping them reads the wrong halves and only this fixture says so.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/w3a.bin" "$TMP/w3b.bin" f16 2>"$TMP/w3.log" \
    && "$WEFT" run kernels/triton/wgmma_swz32.ptx --kernel wgmma_swz32_kernel --cpu-only \
         --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
@@ -1282,7 +1854,7 @@ else
 fi
 
 # The swizzle on an MN-major operand: M is the contiguous direction, so the walk
-# mirrors the K-major one — the byte's place inside an atom is its M offset and the
+# mirrors the K-major one, the byte's place inside an atom is its M offset and the
 # K row is one atom wide. B stays K-major and both tiles are mode 1.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/w6a.bin" "$TMP/w6b.bin" f16 2>"$TMP/w6.log" \
    && "$WEFT" run kernels/triton/wgmma_swztrans.ptx --kernel wgmma_swztrans_kernel --cpu-only \
@@ -1295,8 +1867,8 @@ else
 fi
 
 # The swizzle does not care how wide an element is: it places bytes, and the width
-# only decides how many of them a chunk of K holds. tf32 is the wide end — K is 8 and
-# a row of the tile is a quarter of the atom — and an atom measured in elements
+# only decides how many of them a chunk of K holds. tf32 is the wide end, K is 8 and
+# a row of the tile is a quarter of the atom, and an atom measured in elements
 # rather than bytes lands every row on the wrong half.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/w7a.bin" "$TMP/w7b.bin" tf32 2>"$TMP/w7.log" \
    && "$WEFT" run kernels/triton/wgmma_swztf32.ptx --kernel wgmma_swztf32_kernel --cpu-only \
@@ -1309,7 +1881,7 @@ else
 fi
 
 # The narrow end: one byte an element, so K is 32 and the byte column runs across
-# the atom's chunks — the phase and the column overlap, which no wider element does.
+# the atom's chunks, the phase and the column overlap, which no wider element does.
 # e5m2 is the same geometry, so the same fixture with the format swapped.
 for f8 in e4m3 e5m2; do
   if [ "$f8" = e5m2 ]; then
@@ -1403,7 +1975,7 @@ fi
 
 # e5m2 is the other fp8 format and the same instruction: 5 exponent bits, 2
 # mantissa bits, infinities and NaN at the top exponent. Same layout, different
-# decode — so this catches a decoder wired to the wrong format.
+# decode, so this catches a decoder wired to the wrong format.
 if python3 kernels/triton/fp8_ref.py gen 512 256 "$TMP/e5a.bin" "$TMP/e5b.bin" e5m2 2>"$TMP/e5.log" \
    && "$WEFT" run kernels/triton/dote5m2.ptx --kernel dote5m2_kernel --cpu-only \
         --grid 1 --threads 32 --buffers 512,256,128 --buffer-bytes 0=1,1=1 \
@@ -1438,7 +2010,7 @@ else
   echo "FAIL  triton:abi"; echo "$meta" | sed 's/^/      /'; fail=1
 fi
 
-# A barrier inside a loop, from real codegen — this is the resumable path.
+# A barrier inside a loop, from real codegen, this is the resumable path.
 "$WEFT" run kernels/basic.metal --kernel reduce_sum --cpu-only --grid 1048576 --threads 256 --buffers 1048576,4096 --dump 1="$TMP/red_ref.bin" >/dev/null
 "$WEFT" run kernels/cuda/reduce.ptx --kernel reduce --cpu-only --grid 1048576 --threads 256 --buffers 1048576,4096 --dump 1="$TMP/red_ptx.bin" >/dev/null
 if cmp -s "$TMP/red_ref.bin" "$TMP/red_ptx.bin"; then
@@ -1524,7 +2096,7 @@ atomcheck() {
 atomcheck lanes
 atomcheck warp
 
-# bar.red — a threadgroup-wide fold, checked against arithmetic. Each group's
+# bar.red, a threadgroup-wide fold, checked against arithmetic. Each group's
 # record depends only on how many threads it actually has, so a grid whose last
 # group is short must record a different answer, and no group may see another
 # group's slots.
@@ -1657,12 +2229,12 @@ esac
 # 64-bit atomics whose old value is read back, checked against arithmetic: the
 # olds of `+= 1` are a permutation of 0..n-1, the olds of `max 1` on a counter that
 # starts at 0 are one 0 and n-1 ones, and the signed `min -1` takes the counter to
-# -1 with the olds summing to -(n-1) — unsigned ordering would leave both at 0,
+# -1 with the olds summing to -(n-1), unsigned ordering would leave both at 0,
 # which is what makes it the signed check.
 spvatom64() {
   local n=4096 f=kernels/spirv/atom64.spv b
   # The counters have to start at zero for the arithmetic below to mean anything,
-  # and the launcher's generator fills a buffer with float patterns — so the eight
+  # and the launcher's generator fills a buffer with float patterns, so the eight
   # bytes of each counter are supplied from a file instead.
   printf '\0\0\0\0\0\0\0\0' > "$TMP/a64_zero.bin"
   local io=()
@@ -1691,7 +2263,7 @@ spvatom64() {
   [ "$b5" -eq "$(( 1 - n ))" ] || bad="$bad smin_olds=$b5"
   # The same six counters on the GPU, against the same arithmetic. The launcher's
   # own compare reads these buffers as floats, and a u64 counter that lost 548
-  # increments is a 7.7e-43 difference in that view — so it said "agree" about a
+  # increments is a 7.7e-43 difference in that view, so it said "agree" about a
   # wrong answer. This one compares integers, and compares them because the answer
   # is known, not because two engines were asked the same question.
   local gbad=""
@@ -1750,7 +2322,7 @@ fi
 
 # Both execution backends, same input, byte for byte: the per-lane state machine
 # and the warp-vector backend (WEFT_WARP=1) must agree on every kernel.
-# Same kernel twice — once per execution backend — into $3. Kernels differ in how
+# Same kernel twice, once per execution backend, into $3. Kernels differ in how
 # many buffers they take, so try the common shapes rather than hard-coding one.
 backend_run() {
   local prefix="$1" file="$2" k="$3" dst="$4" n
@@ -1789,7 +2361,7 @@ backends_cmp kernels/bred.ptx  bred
 
 # A render pass. The target is 64x64 pixels and every stage is one invocation per
 # pixel, so the CPU's pixel loop and the GPU's rasteriser have to land on the same
-# pixel for every pixel — the buffer is `in[y * 64 + x]`, so an off-by-one in the
+# pixel for every pixel, the buffer is `in[y * 64 + x]`, so an off-by-one in the
 # position mapping moves the input rather than hiding.
 rendertest() {
   local file="$1" name="$2" target="$3"; shift 3
@@ -1863,7 +2435,7 @@ hop_msg="$("$WEFT" run kernels/tilegroup.metal --kernel fragtilehop --render 64x
 
 # A mesh object stage. A mesh pipeline needs MTLGPUFamilyApple9 (M3 or later), but
 # a mesh stage's output is only buffers, and the translation of it to plain compute
-# is what runs on any Metal device — so this is checked twice: the kernel's two
+# is what runs on any Metal device, so this is checked twice: the kernel's two
 # blocks against a reference model recomputed independently in Python, and the GPU
 # run against the CPU one, on the same machine, bit for bit. One mesh per 32-lane
 # threadgroup is the rule both use to find each mesh's block.
@@ -1875,10 +2447,10 @@ if "$WEFT" run kernels/mesh.metal --kernel meshmaker --grid 256 --buffers 256 \
 import struct, sys
 # The GPU ran this too: a mesh stage is lowered to plain compute, so there is a
 # Metal answer to diff against on a device with no mesh pipeline at all. A host
-# with no Metal backend has no GPU column, and says so instead — that is the one
+# with no Metal backend has no GPU column, and says so instead, that is the one
 # case where the model alone is the check.
 log = open(sys.argv[4], encoding='utf-8').read()
-if 'unavailable' not in log and '— agree' not in log:
+if 'unavailable' not in log and ': agree' not in log:
     sys.exit(1)
 inp = open(sys.argv[1], 'rb').read()
 v = open(sys.argv[2], 'rb').read()
@@ -1935,7 +2507,7 @@ if "$WEFT" run kernels/taskmesh.metal --kernel meshuse --grid 96 --buffers 8 \
               "$TMP/tm.log" <<'TASKPY'
 import struct, sys
 tlog = open(sys.argv[5], encoding='utf-8').read()
-if 'unavailable' not in tlog and '— agree' not in tlog:
+if 'unavailable' not in tlog and ': agree' not in tlog:
     sys.exit(1)
 res = open(sys.argv[1], 'rb').read()
 v = open(sys.argv[2], 'rb').read()
@@ -2098,7 +2670,7 @@ else
 fi
 
 # Portable math: 54 functions over 65,536 lanes, dumped from both engines and
-# compared as bytes. Identical is the whole claim — sqrt, rsqrt, log2, exp2, pow,
+# compared as bytes. Identical is the whole claim, sqrt, rsqrt, log2, exp2, pow,
 # mix, dot, length, distance and normalize are the same code on both sides, so a
 # single differing bit is a failure rather than a tolerance.
 rm -f /tmp/weft_math_cpu.bin /tmp/weft_math_gpu.bin /tmp/weft_math_in.bin
@@ -2158,7 +2730,7 @@ def refs(a, b, u, a3, b3, a4, b4):
     d = dot3(nb, n)
     k = 1.0 - 0.5625 * (1.0 - d * d)
     # refract(I, N, eta) = eta*I - (eta*dot(N,I) + sqrt(k))*N, and zero when the
-    # angle is past the critical one — the same text Metal's documentation gives.
+    # angle is past the critical one, the same text Metal's documentation gives.
     rf = [0.0, 0.0, 0.0] if k < 0 else [0.75 * n[i] - (0.75 * d + math.sqrt(k)) * nb[i]
                                         for i in range(3)]
     return {
@@ -2255,7 +2827,56 @@ else
   echo "FAIL  math:accuracy  no python3 to compare against libm"; fail=1
 fi
 
-# ---- every ptx/spv fixture is compared by a check that names it ----
+# An image whose texel is a half, end to end: the launcher binds two bytes per texel
+# and the module reads them through a 16-bit element type. The texture generator's
+# values are exactly representable in a half (that is why the round trip below is an
+# equality and not a tolerance), so every output must be its own half round trip and
+# inside the generator's range. A reader type with the width and no decode, a
+# `uint16_t`, would pass the first test and fail the second with 15360 for `0x3C00`,
+# which is exactly the mistake this is here to catch.
+if [ -n "$CPUMODE" ]; then
+  echo "skip  texel:halfimg  no gpu on this host"
+else
+  "$WEFT" run kernels/spirv/halftex.spv --kernel halftex --grid 256 --threads 256 \
+      --textures 16x16 --texel-bytes 2 --cpu-only --dump 0="$TMP/ht.bin" >/dev/null 2>&1
+  if python3 - "$TMP/ht.bin" <<'HALFIMG'
+import struct, sys
+raw = open(sys.argv[1], 'rb').read()
+if len(raw) != 256 * 4:
+    sys.exit(1)
+vals = struct.unpack('<256f', raw)
+for v in vals:
+    if not (0.0 <= v < 4.0):
+        sys.exit(1)
+    if struct.unpack('<e', struct.pack('<e', v))[0] != v:
+        sys.exit(1)
+sys.exit(0)
+HALFIMG
+  then
+    echo "ok    texel:halfimg  a 16x16 half image reads back as the halves it holds"
+  else
+    echo "FAIL  texel:halfimg  a two-byte texel did not read as a value in range"; fail=1
+  fi
+fi
+
+# A 16-bit image texel. The sample path is two steps, `sizeof(T)` bytes at the
+# image's element width, then `(float)T`, so the type named for an R16Float texel
+# has to be a width *and* a decode. `uint16_t` satisfies the first and answers the
+# bit pattern (0x3C00 read as 15360), which is what makes this worth pinning: the
+# ordinary value, the largest finite half, and the smallest subnormal.
+CXX=${CXX:-clang++}
+if "$CXX" -std=c++20 -O1 -Iinclude -Iruntime tools/half_texel.cpp -o "$TMP/half_texel" \
+    2>"$TMP/halftex.log"; then
+  ht=$("$TMP/half_texel")
+  if [ "$ht" = "1 65504 5.96046e-08 2" ]; then
+    echo "ok    texel:half  a two-byte texel reads back as the half it holds"
+  else
+    echo "FAIL  texel:half  got[$ht]"; fail=1
+  fi
+else
+  echo "FAIL  texel:half  the probe did not compile: $(head -2 "$TMP/halftex.log")\n"; fail=1
+fi
+
 # A `.ptx` or `.spv` sample that nothing diffs is a translation nobody checked, and
 # a hand-written twin that no call invokes can drift away from the kernel it
 # mirrors with nothing to notice. The inventory is the directory, the coverage is

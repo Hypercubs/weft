@@ -9,7 +9,7 @@
 //
 // Reading a surface through a filter was refused: the write needs a read-write
 // view and Metal has no filtered sample of one. The same texture bound a second
-// time as a sampled view is the answer, so this is a comparison again — and because
+// time as a sampled view is the answer, so this is a comparison again, and because
 // the write comes first and a barrier separates them, `t0` is this lane's own value.
 // A read that saw a stale texel answers with the previous contents of the image.
 .version 7.0

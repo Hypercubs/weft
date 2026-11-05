@@ -10,7 +10,7 @@
 //
 // The two address forms have to produce the same word, which is what makes this a
 // check rather than two runs of the same path. The second form is also what the
-// instruction is for on a GPU — lane 8k+i supplies row i of matrix k — so the
+// instruction is for on a GPU, lane 8k+i supplies row i of matrix k, so the
 // register it reads is a peer's, and only a backend that holds the whole warp can
 // run it.
 .version 7.0

@@ -1,0 +1,56 @@
+// `cp.reduce.async.bulk` with `.inc` and `.dec`, the two bounded integer forms.
+//
+//     counters 0, 1, 2, 3 with bounds 2, 2, 5, 0
+//     .inc  ->  1, 2, 3, 0      (a counter at or past its bound goes to zero)
+//     .dec  ->  2, 0, 1, 0      (zero, or past the bound, takes the bound)
+//
+// The bound is the *source element*, "a result in the range [0..x] where x is the
+// value at the source state space", so the tile carries it rather than a constant.
+// A plain `+1` would answer 4 for the third counter and 4 for the fourth, and an
+// unbounded decrement would wrap 0 to 0xFFFFFFFF, so both forms are distinguished
+// by these eight numbers.
+.version 7.0
+.target sm_90
+.address_size 64
+
+.visible .entry mbarredinc(
+    .param .u64 mbarredinc_param_0,   // the four counters `.inc` walks
+    .param .u64 mbarredinc_param_1    // the same four for `.dec`
+)
+{
+    .shared .align 16 .b32 bound[4];
+
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [mbarredinc_param_0];
+    ld.param.u64 %rd2, [mbarredinc_param_1];
+
+    mov.u32 %r1, 0;
+    st.global.u32 [%rd1], %r1;
+    st.global.u32 [%rd2], %r1;
+    mov.u32 %r1, 1;
+    st.global.u32 [%rd1+4], %r1;
+    st.global.u32 [%rd2+4], %r1;
+    mov.u32 %r1, 2;
+    st.global.u32 [%rd1+8], %r1;
+    st.global.u32 [%rd2+8], %r1;
+    mov.u32 %r1, 3;
+    st.global.u32 [%rd1+12], %r1;
+    st.global.u32 [%rd2+12], %r1;
+
+    mov.u32 %r2, 2;
+    st.shared.u32 [bound], %r2;
+    st.shared.u32 [bound + 4], %r2;
+    mov.u32 %r2, 5;
+    st.shared.u32 [bound + 8], %r2;
+    mov.u32 %r2, 0;
+    st.shared.u32 [bound + 12], %r2;
+    bar.sync 0;
+
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.inc.u32 [%rd1], [bound], 16;
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.dec.u32 [%rd2], [bound], 16;
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+    ret;
+}

@@ -1,4 +1,4 @@
-// Hand-written PTX with threadgroup memory and a barrier — the PTX counterpart
+// Hand-written PTX with threadgroup memory and a barrier, the PTX counterpart
 // of the `reverse` kernel in basic.metal:
 //     threadgroup float tile[256];
 //     tile[lid] = in[gid];

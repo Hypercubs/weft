@@ -1,7 +1,7 @@
 //
 // The swizzle with one-byte elements: `wgmma.mma_async.m64n8k32.f32.e4m3.e4m3`.
 //
-// K is 32 here — 32 bytes — and an element is one byte, so K byte columns run all
+// K is 32 here, 32 bytes, and an element is one byte, so K byte columns run all
 // the way across a quarter of the 128-byte atom. That is the case where the
 // pattern's phase and the byte column overlap: the phase is bits 4-6 and a byte
 // column past 15 has bits there too, so a byte ends up somewhere else in the row
@@ -54,7 +54,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: two adjacent K of one row — n = lane / 16, k = 2 * (lane % 16) ----
+	// ---- B: two adjacent K of one row, n = lane / 16, k = 2 * (lane % 16) ----
 	shr.u32 	%r14, %r1, 4;			// n
 	and.b32 	%r15, %r1, 15;			// which pair of K
 	shl.b32 	%r16, %r15, 4;			// a pair is 16 bytes in: eight values, two bytes
@@ -92,7 +92,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

@@ -2,7 +2,7 @@
 using namespace metal;
 
 // Two plain elementwise kernels and one that needs the threadgroup machinery:
-// shared memory plus a barrier. All three are ordinary Metal — the file is run
+// shared memory plus a barrier. All three are ordinary Metal, the file is run
 // unmodified on the GPU, and translated to C++ for the CPU.
 
 kernel void saxpy(device const float* a [[buffer(0)]],
@@ -59,7 +59,7 @@ kernel void texmix(device float* out [[buffer(0)]],
 }
 
 // Compound assignment to a swizzle: a read-modify-write of part of a value, and
-// the reads are the *old* components — `v.yx *= v.zw` is not a mix of old and new.
+// the reads are the *old* components, `v.yx *= v.zw` is not a mix of old and new.
 // Integer forms too, so `|=` and `^=` are exercised rather than assumed.
 kernel void swzcmp(device float* out [[buffer(0)]],
                    uint gid [[thread_position_in_grid]])
@@ -82,7 +82,7 @@ kernel void swzcmp(device float* out [[buffer(0)]],
 
 // A texture with one row. `texture1d` takes one coordinate, the launcher binds it
 // as `--textures 64x1d`, and a read is unnormalised while a nearest sample at a
-// texel centre is the same texel — so the two must agree with the GPU exactly, and
+// texel centre is the same texel, so the two must agree with the GPU exactly, and
 // with the PTX column's `tex.1d` behind its own Wx1 binding.
 kernel void tex1ds(device float* out [[buffer(0)]],
                    texture1d<float> img [[texture(0)]],
@@ -132,7 +132,7 @@ kernel void texarray(device float* out [[buffer(0)]],
 // ---- a 3D texture: a read and a sample that name a plane ------------------------
 // The volume is `--textures 64x64x8`. Each lane picks a plane from its own
 // coordinates, reads it and samples the same plane at its centre, and folds both
-// the plane and the value into the answer — so a kernel that read plane 0 of the
+// the plane and the value into the answer, so a kernel that read plane 0 of the
 // volume, or took the depth for a slice, lands on a different number.
 kernel void tex3d(device float* out [[buffer(0)]],
                   texture3d<float> vol [[texture(0)]],
@@ -154,8 +154,8 @@ kernel void tex3d(device float* out [[buffer(0)]],
 // ---- a cube texture: six faces, sampled by direction ---------------------------
 // `--textures 64x64c` binds a cube of six 64x64 faces, face after face in the same
 // buffer the CPU indexes. Each lane picks a face and a texel inside it, then
-// rebuilds the direction that lands there — the component mapping is the one each
-// face has — so a kernel that used the wrong face, or flipped one axis, reads a
+// rebuilds the direction that lands there, the component mapping is the one each
+// face has, so a kernel that used the wrong face, or flipped one axis, reads a
 // different texel rather than the one it asked for.
 kernel void texcube(device float* out [[buffer(0)]],
                     texturecube<float> cub [[texture(0)]],
@@ -261,7 +261,7 @@ kernel void reduce_sum(device const float* in  [[buffer(0)]],
     }
 }
 
-// Warp-level inclusive scan — the standard CUDA idiom (Harris's scan), one
+// Warp-level inclusive scan, the standard CUDA idiom (Harris's scan), one
 // shuffle per doubling. Every lane writes a different value, so a wrong lane
 // mapping shows up immediately instead of cancelling out.
 kernel void warpscan(device const float* in [[buffer(0)]],
@@ -346,7 +346,7 @@ kernel void prefixscan(device const uint* in [[buffer(0)]],
 }
 
 // The same scan on floats, where the answer cannot be bit-identical: Metal folds
-// a prefix sum in the hardware's tree and this folds it the doubling way — the
+// a prefix sum in the hardware's tree and this folds it the doubling way, the
 // same shape, not the same tree, and float addition is not associative. The
 // suite checks how big that gap is instead of pretending there isn't one.
 kernel void pfxscan(device const float* in [[buffer(0)]],
@@ -360,7 +360,7 @@ kernel void pfxscan(device const float* in [[buffer(0)]],
 
 // A whole block reduction the way CUB does it: shfl_down within each warp, one
 // shared-memory slot per warp, a barrier, then warp 0 reduces the warp sums.
-// This is the shape of a real reduction kernel — shuffles, shared memory and a
+// This is the shape of a real reduction kernel, shuffles, shared memory and a
 // barrier in one body, one output per threadgroup.
 kernel void block_reduce(device const float* in  [[buffer(0)]],
                          device float* out       [[buffer(1)]],
@@ -393,7 +393,7 @@ kernel void block_reduce(device const float* in  [[buffer(0)]],
     }
 }
 
-// float3 has a 16-byte stride with 4 bytes of padding — the layout a device
+// float3 has a 16-byte stride with 4 bytes of padding, the layout a device
 // float3* depends on. Reading the fields into a float output keeps the padding
 // out of the comparison.
 kernel void vec3_mix(device const float3* in [[buffer(0)]],
@@ -484,7 +484,7 @@ kernel void halfarith(device float* out      [[buffer(0)]],
 
 // fp16 in threadgroup memory, which the fixture above cannot reach: a half is
 // rounded once on the way into shared memory, the group's tree rounds once per
-// step, and a 64-long chain rounds 64 times — the place where fast math's habit
+// step, and a 64-long chain rounds 64 times, the place where fast math's habit
 // of keeping intermediates wide would show up as a last-bit difference. The
 // four vector arrays also fix their sizes from inside the kernel, so a half3
 // that is 6 bytes on one side and 8 on the other is a check and not a comment.
@@ -537,7 +537,7 @@ kernel void half_tg(device const float* in [[buffer(0)]],
   out[o + 10u] = float(chain);
 
   // The group's tree in half: six adds, each rounded and stored back. The
-  // barrier before it is what makes the sums above well defined — the tree's
+  // barrier before it is what makes the sums above well defined, the tree's
   // first write lands in slot 0 before its own barrier, so without this one a
   // lane that starts late reads a half-reduced array. On the GPU that shows up
   // as a group-uniform answer and a per-lane one here, which is exactly how the
@@ -686,7 +686,7 @@ kernel void widevec(device const float* in [[buffer(0)]],
 
     // Every term is an exact integer under 2^24, including the one taken from the
     // buffer, so the GPU's freedom to reassociate float additions cannot show up
-    // — which is what makes this a test of the 64-bit vectors and not of the
+    //, which is what makes this a test of the 64-bit vectors and not of the
     // compiler's fast-math.
     float isum = float(lw.x) + float(lw.y) + float(lw.z) + float(uv.w) + float(bits) +
                  float(qual) + float(sizeof(long3)) + float(sizeof(bool4)) +
@@ -697,7 +697,7 @@ kernel void widevec(device const float* in [[buffer(0)]],
 // ---- simdgroup matrices ------------------------------------------------------
 // One pair of 8x8 blocks per threadgroup. The tile is filled with the integer
 // part of the input first, so every product and partial sum is exact and the
-// hardware's fragment order cannot change a bit — what is being checked is the
+// hardware's fragment order cannot change a bit, what is being checked is the
 // load, the store and the product themselves.
 kernel void sgmat(device const float* in [[buffer(0)]],
                   device float* out      [[buffer(1)]],
@@ -801,7 +801,7 @@ kernel void grpsf(device const float* in [[buffer(0)]],
 }
 
 // Vector comparisons return a bool vector, for every vector type Metal defines
-// them on — here the float and int ones, which is where the GPU can check it.
+// them on, here the float and int ones, which is where the GPU can check it.
 kernel void veccmp(device const float* in [[buffer(0)]],
                    device float* out      [[buffer(1)]],
                    uint gid               [[thread_position_in_grid]]) {
@@ -831,7 +831,7 @@ kernel void globk(device const float* in  [[buffer(0)]],
 // ---- packed and narrow vectors -----------------------------------------------
 // A packed vector is a layout: three elements, no padding. A device buffer of
 // (x, y, z) float triples is exactly what packed_float3 describes, and a struct of
-// them has to come out the same size here as on the GPU — which is what the
+// them has to come out the same size here as on the GPU, which is what the
 // sizeof terms in the result check.
 struct PackedTrip { packed_float3 p; packed_char3 c; packed_short3 s; };
 
@@ -875,7 +875,7 @@ kernel void narrowv(device const float* in [[buffer(0)]],
 // ---- a kernel file's own declarations ----------------------------------------
 // Structs and functions the file defines for itself are carried over, not
 // dropped: a helper that only computes compiles as written, and one that waits on
-// its threadgroup is expanded at each call site — a call cannot suspend the
+// its threadgroup is expanded at each call site, a call cannot suspend the
 // callee's coroutine, so the rendezvous has to end up inside the kernel body,
 // where the resume point lives.
 struct Trip { float lo, mid, hi; };
@@ -905,8 +905,8 @@ kernel void helperk(device const float* in  [[buffer(0)]],
 
 // ---- a storage image ----------------------------------------------------------
 // One lane writes a texel, the next lane reads it back. The value that comes out
-// is the neighbour's, so a write that never reached the texture — kept in a
-// register, or dropped — answers with the wrong number instead of hiding.
+// is the neighbour's, so a write that never reached the texture, kept in a
+// register, or dropped, answers with the wrong number instead of hiding.
 kernel void texrw(device const float* in [[buffer(0)]],
                   device float* out      [[buffer(1)]],
                   texture2d<float, access::read_write> img [[texture(0)]],
@@ -936,8 +936,8 @@ kernel void counts(device float* out [[buffer(0)]],
 // A tile function runs once per pixel of a tile before any fragment of that tile,
 // and what it leaves in tile memory is what those fragments read. Tile memory is
 // an imageblock, which this host's Metal compiler cannot compile, so both sides
-// lower it to one element per pixel of the target — the same memory, addressed by
-// the pixel — and the tile stage becomes a pass over the same grid that runs
+// lower it to one element per pixel of the target, the same memory, addressed by
+// the pixel, and the tile stage becomes a pass over the same grid that runs
 // first. A value the fragment cannot see, or one written at the wrong pixel, is a
 // wrong number rather than a hidden one.
 struct TileVal { float4 c; };
@@ -978,7 +978,7 @@ fragment float4 fragwide(float4 pos [[position]],
 // The reference for kernels/triton/add.ptx: the same masked elementwise add a
 // Triton kernel has after `tl.load(..., mask=..., other=0.0)` and a guarded
 // store. Triton passes `n_elements` as a scalar argument; the Metal front end has
-// no scalar parameters, so the count is baked in — a grid of 1024 threads, 24 of
+// no scalar parameters, so the count is baked in, a grid of 1024 threads, 24 of
 // them past the end.
 kernel void triton_add(device const float* a [[buffer(0)]],
                        device const float* b [[buffer(1)]],
@@ -990,7 +990,7 @@ kernel void triton_add(device const float* a [[buffer(0)]],
 }
 
 // The reference for kernels/triton/matmul.ptx: one 16x8 tile of `tl.dot` per
-// program, computed the way the PTX fragment layout says it should be — each lane
+// program, computed the way the PTX fragment layout says it should be, each lane
 // owns rows g and g+8 and columns 2t, 2t+1 of the product. The PTX rounds its
 // inputs to integers before converting them to halves, so every product and every
 // sum of sixteen is exact and the two sides must agree to the bit.
@@ -1033,7 +1033,7 @@ static inline float tf32r(float x) {
 // The reference for kernels/triton/dot32.ptx: one 16x8 tile of a tf32 dot per
 // program, computed from the documented fragment layout. Each product of two
 // tf32 values needs 22 mantissa bits and so is exact, which leaves the additions
-// — and both sides add in the same order — so the two must agree to the bit.
+//, and both sides add in the same order, so the two must agree to the bit.
 kernel void triton_dot32(device const float* Ain [[buffer(0)]],
                          device const float* Bin [[buffer(1)]],
                          device float* out       [[buffer(2)]],
@@ -1161,7 +1161,7 @@ kernel void vecmath(device const float* in [[buffer(0)]],
 // them. Each is written from the PTX instruction by instruction, so an agreement is
 // the PTX translator and this kernel arriving at the same number independently.
 
-// `bsum`: shfl.sync.down over five distances, added as float — the sum of the lane
+// `bsum`: shfl.sync.down over five distances, added as float, the sum of the lane
 // and the lane `d` above it, clamped at the warp's top.
 kernel void bsum(device const float* in [[buffer(0)]],
                  device float* out       [[buffer(1)]],
@@ -1173,7 +1173,7 @@ kernel void bsum(device const float* in [[buffer(0)]],
 }
 
 // `hsum`: the same fold, but each step multiplies the sum by 0f3F800347 twelve
-// times — a value that is exactly 1 + 839/2^23, so the decimal below is the float
+// times, a value that is exactly 1 + 839/2^23, so the decimal below is the float
 // with nothing rounded on the way in.
 kernel void hsum(device const float* in [[buffer(0)]],
                  device float* out       [[buffer(1)]],
@@ -1200,7 +1200,7 @@ kernel void pred(device const uint* in [[buffer(0)]],
     out[gid] = ((lid & 1u) == 0u) ? (v * 3u + 1u + 2u) : v;
 }
 
-// `rotate`: shfl.sync.idx, the source lane being (lane + 1) & 31 — a rotate of the
+// `rotate`: shfl.sync.idx, the source lane being (lane + 1) & 31, a rotate of the
 // whole warp's values by one lane, wrapped.
 kernel void rotate(device const uint* in [[buffer(0)]],
                    device uint* out       [[buffer(1)]],
@@ -1260,7 +1260,7 @@ kernel void lambdak(device const float* in [[buffer(0)]],
 // ---- a lambda kept in a local and used across the barrier ---------------------
 // The closure has no name a blob field could hold, so its declaration is re-made at
 // every entry rather than stored. It captures `v` by reference and the body changes
-// `v` after the wait, so the lambda that runs has to read the new value — a copy
+// `v` after the wait, so the lambda that runs has to read the new value, a copy
 // taken at its declaration would answer with the old one.
 kernel void lamstore(device const float* in [[buffer(0)]],
                      device float* out      [[buffer(1)]],
@@ -1324,7 +1324,7 @@ kernel void localmeth(device const float* in [[buffer(0)]],
 
 // ---- a lambda kept in a local that copies a local ------------------------------
 // `[=]` takes a copy of `v` where the lambda is written, and the body then changes
-// `v` after the barrier — so the value that comes back has to be the copy, not the
+// `v` after the barrier, so the value that comes back has to be the copy, not the
 // blob's. `[v, &w]` mixes the two: the copy stays, the reference follows the new
 // value. Both would answer the same only if nothing changed in between.
 kernel void stcopy(device const float* in [[buffer(0)]],
@@ -1429,7 +1429,7 @@ kernel void stmut(device const float* in [[buffer(0)]],
 
 // ---- a closure that reads a kernel parameter ----------------------------------
 // `lid` and `tgs` are recomputed at every entry, so the closure holds a copy of each
-// — taken where it is written, which is the only value it could ever have.
+//, taken where it is written, which is the only value it could ever have.
 kernel void stparm(device const float* in [[buffer(0)]],
                    device float* out      [[buffer(1)]],
                    uint gid [[thread_position_in_grid]],
@@ -1448,7 +1448,7 @@ kernel void stparm(device const float* in [[buffer(0)]],
 }
 
 // ---- a lambda inside a stored lambda ------------------------------------------
-// The inner one captures what the outer holds — a member now — so it reads the same
+// The inner one captures what the outer holds, a member now, so it reads the same
 // object the outer does. `[&]` binds it, `[v]` copies the pointer that stands for
 // the outer's reference, and both answer with the blob's `v` after the wait.
 kernel void stnest(device const float* in [[buffer(0)]],
@@ -1475,8 +1475,8 @@ kernel void stnest(device const float* in [[buffer(0)]],
 // ---- an `auto` local that has to survive the wait ------------------------------
 // The declaration writes no type, and the blob needs one: `auto` deduced it, and
 // `decay_t<decltype(init)>` is the same type. Each of these reads something
-// different — a buffer through a parameter, a parameter itself, and another `auto`
-// — and all three are used after the barrier, so a local lost in the wait answers 0.
+// different, a buffer through a parameter, a parameter itself, and another `auto`
+//, and all three are used after the barrier, so a local lost in the wait answers 0.
 kernel void autolocal(device const float* in [[buffer(0)]],
                       device float* out      [[buffer(1)]],
                       uint gid [[thread_position_in_grid]],
@@ -1544,7 +1544,7 @@ kernel void refcap(device const float* in [[buffer(0)]],
 // two have to be two fields: the inner is renamed and everything that reads it moves
 // with it, and the outer `v` is still the outer `v` after the block ends. The second
 // barrier is there so the tile write inside the block cannot race a lane's read of
-// its neighbour's slot — each lane writes its own and reads only its own after.
+// its neighbour's slot, each lane writes its own and reads only its own after.
 kernel void shadow(device const float* in [[buffer(0)]],
                    device float* out      [[buffer(1)]],
                    uint gid [[thread_position_in_grid]],
@@ -1569,7 +1569,7 @@ kernel void shadow(device const float* in [[buffer(0)]],
 // ---- address spaces on locals ---------------------------------------------------
 // `device`, `constant` and `thread` say where a variable lives on the GPU. On the host
 // they are the same memory: `device` and `thread` carry nothing the blob does not
-// already do, and `constant` is a read-only view — `const`. All three pointers are
+// already do, and `constant` is a read-only view, `const`. All three pointers are
 // live across the wait, so a lost one would index from nowhere. The second barrier
 // is the one the algorithm needs: the tile write has to be visible before a lane
 // reads its neighbour's slot.
@@ -1617,7 +1617,7 @@ kernel void arr2d(device const float* in [[buffer(0)]],
 
 // ---- a capture bound to an element ----------------------------------------------
 // `[&q = taps[1]]` holds the address of the second element. The body overwrites the
-// array after the barrier, so the call has to read the element as it is then — a
+// array after the barrier, so the call has to read the element as it is then, a
 // copy would answer with the value it had at the declaration.
 kernel void refsub(device const float* in [[buffer(0)]],
                    device float* out      [[buffer(1)]],
@@ -1662,8 +1662,8 @@ kernel void tgblock(device const float* in [[buffer(0)]],
 // ---- the packed formats, at every boundary --------------------------------------
 // An unsigned normal is round(clamp(x, 0, 1) * 255) and a signed one is
 // round(clamp(x, -1, 1) * 127) in two's complement; the inputs here are chosen so
-// the *rounding* is what is under test. Lane k holds k/255 in .x — every exact
-// byte boundary — an exact tie in .y, a value in snorm's negative half in .z, and
+// the *rounding* is what is under test. Lane k holds k/255 in .x, every exact
+// byte boundary, an exact tie in .y, a value in snorm's negative half in .z, and
 // one that lands between boundaries in .w. Both engines run the same formula
 // (src/soft_math.hpp) and the runs are compared byte for byte, so a tie that
 // rounds the other way on one of them is a difference and not a tolerance.
@@ -1734,7 +1734,7 @@ kernel void choosemask(device const float* in  [[buffer(0)]],
 // `.xy` is the first two components and `.zyx` is three in the other order; `.xxx`
 // repeats one and `.wz` picks two that are not adjacent. The translator turns each
 // read into `weft_swz(v, i, j, ...)` and the preamble's overloads pick the result
-// type from the receiver, so the value is the same on both engines — which is what
+// type from the receiver, so the value is the same on both engines, which is what
 // this kernel checks, including a swizzle of a swizzle.
 kernel void swizzle(device const float* in  [[buffer(0)]],
                     device float* out       [[buffer(1)]],

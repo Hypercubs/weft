@@ -3,10 +3,10 @@
 //
 // The third and widest geometry. A core matrix is 8 rows by 16 bytes whatever the
 // element is, so with one byte an element a row holds sixteen of them and the
-// instruction's K is 32 — twice the f16 form, four times tf32. A is 64x32 (2048
+// instruction's K is 32, twice the f16 form, four times tf32. A is 64x32 (2048
 // bytes: two core matrices along K, eight along M). B is 32x8, and that is where
 // the accounting is easy to get wrong: it is eight real columns, but a core-matrix
-// row is a full sixteen bytes regardless, so B is four cores of 128 bytes — 512
+// row is a full sixteen bytes regardless, so B is four cores of 128 bytes, 512
 // bytes, not 256. The eight padding columns are never read, and they are still
 // part of the layout the descriptor walks.
 //

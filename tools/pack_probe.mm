@@ -2,7 +2,7 @@
 // `pack_float_to_*` builtins?
 //
 // The formula is what both engines run, so the two columns cannot disagree with
-// each other — but they could both be wrong about what Metal means by a normalized
+// each other, but they could both be wrong about what Metal means by a normalized
 // conversion. The rule that is not obvious is rounding: nearest, and at an exact
 // tie the hardware could round up, to even, or away from zero. This asks the
 // hardware instead of reading the spec, over every byte boundary, every 16-bit
@@ -18,7 +18,6 @@
 #include <cstdio>
 #include <vector>
 
-// ---- the formula under test: the text compiled into src/soft_math.hpp --------
 static float pack_clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static int32_t pack_round(float v) {
   return v < 0.0f ? -(int32_t)(0.5f - v) : (int32_t)(v + 0.5f);

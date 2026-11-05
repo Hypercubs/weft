@@ -1,4 +1,4 @@
-// weft-gen — translate a GPU kernel file to C++ at build time.
+// weft-gen, translate a GPU kernel file to C++ at build time.
 //
 //     weft-gen kernels/basic.metal --kernel saxpy -o build/saxpy.cpp
 //     weft-gen kernels/spirv/blockreduce.spv -o build/reduce.cpp
@@ -25,7 +25,7 @@
 namespace {
 
 const char* kUsage =
-    "weft-gen — translate a GPU kernel to C++ at build time\n"
+    "weft-gen: translate a GPU kernel to C++ at build time\n"
     "\n"
     "  weft-gen <file.metal|file.ptx|file.spv> [-o OUT] [--kernel NAME] [--render WxH]\n"
     "  weft-gen <file> --describe\n"

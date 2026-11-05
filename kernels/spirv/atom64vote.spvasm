@@ -13,7 +13,7 @@
 ;                      lane loads it after the barrier, so all 32 loads agree.
 ;   the ballot         lanes are 0..31, so the even ones are 0x55555555.
 ;   the broadcast      lane 0's 64-bit load goes to every lane, so every slot holds
-;                      the counter — the same number, 32 times.
+;                      the counter, the same number, 32 times.
 ;   all-equal, 64-bit  the counter read after the barrier is the same in all 32
 ;                      lanes, so this must be true; the lane index is different in
 ;                      every lane, so that one must be false. Both directions are

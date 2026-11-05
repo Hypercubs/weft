@@ -6,7 +6,7 @@
 //     out[gid] = t * 2 + n + l
 //
 // `.a2d` is the layered form: the third coordinate is the slice, and it is a
-// float at the instruction boundary — CUDA's `tex2DLayered` passes it as one —
+// float at the instruction boundary, CUDA's `tex2DLayered` passes it as one,
 // which the translator truncates to the index the slice has. `txq.depth` on such
 // a binding reports the slice count, because that is the one number a layered
 // kernel has no other way to learn. Both are folded into the value, so a wrong

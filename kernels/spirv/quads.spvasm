@@ -9,7 +9,7 @@
 ; weights turn it into a fingerprint: the four broadcasts pin the four lane indices
 ; and the three swaps pin the three XOR directions, while a base taken from the warp
 ; instead of the quad moves every term at once. check.sh recomputes the number from
-; the lane id, so agreement between the two columns is not the only witness — both
+; the lane id, so agreement between the two columns is not the only witness, both
 ; of them taking a warp base would still be wrong.
 ;
 ; `Index` has to be a constant instruction at this module's version, so the four

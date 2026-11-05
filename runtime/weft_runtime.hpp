@@ -1,4 +1,4 @@
-// weft — the GPU's execution model, implemented on CPU cores.
+// weft, the GPU's execution model, implemented on CPU cores.
 //
 // A Metal kernel sees: a grid of threads, grouped into threadgroups, each group
 // sharing a block of fast memory, with a barrier that all threads in the group
@@ -51,7 +51,7 @@ struct Ctx {
   // A warp holds 32 lanes of one threadgroup on one worker thread, so the scan
   // and fold trees those lanes run are the same tree: the first lane to reach a
   // call site computes it and the other 31 read its answer. `fold` points at this
-  // lane's warp's slot — [0] site, [1] pass, [2] base, [3..34] the tree.
+  // lane's warp's slot, [0] site, [1] pass, [2] base, [3..34] the tree.
   uint32_t* fold = nullptr;
   unsigned char* warp16 = nullptr;  // per-lane scratch for values wider than a word
   uint32_t* red = nullptr;   // per-threadgroup scratch for bar.red (tg + 32 slots)
@@ -78,7 +78,7 @@ using Body = void (*)(Ctx&);
 using FlatBody = void (*)(Ctx&, uint32_t begin, uint32_t end);
 
 // A resumable kernel: the thread's whole state lives in a caller-owned blob, so
-// a barrier is just "save the resume point and return" — no new stack, no
+// a barrier is just "save the resume point and return", no new stack, no
 // context switch. The dispatcher calls every thread once per barrier segment.
 // `pc == kThreadDone` means the thread finished.
 using StepFn = void (*)(Ctx&, void* state, void* const* bufs, unsigned char* sh);
@@ -118,7 +118,7 @@ using WarpFn = uint32_t (*)(WCtx&, void* state);
 
 // A kernel body that can suspend at a barrier and be resumed later. The C++
 // compiler keeps the frame alive, locals included, so a Metal kernel with
-// arbitrary locals can be resumable too — this is what replaces fibers.
+// arbitrary locals can be resumable too, this is what replaces fibers.
 struct Task {
   struct promise_type {
     Task get_return_object() { return Task{handle_type::from_promise(*this)}; }
@@ -143,7 +143,7 @@ struct Task {
   void resume() {
     if (h_ && !h_.done()) h_.resume();
   }
-  // The same call for a caller that has just checked `done()` — the dispatcher
+  // The same call for a caller that has just checked `done()`, the dispatcher
   // does, once per lane per pass, and a 1M-lane scan runs it five million times.
   void resume_ready() { h_.resume(); }
 
@@ -160,7 +160,7 @@ struct BarrierAwaitable {
 inline BarrierAwaitable barrier_async() { return {}; }
 
 // Warp shuffles. A shuffle is a rendezvous among 32 lanes, and the only
-// rendezvous this runtime has is "hand the worker back and resume later" — so a
+// rendezvous this runtime has is "hand the worker back and resume later", so a
 // shuffle suspends exactly like a barrier and costs the same.
 enum ShflMode { kShflIdx = 0, kShflUp = 1, kShflDown = 2, kShflBfly = 3 };
 
@@ -185,7 +185,7 @@ inline T from_bits(uint32_t b) {
 
 // Lanes do not stop together. One dispatcher pass moves every lane on by
 // exactly one shuffle: it publishes, returns, and reads the peer on the pass
-// after. So the slots are double-buffered by *pass* — a lane publishes into the
+// after. So the slots are double-buffered by *pass*, a lane publishes into the
 // half for its own pass and reads back the half it published into, so the next
 // pass writing the other half cannot corrupt a lane that has not caught up.
 inline const uint32_t* shfl_pub_buf(const Ctx& c) {
@@ -202,12 +202,12 @@ inline const uint32_t* shfl_read_buf(const Ctx& c) {
 uint32_t vote_ballot(Ctx& c);
 
 // The peer a lane will read from. Metal's shuffles are full-warp, and a lane
-// whose source falls outside it keeps its own value — which is what PTX does
+// whose source falls outside it keeps its own value, which is what PTX does
 // with the clamps CUDA emits (0x1f for down, 0 for up).
 //
 // `width` is the size of the group the shuffle is relative to: 32 for a warp,
 // 4 for a quad. A group is a run of consecutive lanes inside a warp, so the same
-// arithmetic works for both — only the base and the mask change.
+// arithmetic works for both, only the base and the mask change.
 inline uint32_t shfl_peer_lane(const Ctx& c, uint32_t b, int mode, uint32_t width = 32u) {
   const uint32_t base = c.lid & ~(width - 1u);
   const uint32_t lane = c.lid - base;
@@ -229,7 +229,7 @@ inline uint32_t shfl_peer(const Ctx& c, uint32_t b, int mode, uint32_t width = 3
 }
 
 // A rendezvous slot for a value wider than a word: 16 bytes takes every type
-// simd_shuffle accepts — a float4, a long2, a double2 — so one of those is still
+// simd_shuffle accepts, a float4, a long2, a double2, so one of those is still
 // a single suspension. The slots are double-buffered by pass exactly like the
 // word-wide ones, and live in their own scratch so that indexing the word-wide
 // array (every lane reading every peer) still means what it says.
@@ -263,11 +263,10 @@ inline const unsigned char* wide_read_slot(const Ctx& c, uint32_t lane) {
   return c.warp16 + ((size_t)((c.pass - 1u) & 1u) * c.tg_size + lane) * kWideSlotBytes;
 }
 
-// ---- the two halves of a rendezvous -----------------------------------------
 //
 // A coroutine spells a rendezvous as one suspension: publish before it, read
 // after. A state machine has to name the boundary, so the same two steps are
-// separate calls here — publish at the end of one segment, take at the start of
+// separate calls here, publish at the end of one segment, take at the start of
 // the next. Both shapes go through these, so they cannot disagree about what a
 // rendezvous carries.
 template <class T>
@@ -351,8 +350,8 @@ inline WideShflAwaitable<T> grp_shfl(Ctx& c, T value, uint32_t b, int mode, uint
 
 // simd_shuffle_and_fill_up/down: the same shuffle, but a lane whose source is
 // outside the warp takes the fill value instead of its own. Every lane still
-// publishes — the select happens when the lane is resumed, not before the
-// rendezvous — because a lane that skipped the publish would leave a stale slot
+// publishes, the select happens when the lane is resumed, not before the
+// rendezvous, because a lane that skipped the publish would leave a stale slot
 // for the peer that reads it.
 template <class T>
 struct ShflFillAwaitable {
@@ -369,7 +368,7 @@ struct ShflFillAwaitable {
 };
 
 // simd_prefix_inclusive_sum / exclusive_sum: a warp-wide scalar scan. One
-// rendezvous is enough — the published array holds every lane's input, so each
+// rendezvous is enough, the published array holds every lane's input, so each
 // lane folds the slots up to its own index after it is resumed. The GPU does it
 // with five shuffles; this does it with one suspension and 32 loads, which is
 // cheaper here because a suspension is the expensive part.
@@ -433,10 +432,9 @@ inline PrefixAwaitable<T> prefix(Ctx& c, T value, bool inclusive, bool product =
   return PrefixAwaitable<T>{&c, value, inclusive, product, width, site};
 }
 
-// ---- bar.red: a fold over the whole threadgroup ---------------------------------
 //
 // `bar.red.popc/or/and` is a barrier whose result is a reduction across every
-// thread in the group — `__syncthreads_count` and its two cousins. A barrier is
+// thread in the group, `__syncthreads_count` and its two cousins. A barrier is
 // the only rendezvous this runtime has, so this is two of them: publish my value
 // and arrive, then the group has everything and each warp folds its own 32 slots
 // into one total, arrive again, and the per-warp totals are folded. Every thread
@@ -456,7 +454,7 @@ inline uint32_t red_empty(int mode) { return mode == kRedAnd ? 1u : 0u; }
 
 // The last threadgroup of a grid can be short: 1000 threads at 96 a group leaves
 // 40 in the last one. The slots of the threads that do not exist hold whatever
-// the previous group left there, so the fold has to stop at the live count —
+// the previous group left there, so the fold has to stop at the live count , 
 // which is derivable from the launch geometry, no extra state.
 inline uint32_t live_threads(uint32_t tgid, uint32_t tg_size, uint32_t grid) {
   const uint64_t base = (uint64_t)tgid * tg_size;
@@ -547,7 +545,6 @@ inline WideShflFillAwaitable<T> shfl_fill(Ctx& c, T value, uint32_t b, int mode,
   return WideShflFillAwaitable<T>{&c, value, fill, T{}, b, mode, width, in};
 }
 
-// ---- group reductions -------------------------------------------------------
 //
 // simd_sum / simd_max / quad_sum and their cousins are a fold over the group's
 // published values, done in the butterfly order the hardware uses: five minutes
@@ -586,8 +583,8 @@ struct ReduceAwaitable {
     }
     // The hardware's fold is a butterfly: every lane folds its partner's
     // *running* value, step by step. Reading the published slots once and
-    // folding them together would be a different tree — and for floats a
-    // different answer — so the same three-step shape is kept here, one array
+    // folding them together would be a different tree, and for floats a
+    // different answer, so the same three-step shape is kept here, one array
     // for the values and one for the step's results.
     T v[32], next[32];
     for (uint32_t i = 0; i < width && i < 32u; i++) v[i] = from_bits<T>(slots[i]);
@@ -674,7 +671,7 @@ struct KernelDef {
   int nargs;
   // Whether the kernel synchronises (shared memory, a barrier or a shuffle).
   // Module metadata: `weft-gen --describe` reports it, and nothing dispatches on
-  // it — the fiber backend that used to was deleted, because every kernel with a
+  // it, the fiber backend that used to was deleted, because every kernel with a
   // barrier is routed to its coroutine or state-machine body first.
   bool sync;
   FlatBody flat;    // nullptr when the kernel cannot be flattened
@@ -686,12 +683,11 @@ struct KernelDef {
   GroupStepFn group_step;  // set when the module emits one
 };
 
-// ---- textures ----
 //
 // A texture is an image the launcher fills before the run, so the GPU and the
 // CPU sides read the same texels. Only the shapes a compute kernel uses are here:
 // no mip levels. It is 2D, a 2D *array*, or 3D, and the last two differ only in
-// what the outermost index means — a slice or a plane — so one number and one
+// what the outermost index means, a slice or a plane, so one number and one
 // layout serve both, which is `MTLTextureType2DArray`'s layout and
 // `MTLTextureType3D`'s. `read` is unnormalised and exact; `sample` filters.
 struct Texture {
@@ -702,8 +698,8 @@ struct Texture {
   uint32_t width = 0, height = 0;
   uint32_t elem = 4;    // bytes per texel (4 for float/uint, 2 for half)
   // The outermost extent: the slices of a 2D array, or a 3D texture's depth. One
-  // number because the storage is the same either way — slice after slice, plane
-  // after plane — so a 3D read is the same index arithmetic as a layered one and
+  // number because the storage is the same either way, slice after slice, plane
+  // after plane, so a 3D read is the same index arithmetic as a layered one and
   // neither needs its own path through this file.
   uint32_t layers = 1;
 };
@@ -725,7 +721,7 @@ Sampler sampler(int index);
 void set_sampler(int index, int filter, int addr);
 
 // The image a sampler reads: `OpTypeImage` is a handle, so a kernel value is a
-// pointer to the bound texture — the texture itself is host storage, exactly as
+// pointer to the bound texture, the texture itself is host storage, exactly as
 // it is on a GPU, where an image handle names a resource rather than copying it.
 const Texture* texture_ptr(int index);
 
@@ -750,11 +746,11 @@ inline T tex_read(const Texture& t, uint32_t x, uint32_t y) {
 
 // A write to a texture: `OpImageWrite` and `texture2d::write`. The launcher
 // creates single-channel images, so the first channel is the texel and the rest
-// of the vector has nowhere to go — the same thing the GPU does with an R32
+// of the vector has nowhere to go, the same thing the GPU does with an R32
 // format.
 // A texel is one value or a vector whose first member is channel 0, so the
 // address of either is the address of the texel being written. That keeps this
-// one template independent of the vector types, which do not exist yet here —
+// one template independent of the vector types, which do not exist yet here , 
 // this header is compiled before the preamble that defines them.
 template <class T>
 inline void tex_write(const Texture& t, uint32_t x, uint32_t y, uint32_t layer, T v) {
@@ -779,7 +775,7 @@ inline uint32_t tex_wrap(int64_t i, uint32_t n, int addr) {
     return (uint32_t)(r < 0 ? r + m : r);
   }
   // Clamp to zero answers with nothing; clamp to edge answers with the nearest
-  // texel, which is what a filter footprint hanging off the image must do —
+  // texel, which is what a filter footprint hanging off the image must do , 
   // otherwise every sample near an edge is darkened towards black.
   if (addr == kTexClampToZero || n == 0) return (uint32_t)-1;
   return i < 0 ? 0u : n - 1u;
@@ -830,7 +826,7 @@ inline void tex_sample4(const Texture& t, float u, float v, float w, int filter,
 // faces are +X, -X, +Y, -Y, +Z, -Z, and `s`/`t` run from -1 to 1 across the face
 // with t pointing up, which is what a cube coordinate means. This inverts the rule
 // in `tex_cube_uv` above, so a direction built here lands back on the same face at
-// the same place — that inverse is what makes PTX's `(s, t, face)` form
+// the same place, that inverse is what makes PTX's `(s, t, face)` form
 // translatable at all. Both engines run this text, so both build the same bits.
 inline void weft_cube_dir(uint32_t face, float s, float t, float& dx, float& dy, float& dz) {
   switch (face % 6u) {
@@ -877,7 +873,7 @@ inline void tex_gather4(const Texture& t, float u, float v, float out[4]) {
 }
 
 // A 3-D gather: the same 2x2 footprint, in the plane the coordinate names. A
-// gather has no filter, so there is nothing to blend along z — the plane is the
+// gather has no filter, so there is nothing to blend along z, the plane is the
 // nearest one under w, which is the plane a nearest sample of the same coordinate
 // reads. A footprint that leaves the binding answers with nothing, exactly as the
 // 2-D form does.
@@ -916,7 +912,7 @@ inline void tex_gather4_cube(const Texture& t, float s, float v, uint32_t face, 
 // The xy half of a filtered sample at one slice: the whole of a 2D sample, and one
 // plane of a 3D one. The weights are the hardware's 8-bit fixed point. Measured on
 // this GPU by sampling between two known texels, the weight it applies is exactly
-// round(f * 256) / 256 — which is what makes filtered samples identical to the GPU
+// round(f * 256) / 256, which is what makes filtered samples identical to the GPU
 // instead of close.
 template <class T>
 inline float tex_bilinear(const Texture& t, float u, float v, uint32_t layer, int addr) {
@@ -977,13 +973,12 @@ inline float tex_sample(const Texture& t, float u, float v, float w, int filter,
   return std::fma(s1 - s0, az, s0);
 }
 
-// ---- cubes ----
 //
 // A cube is six square faces stored face after face, which is the same slice
 // layout a 2D array has, so a cube sample is a 2D sample of one of them. What
 // picks the face is the direction: the axis it points along most strongly, and the
 // other two components over that length place the texel on the face. Ties go to X
-// then Y, and the six faces are +X, -X, +Y, -Y, +Z, -Z — `MTLTextureTypeCube`'s
+// then Y, and the six faces are +X, -X, +Y, -Y, +Z, -Z, `MTLTextureTypeCube`'s
 // order, which is also every other GPU's.
 inline void tex_cube_uv(float dx, float dy, float dz, uint32_t& face, float& u, float& v) {
   const float ax = std::fabs(dx), ay = std::fabs(dy), az = std::fabs(dz);
@@ -1014,6 +1009,23 @@ inline float tex_sample_cube(const Texture& t, float dx, float dy, float dz, int
   return tex_sample<T>(t, u, v, face, filter, addr);
 }
 
+// A gather of a cube by direction: the sampler's own rule picks the face and the
+// place on it, and the footprint is read off that face, six faces are six layers,
+// so the arrayed gather is the same four texels a `tld4` that names the face reads.
+// This is the form SPIR-V asks for, where the coordinate is a direction.
+template <class T>
+inline void tex_gather4_cube_dir(const Texture& t, float dx, float dy, float dz, float du,
+                                 float dv, float out[4]) {
+  if (t.layers == 0) {
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    return;
+  }
+  uint32_t face = 0;
+  float u = 0.5f, v = 0.5f;
+  tex_cube_uv(dx, dy, dz, face, u, v);
+  tex_gather4<T>(t, u + du, v + dv, face % t.layers, out);
+}
+
 
 // A plain texture is layer 0 of itself, so every call written before arrays
 // existed keeps its meaning.
@@ -1022,12 +1034,11 @@ inline float tex_sample(const Texture& t, float u, float v, int filter, int addr
   return tex_sample<T>(t, u, v, 0u, filter, addr);
 }
 
-// ---- a mesh stage's output ----
 //
 // A `[[mesh]]` function produces one mesh per threadgroup: NV vertices and NP
 // primitives, written by the 32 lanes of that group together. The launcher
 // creates a vertex block and a triangle block per mesh, and the view below is
-// this invocation's slice of both — so `set_vertex(i, v)` writes slot i of
+// this invocation's slice of both, so `set_vertex(i, v)` writes slot i of
 // *this* mesh and cannot reach another group's. A primitive is three indices,
 // 12 bytes: dense, and the layout a primitive buffer has on the hardware.
 // A triangle is a `uint3` on the GPU, and Metal pads one to 16 bytes: a block of
@@ -1068,11 +1079,10 @@ struct mesh_view {
   }
 };
 
-// ---- a task stage's say in the dispatch ----
 //
 // A task stage (`[[object]]`) runs first and decides how many meshes run after
 // it: `mgp.set_threadgroups_per_grid(n)` writes the meshgrid the launcher then
-// dispatches. It is a parameter with no binding — `mesh_grid_properties mgp` —
+// dispatches. It is a parameter with no binding, `mesh_grid_properties mgp` , 
 // because it is not memory the caller supplies but the stage's own output about
 // the shape of the next stage.
 struct mesh_grid_properties {
@@ -1097,11 +1107,10 @@ struct mesh_grid_properties {
 // line, that was a cross-image call for a single pointer load.
 inline void* buffer(const Ctx& c, int index) { return c.bufs[index]; }
 
-// ---- tile memory's boundary ----
 //
 // A tile stage and the fragments of one tile share that tile's memory and
 // nothing else. This runtime lowers tile memory to one slot per pixel of the
-// target, which keeps every *pixel* addressable — so an access outside the
+// target, which keeps every *pixel* addressable, so an access outside the
 // invocation's own 32x32 tile is representable here in a way the hardware
 // leaves undefined and order-dependent (it is the other tile's memory, which
 // may not have been written yet).
@@ -1192,7 +1201,7 @@ float atom_min_f32(float* p, float v);
 // Each distinct `threadgroup T name[N]` declaration in a kernel maps to one slot,
 // named by its ordinal in the source. Not by a running count: a resumable kernel
 // jumps into the middle of its body, so the declarations it skipped on the way in do
-// not run — a counter would hand the next declaration the previous one's storage.
+// not run, a counter would hand the next declaration the previous one's storage.
 // The ordinal is fixed at translation, so every entry, every lane and every pass
 // finds the same object at the same index.
 template <class T, size_t N>
@@ -1212,14 +1221,13 @@ T* shared_mem(Ctx& c, int k) {
   return reinterpret_cast<T*>(const_cast<unsigned char*>(c.shared) + c.slots->off[k]);
 }
 
-// ---- tensor maps ----
 //
 // `cp.async.bulk.tensor` takes its description of the tensor from a 128-byte object
 // rather than from its operands: the instruction names a box and the corner that box
 // starts at, and the object says where the tensor begins and how it is laid out.
-// NVIDIA's driver encodes that object and does not publish the byte layout — under
+// NVIDIA's driver encodes that object and does not publish the byte layout, under
 // CUDA 12 the type is opaque, and CUTLASS only ever edits fields through
-// `tensormap.replace`, which indexes them instead of giving offsets — so weft defines
+// `tensormap.replace`, which indexes them instead of giving offsets, so weft defines
 // the layout, and both engines read it with the decode below (`src/weft_msl.hpp` is the
 // same code in Metal). The tag word is what keeps that honest: an object without it is
 // not decoded at all, so a blob from `cuTensorMapEncodeTiled` ends on a message instead
@@ -1474,8 +1482,8 @@ inline uint32_t tma_im2col(unsigned char* dst, const void* map, int32_t c0, int3
 }
 
 // The same column going back out: threadgroup memory is scattered into the window. An
-// element whose place fell outside the tensor writes nothing — a store has nothing to
-// zero-fill — so a column that hangs off the edge changes only the part that fits.
+// element whose place fell outside the tensor writes nothing, a store has nothing to
+// zero-fill, so a column that hangs off the edge changes only the part that fits.
 inline void tma_im2col_store(const void* map, int32_t c0, int32_t c1, int32_t c2, int32_t c3,
                              int32_t c4, int32_t o0, int32_t o1, int32_t o2,
                              const unsigned char* src) {

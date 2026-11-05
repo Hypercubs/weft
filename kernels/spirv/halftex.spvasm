@@ -1,0 +1,54 @@
+; An image whose texel is a half: `R16Float`, two bytes a texel.
+;
+; The module is `texmix` with the picture taken out, one texel read, widened, and
+; stored, because what this checks is the *element type* of the binding rather than
+; a filter. A texel of `%f16` is where `ctype` has to name a two-byte type that
+; converts, and where the launcher has to bind two bytes and an `R16Float` texture:
+; a `uint16_t` has the width and answers the bit pattern, so the two columns
+; disagreeing here is how that mistake shows up.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability ImageBasic
+               OpCapability Int64
+               OpCapability Float16
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "halftex" %gid
+               OpName %main "halftex"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f16 = OpTypeFloat 16
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+       %v2u = OpTypeVector %u32 2
+       %v4h = OpTypeVector %f16 4
+     %v3u64 = OpTypeVector %u64 3
+       %img = OpTypeImage %f16 2D 0 0 0 0 Unknown
+ %ptr_uc_img = OpTypePointer UniformConstant %img
+    %ptr_out = OpTypePointer CrossWorkgroup %f32
+        %pin = OpTypePointer Input %v3u64
+       %fnty = OpTypeFunction %void %ptr_out %ptr_uc_img
+        %gid = OpVariable %pin Input
+      %zerou = OpConstant %u32 0
+       %main = OpFunction %void None %fnty
+          %o = OpFunctionParameter %ptr_out
+        %tex = OpFunctionParameter %ptr_uc_img
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %g32 = OpUConvert %u32 %gi
+      %vimg = OpLoad %img %tex
+       %wsz = OpImageQuerySizeLod %v2u %vimg %zerou
+         %w = OpCompositeExtract %u32 %wsz 0
+         %h = OpCompositeExtract %u32 %wsz 1
+         %x = OpUMod %u32 %g32 %w
+        %dy = OpUDiv %u32 %g32 %w
+         %y = OpUMod %u32 %dy %h
+       %xyu = OpCompositeConstruct %v2u %x %y
+         %a = OpImageRead %v4h %vimg %xyu
+        %ax = OpCompositeExtract %f16 %a 0
+        %af = OpFConvert %f32 %ax
+        %po = OpPtrAccessChain %ptr_out %o %gi
+               OpStore %po %af
+               OpReturn
+               OpFunctionEnd

@@ -2,7 +2,7 @@
 // The other transpose: B is MN-major, A stays K-major, and both are swizzled.
 //
 // With trans-b set, N is B's contiguous direction, so a row of the atom is the
-// eight columns — 16 bytes — and eight K rows make one atom. LBO therefore steps
+// eight columns, 16 bytes, and eight K rows make one atom. LBO therefore steps
 // between atoms along K, 1024 bytes apart, and the second half of K lives in the
 // second atom. The phase is the row's own: rows 0-7 of the pattern are the eight
 // K rows of the atom.
@@ -58,7 +58,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: MN-major, one K row of eight columns — lane = K row ----
+	// ---- B: MN-major, one K row of eight columns, lane = K row ----
 	setp.lt.u32 	%p1, %r1, 16;
 	shl.b32 	%r14, %r1, 4;			// a K row is eight values, 16 bytes
 	cvt.u64.u32 	%rd7, %r14;
@@ -93,7 +93,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

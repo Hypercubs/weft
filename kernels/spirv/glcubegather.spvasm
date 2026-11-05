@@ -1,0 +1,125 @@
+               ; A gather of a cube: the direction picks the face and the place on it, and
+               ; the 2x2 footprint is read off that face. It is the pair of `glcube`
+               ; beside it, same binding, same direction built from a face number and a
+               ; position, with `OpImageGather` in place of the sample, so the four
+               ; texels that sample blends are the four words this writes.
+               ;
+               ; Metal has no `gather` on a `texturecube` bound with `access::sample`, so
+               ; this is the lowering that has to exist for the column to agree: the face
+               ; the direction lands on is read four times, which is what a `tld4` naming
+               ; that face does on the PTX column.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "glcubegather" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpName %main "glcubegather"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %blk Block
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %outbuf DescriptorSet 0
+               OpDecorate %outbuf Binding 0
+               OpDecorate %tex DescriptorSet 0
+               OpDecorate %tex Binding 1
+               OpDecorate %smp DescriptorSet 0
+               OpDecorate %smp Binding 2
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+    %v3bool = OpTypeVector %bool 3
+       %f32 = OpTypeFloat 32
+       %u32 = OpTypeInt 32 0
+       %v3u = OpTypeVector %u32 3
+     %v4f = OpTypeVector %f32 4
+     %v3f = OpTypeVector %f32 3
+     %rtarr = OpTypeRuntimeArray %f32
+       %blk = OpTypeStruct %rtarr
+   %ptr_sb = OpTypePointer StorageBuffer %f32
+  %ptr_blk = OpTypePointer StorageBuffer %blk
+      %img1 = OpTypeImage %f32 Cube 0 0 0 1 Unknown
+     %smp_t = OpTypeSampler
+     %si_t = OpTypeSampledImage %img1
+ %ptr_uc_img = OpTypePointer UniformConstant %img1
+ %ptr_uc_smp = OpTypePointer UniformConstant %smp_t
+       %pin = OpTypePointer Input %v3u
+      %fnty = OpTypeFunction %void
+        %gid = OpVariable %pin Input
+    %outbuf = OpVariable %ptr_blk StorageBuffer
+       %tex = OpVariable %ptr_uc_img UniformConstant
+       %smp = OpVariable %ptr_uc_smp UniformConstant
+      %zerou = OpConstant %u32 0
+        %neg = OpConstant %f32 -1
+        %one = OpConstant %f32 1
+       %half = OpConstant %f32 0.5
+     %c64 = OpConstant %f32 64
+     %c0u = OpConstant %u32 0
+     %c1u = OpConstant %u32 1
+     %c2u = OpConstant %u32 2
+     %c3u = OpConstant %u32 3
+     %c4u = OpConstant %u32 4
+     %c5u = OpConstant %u32 5
+     %c6u = OpConstant %u32 6
+    %c12u = OpConstant %u32 12
+    %c63u = OpConstant %u32 63
+       %main = OpFunction %void None %fnty
+      %entry = OpLabel
+          %g = OpLoad %v3u %gid
+         %gi = OpCompositeExtract %u32 %g 0
+         %fi = OpShiftRightLogical %u32 %gi %c12u
+         %fm = OpUMod %u32 %fi %c6u
+         %e0 = OpIEqual %bool %fm %c0u
+         %e1 = OpIEqual %bool %fm %c1u
+         %e2 = OpIEqual %bool %fm %c2u
+         %e3 = OpIEqual %bool %fm %c3u
+         %e4 = OpIEqual %bool %fm %c4u
+        %xl = OpBitwiseAnd %u32 %gi %c63u
+        %yh = OpShiftRightLogical %u32 %gi %c6u
+        %yl = OpBitwiseAnd %u32 %yh %c63u
+        %xf = OpConvertUToF %f32 %xl
+        %yf = OpConvertUToF %f32 %yl
+       %xo = OpFAdd %f32 %xf %half
+        %yo = OpFAdd %f32 %yf %half
+        %su = OpFDiv %f32 %xo %c64
+        %tu = OpFDiv %f32 %yo %c64
+        %s2 = OpFAdd %f32 %su %su
+        %t2 = OpFAdd %f32 %tu %tu
+        %s = OpFSub %f32 %s2 %one
+        %t = OpFSub %f32 %t2 %one
+        %ns = OpFNegate %f32 %s
+        %nt = OpFNegate %f32 %t
+         %d0 = OpCompositeConstruct %v3f %one %nt %ns
+         %d1 = OpCompositeConstruct %v3f %neg %nt %s
+         %d2 = OpCompositeConstruct %v3f %s %one %t
+         %d3 = OpCompositeConstruct %v3f %s %neg %nt
+         %d4 = OpCompositeConstruct %v3f %s %nt %one
+         %d5 = OpCompositeConstruct %v3f %ns %nt %neg
+         %be4 = OpCompositeConstruct %v3bool %e4 %e4 %e4
+         %m4 = OpSelect %v3f %be4 %d4 %d5
+         %be3 = OpCompositeConstruct %v3bool %e3 %e3 %e3
+         %m3 = OpSelect %v3f %be3 %d3 %m4
+         %be2 = OpCompositeConstruct %v3bool %e2 %e2 %e2
+         %m2 = OpSelect %v3f %be2 %d2 %m3
+         %be1 = OpCompositeConstruct %v3bool %e1 %e1 %e1
+         %m1 = OpSelect %v3f %be1 %d1 %m2
+         %be0 = OpCompositeConstruct %v3bool %e0 %e0 %e0
+        %dir = OpSelect %v3f %be0 %d0 %m1
+         %vi = OpLoad %img1 %tex
+         %vs = OpLoad %smp_t %smp
+        %sim = OpSampledImage %si_t %vi %vs
+          %r = OpImageGather %v4f %sim %dir %zerou
+         %r0 = OpCompositeExtract %f32 %r 0
+         %r1 = OpCompositeExtract %f32 %r 1
+         %r2 = OpCompositeExtract %f32 %r 2
+         %r3 = OpCompositeExtract %f32 %r 3
+        %idx = OpIMul %u32 %gi %c4u
+         %q0 = OpAccessChain %ptr_sb %outbuf %zerou %idx
+               OpStore %q0 %r0
+        %i1 = OpIAdd %u32 %idx %c1u
+         %q1 = OpAccessChain %ptr_sb %outbuf %zerou %i1
+               OpStore %q1 %r1
+        %i2 = OpIAdd %u32 %idx %c2u
+         %q2 = OpAccessChain %ptr_sb %outbuf %zerou %i2
+               OpStore %q2 %r2
+        %i3 = OpIAdd %u32 %idx %c3u
+         %q3 = OpAccessChain %ptr_sb %outbuf %zerou %i3
+               OpStore %q3 %r3
+               OpReturn
+               OpFunctionEnd

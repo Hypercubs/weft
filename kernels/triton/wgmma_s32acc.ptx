@@ -1,8 +1,8 @@
 //
 // The integer accumulator: `wgmma.mma_async.sync.aligned.m64n8k32.s32.s8.s8`.
 //
-// Same geometry and same staged bytes as the f32 integer fixture — the layout does
-// not depend on what the accumulator holds — and the accumulator is `.s32`. The
+// Same geometry and same staged bytes as the f32 integer fixture, the layout does
+// not depend on what the accumulator holds, and the accumulator is `.s32`. The
 // sum of 32 products of bytes is exact in s32; it is also exact in f32 for these
 // inputs, so the reference reads the answer as an *integer* and a translator that
 // added in float would still agree here. What this fixture pins is the register

@@ -1,8 +1,8 @@
 //
 // A short immediate list, and the one flag that changes a sign.
 //
-// PTX says the immediates after the descriptors — scale-d, then scale-a scale-b,
-// then transpose-a transpose-b — may be left off from the end, so a run of one to
+// PTX says the immediates after the descriptors, scale-d, then scale-a scale-b,
+// then transpose-a transpose-b, may be left off from the end, so a run of one to
 // five is legal. This kernel gives two: `1, 1`, which is accumulate into D and
 // negate A. A translator that only accepted one, three or five immediates refused
 // this outright; one that read them positionally but always applied zero would
@@ -92,7 +92,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

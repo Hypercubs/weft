@@ -5,7 +5,7 @@
 //     /tmp/mslcheck out.metal
 //
 // It is the same compiler the launcher hands its source to, so a file that
-// passes here is one the launcher will take — which is what makes it usable as a
+// passes here is one the launcher will take, which is what makes it usable as a
 // build check for the GPU back end without a GPU present in the loop.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

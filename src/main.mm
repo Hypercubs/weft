@@ -1,17 +1,28 @@
 // The GPU column is Metal's, so only the Apple build has one. Everything else in
-// this file — the three front ends, the generated module, the CPU launch, the
-// comparison and the image writer — is plain C++ and compiles anywhere that has
-// dlopen and a C++20 compiler.
+// this file, the three front ends, the generated module, the CPU launch, the
+// comparison and the image writer, is plain C++ and compiles on any host with a
+// C++20 compiler and a loader for the module it builds.
 #if defined(__APPLE__)
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #endif
 
-#include <dlfcn.h>
 #include <signal.h>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <direct.h>
+#include <io.h>
+#include <process.h>
+#include <windows.h>
+#else
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -24,30 +35,18 @@
 
 #include "translate.hpp"
 #include "soft_math.hpp"
+// The software double is its own text (src/weft_f64.hpp) and the float bridges in the
+// portable math call it, so the Metal source for a .metal kernel carries both.
+#include "weft_f64.hpp"
 #include "translate_ptx.hpp"
 #include "translate_spirv.hpp"
 #include <weft/weft.h>
 
 namespace {
 
-// ---- a buffer's end is a page ----
-//
-// A kernel that indexes past the end of a buffer used to take the whole process
-// down with it, and a bare `Segmentation fault` reads as a broken tool rather
-// than a launch that was too small. The storage a kernel is handed is therefore
-// mapped with a page of PROT_NONE after it, so the first access past the end
-// lands in a handler that says which buffer, by how much, and over what grid.
-// The page size is the host's, not an assumption: Apple silicon maps 16 KiB pages,
-// and a guard page placed at a 4 KiB offset there is not page-aligned at all —
-// `mprotect` refuses it. The value is read once, before the first allocation, and
-// cached so the fault handler can use it without calling anything.
-size_t g_page_bytes = 0;
-
-size_t guard_page() {
-  if (!g_page_bytes) g_page_bytes = (size_t)getpagesize();
-  return g_page_bytes;
-}
-
+// A buffer is mapped with a page the kernel cannot touch after it, so an access
+// past the end names the buffer and the launch instead of taking the process
+// down with a bare fault. The page size is the host's: Apple silicon maps 16 KiB.
 struct GuardTag {
   const char* base = nullptr;
   size_t bytes = 0;
@@ -61,6 +60,29 @@ int g_nguards = 0;
 volatile sig_atomic_t g_guard_reported = 0;
 uint64_t g_guard_grid = 0;
 uint64_t g_guard_threads = 0;
+
+#if defined(_WIN32)
+// No guard page here: an overrun is the host's to report.
+void* guard_alloc(size_t bytes) {
+  void* p = std::malloc(bytes ? bytes : 1);
+  if (!p) {
+    std::fprintf(stderr, "weft: out of memory for %zu bytes of buffer\n", bytes);
+    std::abort();
+  }
+  return p;
+}
+
+void guard_free(void* p, size_t) { std::free(p); }
+
+void guard_install() {}
+
+#else
+
+size_t g_page_bytes = 0;
+size_t guard_page() {
+  if (!g_page_bytes) g_page_bytes = (size_t)getpagesize();
+  return g_page_bytes;
+}
 
 void* guard_alloc(size_t bytes) {
   const size_t page = guard_page();
@@ -157,6 +179,8 @@ void guard_install() {
   sigaction(SIGBUS, &sa, nullptr);
 }
 
+#endif
+
 void guard_tag(const void* base, size_t bytes, int index) {
   if (!base || index < 0 || index >= 64) return;
   guard_install();
@@ -167,7 +191,7 @@ void guard_tag(const void* base, size_t bytes, int index) {
 }
 
 // A std::vector's storage, with the guard page after it. Everything the rest of
-// this file does to a buffer — resize, assign, data, size, copy — is unchanged.
+// this file does to a buffer, resize, assign, data, size, copy, is unchanged.
 template <class T>
 struct GuardAlloc {
   using value_type = T;
@@ -184,8 +208,24 @@ struct GuardAlloc {
 
 using GuardedFloats = std::vector<float, GuardAlloc<float>>;
 
+#if defined(_WIN32)
+void* lib_open(const char* path) { return (void*)LoadLibraryA(path); }
+void* lib_sym(void* h, const char* name) { return (void*)GetProcAddress((HMODULE)h, name); }
+const char* lib_error() { return "the module did not load"; }
+void make_dir(const char* path) { _mkdir(path); }
+bool file_readable(const char* path) { return _access(path, 4) == 0; }
+long proc_id() { return (long)_getpid(); }
+#else
+void* lib_open(const char* path) { return dlopen(path, RTLD_NOW); }
+void* lib_sym(void* h, const char* name) { return dlsym(h, name); }
+const char* lib_error() { return dlerror(); }
+void make_dir(const char* path) { ::mkdir(path, 0755); }
+bool file_readable(const char* path) { return ::access(path, R_OK) == 0; }
+long proc_id() { return (long)::getpid(); }
+#endif
+
 const char* kUsage =
-    "weft — run GPU compute kernels on CPU cores\n"
+    "weft: run GPU compute kernels on CPU cores\n"
     "\n"
     "  weft run <file.metal|file.ptx|file.spv> [options]\n"
     "\n"
@@ -207,6 +247,7 @@ const char* kUsage =
     "                    thread search described under --cpu-only\n"
     "  --arg N=V         scalar kernel parameter N (PTX scalars; V may be 1.5 or 42)\n"
     "  --cpu-only        skip the GPU path (no Metal device needed)\n"
+    "  --exact           compare the two columns word for word, NaN and zero signs too\n"
     "                    the cpu path times 1/2/4/8 threads on this kernel and keeps\n"
     "                    the fastest, because the right count is a property of the\n"
     "                    kernel: atomics want one, elementwise wants two to four. The\n"
@@ -284,15 +325,24 @@ struct Options {
   std::vector<size_t> bufs;
   std::vector<std::pair<int, uint32_t>> widths;  // --buffer-bytes overrides
   // One binding per --textures entry: its width x height, the slice count when it
-  // is a 2D array (1 for a plain texture), and the depth when it is a volume —
+  // is a 2D array (1 for a plain texture), and the depth when it is a volume , 
   // `WxHxD`, which is 0 for the other two shapes.
   struct TexBind { uint32_t w, h, layers, d; bool cube; bool one_d; };
   std::vector<TexBind> textures;  // bound at index 0, 1, ...
+  // How many bytes one texel is. Four is the float image every fixture used
+  // before; two binds an `R16Float` one, where a texel is a half and the reader's
+  // type has to be two bytes wide *and* a decode.
+  uint32_t texel_bytes = 4;
   std::vector<std::pair<int, int>> samplers;            // filter, address mode
   std::vector<std::pair<int, uint64_t>> args;  // scalar kernel parameters
   std::vector<std::pair<int, std::string>> dumps, gpu_dumps;
   std::vector<std::pair<int, std::string>> loads;  // raw float32 in
   bool cpu_only = false, emit = false, emit_gpu = false, ptx = false;
+  // --exact: compare the two columns as words rather than as numbers. The numeric
+  // comparison cannot see a NaN (a NaN difference is greater than nothing) or the sign
+  // of a zero (0 - (-0) is 0), and those are exactly the edges a software double can
+  // get wrong.
+  bool exact = false;
   bool render = false;
   uint32_t rw = 0, rh = 0;  // the render target
   std::string out, out_gpu;  // --out, --out-gpu: the colour target as a PNG
@@ -307,7 +357,6 @@ bool write_bin(const std::string& path, const void* data, size_t bytes) {
   return n == bytes;
 }
 
-// ---- PNG out ---------------------------------------------------------------
 // A renderer that cannot save its frame has no output. This writes a PNG with
 // stored deflate blocks: no zlib, no dependency, and every viewer opens it. The
 // colour is clamped to [0,1] and sRGB-encoded because the fragment writes linear
@@ -453,6 +502,7 @@ int main(int argc, char** argv) {
       }
       else if (a == "--bench") o.bench = (uint32_t)std::strtoul(next("--bench").c_str(), nullptr, 10);
       else if (a == "--cpu-only") o.cpu_only = true;
+      else if (a == "--exact") o.exact = true;
       else if (a == "--buffer-bytes") {
         const std::string v = next("--buffer-bytes");
         size_t pos = 0;
@@ -554,8 +604,8 @@ int main(int argc, char** argv) {
             return 2;
           }
           // `WxH*L` is a 2D array of L slices, `WxHxD` is a volume of D planes,
-          // `WxHc` is a cube of six square faces, `WxHd` is a 1D texture — one row,
-          // which is what `texture1d` and PTX's `tex.1d` both read — and without any
+          // `WxHc` is a cube of six square faces, `WxHd` is a 1D texture, one row,
+          // which is what `texture1d` and PTX's `tex.1d` both read, and without any
           // of them it is one 2D image.
           const std::string rest = part.substr(x + 1);
           const size_t star = rest.find('*');
@@ -590,6 +640,16 @@ int main(int argc, char** argv) {
           if (comma == std::string::npos) break;
           start = comma + 1;
         }
+      }
+      else if (a == "--texel-bytes") {
+        const std::string v = next("--texel-bytes");
+        const unsigned long n = std::strtoul(v.c_str(), nullptr, 10);
+        if (n != 2 && n != 4) {
+          std::fprintf(stderr, "weft: --texel-bytes takes 2 (a half image) or 4, got '%s'\n",
+                       v.c_str());
+          return 2;
+        }
+        o.texel_bytes = (uint32_t)n;
       }
       else if (a == "--samplers") {
         std::string v = next("--samplers");
@@ -638,8 +698,8 @@ int main(int argc, char** argv) {
       return 2;
     }
     const bool spv = !o.render && o.file.size() > 4 && o.file.compare(o.file.size() - 4, 4, ".spv") == 0;
-    // Both binary front ends have a Metal back end now — the same decode emitted
-    // for the GPU — so both get a GPU column, which is set up below.
+    // Both binary front ends have a Metal back end now, the same decode emitted
+    // for the GPU, so both get a GPU column, which is set up below.
     o.front = spv ? "spir-v" : (o.ptx ? "ptx" : "metal");
 
     // A render pass translates `fragment` functions and needs the target's
@@ -657,13 +717,12 @@ int main(int argc, char** argv) {
                                      : translate_msl(src, o.render ? &rm : nullptr);
     if (!tr.ok) { std::fprintf(stderr, "weft: %s\n", tr.error.c_str()); return 1; }
 
-    // ---- the GPU column for PTX ----
     // The PTX front end has a second back end: the same decode emitted as Metal
     // (src/weft_msl.hpp is the runtime behind it). When it produces kernels the
     // GPU run compiles and executes those, so the comparison below is the CPU
     // and the GPU running the same generated code rather than two
-    // implementations that were written to agree. When it cannot — a 64-bit
-    // atomic, a 64-bit float, which this host's Metal has no form for — the run
+    // implementations that were written to agree. When it cannot, a 64-bit
+    // atomic, a 64-bit float, which this host's Metal has no form for, the run
     // names the instruction and keeps the CPU column instead of passing a twin
     // off as one.
     std::string gpu_refusal;
@@ -674,7 +733,7 @@ int main(int argc, char** argv) {
         tr.gpu_src = g.gpu_src;
         // The GPU translation is the one that decides a kernel has no per-lane
         // body and needs the warp back end, and that decision is the launcher's
-        // dispatch geometry — one thread per warp instead of one per lane. The
+        // dispatch geometry, one thread per warp instead of one per lane. The
         // kernel list comes from the CPU translation, so the flag travels across
         // by name rather than being guessed from the source.
         for (size_t i = 0; i < tr.kernels.size() && i < g.kernels.size(); i++)
@@ -715,7 +774,7 @@ int main(int argc, char** argv) {
     // different program. `--threads` always wins.
     if (!o.threads_set && kern.tg_hint) o.threads = kern.tg_hint;
     // A module that states the group it was written to run in without depending on
-    // it — SPIR-V's `LocalSize` — gets it as the default too, but not as a
+    // it, SPIR-V's `LocalSize`, gets it as the default too, but not as a
     // constraint: the kernel is indexed by its global invocation id.
     if (!o.threads_set && !kern.tg_hint && kern.def_threads) o.threads = kern.def_threads;
     // A group wider than a row is not a suggestion: the lane identity is
@@ -727,7 +786,7 @@ int main(int argc, char** argv) {
       o.threads = kern.fixed_threads;
     }
     // What each texture binding has to be. A cube kernel handed a 2-D texture is
-    // not a slow run — the sampler reads a texel nobody asked for — so the shape
+    // not a slow run, the sampler reads a texel nobody asked for, so the shape
     // the command line gave is checked against the shape the module declared, in
     // binding order.
     for (size_t t = 0; t < kern.tex_shape.size() && t < o.textures.size(); t++) {
@@ -755,7 +814,7 @@ int main(int argc, char** argv) {
     // A mesh stage produces one mesh per threadgroup, and the hardware caps a
     // mesh threadgroup at 32 lanes, so that is the group size unless one is given.
     if (!o.threads_set && kern.mesh) o.threads = 32;
-    // A kernel with only a warp body — a tensor-core fragment — is one warp wide
+    // A kernel with only a warp body, a tensor-core fragment, is one warp wide
     // by construction: its fragment map is derived from `%tid.x` inside the
     // block, so the block *is* that many lanes and a wider group is not a launch
     // the hardware would accept either. The module's declared size wins (32 when
@@ -797,15 +856,14 @@ int main(int argc, char** argv) {
       if (tr.kernels[i].task) task_kidx = (int)i;
     if (o.bufs.empty()) o.bufs.assign((size_t)kern.nbufs, (size_t)o.grid);
 
-    // ---- translate -> C++ -> dylib ----
     const char* root = WEFT_ROOT;
     std::string build = std::string(root) + "/build";
-    ::mkdir(build.c_str(), 0755);
+    make_dir(build.c_str());
     // The generated translation unit is a pure function of the kernel source, so
     // its bytes name the compiled library: hash the code, the runtime it links
     // against and the flags, and a second run with the same kernel skips clang++
     // entirely. An edit to the kernel changes the hash, so a stale library cannot
-    // be picked up — the cache is keyed by content, not by file name.
+    // be picked up, the cache is keyed by content, not by file name.
     auto fnv = [](const std::string& s, uint64_t h) {
       for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
       return h;
@@ -822,9 +880,19 @@ int main(int argc, char** argv) {
     // The flags are part of the cache key, because a different compiler or a
     // different `-O` level builds a different library.
     // `WEFT_CXX` names the compiler. Without it: clang++ if this host has one,
-    // the system C++ compiler otherwise — which on a Linux box is often the only
+    // the system C++ compiler otherwise, which on a Linux box is often the only
     // one there is, and gcc is what `c++` means there.
     const char* cxx_env = std::getenv("WEFT_CXX");
+#if defined(_WIN32)
+    // cmd.exe runs the probe, so ask the compiler for its own version.
+    const std::string cxx =
+        cxx_env ? std::string(cxx_env)
+                : (std::system("clang++ --version >NUL 2>&1") == 0 ? "clang++" : "c++");
+    // A .dll keeps only what it exports, and every runtime entry point is looked
+    // up by name.
+    const char* kSharedFlag = "-shared -Wl,--export-all-symbols";
+    const char* kLibExt = ".dll";
+#else
     const std::string cxx =
         cxx_env ? std::string(cxx_env)
                 : (std::system("command -v clang++ >/dev/null 2>&1") == 0 ? "clang++" : "c++");
@@ -835,14 +903,15 @@ int main(int argc, char** argv) {
     const char* kSharedFlag = "-shared";
     const char* kLibExt = ".so";
 #endif
+#endif
     hash = fnv(cxx + " -std=c++20 -O2 -fsigned-char " + kSharedFlag + " -fPIC " + root, hash);
     char hexkey[32];
     std::snprintf(hexkey, sizeof hexkey, "%016llx", (unsigned long long)hash);
     const std::string cache = build + "/cache";
-    ::mkdir(cache.c_str(), 0755);
+    make_dir(cache.c_str());
     const std::string gen = build + "/generated.cpp";
     const std::string lib = cache + "/" + hexkey + kLibExt;
-    const bool cached = ::access(lib.c_str(), R_OK) == 0;
+    const bool cached = file_readable(lib.c_str());
 
     double t0 = now_ms();
     if (!cached) {
@@ -854,9 +923,9 @@ int main(int argc, char** argv) {
       }
       // Compiled to a temporary name and renamed: two runs of the same kernel at
       // once must not read a half-written library.
-      const std::string tmp = lib + ".tmp." + std::to_string(::getpid());
+      const std::string tmp = lib + ".tmp." + std::to_string(proc_id());
       // `-fsigned-char`: Metal's `char` is a signed 8-bit integer. Where the
-      // platform's plain `char` is unsigned — aarch64 Linux — a kernel's
+      // platform's plain `char` is unsigned, aarch64 Linux, a kernel's
       // `(char)-2` would be 254 and would not fit an `int8_t`, so the module is
       // built with the signedness the shader means. It is a no-op where `char`
       // is already signed.
@@ -888,17 +957,17 @@ int main(int argc, char** argv) {
     }
     const double compile_ms = cached ? 0.0 : now_ms() - t0;
 
-    void* handle = dlopen(lib.c_str(), RTLD_NOW);
-    if (!handle) { std::fprintf(stderr, "weft: %s\n", dlerror()); return 1; }
-    auto run_cpu = (void (*)(int, void**, uint32_t, uint32_t))dlsym(handle, "weft_run");
+    void* handle = lib_open(lib.c_str());
+    if (!handle) { std::fprintf(stderr, "weft: %s\n", lib_error()); return 1; }
+    auto run_cpu = (void (*)(int, void**, uint32_t, uint32_t))lib_sym(handle, "weft_run");
     // Tile memory is one slot per pixel here, so a read of another tile is
-    // representable — on the GPU it is undefined and order-dependent. The
+    // representable, on the GPU it is undefined and order-dependent. The
     // module counts those reads; if any happened there is nothing to compare.
-    auto tile_reset = (void (*)())dlsym(handle, "weft_tile_reset");
-    auto tile_violations = (uint64_t (*)())dlsym(handle, "weft_tile_violations");
-    auto kernel_count = (int (*)())dlsym(handle, "weft_kernel_count");
-    auto kernel_at = (const weft_kernel_info* (*)(int))dlsym(handle, "weft_kernel_at");
-    auto set_param = (void (*)(int, uint64_t))dlsym(handle, "weft_set_param");
+    auto tile_reset = (void (*)())lib_sym(handle, "weft_tile_reset");
+    auto tile_violations = (uint64_t (*)())lib_sym(handle, "weft_tile_violations");
+    auto kernel_count = (int (*)())lib_sym(handle, "weft_kernel_count");
+    auto kernel_at = (const weft_kernel_info* (*)(int))lib_sym(handle, "weft_kernel_at");
+    auto set_param = (void (*)(int, uint64_t))lib_sym(handle, "weft_set_param");
     if (set_param)
       for (const auto& a : o.args) set_param(a.first, a.second);
 
@@ -914,13 +983,31 @@ int main(int argc, char** argv) {
       texdata[t].resize(n);
       for (size_t i = 0; i < n; i++) texdata[t][i] = det_value((uint32_t)i, (uint32_t)(100 + t));
     }
+    // The bytes actually uploaded. A four-byte texel is the float its bits are; a
+    // two-byte one is that value encoded to the half it rounds to, with the same
+    // round-to-nearest the kernels' own `cvt` uses, so a texel the GPU and the CPU
+    // column both read is the same number, which is what makes a comparison mean
+    // anything.
+    std::vector<std::vector<unsigned char>> texbytes(o.textures.size());
+    for (size_t t = 0; t < texdata.size(); t++) {
+      texbytes[t].resize(texdata[t].size() * o.texel_bytes);
+      for (size_t i = 0; i < texdata[t].size(); i++) {
+        if (o.texel_bytes == 2) {
+          const _Float16 h = (_Float16)texdata[t][i];
+          std::memcpy(&texbytes[t][2 * i], &h, 2);
+        } else {
+          std::memcpy(&texbytes[t][4 * i], &texdata[t][i], 4);
+        }
+      }
+    }
     auto set_texture =
-        (void (*)(int, void*, uint32_t, uint32_t, uint32_t))dlsym(handle, "weft_set_texture");
+        (void (*)(int, void*, uint32_t, uint32_t, uint32_t))lib_sym(handle, "weft_set_texture");
     auto set_texture_layers = (void (*)(int, void*, uint32_t, uint32_t, uint32_t, uint32_t))
-        dlsym(handle, "weft_set_texture_layers");
+        lib_sym(handle, "weft_set_texture_layers");
     if (set_texture_layers)
       for (size_t t = 0; t < o.textures.size(); t++)
-        set_texture_layers((int)t, texdata[t].data(), o.textures[t].w, o.textures[t].h, 4,
+        set_texture_layers((int)t, texbytes[t].data(), o.textures[t].w, o.textures[t].h,
+                           o.texel_bytes,
                            o.textures[t].d > 0 ? o.textures[t].d : o.textures[t].layers);
     else if (set_texture)
       for (size_t t = 0; t < o.textures.size(); t++) {
@@ -928,7 +1015,7 @@ int main(int argc, char** argv) {
           std::fprintf(stderr, "weft: this module cannot bind an array texture\n");
           return 2;
         }
-        set_texture((int)t, texdata[t].data(), o.textures[t].w, o.textures[t].h, 4);
+        set_texture((int)t, texbytes[t].data(), o.textures[t].w, o.textures[t].h, o.texel_bytes);
       }
     // Samplers are host state for a SPIR-V kernel, the way a descriptor is on a
     // GPU: one is created per index and the kernel reads through it.
@@ -937,7 +1024,7 @@ int main(int argc, char** argv) {
                    kern.name.c_str(), kern.ntex, kern.ntex == 1 ? "" : "s", o.textures.size());
       return 2;
     }
-    auto set_sampler = (void (*)(int, int, int))dlsym(handle, "weft_set_sampler");
+    auto set_sampler = (void (*)(int, int, int))lib_sym(handle, "weft_set_sampler");
     if (set_sampler) {
       const size_t want = (size_t)kern.nsamp > o.samplers.size() ? (size_t)kern.nsamp : o.samplers.size();
       for (size_t s = 0; s < want; s++) {
@@ -948,10 +1035,9 @@ int main(int argc, char** argv) {
     if (!run_cpu || !kernel_count) { std::fprintf(stderr, "weft: bad kernel library\n"); return 1; }
     if (kernel_count() != (int)tr.kernels.size()) { std::fprintf(stderr, "weft: kernel table mismatch\n"); return 1; }
 
-    // ---- task stage, then the meshgrid it asked for ----
     // A task stage runs before the meshes it feeds: it fills the payload and says
     // how many meshes to dispatch. It runs over the grid given on the command
-    // line, and what it asks for becomes the mesh stage's grid — that is the whole
+    // line, and what it asks for becomes the mesh stage's grid, that is the whole
     // job of the stage. A mesh reads the payload element of the task group that
     // owns its block of the meshgrid, which the launcher fills in below.
     std::vector<uint32_t> task_payload;  // one element per task threadgroup
@@ -987,7 +1073,7 @@ int main(int argc, char** argv) {
       const uint32_t set = props[0] ? props[0] : task_groups;
       // The meshgrid is cut into contiguous blocks, one per task threadgroup, and
       // every mesh in a block gets that group's payload. A mesh then reads its
-      // own element — the partition is defined here, in the launcher, so nothing
+      // own element, the partition is defined here, in the launcher, so nothing
       // a mesh computes depends on an assignment left to the hardware.
       if (tk.payload_idx >= 0 && pbytes >= 4) {
         const size_t words = pbytes / 4u;
@@ -999,7 +1085,7 @@ int main(int argc, char** argv) {
             mesh_payload[(size_t)m * words + w] = task_payload[(size_t)at * words + w];
         }
       }
-      std::printf("task      %u threadgroup%s of %u lanes  ·  meshgrid it set: %u mesh%s\n",
+      std::printf("task      %u threadgroup%s of %u lanes  meshgrid it set: %u mesh%s\n",
                   task_groups, task_groups == 1 ? "" : "s", o.threads, set,
                   set == 1 ? "" : "es");
       // From here the mesh stage runs over what the task stage asked for.
@@ -1008,7 +1094,6 @@ int main(int argc, char** argv) {
       o.threads_set = true;
     }
 
-    // ---- buffers ----
     const size_t nb = (size_t)kern.nbufs;  // buffers the stage declares itself
     // A render pass has up to two more buffers than the fragment declares: tile
     // memory, one float4 per pixel, if the pass has an imageblock, and the
@@ -1035,7 +1120,7 @@ int main(int argc, char** argv) {
     }
     const int tile_run = tile_mem ? tile_kidx : -1;
     // A tile is 32x32 pixels and a tile function is dispatched one threadgroup per
-    // tile, so its group is the tile — not whatever --threads says. That is the
+    // tile, so its group is the tile, not whatever --threads says. That is the
     // size `threads_per_threadgroup` has to report inside it, and it is what makes
     // threadgroup memory inside a tile stage mean what it means on a GPU.
     const uint32_t tile_threads = 32 * 32;
@@ -1051,7 +1136,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     // Element widths come from the module: `sizeof` of the type each buffer was
-    // declared with, so `--buffers N` is N elements of *that* type — 4 bytes for a
+    // declared with, so `--buffers N` is N elements of *that* type, 4 bytes for a
     // float*, 16 for a float4*, 12 for a packed_float3*. The front ends that bind
     // addresses report the width their own loads and stores address the buffer at
     // (or the one `--buffer-bytes` stated), and 4 bytes is the fallback only where
@@ -1070,7 +1155,7 @@ int main(int argc, char** argv) {
     // module's ABI (the front ends take it as an argument), so `elem` above is the
     // one answer the run and the module both read. A second path would drift.
     // Tile memory is a 32x32 block per tile, so its size is the number of tiles
-    // the target covers — including the short last row and column a target that
+    // the target covers, including the short last row and column a target that
     // is not a multiple of 32 still pays for, exactly as the hardware does.
     const uint64_t tiles_x = (o.rw + 31u) / 32u, tiles_y = (o.rh + 31u) / 32u;
     std::vector<GuardedFloats> host(nbuf);
@@ -1149,20 +1234,20 @@ int main(int argc, char** argv) {
     // file, and a report in front of it is a syntax error rather than a
     // preamble: in that mode the source is the only thing that goes there.
     const bool report = !o.emit_gpu;
-    if (report) std::printf("weft — gpu on cpu\n\n");
+    if (report) std::printf("weft  gpu on cpu\n\n");
     if (kern.mesh && report)
-      std::printf("mesh      %d vertices and %d primitives per mesh  ·  %llu mesh%s for this grid\n",
+      std::printf("mesh      %d vertices and %d primitives per mesh  %llu mesh%s for this grid\n",
                   kern.mesh_nv, kern.mesh_np, (unsigned long long)meshes,
                   meshes == 1 ? "" : "es");
     if (o.render) {
       if (report)
-        std::printf("fragment  %s  ·  target %ux%u  ·  %zu buffer%s\n", kern.name.c_str(), o.rw,
+        std::printf("fragment  %s  target %ux%u  %zu buffer%s\n", kern.name.c_str(), o.rw,
                     o.rh, nb, nb == 1 ? "" : "s");
     }
     else {
       // A front end that types its pointers names the element (`float4 16B`). One
       // that binds an address has no name to give, and calling it `float` would be
-      // the tool inventing a layout — so it says `addr 8B`, a byte count without a
+      // the tool inventing a layout, so it says `addr 8B`, a byte count without a
       // type. That count is measured (the width the instructions that reach the
       // buffer address it at), or stated with `--buffer-bytes`; only a buffer
       // nothing typed reaches is left at the 4-byte fallback, marked `*`.
@@ -1183,7 +1268,7 @@ int main(int argc, char** argv) {
         }
       }
       if (report)
-        std::printf("kernel    %s  ·  grid %s  ·  threadgroup %u  ·  %zu buffer%s (%s)\n",
+        std::printf("kernel    %s  grid %s  threadgroup %u  %zu buffer%s (%s)\n",
                     kern.name.c_str(), fmt_uint(o.grid).c_str(), o.threads, nb,
                     nb == 1 ? "" : "s", types.c_str());
       if (report && unknown_width)
@@ -1191,8 +1276,8 @@ int main(int argc, char** argv) {
                     "width is\n"
                     "           unknown: 4 bytes is assumed. State one with "
                     "`--buffer-bytes I=N[,J=N]`.\n");
-      // A parameter the kernel declares and never reads is not bound — Triton's
-      // `global_scratch` is the common case — so the buffer count can be one
+      // A parameter the kernel declares and never reads is not bound, Triton's
+      // `global_scratch` is the common case, so the buffer count can be one
       // smaller than the signature suggests. Say which, rather than leaving the
       // caller to work out why --buffers wanted fewer.
       if (report && !kern.unused.empty()) {
@@ -1208,11 +1293,10 @@ int main(int argc, char** argv) {
     else
       std::snprintf(timing, sizeof timing, "%s %.0f ms", cxx.c_str(), compile_ms);
     if (report)
-      std::printf("translate %zu kernel%s, %d with barriers  ·  %s  ·  %s\n",
+      std::printf("translate %zu kernel%s, %d with barriers  %s  %s\n",
                   tr.kernels.size(), tr.kernels.size() == 1 ? "" : "s", kern.sync ? 1 : 0,
                   timing, o.front.c_str());
 
-    // ---- CPU path ----
     std::vector<std::vector<float>> cpu_out(nbuf);
     for (size_t b = 0; b < nbuf; b++) cpu_out[b].assign(host[b].size(), 0.0f);
 
@@ -1229,7 +1313,6 @@ int main(int argc, char** argv) {
       return now_ms() - s;
     };
 
-    // ---- how many cores? ----
     // A launch is cheap now that the pool keeps its threads parked, so the
     // answer belongs to the kernel rather than to the machine: elementwise work
     // saturates on two cores and loses the rest to bandwidth, while an
@@ -1291,7 +1374,6 @@ int main(int argc, char** argv) {
       }
     }
 
-    // ---- GPU path ----
     // The GPU column is Metal's, so it exists only in the Apple build. Every
     // other platform translates and launches the same kernel the same way; what
     // it does not have is hardware to diff against, and it says so rather than
@@ -1303,7 +1385,7 @@ int main(int argc, char** argv) {
 
 #if defined(__APPLE__)
     // A kernel the Metal back end cannot build has no GPU column, and saying so
-    // here — before the launch is set up — keeps the run a CPU one instead of
+    // here, before the launch is set up, keeps the run a CPU one instead of
     // aborting it. Two things land here: a kernel with no GPU form at all (a
     // 64-bit atomic, a 64-bit float, a body only the warp back end has), which
     // the translator refuses by name, and a shader this host's compiler itself
@@ -1387,8 +1469,8 @@ int main(int argc, char** argv) {
       // within an ulp of Metal's hardware approximations. Placed after the
       // includes, where float2/float3/float4 exist.
       // The emitted PTX module calls the language's own functions and the build
-      // compiles with safe math, so the portable-math rewrite — which exists to
-      // replace Metal's *approximations* in a .metal file — has nothing to do
+      // compiles with safe math, so the portable-math rewrite, which exists to
+      // replace Metal's *approximations* in a .metal file, has nothing to do
       // here.
       if (o.ptx || spv) gpu_src = std::string();
       {
@@ -1404,7 +1486,11 @@ int main(int argc, char** argv) {
           at = gpu_src.find('\n', at);
         }
         at = (at == std::string::npos) ? 0 : at + 1;
-        gpu_src.insert(at, kWSoftMath);
+        // The software double goes in with it: the float bridges that Metal's own
+        // library cannot answer (`erf`, `cbrt`, `asinh`, …) widen to a double, hand it
+        // to that text and narrow once, so a kernel calling one needs its definitions
+        // here or the Metal linker stops with the symbol undefined.
+        gpu_src.insert(at, std::string(kWWeftF64) + kWSoftMath);
       }
       if (o.emit_gpu) {
         std::fputs(gpu_src.c_str(), stdout);
@@ -1418,7 +1504,7 @@ int main(int argc, char** argv) {
       // divide and rsqrt are approximations, and the compiler is free to fuse and
       // reassociate. That makes the GPU the imprecise side of an exactness claim,
       // and no CPU can reproduce an undocumented hardware approximation. Safe math
-      // is IEEE — the same arithmetic the translated C++ performs — so the two
+      // is IEEE, the same arithmetic the translated C++ performs, so the two
       // engines can be compared bit for bit instead of to a tolerance.
       MTLCompileOptions* copts = [MTLCompileOptions new];
       if (@available(macOS 15.0, *)) {
@@ -1431,8 +1517,8 @@ int main(int argc, char** argv) {
       }
       // The build check above compiled this exact text on this exact device, so
       // its library is the answer and there is nothing to ask the compiler for.
-      // Anything else — a `.metal` file, whose source is rewritten for the target,
-      // or a render pass, which appends a vertex stage — is compiled here.
+      // Anything else, a `.metal` file, whose source is rewritten for the target,
+      // or a render pass, which appends a vertex stage, is compiled here.
       const bool reuse_build = probed_pso != nil && probed_dev == dev && probed_src == gpu_src;
       id<MTLLibrary> mtllib = reuse_build ? probed_lib : nil;
       if (!mtllib) {
@@ -1459,7 +1545,7 @@ int main(int argc, char** argv) {
         }
         // The tile stage runs as its own pass before the draw. Tile memory is a
         // buffer both sides share, so it needs a compute pipeline over the same
-        // pixels and a dispatch ahead of the render pass — no tile pipeline.
+        // pixels and a dispatch ahead of the render pass, no tile pipeline.
         if (tile_run >= 0) {
           id<MTLFunction> tf = [mtllib newFunctionWithName:[NSString stringWithUTF8String:
                                                       tr.kernels[tile_run].name.c_str()]];
@@ -1506,7 +1592,7 @@ int main(int argc, char** argv) {
         mbuf[b] = [dev newBufferWithLength:host[b].size() * sizeof(float)
                                    options:MTLResourceStorageModeShared];
       }
-      // An emitted PTX kernel binds its buffers the way any Metal kernel does —
+      // An emitted PTX kernel binds its buffers the way any Metal kernel does , 
       // one resource per index, because a GPU address is not something the host
       // can name (tools/ptrprobe). What the C++ ABI passes as a `void*` array is
       // therefore a set of bound resources here, and the scalar parameters are
@@ -1527,7 +1613,7 @@ int main(int argc, char** argv) {
         geom_buf = [dev newBufferWithLength:4 * sizeof(uint64_t)
                                    options:MTLResourceStorageModeShared];
       // The words a 64-bit atomic locks on. The shape is `kLockWords` in
-      // src/weft_warp_msl.hpp — one word per slot, hashed from the address — so
+      // src/weft_warp_msl.hpp, one word per slot, hashed from the address, so
       // the host only has to make the table exist and hand it over zeroed.
       id<MTLBuffer> lock_buf = nil;
       if (kern.wide)
@@ -1548,31 +1634,34 @@ int main(int argc, char** argv) {
       for (size_t t = 0; t < o.textures.size(); t++) {
         const Options::TexBind& tb = o.textures[t];
         // A volume is its own descriptor: `texture3d` is `MTLTextureType3D`, whose
-        // planes are stored one after another — the order the host data was filled
+        // planes are stored one after another, the order the host data was filled
         // in, and the order the CPU runtime indexes.
         MTLTextureDescriptor* td;
         if (tb.d > 0) {
           // This SDK has no `texture3DDescriptor…` class method, so the descriptor
-          // is built field by field — which is what the convenience constructors
+          // is built field by field, which is what the convenience constructors
           // do anyway.
           td = [[MTLTextureDescriptor alloc] init];
-          td.pixelFormat = MTLPixelFormatR32Float;
+          td.pixelFormat =
+              o.texel_bytes == 2 ? MTLPixelFormatR16Float : MTLPixelFormatR32Float;
           td.textureType = MTLTextureType3D;
           td.width = tb.w;
           td.height = tb.h;
           td.depth = tb.d;
           td.mipmapLevelCount = 1;
         } else {
-          td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
-                                                                  width:tb.w
-                                                                 height:tb.h
-                                                              mipmapped:NO];
+          td = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:(o.texel_bytes == 2 ? MTLPixelFormatR16Float
+                                                                    : MTLPixelFormatR32Float)
+                                           width:tb.w
+                                          height:tb.h
+                                       mipmapped:NO];
         }
         // An array binding is the texture type the kernel declares:
         // `texture2d_array<float>` is an MTLTextureType2DArray of L slices, and
         // its slices are stored one after another, which is the order the host
         // data was filled in. A cube is six faces of the same descriptor, in the
-        // same order — the two types differ, the layout does not.
+        // same order, the two types differ, the layout does not.
         if (tb.one_d) {
           // One row, and the GPU type that says so: `texture1d` is
           // `MTLTextureType1D`, which has a width and no height at all.
@@ -1587,23 +1676,23 @@ int main(int argc, char** argv) {
         // needs the GPU's permission to write the resource back.
         td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         mtex[t] = [dev newTextureWithDescriptor:td];
-        // The slice form uploads one slice per call — its region is a single
-        // slice, not the whole array — so the slices are copied in one at a time
+        // The slice form uploads one slice per call, its region is a single
+        // slice, not the whole array, so the slices are copied in one at a time
         // from the same flat buffer the CPU runtime indexes.
         if (tb.d > 0) {
           // A volume goes up through a blit: this SDK's `replaceRegion` has no 3D
           // form, and the blit's source is the same flat buffer the CPU runtime
           // indexes, one plane after another.
-          id<MTLBuffer> src = [dev newBufferWithBytes:texdata[t].data()
-                                               length:texdata[t].size() * sizeof(float)
+          id<MTLBuffer> src = [dev newBufferWithBytes:texbytes[t].data()
+                                               length:texbytes[t].size()
                                               options:MTLResourceStorageModeShared];
           id<MTLCommandQueue> q = [dev newCommandQueue];
           id<MTLCommandBuffer> cb = [q commandBuffer];
           id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
           [bl copyFromBuffer:src
                   sourceOffset:0
-              sourceBytesPerRow:(NSUInteger)tb.w * sizeof(float)
-            sourceBytesPerImage:(NSUInteger)tb.w * tb.h * sizeof(float)
+              sourceBytesPerRow:(NSUInteger)tb.w * o.texel_bytes
+            sourceBytesPerImage:(NSUInteger)tb.w * tb.h * o.texel_bytes
                     sourceSize:MTLSizeMake(tb.w, tb.h, tb.d)
                      toTexture:mtex[t]
               destinationSlice:0
@@ -1613,26 +1702,26 @@ int main(int argc, char** argv) {
           [cb commit];
           [cb waitUntilCompleted];
         } else if (tb.layers > 1) {
-          const size_t slice = (size_t)tb.w * tb.h * sizeof(float);
+          const size_t slice = (size_t)tb.w * tb.h * o.texel_bytes;
           for (uint32_t l = 0; l < tb.layers; l++)
             [mtex[t] replaceRegion:MTLRegionMake3D(0, 0, 0, tb.w, tb.h, 1)
                        mipmapLevel:0
                              slice:l
-                         withBytes:texdata[t].data() + (size_t)l * tb.w * tb.h
-                       bytesPerRow:(NSUInteger)tb.w * sizeof(float)
+                         withBytes:texbytes[t].data() + (size_t)l * slice
+                       bytesPerRow:(NSUInteger)tb.w * o.texel_bytes
                       bytesPerImage:slice];
         }
         else
           [mtex[t] replaceRegion:MTLRegionMake2D(0, 0, tb.w, tb.h)
                      mipmapLevel:0
-                       withBytes:texdata[t].data()
-                     bytesPerRow:(NSUInteger)tb.w * sizeof(float)];
+                       withBytes:texbytes[t].data()
+                     bytesPerRow:(NSUInteger)tb.w * o.texel_bytes];
       }
 
       // The sampler state the CPU runtime models is the GPU's descriptor, so the
       // same two choices go to the encoder: the filter, and what a coordinate
       // outside the image means. A sampler the command line did not name gets the
-      // CPU runtime's default — nearest, clamped — and binding it explicitly is
+      // CPU runtime's default, nearest, clamped, and binding it explicitly is
       // what makes that a decision rather than whatever the driver does.
       auto make_sampler = [&](int filter, int addr) -> id<MTLSamplerState> {
         MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
@@ -1722,7 +1811,7 @@ int main(int argc, char** argv) {
           else if (lock_buf) [enc setBuffer:lock_buf offset:0 atIndex:nbind + 1];
           // A warp kernel carries geometry at +1, so its lock table is bound one
           // past that. It used to be handed over as a raw address inside the
-          // geometry buffer instead, which is memory the kernel never declared —
+          // geometry buffer instead, which is memory the kernel never declared , 
           // and a spinlock on it lost increments under load.
           if (kern.gpu_warp && lock_buf) [enc setBuffer:lock_buf offset:0 atIndex:nbind + 2];
           for (size_t t = 0; t < mtex.size(); t++) [enc setTexture:mtex[t] atIndex:t];
@@ -1751,8 +1840,8 @@ int main(int argc, char** argv) {
               const uint32_t warps = (o.grid + 31u) / 32u;
               // A group is never wider than the warps the launch actually has:
               // with a grid smaller than one block, a group of four threads would
-              // run three warps the program does not have, and the CPU twin —
-              // which launches `ceil(live/32)` warps — runs only the first.
+              // run three warps the program does not have, and the CPU twin , 
+              // which launches `ceil(live/32)` warps, runs only the first.
               uint32_t per = std::max(1u, std::min(o.threads / 32u, warps));
               // A kernel that relays between lanes has one slice of threadgroup
               // memory per warp, and the translator sized that array: a wider
@@ -1766,10 +1855,10 @@ int main(int argc, char** argv) {
               // stops completing where four warps per group answers in 22 ms, so a
               // group of one thread costs whatever the per-group `threadgroup`
               // memory costs and buys nothing. The shared arena is not a reason to
-              // widen the dispatch either — it is zeroed before the body runs (see
+              // widen the dispatch either, it is zeroed before the body runs (see
               // the emitter), so a warp cannot read a peer's half-written slice.
-              // A kernel that needs the 64-bit pair is walked by one thread — that
-              // is what gives the pair a single writer — so it is dispatched once.
+              // A kernel that needs the 64-bit pair is walked by one thread, that
+              // is what gives the pair a single writer, so it is dispatched once.
               const bool one_walker = kern.wide && spv;
               uint64_t* cg = (uint64_t*)[geom_buf contents];
               cg[0] = o.grid;                   // lanes the kernel is written against
@@ -1865,9 +1954,8 @@ int main(int argc, char** argv) {
     if (!gpu_refusal.empty() && !gpu_ran)
       std::printf("%-9s %-34s %s\n", "gpu", "no column for this kernel", gpu_refusal.c_str());
 
-    // ---- compare ----
     double worst_abs = 0.0, worst_rel = 0.0;
-    size_t checked = 0;
+    size_t checked = 0, bitdiff = 0;
     for (size_t b = 0; b < nbuf && gpu_ran; b++) {
       for (size_t i = 0; i < gpu_out[b].size(); i++) {
         double a = gpu_out[b][i], c = cpu_out[b][i];
@@ -1875,6 +1963,16 @@ int main(int argc, char** argv) {
         double denom = std::fmax(std::fabs(a), 1e-30);
         if (ad > worst_abs) worst_abs = ad;
         if (ad / denom > worst_rel) worst_rel = ad / denom;
+        // Two words, not two numbers: an infinity against an infinity and a NaN
+        // against a NaN both subtract to a NaN, which is never greater than the worst
+        // so far, so in the numeric comparison they are invisible whatever they are.
+        if (o.exact) {
+          uint32_t wa = 0, wc = 0;
+          float fa = (float)gpu_out[b][i], fc = (float)cpu_out[b][i];
+          std::memcpy(&wa, &fa, 4);
+          std::memcpy(&wc, &fc, 4);
+          if (wa != wc) bitdiff++;
+        }
         checked++;
       }
     }
@@ -1901,7 +1999,6 @@ int main(int argc, char** argv) {
       }
     }
 
-    // ---- the image ----
     // A render pass's colour target is the frame; --out is how it leaves the
     // process. The gpu form exists so the two files can be compared with `cmp`,
     // which is the same claim as `compare` in a form that opens in a viewer.
@@ -1938,9 +2035,15 @@ int main(int argc, char** argv) {
       const double ratio = cpu_avg / std::fmax(gpu_avg, 1e-9);
       std::printf("%-9s cpu is %.2fx %s than the gpu\n", "", ratio >= 1.0 ? ratio : 1.0 / ratio,
                   ratio >= 1.0 ? "slower" : "faster");
-      std::printf("%-9s %s values  ·  max |diff| %.3g  ·  max rel %.3g%s\n", "compare",
-                  fmt_uint(checked).c_str(), worst_abs, worst_rel,
-                  worst_rel <= 1e-4 ? "  — agree" : "  — DISAGREE");
+      if (o.exact) {
+        std::printf("%-9s %s values  %s differ: %s\n", "compare",
+                    fmt_uint(checked).c_str(), fmt_uint(bitdiff).c_str(),
+                    bitdiff == 0 ? "the words agree" : "DISAGREE");
+      } else {
+        std::printf("%-9s %s values  max |diff| %.3g  max rel %.3g%s\n", "compare",
+                    fmt_uint(checked).c_str(), worst_abs, worst_rel,
+                    worst_rel <= 1e-4 ? ": agree" : ": DISAGREE");
+      }
     }
     std::printf("\n");
     return 0;

@@ -2,8 +2,8 @@
 ;
 ; Both used to be refused: this host's Metal has no 64-bit atomic instruction, and
 ; a plain load of eight bytes can be torn by another lane writing the other half.
-; They take the shape the pair updates already take — one thread for the whole
-; grid, which walks every warp — and there the pair has a single reader and a
+; They take the shape the pair updates already take, one thread for the whole
+; grid, which walks every warp, and there the pair has a single reader and a
 ; single writer, so two 32-bit atomic loads are the 64-bit load and two 32-bit
 ; atomic stores are the 64-bit store.
 ;

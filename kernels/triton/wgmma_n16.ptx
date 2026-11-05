@@ -9,13 +9,13 @@
 // run at all.
 //
 // Here N is 16: B is 16x16, so there are two N groups and the second one is a real
-// address, and D is 64x16, so a lane holds eight accumulators — D[16w+g][2t..2t+1]
+// address, and D is 64x16, so a lane holds eight accumulators, D[16w+g][2t..2t+1]
 // and the row 8 below for each of the two groups. The inputs and the product are
 // the same small integers as `wgmma.ptx`, so the same reference still applies.
 //
 // A is 64x16 (2048 bytes): LBO = 128 between the two K groups, SBO = 256 between
 // the eight M groups. B is 16x16: LBO = 128 between K groups, SBO = 256 between N
-// groups — 512 bytes, since two K groups by two N groups of 128.
+// groups, 512 bytes, since two K groups by two N groups of 128.
 .version 8.1
 .target sm_90
 .address_size 64
@@ -116,7 +116,7 @@
 
 	// The accumulator: per N group of eight columns, D[16w+g][2t], [2t+1] and the
 	// row 8 below. The second group is a whole 32 bytes along, and the row 8 below
-	// is 512 — eight rows of sixteen columns.
+	// is 512, eight rows of sixteen columns.
 	shr.u32 	%r30, %r1, 5;
 	shr.u32 	%r31, %r1, 2;
 	and.b32 	%r31, %r31, 7;

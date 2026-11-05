@@ -1,6 +1,6 @@
 ; Subgroup shuffles of values wider than one 32-bit word: a float2 and a 64-bit
-; integer. The Metal twin is `wide_shfl` in basic.metal — `simd_shuffle` of a
-; float2 and of a long — so the two front ends have to agree bit for bit.
+; integer. The Metal twin is `wide_shfl` in basic.metal, `simd_shuffle` of a
+; float2 and of a long, so the two front ends have to agree bit for bit.
                OpCapability Kernel
                OpCapability Addresses
                OpCapability Int64

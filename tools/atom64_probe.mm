@@ -6,7 +6,7 @@
 //   - `atomic_ulong` is *declared* (metal_atomic, behind `__HAVE_ATOMIC_ULONG__`).
 //   - `atomic_fetch_add_explicit` and the other fetching forms are SFINAE'd to
 //     32-bit pointer types (`_valid_fetch_*_type`), so they do not exist for
-//     `ulong` at all — a compile error, not a hardware answer.
+//     `ulong` at all, a compile error, not a hardware answer.
 //   - `atomic_max_explicit` / `atomic_min_explicit` on `ulong` *do* compile and
 //     the pipeline for them is refused.
 //   - `atomic_load` / `store` / `exchange` / `compare_exchange` look generic over
@@ -29,7 +29,7 @@
 #include <cstdio>
 #include <cstring>
 
-// Compiles `body` and, when it compiles, builds its pipeline too — the step where
+// Compiles `body` and, when it compiles, builds its pipeline too, the step where
 // a 64-bit atomic is actually refused.
 //
 // `threads` > 0 also runs the pipeline that many threads wide and prints the
@@ -115,7 +115,6 @@ int main() {
     }
     std::printf("device: %s\n\n", [[dev name] UTF8String]);
 
-    // ---- the fetching forms: SFINAE'd to 32-bit, so these should not compile ----
     probe(dev, "atomic_ulong fetch_add", R"(
 kernel void k(device ulong* p [[buffer(0)]]) {
   device atomic_ulong* a = (device atomic_ulong*)&p[0];
@@ -124,7 +123,6 @@ kernel void k(device ulong* p [[buffer(0)]]) {
 }
 )", true);
 
-    // ---- min/max on ulong: declared, compiled, and refused by the device ----
     probe(dev, "atomic_ulong max", R"(
 kernel void k(device ulong* p [[buffer(0)]]) {
   device atomic_ulong* a = (device atomic_ulong*)&p[0];
@@ -132,7 +130,6 @@ kernel void k(device ulong* p [[buffer(0)]]) {
 }
 )", true);
 
-    // ---- the generic-over-_atomic<T> forms ----
     probe(dev, "atomic_ulong load", R"(
 kernel void k(device ulong* p [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
   device atomic_ulong* a = (device atomic_ulong*)&p[0];
@@ -155,7 +152,6 @@ kernel void k(device ulong* p [[buffer(0)]], uint gid [[thread_position_in_grid]
 }
 )", true);
 
-    // ---- the decisive one: a public 64-bit CAS ----
     probe(dev, "atomic_ulong cas (compile)", R"(
 kernel void k(device ulong* p [[buffer(0)]]) {
   device atomic_ulong* a = (device atomic_ulong*)&p[0];

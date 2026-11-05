@@ -7,7 +7,7 @@
 ;     s = OpGroupNonUniformLogicalXor  InclusiveScan p     false up to lane 4, then true
 ;     out[gid] = o + 2a + 4x + 8s
 ;
-; So every lane below 5 writes 5 and every lane from 5 on writes 13 — exact, and
+; So every lane below 5 writes 5 and every lane from 5 on writes 13, exact, and
 ; recomputed by check.sh. A fold that seeded `and` with false answers 0 for it, and
 ; one that seeded `or` with true answers 1 for a lane that never ran; neither moves
 ; the sum the way the identity above does.

@@ -4,7 +4,7 @@
 //
 // `redux.sync.add` folds a value across the warp's lanes, which the per-lane
 // machine cannot do without suspending every lane, so a kernel with one runs on
-// the warp backend — one thread owning 32 lanes, a warpgroup being four of those
+// the warp backend, one thread owning 32 lanes, a warpgroup being four of those
 // threads. wgmma has to work there too: its lanes are `ctx.lid0 + l`, its
 // accumulators are the vector's elements, and its operands are in shared memory,
 // which the warp backend has.
@@ -94,7 +94,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r22, %r1, 5;
 	shr.u32 	%r23, %r1, 2;

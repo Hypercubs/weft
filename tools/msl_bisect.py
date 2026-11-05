@@ -3,7 +3,7 @@
 
 The Metal compiler is two stages, and they fail differently. `newLibraryWithSource`
 builds a library from source; `newComputePipelineStateWithFunction` then generates
-machine code. A shader can pass the first and take the second down hard — the
+machine code. A shader can pass the first and take the second down hard, the
 diagnostic is `XPC_ERROR_CONNECTION_INTERRUPTED`, which names the transport rather
 than the construct, so it says nothing about what is wrong.
 
@@ -18,15 +18,15 @@ a time, and asks the compiler after each removal:
 `crash` shrinks the candidate set, `ok` and `error` grow the granularity, and what
 survives is a minimal set of lines whose presence reproduces the failure. That is
 usually one statement, and it is usually a type or an operation the back end has no
-lowering for — on this host it was a `__int128` multiply that a 32-bit limb product
+lowering for, on this host it was a `__int128` multiply that a 32-bit limb product
 replaced.
 
     ./build/weft run file.ptx --emit-gpu > out.metal   # the source, nothing else
     python3 tools/msl_bisect.py out.metal
     python3 tools/msl_bisect.py out.metal --timeout 60
 
-The checker is `tools/msl_check.mm` — the same compiler the launcher hands its
-source to — so a failure here is a failure there, with no GPU in the loop.
+The checker is `tools/msl_check.mm`, the same compiler the launcher hands its
+source to, so a failure here is a failure there, with no GPU in the loop.
 """
 
 import os
@@ -81,7 +81,7 @@ def statements(lines):
 
     Only the last kernel's body counts. The helpers above it are shared by every
     kernel in the file, and a statement removed from one of them changes the file
-    rather than the kernel — which reads as a cure when it is really a warning.
+    rather than the kernel, which reads as a cure when it is really a warning.
     """
     start = 0
     for i, line in enumerate(lines):
@@ -148,7 +148,7 @@ def main():
 
     what, msg = classify(text, timeout)
     if what == "ok":
-        print("%s builds and takes a pipeline — nothing to bisect" % path)
+        print("%s builds and takes a pipeline, nothing to bisect" % path)
         return 0
     print("%s: %s" % (what, msg))
     if what != "crash":
@@ -162,8 +162,8 @@ def main():
     keep = shrink(lines, cand, timeout)
 
     # Two different answers are worth separating, because they point at different
-    # things. Either a small set of statements reproduces the failure on its own —
-    # that is the construct, and the search above has already found it — or the body
+    # things. Either a small set of statements reproduces the failure on its own , 
+    # that is the construct, and the search above has already found it, or the body
     # fails as a whole, in which case there is no construct and the question becomes
     # which statements matter.
     # Remove the candidates the search let go of, and leave every line that is not a
@@ -195,8 +195,8 @@ def main():
         print("  (none: this one needs a combination, and the group above is the")
         print("   smallest the search found)")
     else:
-        print("  Many single removals curing it means a limit the body crosses — a")
-        print("  register count, an instruction count — rather than one unsupported")
+        print("  Many single removals curing it means a limit the body crosses, a")
+        print("  register count, an instruction count, rather than one unsupported")
         print("  construct. Look for the widest type or operation in it: a 128-bit")
         print("  multiply in a kernel this size is exactly what this looked like.")
     return 0

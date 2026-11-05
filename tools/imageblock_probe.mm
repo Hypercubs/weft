@@ -1,7 +1,7 @@
 // Which imageblock spelling does this host's Metal compiler accept?
 //
 // The `metal` command-line tool is not installed on this machine, but the runtime
-// compiler is — and that is the one weft hands its source to. So the question is
+// compiler is, and that is the one weft hands its source to. So the question is
 // answered by compiling each spelling with Metal.framework and printing the real
 // diagnostic, rather than by guessing.
 //

@@ -1,0 +1,76 @@
+// `prmt` in each of its six named modes, plus the generic form. The mode is a
+// 2-bit selector taken from the low bits of `c`, and the ISA's table for it is
+//   f4e  d.bj = src[(k + j) & 7]     b4e  d.bj = src[(k - j) & 7]
+//   rc8  d.bj = src[k]               rc16 d.bj = src[(k & 1) * 2 + (j & 1)]
+//   ecl  d.bj = src[max(k, j)]       ecr  d.bj = src[min(k, j)]
+// over the eight bytes of (a:b). The fixture's eight source bytes are consecutive
+// from 4*(lane&63), so the selector column spans all four values and the bytes
+// cross 0x80, which is the only way the generic form's sign replication and the
+// edge clamps that hold a high end are both reached. `c` is the lane, so the
+// generic form's four nibbles vary too.
+.version 8.0
+.target sm_80
+.address_size 64
+
+.visible .entry prmtmodes(
+    .param .u64 prmtmodes_param_0    // out: seven words a lane
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [prmtmodes_param_0];
+    mov.u32 %r1, %tid.x;
+
+    // a holds bytes 4l..4l+3 and b holds 4l+4..4l+7, one byte each in order.
+    and.b32 %r2, %r1, 63;
+    shl.b32 %r2, %r2, 2;
+    mov.u32 %r4, %r2;
+    add.u32 %r3, %r2, 1;
+    shl.b32 %r3, %r3, 8;
+    or.b32 %r4, %r4, %r3;
+    add.u32 %r3, %r2, 2;
+    shl.b32 %r3, %r3, 16;
+    or.b32 %r4, %r4, %r3;
+    add.u32 %r3, %r2, 3;
+    shl.b32 %r3, %r3, 24;
+    or.b32 %r4, %r4, %r3;
+
+    // The second four wrap at 256, so the byte is masked before it is shifted in.
+    add.u32 %r5, %r2, 4;
+    and.b32 %r5, %r5, 255;
+    add.u32 %r3, %r2, 5;
+    and.b32 %r3, %r3, 255;
+    shl.b32 %r3, %r3, 8;
+    or.b32 %r5, %r5, %r3;
+    add.u32 %r3, %r2, 6;
+    and.b32 %r3, %r3, 255;
+    shl.b32 %r3, %r3, 16;
+    or.b32 %r5, %r5, %r3;
+    add.u32 %r3, %r2, 7;
+    and.b32 %r3, %r3, 255;
+    shl.b32 %r3, %r3, 24;
+    or.b32 %r5, %r5, %r3;
+
+    mov.u32 %r6, %r1;                   // c: the lane
+
+    prmt.b32.f4e  %r7,  %r4, %r5, %r6;
+    prmt.b32.b4e  %r8,  %r4, %r5, %r6;
+    prmt.b32.rc8  %r9,  %r4, %r5, %r6;
+    prmt.b32.ecl  %r10, %r4, %r5, %r6;
+    prmt.b32.ecr  %r11, %r4, %r5, %r6;
+    prmt.b32.rc16 %r12, %r4, %r5, %r6;
+    prmt.b32      %r13, %r4, %r5, %r6;
+
+    mul.lo.u32 %r14, %r1, 28;           // seven words a lane
+    cvt.u64.u32 %rd2, %r14;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.b32 [%rd2], %r7;
+    st.global.b32 [%rd2+4], %r8;
+    st.global.b32 [%rd2+8], %r9;
+    st.global.b32 [%rd2+12], %r10;
+    st.global.b32 [%rd2+16], %r11;
+    st.global.b32 [%rd2+20], %r12;
+    st.global.b32 [%rd2+24], %r13;
+    ret;
+}

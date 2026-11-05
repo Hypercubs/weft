@@ -6,7 +6,7 @@
 //     out[3*gid+2] = buf[2]     5
 //
 // Three different answers, so an offset that is swallowed reads 9, 9, 9 instead of
-// 7, 9, 5 — the failure is a number, not a shape. Every slot is written: threadgroup
+// 7, 9, 5, the failure is a number, not a shape. Every slot is written: threadgroup
 // memory starts with whatever was there, so a slot nothing writes cannot be compared.
 .version 7.0
 .target sm_70

@@ -1,6 +1,6 @@
 ; The same warp scan as basic.metal's warpscan, written in SPIR-V: five
 ; subgroup shuffles, each guarded by "lane >= d". Unrolled rather than looped
-; because the d sequence is 1,2,4,8,16 — five steps, not a loop.
+; because the d sequence is 1,2,4,8,16, five steps, not a loop.
                OpCapability Kernel
                OpCapability Addresses
                OpCapability Int64

@@ -1,6 +1,6 @@
 // Hand-written PTX for `lop3` (an arbitrary three-input bitwise function) and
 // the `testp` floating-point class tests. LLVM 23 emits neither at -O2, so these
-// are the two instructions only hand-written PTX contains — which is exactly why
+// are the two instructions only hand-written PTX contains, which is exactly why
 // they are worth a kernel. The Metal kernel `logic` computes the same numbers
 // from the definitions and check.sh compares the two byte for byte.
 //

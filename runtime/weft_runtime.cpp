@@ -8,7 +8,6 @@
 #include <mutex>
 #include <vector>
 
-// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -137,7 +136,7 @@ struct StepGroup {
 };
 
 // Resumable kernels: one call per thread per barrier segment. No stacks, no
-// switches — the thread's registers are already in the state blob.
+// switches, the thread's registers are already in the state blob.
 void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32_t grid,
                     WorkerState& ws, void* const* bufs, unsigned char* shared,
                     unsigned char* states, uint32_t* warp, uint32_t* red, uint32_t* fold,
@@ -228,7 +227,7 @@ void run_group_warp(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   const uint32_t live = (base + tg <= grid) ? tg : (grid > base ? grid - base : 0);  const uint32_t warps = (live + 31) / 32;
   // A last group that is short has lanes which do not exist: a kernel that reads
   // a slot only they would have written reads the arena instead. The step and
-  // coroutine paths zero it there, so this one does too — the same rule, and it
+  // coroutine paths zero it there, so this one does too, the same rule, and it
   // only touches a group the launch did not fill.
   if (live < tg) std::memset(shared, 0, kSharedBytes);
 
@@ -326,7 +325,7 @@ void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
 
   // A coroutine with no suspension point (a kernel that only asks for its lane
   // id, say) is already finished when it is built, and the loop below only ever
-  // looks at tasks it resumes — so the live count has to come from the tasks
+  // looks at tasks it resumes, so the live count has to come from the tasks
   // themselves, or it would wait forever for a thread with nothing left to do.
   uint32_t remaining = 0;
   for (uint32_t i = 0; i < live; i++)
@@ -494,7 +493,7 @@ Sampler sampler(int index) { return (index >= 0 && index < 16) ? g_samplers[inde
 // a compare-and-swap loop. Everything below that *does* have one uses the
 // builtin form: `__atomic_fetch_add` on arm64 is a single ldadd, while the
 // obvious load/CAS loop is a load, a compare, a store, and a retry under
-// contention — three times the cost for the same answer.
+// contention, three times the cost for the same answer.
 float atom_add_f32(float* p, float v) {
   uint32_t* bits = reinterpret_cast<uint32_t*>(p);
   uint32_t old = __atomic_load_n(bits, __ATOMIC_RELAXED);
@@ -737,7 +736,7 @@ void dispatch(const KernelDef& k, void* const* bufs, uint32_t grid, uint32_t tg)
   if (tg == 0 || tg > kMaxThreadgroup) {
     // Not silent: a launch whose geometry is changed underneath it gives an answer
     // for a grid the caller did not ask for, and a barrier kernel's is not even the
-    // same shape. It still runs — a caller of weft_run gets no refusal channel —
+    // same shape. It still runs, a caller of weft_run gets no refusal channel , 
     // but it says so, and at the biggest group there is rather than an arbitrary
     // small one.
     std::fprintf(stderr,

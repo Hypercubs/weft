@@ -1,5 +1,5 @@
 ; Transcendentals through OpenCL.std: `sin`, `atan2` and `pow`, which are the
-; three shapes a kernel reaches for — one-argument, two-argument, and a power.
+; three shapes a kernel reaches for, one-argument, two-argument, and a power.
 ;
 ;     out[gid] = sin(x) * 3 + atan2(x, 2) + pow(x, 0.5)
 ;

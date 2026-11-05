@@ -3,7 +3,7 @@
 ; `kernels/spirv/atomic.spvasm` covers the case where nobody reads the pair: an
 ; order-free operation whose result is dropped is a reduction, and a reduction is
 ; two 32-bit atomics. Here every old value is used, so the pair has to be read,
-; changed and written back as one value — which this host builds out of a lock
+; changed and written back as one value, which this host builds out of a lock
 ; over the two halves, taken in lane order.
 ;
 ; The checks are arithmetic rather than a reference implementation, because the
@@ -23,7 +23,7 @@
 ;                               there is, so both stay 0.
 ;
 ; The sums go through `OpAtomicIAdd` with the result unused, which is the
-; reduction that already existed at 64 bits — so this fixture exercises the new
+; reduction that already existed at 64 bits, so this fixture exercises the new
 ; path and the old one in the same kernel.
                OpCapability Kernel
                OpCapability Addresses

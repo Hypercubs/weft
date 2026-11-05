@@ -1,0 +1,41 @@
+// `cp.reduce.async.bulk` with 64-bit float elements: 1.5 and 2.5 with 0.25 added,
+// which is 1.75 and 2.75, all four exact in binary64, so the expected bits are a
+// constant. On the GPU a double is the `uint64_t` its bits live in and the sum is
+// `weft_fp64::add`; on the CPU it is the host's own double. A reduce that added the
+// words as integers, or walked four elements instead of two, lands elsewhere.
+.version 7.0
+.target sm_90
+.address_size 64
+
+.visible .entry mbarredf64(
+    .param .u64 mbarredf64_param_0,   // the two doubles the reduce adds into
+    .param .u64 mbarredf64_param_1    // the same two, copied out for the check
+)
+{
+    .shared .align 16 .b64 tile[2];
+
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [mbarredf64_param_0];
+    ld.param.u64 %rd2, [mbarredf64_param_1];
+
+    mov.u64 %rd3, 0x3FF8000000000000;   // 1.5
+    st.global.u64 [%rd1], %rd3;
+    mov.u64 %rd3, 0x4004000000000000;   // 2.5
+    st.global.u64 [%rd1+8], %rd3;
+
+    mov.u64 %rd4, 0x3FD0000000000000;   // 0.25
+    st.shared.u64 [tile], %rd4;
+    st.shared.u64 [tile + 8], %rd4;
+    bar.sync 0;
+
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f64 [%rd1], [tile], 16;
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+
+    ld.global.u64 %rd5, [%rd1];
+    st.global.u64 [%rd2], %rd5;
+    ld.global.u64 %rd5, [%rd1+8];
+    st.global.u64 [%rd2+8], %rd5;
+    ret;
+}

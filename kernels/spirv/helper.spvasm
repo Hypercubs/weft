@@ -1,8 +1,8 @@
 ; A helper function, written as SPIR-V writes one and as a compiler emits it.
 ;
 ; A module may define more than one function, and the entry point may call the other
-; one. Until now that was refused by name — "call to a defined function ... is not
-; supported (inline it)" — and this is the fixture that says it is inlined now.
+; one. Until now that was refused by name, "call to a defined function ... is not
+; supported (inline it)", and this is the fixture that says it is inlined now.
 ;
 ;   twice(v) = v * 2 + 1
 ;   a1[2i+0] = twice(x)

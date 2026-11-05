@@ -9,7 +9,7 @@
 // runs the host's own doubles, and the GPU runs the software one in `weft_fp64`
 // over the bits, so the comparison is of the same arithmetic rather than of an
 // approximation of it. The literals are `0d…` forms, which is what used to have no
-// GPU spelling at all — a double here is the `uint64_t` its bits live in, so the
+// GPU spelling at all, a double here is the `uint64_t` its bits live in, so the
 // constant is handed over as bits and the register holding it is that same word.
 //
 // The last line crosses back to binary32 so the result is one four-byte value per
@@ -81,7 +81,7 @@
     add.s64 %rd10, %rd9, %rd3;
     st.global.f64 [%rd10], %fd13;
 
-    // The square root, which IEEE pins to the correctly rounded answer — so the
+    // The square root, which IEEE pins to the correctly rounded answer, so the
     // software one is the host's own number and not an approximation of it. It is
     // taken of `abs(-y)`, a value the arithmetic above already produced.
     sqrt.rn.f64 %fd14, %fd7;

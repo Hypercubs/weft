@@ -1,0 +1,193 @@
+// The sub-byte shapes: `ldmatrix.m8n16` with `.b6x16_p32` and `.b4x16_p64`, which
+// widen a 6- or 4-bit element to a byte while they load, what a Blackwell kernel
+// feeds an fp6 or fp4 tensor core with.
+//
+// The source side is the ISA's own definition: one 16-byte container holds sixteen
+// 6-bit elements in its first 96 bits (or sixteen 4-bit elements in its first 64) and
+// the rest of the container is padding, which is the same `x16` container the tensor
+// copy instructions use. The destination side is CUTLASS's: `SM100_SU6_DU8x16_x1_LDSM_N`
+// and its fp4 twin in `cute/atom/copy_traits_sm100.hpp` say the warp reads eight
+// containers, lane t supplies container t&7, and that a lane's slice is the 32 bits
+// at 32*t of a 1024-bit reference, four consecutive bytes in order.
+//
+// Composed, with a container being one row of sixteen elements: lane l holds row l>>2
+// at columns 4*(l&3)..+3, and a container sits 16 bytes on from the one before. That is
+// what this fixture writes out and what check.sh recomputes from the same rule, so the
+// two are a check rather than a copy of each other.
+//
+// The .x2 loads put a different pattern in the second matrix, 128 bytes on, so its
+// stride is checked rather than assumed. The fp4 load reads through a per-lane address
+// instead of a named symbol, which is the form a real kernel uses, and the signed form
+// (.s8.s4) is loaded a third time, so all three paths are covered.
+.version 8.3
+.target sm_100
+.address_size 64
+
+.visible .entry ldmsub(
+    .param .u64 ldmsub_param_0      // out: 64 words of 6-bit, 64 of 4-bit, 32 signed
+)
+{
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<8>;
+
+    .shared .align 16 .b8 sub[512];
+
+    ld.param.u64 %rd1, [ldmsub_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd2, sub;
+
+    // ---- sixteen containers of six-bit elements: two words a lane ----
+    mov.u32 %r20, 0;
+F6: setp.ge.u32 %p1, %r20, 2;
+    @%p1 bra F6D;
+    shl.b32 %r21, %r20, 5;
+    add.u32 %r21, %r21, %r1;                // n = 32 i + lane
+    shr.u32 %r22, %r21, 2;                  // container
+    and.b32 %r23, %r21, 3;                  // word in the container
+    mov.u32 %r24, 0;
+    mov.u32 %r25, 0;                        // element
+E6: setp.ge.u32 %p2, %r25, 16;
+    @%p2 bra E6D;
+    // v = container < 8 ? (13 c + 7 e) & 63 : (29 (c-8) + 11 e + 5) & 63
+    mul.lo.u32 %r26, %r22, 13;
+    mul.lo.u32 %r27, %r25, 7;
+    add.u32 %r26, %r26, %r27;
+    sub.s32 %r28, %r22, 8;
+    mul.lo.s32 %r29, %r28, 29;
+    mul.lo.u32 %r30, %r25, 11;
+    add.s32 %r29, %r29, %r30;
+    add.s32 %r29, %r29, 5;
+    setp.lt.u32 %p3, %r22, 8;
+    selp.b32 %r26, %r26, %r29, %p3;
+    and.b32 %r26, %r26, 63;
+    // A six-bit field straddles a word boundary, so its bits land in this word when
+    // they start before the word ends and cross into the next when they do not.
+    mul.lo.s32 %r27, %r25, 6;
+    shl.b32 %r31, %r23, 5;
+    sub.s32 %r27, %r27, %r31;               // 6e - 32w
+    setp.ge.s32 %p4, %r27, 0;
+    @%p4 bra S6P;
+    setp.le.s32 %p5, %r27, -6;
+    @%p5 bra E6N;
+    neg.s32 %r27, %r27;
+    shr.u32 %r26, %r26, %r27;
+    or.b32 %r24, %r24, %r26;
+    bra E6N;
+S6P: shl.b32 %r26, %r26, %r27;
+    or.b32 %r24, %r24, %r26;
+E6N: add.u32 %r25, %r25, 1;
+    bra E6;
+E6D:
+    shl.b32 %r32, %r21, 2;
+    cvt.u64.u32 %rd3, %r32;
+    add.s64 %rd3, %rd2, %rd3;
+    st.shared.u32 [%rd3], %r24;
+    add.u32 %r20, %r20, 1;
+    bra F6;
+F6D:
+    bar.sync 0;
+
+    ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b6x16_p32 {%r10, %r11}, [sub];
+
+    shl.b32 %r33, %r1, 3;
+    cvt.u64.u32 %rd4, %r33;
+    add.s64 %rd5, %rd1, %rd4;
+    st.global.b32 [%rd5], %r10;
+    st.global.b32 [%rd5+4], %r11;
+
+    // ---- the same sixteen containers as four-bit elements ----
+    bar.sync 0;
+    mov.u32 %r20, 0;
+F4: setp.ge.u32 %p1, %r20, 2;
+    @%p1 bra F4D;
+    shl.b32 %r21, %r20, 5;
+    add.u32 %r21, %r21, %r1;
+    shr.u32 %r22, %r21, 2;
+    and.b32 %r23, %r21, 3;
+    mov.u32 %r24, 0;
+    setp.ge.u32 %p6, %r23, 2;               // the second half is padding
+    @%p6 bra E4D;
+    mov.u32 %r25, 0;
+E4: setp.ge.u32 %p2, %r25, 8;
+    @%p2 bra E4D;
+    shl.b32 %r30, %r23, 3;
+    add.u32 %r30, %r30, %r25;               // col = 8 w + e
+    // v = container < 8 ? (5 c + 3 col) & 15 : (11 (c-8) + 7 col + 3) & 15
+    mul.lo.u32 %r26, %r22, 5;
+    mul.lo.u32 %r27, %r30, 3;
+    add.u32 %r26, %r26, %r27;
+    sub.s32 %r28, %r22, 8;
+    mul.lo.s32 %r29, %r28, 11;
+    mul.lo.u32 %r27, %r30, 7;
+    add.s32 %r29, %r29, %r27;
+    add.s32 %r29, %r29, 3;
+    setp.lt.u32 %p3, %r22, 8;
+    selp.b32 %r26, %r26, %r29, %p3;
+    and.b32 %r26, %r26, 15;
+    shl.b32 %r27, %r25, 2;                  // eight fields a word, no straddling
+    shl.b32 %r26, %r26, %r27;
+    or.b32 %r24, %r24, %r26;
+    add.u32 %r25, %r25, 1;
+    bra E4;
+E4D:
+    shl.b32 %r32, %r21, 2;
+    cvt.u64.u32 %rd3, %r32;
+    add.s64 %rd3, %rd2, %rd3;
+    st.shared.u32 [%rd3], %r24;
+    add.u32 %r20, %r20, 1;
+    bra F4;
+F4D:
+    bar.sync 0;
+
+    // ---- the same load, addressed a lane at a time ----
+    and.b32 %r34, %r1, 15;
+    shl.b32 %r35, %r34, 4;
+    cvt.u64.u32 %rd6, %r35;
+    add.s64 %rd7, %rd2, %rd6;
+    ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b4x16_p64 {%r12, %r13}, [%rd7];
+
+    add.s64 %rd8, %rd1, 256;
+    add.s64 %rd8, %rd8, %rd4;
+    st.global.b32 [%rd8], %r12;
+    st.global.b32 [%rd8+4], %r13;
+
+    // ---- eight containers of signed four-bit elements, one matrix ----
+    bar.sync 0;
+    shr.u32 %r22, %r1, 2;
+    and.b32 %r23, %r1, 3;
+    mov.u32 %r24, 0;
+    setp.ge.u32 %p6, %r23, 2;
+    @%p6 bra ESD;
+    mov.u32 %r25, 0;
+ES: setp.ge.u32 %p2, %r25, 8;
+    @%p2 bra ESD;
+    shl.b32 %r30, %r23, 3;
+    add.u32 %r30, %r30, %r25;
+    // v = ((5 c + 3 col) & 15) - 8, as the four bits that name it
+    mul.lo.u32 %r26, %r22, 5;
+    mul.lo.u32 %r27, %r30, 3;
+    add.u32 %r26, %r26, %r27;
+    and.b32 %r26, %r26, 15;
+    sub.s32 %r26, %r26, 8;
+    and.b32 %r26, %r26, 15;
+    shl.b32 %r27, %r25, 2;
+    shl.b32 %r26, %r26, %r27;
+    or.b32 %r24, %r24, %r26;
+    add.u32 %r25, %r25, 1;
+    bra ES;
+ESD:
+    shl.b32 %r32, %r1, 2;
+    cvt.u64.u32 %rd3, %r32;
+    add.s64 %rd3, %rd2, %rd3;
+    st.shared.u32 [%rd3], %r24;
+    bar.sync 0;
+
+    ldmatrix.sync.aligned.m8n16.x1.shared.s8.s4 {%r14}, [sub];
+
+    add.s64 %rd9, %rd1, 512;
+    cvt.u64.u32 %rd10, %r32;
+    add.s64 %rd9, %rd9, %rd10;
+    st.global.b32 [%rd9], %r14;
+    ret;
+}

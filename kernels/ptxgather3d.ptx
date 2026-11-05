@@ -5,7 +5,7 @@
 //     g = tld4(vol, u, v, w)             // (x,y), (x+1,y), (x,y+1), (x+1,y+1)
 //     out[gid] = g.x + 2 g.y + 3 g.z + 5 g.w + z
 //
-// A gather is exact — four texel reads, no filter — so both columns compare bytes.
+// A gather is exact, four texel reads, no filter, so both columns compare bytes.
 // The plane is folded into the answer as well as into the coordinate, so a footprint
 // taken from the wrong plane cannot hide behind four texels that happen to be equal.
 .version 7.0

@@ -4,7 +4,7 @@
 // The same instruction and the same descriptor, one element size down in K: a
 // core matrix is still 8 rows by 16 bytes, but 16 bytes holds four tf32 values
 // rather than eight halves, so K is 8 and A is 64x8 instead of 64x16. Everything
-// else — the descriptor fields, the core-matrix walk, the accumulator pattern —
+// else, the descriptor fields, the core-matrix walk, the accumulator pattern,
 // is the rule from `wgmma.ptx` unchanged, which is what this fixture is for: if
 // the layout had been special-cased somewhere, one of the two would disagree
 // with the reference.

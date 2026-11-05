@@ -1,5 +1,5 @@
 //
-// Triton: `tl.dot` over fp8 (e4m3) — `mma.sync.m16n8k32`, four bytes a register
+// Triton: `tl.dot` over fp8 (e4m3), `mma.sync.m16n8k32`, four bytes a register
 // and twice the K of the half-precision form.
 //
 // The operands arrive already converted, as the byte tiles a `cvt`+`prmt` pass
@@ -17,7 +17,7 @@
 )
 {
 	.reg .b32 	%r<64>;
-	.reg .f32 	%f<8>;
+	.reg .f32 	%f<9>;
 	.reg .b64 	%rd<12>;
 
 	ld.param.u64 	%rd1, [dotfp8_kernel_param_0];

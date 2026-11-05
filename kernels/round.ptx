@@ -35,7 +35,7 @@
     add.u64 %rd4, %rd1, %rd3;
     ld.global.f32 %f1, [%rd4];
 
-    // f = (v - 1) * 1000 + 0.25 — signed, fractional, and never a tie
+    // f = (v - 1) * 1000 + 0.25, signed, fractional, and never a tie
     add.f32 %f2, %f1, 0fBF800000;
     mul.f32 %f3, %f2, 0f447A0000;
     add.f32 %f4, %f3, 0f3E800000;

@@ -1,5 +1,5 @@
 ; Float atomics over one threadgroup of 1,024 lanes. The three forms that exist
-; for a 32-bit float — min, max and exchange — in one kernel:
+; for a 32-bit float, min, max and exchange, in one kernel:
 ;
 ;     min(c[0], v), max(c[1], v)        a device-scope fold over every lane
 ;     old = exchange(out[gid], v)       per-lane, so the old value is the seed
@@ -16,7 +16,7 @@
 ; and `AtomicFloat32AddEXT` for the add that was already translated.
 ;
 ; One threadgroup on purpose. A control barrier is a rendezvous among the lanes of
-; a group — `OpControlBarrier` at Device scope included — so a lane in a group of
+; a group, `OpControlBarrier` at Device scope included, so a lane in a group of
 ; 512 can read the fold while 511 other groups are still folding it, and the two
 ; columns then disagree by however far the fold had got. That is not the atomics
 ; being wrong; it is a fixture asking for a rendezvous the launch does not have.

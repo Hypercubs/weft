@@ -1,0 +1,155 @@
+// The MX converts: fp4 (e2m1) and fp6 (e2m3, e3m2), the formats a Blackwell
+// quantization pass writes with `cvt.rn.satfinite.*`. None of the three has an
+// infinity or a NaN, so `.satfinite`, which the ISA makes mandatory on these
+// converts, is the whole range rule: a NaN answers the positive MAX_NORM, a
+// magnitude past it answers MAX_NORM keeping its sign, and a subnormal rounds
+// onto its own grid.
+//
+//   3.4, 2.7 as e2m1x2      -> 00000055  3.4 -> 3 (0b101) and 2.7 -> 3, first in d[7:4]
+//  -1, -100 with .relu      -> 00000000  relu zeroes both, and it is the converted
+//                                        value it zeroes: without it the word is
+//                                        0xbf, -1 and a saturated -6
+//   NaN, 0.75 as e2m1x2      -> 00000072  a NaN is +MAX_NORM (0111); 0.75 is a tie
+//                                        between 0.5 and 1 and nearest-even takes 1
+//   7.4, 0.2 as e2m3x2       -> 00001f02  7.4 -> 7.5 (11111); 0.2 -> 0.25, a
+//                                        subnormal of the M/8 grid (M=2)
+//   30, 0.07 as e3m2x2       -> 00001f01  30 saturates to 28 (11111); 0.07 -> 1/16
+//   NaN, -inf as e2m3x2      -> 00001f3f  +MAX_NORM, and MAX_NORM with the sign kept
+//
+// Each result is one 16-bit value in a 32-bit word, so a store keeps the fixture
+// off paths that are not themselves under test.
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry cvtmx(
+    .param .u64 cvtmx_param_0      // six words
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtmx_param_0];
+
+    mov.u32 %r1, 0x4059999A;
+    mov.u32 %r2, 0x402CCCCD;
+    cvt.rn.satfinite.e2m1x2.f32 %r3, %r1, %r2;
+    st.global.u32 [%rd1], %r3;
+
+    mov.u32 %r1, 0xBF800000;
+    mov.u32 %r2, 0xC2C80000;
+    cvt.rn.satfinite.relu.e2m1x2.f32 %r4, %r1, %r2;
+    st.global.u32 [%rd1+4], %r4;
+
+    mov.u32 %r1, 0x7FC00000;
+    mov.u32 %r2, 0x3F400000;
+    cvt.rn.satfinite.e2m1x2.f32 %r5, %r1, %r2;
+    st.global.u32 [%rd1+8], %r5;
+
+    mov.u32 %r1, 0x40ECCCCD;
+    mov.u32 %r2, 0x3E4CCCCD;
+    cvt.rn.satfinite.e2m3x2.f32 %r6, %r1, %r2;
+    st.global.u32 [%rd1+12], %r6;
+
+    mov.u32 %r1, 0x41F00000;
+    mov.u32 %r2, 0x3D8F5C29;
+    cvt.rn.satfinite.e3m2x2.f32 %r7, %r1, %r2;
+    st.global.u32 [%rd1+16], %r7;
+
+    mov.u32 %r1, 0x7FC00000;
+    mov.u32 %r2, 0xFF800000;
+    cvt.rn.satfinite.e2m3x2.f32 %r8, %r1, %r2;
+    st.global.u32 [%rd1+20], %r8;
+    ret;
+}
+
+// The four-value forms, which fill a destination register in one instruction: an
+// e2m1x4 packs into a 16-bit destination (a b16 register here, widened by the
+// store) and the f6 pair into the full 32 bits.
+//
+//   {1, 3, 0.25, -7} as e2m1x4 -> 0000250f  1 -> 0010, 3 -> 0101, 0.25 is a tie
+//                                          between 0 and 0.5 and takes 0, -7
+//                                          saturates to -6 (1111)
+//   {1.5, -2, 0.0625, 8} as e2m3x4 with .relu
+//                              -> 0c00001f  relu zeroes the negative; 1.5 -> 01100,
+//                                          8 saturates to 7.5 (011111), and 0.0625
+//                                          is a tie on the M/8 grid that takes 0
+//   {28, 0.25, 1.75, 1e6} as e3m2x4
+//                              -> 1f040f1f  28 is MAX_NORM itself (011111), 0.25 is
+//                                          the smallest normal (000100), 1.75 is
+//                                          001111, and 1e6 saturates
+.visible .entry cvtmx4(
+    .param .u64 cvtmx4_param_0     // three words
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtmx4_param_0];
+
+    mov.u32 %r1, 0x3F800000;
+    mov.u32 %r2, 0x40400000;
+    mov.u32 %r3, 0x3E800000;
+    mov.u32 %r4, 0xC0E00000;
+    cvt.rn.satfinite.e2m1x4.f32 %r5, {%r1, %r2, %r3, %r4};
+    st.global.u32 [%rd1], %r5;
+
+    mov.u32 %r1, 0x3FC00000;
+    mov.u32 %r2, 0xC0000000;
+    mov.u32 %r3, 0x3D800000;
+    mov.u32 %r4, 0x41000000;
+    cvt.rn.satfinite.relu.e2m3x4.f32 %r6, {%r1, %r2, %r3, %r4};
+    st.global.u32 [%rd1+4], %r6;
+
+    mov.u32 %r1, 0x41E00000;
+    mov.u32 %r2, 0x3E800000;
+    mov.u32 %r3, 0x3FE00000;
+    mov.u32 %r4, 0x49742400;
+    cvt.rn.satfinite.e3m2x4.f32 %r7, {%r1, %r2, %r3, %r4};
+    st.global.u32 [%rd1+8], %r7;
+    ret;
+}
+
+// `cvt.rs.f16x2.f32`, stochastic rounding, which a quantization pass uses in
+// place of nearest so the error averages out instead of biasing. The ISA's figure
+// splits the random word: bits[12:0] for the low result, bits[28:16] for the high
+// one with a half, and bits[15:0] / [31:16] with a bf16. Every value below sits
+// exactly half an ulp above its lower grid point, so the random bits alone decide:
+//
+//   1+1.5*2^-10, -(1+1.5*2^-10), rbits 0
+//                       -> 3c01c401  no carry: both truncate toward zero, which is
+//                                    one ulp above 1.0 and not 1.0 itself
+//   the same pair with 0x1FFF in both fields
+//                       -> 3c02c402  both carry: one ulp further from zero
+//   bf16 of 1+1.5*2^-8 and +inf, rbits 0xFFFF in the high field, .satfinite
+//                       -> 3f827f7f  the carry takes the bf16 up one, and the
+//                                    infinity clamps to the largest finite bf16
+//   the same value twice with 0x1000, one half of the range, in the high field
+//                       -> 3c023c01  half the random range carries and the empty
+//                                    field does not, so the two halves differ
+.visible .entry cvtrs(
+    .param .u64 cvtrs_param_0      // four words
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtrs_param_0];
+
+    mov.u32 %r1, 0x3F803000;
+    mov.u32 %r2, 0xC0803000;
+    cvt.rs.f16x2.f32 %r3, %r1, %r2, 0x00000000;
+    st.global.u32 [%rd1], %r3;
+
+    cvt.rs.f16x2.f32 %r4, %r1, %r2, 0x1FFF1FFF;
+    st.global.u32 [%rd1+4], %r4;
+
+    mov.u32 %r5, 0x3F818000;
+    mov.u32 %r6, 0x7F800000;
+    cvt.rs.satfinite.bf16x2.f32 %r7, %r5, %r6, 0xFFFF0000;
+    st.global.u32 [%rd1+8], %r7;
+
+    cvt.rs.f16x2.f32 %r8, %r1, %r1, 0x10000000;
+    st.global.u32 [%rd1+12], %r8;
+    ret;
+}

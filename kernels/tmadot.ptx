@@ -4,14 +4,14 @@
 // and rounds the floats to halves on the way. Here the same two tiles arrive through
 // `cp.async.bulk.tensor` instead: the kernel describes each tensor once, loads both
 // tiles with one barrier, and from there the matrix path is the one the Triton kernel
-// already uses — `ldmatrix` reads the fragments out of threadgroup memory,
+// already uses, `ldmatrix` reads the fragments out of threadgroup memory,
 // `mma.sync.m16n8k16` multiplies them, and each lane stores the four outputs it owns.
 // Nothing between the copy and the multiply is special-cased, so what this checks is
 // that a tile delivered by a descriptor is in the layout the fragments are read in.
 //
 // A is 16x16 halves with 1.0 at or below the diagonal; B is 16x8 with 1.0 in column 0.
 // Row r of the product is therefore r+1 in column 0 and zero everywhere else, which a
-// tile that arrived a row or a column off does not produce — a descriptor with the
+// tile that arrived a row or a column off does not produce, a descriptor with the
 // wrong stride walks the tensor by the wrong amount, and a box read in the wrong order
 // fills the tile transposed.
 .version 8.3
@@ -169,7 +169,7 @@
     // ---- both tiles, one barrier, 512 + 256 bytes ----
     // The barrier is the block's: all thirty-two lanes owe an arrival, and the lane that
     // issues the copies is the one that says how many bytes they will move. That is the
-    // shape a Triton kernel has — elect a leader for the copies, then everyone arrives.
+    // shape a Triton kernel has, elect a leader for the copies, then everyone arrives.
     setp.eq.u32 %p5, %r2, 0;
     mbarrier.init.shared.b64 [mbr], 32;
     bar.sync 0;
@@ -230,8 +230,8 @@ WAIT: mbarrier.try_wait.parity.shared.b64 %p4, [mbr], 0;
     st.global.b32 [%rd20+256], %f19;
     st.global.b32 [%rd20+260], %f20;
 
-    // The two addresses are the one field the engines cannot share — a host pointer
-    // against a device one — so they are cleared: the maps are scratch, and what a run
+    // The two addresses are the one field the engines cannot share, a host pointer
+    // against a device one, so they are cleared: the maps are scratch, and what a run
     // has to agree on is the product.
     mov.u32 %r49, 0;
     st.global.b32 [%rd9], %r49;

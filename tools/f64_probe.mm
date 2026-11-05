@@ -6,7 +6,7 @@
 //
 // The kernel is `probe(device uint64_t* in, device uint64_t* out, uint id)`: it runs
 // one thread per element of `in`, and every element of `out` is printed as sixteen
-// hex digits. That is the whole harness — the values live in a file, so the caller
+// hex digits. That is the whole harness, the values live in a file, so the caller
 // can generate them, and the answer comes back as bits so a difference of one ulp
 // is visible rather than rounded away.
 //

@@ -1,7 +1,7 @@
 // Hand-written PTX for the atomic paths: a 32-bit counter, a 64-bit counter, and
 // two maxes whose answer is a constant because every value already in the buffer
 // is smaller. Buffers 0 and 2 are read-and-add so their answer depends on what
-// the buffer held before — check.sh runs the kernel with a zero grid first to
+// the buffer held before, check.sh runs the kernel with a zero grid first to
 // learn that, and compares against base + grid.
 //
 // Real codegen writes the scope and the memory semantics out in full
@@ -40,7 +40,7 @@
     atom.global.add.u32 %r1, [%rd1], 1;
     // a 32-bit max against a constant larger than anything in the buffer
     red.global.max.u32 [%rd2], 2147483647;
-    // one 64-bit counter, and a 64-bit max against INT64_MAX — larger than any
+    // one 64-bit counter, and a 64-bit max against INT64_MAX, larger than any
     // two floats read as one 64-bit value, so the answer is that constant
     atom.global.add.u64 %rd5, [%rd3], 1;
     atom.acquire.sys.global.max.s64 %rd6, [%rd4], 9223372036854775807;

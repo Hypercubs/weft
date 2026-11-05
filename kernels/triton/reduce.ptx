@@ -1,6 +1,6 @@
 //
 // Triton: `tl.sum` / `tl.max` / `tl.and` over an integer block, which Triton
-// emits as `redux.sync` — the warp-wide fold PTX added for `__reduce_add_sync`
+// emits as `redux.sync`, the warp-wide fold PTX added for `__reduce_add_sync`
 // and its cousins.
 //
 // One program is one warp of 32 values (`.maxntid 32`), each lane holds one, and
@@ -9,8 +9,8 @@
 // whatever order it is formed in, which is what lets it be checked against a
 // reference rather than against itself.
 //
-// `redux.sync` is an integer fold. A float reduction is the shuffle form — PTX
-// has no `redux.sync.add.f32` — and that is what a `tl.sum` of a float block
+// `redux.sync` is an integer fold. A float reduction is the shuffle form, PTX
+// has no `redux.sync.add.f32`, and that is what a `tl.sum` of a float block
 // compiles to, so the shuffle path already handles it.
 .version 8.1
 .target sm_80

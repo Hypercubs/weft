@@ -8,7 +8,7 @@
 // again, so the buffer holds 2 * A * B. That is the only thing in the suite that
 // tests scale-d at all: every other fixture writes a value and stops, so a
 // translator that treated scale-d as "overwrite" would agree with all of them. A
-// real `tl.dot` chain — `for k: acc += tl.dot(a, b)` — is exactly this shape, and
+// real `tl.dot` chain, `for k: acc += tl.dot(a, b)`, is exactly this shape, and
 // getting it wrong loses every tile but the last.
 //
 // A is 64x16 f16 and B is 16x8, both K-major, staged as in `wgmma.ptx`.

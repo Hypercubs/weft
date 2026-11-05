@@ -1,0 +1,74 @@
+//
+// Triton: `tl.dot` over integers, which is `mma.sync.m16n8k32` with `.s8` operands.
+//
+// The fragment map is the one the fp8 form uses, four bytes a register, K of 32,
+// and the only difference is that a byte is a signed integer instead of an e5m2
+// value. So the operands here are built straight into the registers rather than
+// loaded, because the fragments are what this kernel is checking:
+//
+//   A[g][k]  = g + 1          the row this lane group holds, in all four bytes
+//   A[g+8][k] = g + 9         the group eight above it
+//   B[k][n]  = ((k%4) + 1) * (n + 1)
+//
+// With those, every lane group contributes the same four byte weights and the
+// product is
+//
+//   D[r][n] = sum_k A[r][k] * B[k][n] = 80 (r + 1) (n + 1)
+//
+// which is a different number for every one of the 128 outputs, so a fragment map
+// that took a row for a column, read the bytes big-endian, or widened the bytes
+// without a sign answers something else. The values stay small enough that the
+// whole accumulation is exact in f32 as well as in s32: the largest is 10,240.
+.version 8.1
+.target sm_80
+.address_size 64
+
+.visible .entry dots8_kernel(
+	.param .u64 dots8_kernel_param_0
+)
+{
+	.reg .b32 %r<32>;
+	.reg .s32 %d<8>;
+	.reg .b64 %rd<8>;
+
+	ld.param.u64 %rd1, [dots8_kernel_param_0];
+
+	mov.u32 %r1, %tid.x;
+	shr.u32 %r2, %r1, 2;                    // g
+	and.b32 %r3, %r2, 7;
+
+	// ---- A: the row's value in all four bytes of every operand register ----
+	add.s32 %r4, %r3, 1;                    // g + 1
+	mul.lo.s32 %r5, %r4, 0x01010101;
+	add.s32 %r6, %r3, 9;                    // g + 9
+	mul.lo.s32 %r7, %r6, 0x01010101;
+
+	// ---- B: the four byte weights of the column this slot names ----
+	shr.u32 %r8, %r1, 3;                    // the column pair
+	shl.b32 %r8, %r8, 1;
+	shr.u32 %r9, %r1, 2;
+	and.b32 %r9, %r9, 1;                    // which of the pair
+	add.s32 %r8, %r8, %r9;
+	add.s32 %r8, %r8, 1;                    // n + 1
+	mul.lo.s32 %r14, %r8, 0x04030201;       // (1, 2, 3, 4) * (n + 1)
+
+	mov.s32 %d1, 0;
+	mov.s32 %d2, 0;
+	mov.s32 %d3, 0;
+	mov.s32 %d4, 0;
+
+	mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%d1, %d2, %d3, %d4}, {%r5, %r7, %r5, %r7}, {%r14, %r14}, {%d1, %d2, %d3, %d4};
+
+	// ---- rows g and g+8, columns 2t and 2t+1 ----
+	shl.b32 %r20, %r3, 5;
+	and.b32 %r21, %r1, 3;
+	shl.b32 %r21, %r21, 3;
+	add.s32 %r20, %r20, %r21;
+	cvt.u64.u32 %rd2, %r20;
+	add.s64 %rd2, %rd1, %rd2;
+	st.global.b32 [%rd2], %d1;
+	st.global.b32 [%rd2+4], %d2;
+	st.global.b32 [%rd2+256], %d3;
+	st.global.b32 [%rd2+260], %d4;
+	ret;
+}

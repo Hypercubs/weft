@@ -1,0 +1,73 @@
+// The 16-bit float read back out: `cvt.f32.f16` and `cvt.f32.bf16`, the widening
+// `__half2float` compiles to and the first thing a half-precision kernel does with
+// its inputs. Nine patterns in, nine words out, each chosen so a wrong widening
+// shows in the word:
+//
+//   3c00         -> 3f800000    1.0
+//   3c02         -> 3f804000    1 + 2*2^-10, a half's significand kept exactly, a
+//                               widening that dropped the last bit would say 3c01
+//   7bff         -> 477fe000    the largest finite half, 65504
+//   c100         -> c0200000    -2.5, so the sign survives
+//   7c00         -> 7f800000    an infinity is an infinity in both types
+//   0001         -> 33800000    the smallest subnormal half, 2^-24, a widening that
+//                               flushed it would answer zero
+//   3f80 bf16    -> 3f800000    one significand byte fewer, and the same 1.0
+//   bf80 bf16    -> bf800000    ... with the sign
+//   7f7f bf16    -> 7f7f0000    the largest finite bf16, which is not a half's range
+//
+// The results are stored as words, because the point is the exact bits: every one of
+// these is a value binary32 holds without rounding, so a difference is the widening
+// and not a rounding of it.
+.version 8.1
+.target sm_80
+.address_size 64
+
+.visible .entry cvtf16up(
+    .param .u64 cvtf16up_param_0,   // nine 16-bit patterns
+    .param .u64 cvtf16up_param_1    // nine words, one float each
+)
+{
+    .reg .b16 %rs<10>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtf16up_param_0];
+    ld.param.u64 %rd2, [cvtf16up_param_1];
+
+    ld.global.b16 %rs1, [%rd1];
+    cvt.f32.f16 %f1, %rs1;
+    st.global.b32 [%rd2], %f1;
+
+    ld.global.b16 %rs2, [%rd1+2];
+    cvt.f32.f16 %f2, %rs2;
+    st.global.b32 [%rd2+4], %f2;
+
+    ld.global.b16 %rs3, [%rd1+4];
+    cvt.f32.f16 %f3, %rs3;
+    st.global.b32 [%rd2+8], %f3;
+
+    ld.global.b16 %rs4, [%rd1+6];
+    cvt.f32.f16 %f4, %rs4;
+    st.global.b32 [%rd2+12], %f4;
+
+    ld.global.b16 %rs5, [%rd1+8];
+    cvt.f32.f16 %f5, %rs5;
+    st.global.b32 [%rd2+16], %f5;
+
+    ld.global.b16 %rs6, [%rd1+10];
+    cvt.f32.f16 %f6, %rs6;
+    st.global.b32 [%rd2+20], %f6;
+
+    ld.global.b16 %rs7, [%rd1+12];
+    cvt.f32.bf16 %f7, %rs7;
+    st.global.b32 [%rd2+24], %f7;
+
+    ld.global.b16 %rs8, [%rd1+14];
+    cvt.f32.bf16 %f8, %rs8;
+    st.global.b32 [%rd2+28], %f8;
+
+    ld.global.b16 %rs9, [%rd1+16];
+    cvt.f32.bf16 %f9, %rs9;
+    st.global.b32 [%rd2+32], %f9;
+    ret;
+}

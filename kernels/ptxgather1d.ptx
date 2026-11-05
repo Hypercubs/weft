@@ -7,7 +7,7 @@
 // The footprint is still 2x2: the second row of it is outside a binding that has one
 // row, so those two texels are nothing and the answer is the two along x. That is
 // the same rule the 2-D form follows at an edge, which is why this is a comparison
-// rather than a tolerance — a footprint that silently wrapped would add the texel at
+// rather than a tolerance, a footprint that silently wrapped would add the texel at
 // the start of the row twice.
 .version 7.0
 .target sm_70

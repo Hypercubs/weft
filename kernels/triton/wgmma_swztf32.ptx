@@ -1,7 +1,7 @@
 //
 // The swizzle with four-byte elements: `wgmma.mma_async.m64n8k8.f32.tf32.tf32`.
 //
-// Same descriptor as the f16 fixture — mode 1, a 128-byte atom — and K is 8
+// Same descriptor as the f16 fixture, mode 1, a 128-byte atom, and K is 8
 // instead of 16 because the K extent of the instruction is 32 bytes and an element
 // is four of them. A row of the tile is the 32 bytes of K, which is a quarter of
 // the atom's width, so the pattern moves each row's two chunks about on its own.
@@ -55,7 +55,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: one float — row n = lane / 2, half of its 32 bytes = lane % 2 ----
+	// ---- B: one float, row n = lane / 2, half of its 32 bytes = lane % 2 ----
 	setp.lt.u32 	%p1, %r1, 16;
 	shr.u32 	%r14, %r1, 1;
 	and.b32 	%r14, %r14, 7;			// n
@@ -99,7 +99,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

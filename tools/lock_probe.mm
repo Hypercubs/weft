@@ -36,7 +36,7 @@
 //
 // So propagation is fine and a fence is available; what fails is progress. A lane
 // that wins the section cannot run it until the other lanes in its warp leave the
-// spin loop, and they cannot leave until it releases — the warp is one program
+// spin loop, and they cannot leave until it releases, the warp is one program
 // counter. A threadgroup of one thread does not escape it either: several such
 // threadgroups are co-scheduled into one warp, and the wait then deadlocks across
 // them instead of within them. Handing out LOCK kernels is only safe when at most
@@ -71,7 +71,7 @@ using namespace metal;
 // The work between increments: a strided read of the same words the real 64-bit
 // path touches, so the loop is not optimised away and the timing means something.
 // Every word it reads is 1, so the value it accumulates is the number of
-// iterations it ran — which the host computes independently.
+// iterations it ran, which the host computes independently.
 static uint32_t spin_work(device uint32_t* st, uint32_t gid, uint32_t n, uint32_t stride) {
   uint32_t x = 0;
   for (uint32_t i = gid; i < n; i += stride) x += st[64u + (i & 63u)];
@@ -87,9 +87,9 @@ kernel void control(device uint32_t* st [[buffer(0)]], constant uint32_t* p [[bu
   atomic_fetch_add_explicit((device atomic_uint*)&st[1], x, memory_order_relaxed);
 }
 
-// Metal takes no acquire or release ON AN OPERATION — every `atomic_load_explicit`,
+// Metal takes no acquire or release ON AN OPERATION, every `atomic_load_explicit`,
 // `store`, `exchange` and `compare_exchange` here is constrained to
-// `memory_order_relaxed` — but `atomic_thread_fence(mem_flags, memory_order)` does
+// `memory_order_relaxed`, but `atomic_thread_fence(mem_flags, memory_order)` does
 // exist, and a fence beside a relaxed operation is the release-then-store /
 // load-then-acquire pair C++ gives when the hardware cannot do it in one
 // instruction. So this case is `locked` with the two fences added, and it measures

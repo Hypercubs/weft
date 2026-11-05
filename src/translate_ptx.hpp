@@ -15,7 +15,7 @@ TranslateResult translate_ptx(const std::string& ptx,
 
 // The same decode, emitted as Metal Shading Language instead of C++: the second
 // back end for one front end. The instruction text is the same, the runtime
-// behind it is the GPU's, and the result is a kernel the Metal compiler takes —
+// behind it is the GPU's, and the result is a kernel the Metal compiler takes , 
 // which is what gives PTX (and so Triton) a GPU column of its own instead of a
 // hand-written twin standing in for one.
 TranslateResult translate_ptx_gpu(const std::string& ptx,

@@ -2,7 +2,7 @@
 ;     a = img.read(uint2(x, y)).x
 ;     b = img.sample(nearest, float2((x + 0.5)/w, (y + 0.5)/h)).x
 ;     out[gid] = a * 2 + b
-; The sampler is host state here — `--samplers nearest/clamp` — because in SPIR-V
+; The sampler is host state here, `--samplers nearest/clamp`, because in SPIR-V
 ; a sampler is a value the launcher creates and binds, not a constexpr the kernel
 ; declares. Every texel is covered, so the two front ends must agree byte for
 ; byte on all 65536 outputs.

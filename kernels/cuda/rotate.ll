@@ -1,4 +1,4 @@
-; out[gid] = in[gid rotated one lane up within its warp] — a shfl.idx.
+; out[gid] = in[gid rotated one lane up within its warp], a shfl.idx.
 target triple = "nvptx64-nvidia-cuda"
 
 declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()

@@ -1,0 +1,149 @@
+// The qualifiers the narrow converts carry, each case pinned to a word:
+//
+//   rs   1.0625 in e4m3 is exactly half an ulp above 1, so the random byte alone
+//        decides, 0x80 carries to 1.125, 0x7f truncates to 1, and the f6, fp4 and
+//        e5m2 rows are the same rule on their own grids
+//   rs   the random word splits by operand, not by value: the byte-wide destinations
+//        take a and b from the upper half and e and f from the lower, and the
+//        nibble-wide fp4 keeps that rule when it puts b's bits in the low byte of
+//        the upper half
+//   rz   1.1875 in e4m3 rounds to 1.25 and truncates to 1.125, 1.75 in e2m1 rounds
+//        to 2 and truncates to 1.5, and a half truncates one step below its rn answer
+//   sc   the n1 factor divides both sources by 2^(s-127) and a subnormal source
+//        flushes to a zero of its own sign, while the n2 pair scales each value of an
+//        up-convert by its own byte, the upper byte for the upper value
+//   pzo  -0.0 becomes +0.0
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry cvtrsx4(
+    .param .u64 cvtrsx4_param_0      // five words
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtrsx4_param_0];
+
+    // a and b are half an ulp above 1, e and f sit on the grid
+    mov.u32 %r1, 0x3F880000;
+    mov.u32 %r2, 0x3F880000;
+    mov.u32 %r3, 0x40000000;
+    mov.u32 %r4, 0xBF000000;
+    mov.u32 %r5, 0x807F0000;
+    cvt.rs.satfinite.e4m3x4.f32 %r6, {%r1, %r2, %r3, %r4}, %r5;
+    st.global.u32 [%rd1], %r6;
+
+    // the same tie one grid step wider, in four bits a value
+    mov.u32 %r1, 0x3FA00000;
+    mov.u32 %r2, 0x3FA00000;
+    mov.u32 %r3, 0x40000000;
+    mov.u32 %r4, 0xBF800000;
+    mov.u32 %r5, 0x80007F00;
+    cvt.rs.satfinite.e2m1x4.f32 %r7, {%r1, %r2, %r3, %r4}, %r5;
+    st.global.u32 [%rd1+4], %r7;
+
+    // fp6: six-bit destinations, a byte apart
+    mov.u32 %r1, 0x3F900000;
+    mov.u32 %r2, 0x3F900000;
+    mov.u32 %r3, 0x3F800000;
+    mov.u32 %r4, 0xC0800000;
+    mov.u32 %r5, 0x807F0000;
+    cvt.rs.satfinite.e3m2x4.f32 %r8, {%r1, %r2, %r3, %r4}, %r5;
+    st.global.u32 [%rd1+8], %r8;
+
+    // e5m2 keeps an infinity and a NaN, and `.satfinite` still rounds the rest
+    mov.u32 %r1, 0x3F900000;
+    mov.u32 %r2, 0x3F900000;
+    mov.u32 %r3, 0xC0000000;
+    mov.u32 %r4, 0x3E800000;
+    mov.u32 %r5, 0x807F0000;
+    cvt.rs.satfinite.e5m2x4.f32 %r9, {%r1, %r2, %r3, %r4}, %r5;
+    st.global.u32 [%rd1+12], %r9;
+
+    // `.relu` zeroes the negative before the convert; zero random bits carry nothing
+    mov.u32 %r1, 0xBF800000;
+    mov.u32 %r2, 0x40800000;
+    mov.u32 %r3, 0x40400000;
+    mov.u32 %r4, 0x3F000000;
+    mov.u32 %r5, 0x00000000;
+    cvt.rs.satfinite.relu.e2m1x4.f32 %r10, {%r1, %r2, %r3, %r4}, %r5;
+    st.global.u32 [%rd1+16], %r10;
+    ret;
+}
+
+// The truncating and the zero-sign converts, on the pair forms.
+.visible .entry cvtrz2(
+    .param .u64 cvtrz2_param_0      // three words
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtrz2_param_0];
+
+    // 1.1875 is three eighths of an ulp into a 0.125 grid: rn takes it up, rz does not
+    mov.u32 %r1, 0x3F980000;
+    mov.u32 %r2, 0xBF980000;
+    cvt.rz.satfinite.e4m3x2.f32 %r3, %r1, %r2;
+    st.global.u32 [%rd1], %r3;
+
+    // 1.75 is exactly half way between two fp4 values, and a tie truncates down
+    mov.u32 %r1, 0x3FE00000;
+    mov.u32 %r2, 0xBFE00000;
+    cvt.rz.satfinite.e2m1x2.f32 %r4, %r1, %r2;
+    st.global.u32 [%rd1+4], %r4;
+
+    // the same on the 16-bit destination, where rn would answer 3c04bc04
+    mov.u32 %r1, 0x3F807000;
+    mov.u32 %r2, 0xBF807000;
+    cvt.rz.satfinite.f16x2.f32 %r5, %r1, %r2;
+    st.global.u32 [%rd1+8], %r5;
+    ret;
+}
+
+// The ue8m0 scales and `.pzo`.
+.visible .entry cvtscaled(
+    .param .u64 cvtscaled_param_0      // five words
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [cvtscaled_param_0];
+
+    // 0x7e is 2^-1, so dividing by it doubles both sources
+    mov.u32 %r1, 0x40000000;
+    mov.u32 %r2, 0x3F800000;
+    mov.u32 %r3, 0x0000007E;
+    cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32 %r4, %r1, %r2, %r3;
+    st.global.u32 [%rd1], %r4;
+
+    // with the scale at 1.0 the flush is the only thing happening: both sources are
+    // subnormals, and each becomes a zero keeping its own sign
+    mov.u32 %r1, 0x00000001;
+    mov.u32 %r2, 0x80000001;
+    mov.u32 %r3, 0x0000007F;
+    cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32 %r5, %r1, %r2, %r3;
+    st.global.u32 [%rd1+4], %r5;
+
+    // the f16x2 source form: 2.0 and 1.0 halved by 0x80
+    mov.u32 %r1, 0x40003C00;
+    mov.u32 %r2, 0x00000080;
+    cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f16x2 %r6, %r1, %r2;
+    st.global.u32 [%rd1+8], %r6;
+
+    // `.pzo` folds the two negative zeros into positive ones
+    mov.u32 %r1, 0x80000000;
+    mov.u32 %r2, 0x80000000;
+    cvt.rn.satfinite.pzo.e4m3x2.f32 %r7, %r1, %r2;
+    st.global.u32 [%rd1+12], %r7;
+
+    // the up-convert with two scales: 1.0 and 1.0, times 4 (0x81 is 2^2) and times 2
+    mov.u32 %r1, 0x00003838;
+    mov.u32 %r2, 0x00008180;
+    cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 %r8, %r1, %r2;
+    st.global.u32 [%rd1+16], %r8;
+    ret;
+}

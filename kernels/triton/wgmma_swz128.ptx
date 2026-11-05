@@ -2,15 +2,15 @@
 // wgmma with swizzled shared operands: the layout every real Hopper kernel uses.
 //
 // A swizzle atom is eight rows of 128 bytes, contiguous, and inside it the
-// 16-byte chunk a row falls in is XORed with the row's position in the pattern —
+// 16-byte chunk a row falls in is XORed with the row's position in the pattern,
 // CUTLASS's Swizzle<3,4,3> over byte offsets, `off ^ (((off >> 7) & 7) << 4)`.
 // The descriptor says all of this in bits 62-63 (1 = 128B) instead of the 0 an
 // unswizzled tile carries, and the two strides become whole atoms: SBO = 1024
 // bytes between the eight-row groups, LBO = 1024 unused here because one
 // instruction's 32 bytes of K never leave an atom.
 //
-// The tiles are wider than the instruction reads — a row of A is 128 bytes and
-// K = 16 halves is 32 of them — which is the point: the swizzle scatters those
+// The tiles are wider than the instruction reads, a row of A is 128 bytes and
+// K = 16 halves is 32 of them, which is the point: the swizzle scatters those
 // 32 bytes across the whole row, so an address computed without it reads the
 // wrong half rather than a nearby one.
 //
@@ -62,7 +62,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: one value — row n = lane / 16, column k = lane % 16 ----
+	// ---- B: one value, row n = lane / 16, column k = lane % 16 ----
 	shr.u32 	%r14, %r1, 4;			// n
 	and.b32 	%r15, %r1, 15;			// k
 	shl.b32 	%r16, %r15, 3;			// B's rows are eight columns wide
@@ -98,7 +98,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

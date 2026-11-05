@@ -2,7 +2,7 @@
 ;
 ; The increment's old value is dropped, so it takes the 64-bit reduction form that
 ; already existed. The load is the pair read as one value, which needs the warp
-; target — and the barrier used to keep the module away from it, because a single
+; target, and the barrier used to keep the module away from it, because a single
 ; thread running 32 lanes has no second lane to arrive with. The warp target now
 ; runs the lanes in step: one program counter each, and the lowest one is run
 ; first, so a lane parked on the barrier cannot be passed by a lane that has not
@@ -10,7 +10,7 @@
 ;
 ; That makes the barrier observable rather than decorative. Every lane of the one
 ; warp adds one, waits, then loads: if the barrier holds, all 32 lanes read the
-; same number — the counter after all 32 increments — and every slot ends up with
+; same number, the counter after all 32 increments, and every slot ends up with
 ; that value. If it did not hold, the first lanes to arrive would read a smaller
 ; counter than the last ones, and the slots would disagree with each other.
                OpCapability Kernel

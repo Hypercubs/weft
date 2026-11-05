@@ -1,0 +1,390 @@
+// The tensor-core shapes past `m16n8k16`: the two narrow-K forms and the eight-row
+// integer one. Each is a warp-wide instruction, so the kernel is one warp and every
+// lane loads the pieces of A and B its fragment owns, straight from the buffers.
+//
+//   1. `mma.m16n8k8.row.col.f32.f16.f16.f32`, half the K of the shape Triton emits
+//      for a 16-wide reduction. A lane holds A[g][2t..2t+1] and A[g+8][2t..2t+1] in
+//      two registers, and both halves of its B column in one.
+//   2. `mma.m16n8k4.row.col.f32.tf32.tf32.f32`, the four-wide tf32 form, one element
+//      a register: A[g][t], A[g+8][t] and B[t][g].
+//   3. `mma.m8n8k16.row.col.s32.s8.s8.s32`, the eight-row integer dot, four bytes a
+//      register and only two accumulators a lane.
+//
+// B is stored transposed (`Bt[n][k] = B[k][n]`) except for the tf32 shape, whose
+// fragment is one element and needs no transpose: a lane's B values are then four or
+// eight contiguous bytes, which is what an `ldmatrix` would have handed it.
+//
+// Every input is a small integer, so each product and each sum is exact in binary32
+// and exact in binary64 as well, a disagreement is a fragment-map bug and never a
+// rounding one.
+.version 8.1
+.target sm_80
+.address_size 64
+
+.maxntid 32, 1, 1
+
+.visible .entry mmak8f16(
+    .param .u64 mmak8f16_param_0,   // A: 16 x 8 halves, row major, 16 bytes a row
+    .param .u64 mmak8f16_param_1,   // Bt: 8 x 8 halves, 16 bytes a row
+    .param .u64 mmak8f16_param_2    // D: 16 x 8 floats, 32 bytes a row
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [mmak8f16_param_0];
+    ld.param.u64 %rd2, [mmak8f16_param_1];
+    ld.param.u64 %rd3, [mmak8f16_param_2];
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;                // g: the row group
+    and.b32 %r3, %r1, 3;                // t: the column pair
+
+    mul.wide.u32 %rd4, %r2, 16;         // g rows of 16 bytes
+    mad.lo.s32 %r4, %r3, 4, 0;          // 4t bytes: the pair a lane holds
+    mul.wide.u32 %rd6, %r4, 1;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.b32 %r5, [%rd7];          // A[g][2t], A[g][2t+1]
+    ld.global.b32 %r6, [%rd7+128];      // A[g+8][2t], A[g+8][2t+1]
+    add.s64 %rd8, %rd2, %rd4;
+    add.s64 %rd9, %rd8, %rd6;
+    ld.global.b32 %r7, [%rd9];          // B[2t][g], B[2t+1][g]
+
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.f32 %f4, 0f00000000;
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%f5,%f6,%f7,%f8}, {%r5,%r6}, {%r7}, {%f1,%f2,%f3,%f4};
+
+    // D[g][2t], D[g][2t+1], D[g+8][2t], D[g+8][2t+1]
+    mad.lo.s32 %r8, %r3, 8, 0;
+    mul.wide.u32 %rd10, %r2, 32;
+    add.s64 %rd11, %rd3, %rd10;
+    mul.wide.u32 %rd12, %r8, 1;
+    add.s64 %rd13, %rd11, %rd12;
+    st.global.f32 [%rd13], %f5;
+    st.global.f32 [%rd13+4], %f6;
+    st.global.f32 [%rd13+256], %f7;
+    st.global.f32 [%rd13+260], %f8;
+    ret;
+}
+
+.visible .entry mmak4tf32(
+    .param .u64 mmak4tf32_param_0,   // A: 16 x 4 floats, 16 bytes a row
+    .param .u64 mmak4tf32_param_1,   // B: 4 x 8 floats, 32 bytes a row
+    .param .u64 mmak4tf32_param_2    // D: 16 x 8 floats
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<16>;
+
+    ld.param.u64 %rd1, [mmak4tf32_param_0];
+    ld.param.u64 %rd2, [mmak4tf32_param_1];
+    ld.param.u64 %rd3, [mmak4tf32_param_2];
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;                // g
+    and.b32 %r3, %r1, 3;                // t
+
+    mul.wide.u32 %rd4, %r2, 16;
+    mad.lo.s32 %r4, %r3, 4, 0;
+    mul.wide.u32 %rd6, %r4, 1;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.b32 %f1, [%rd7];          // A[g][t]
+    ld.global.b32 %f2, [%rd7+128];      // A[g+8][t]
+
+    // B[t][g]: 32 bytes a row, one element a column
+    mul.wide.u32 %rd8, %r3, 32;
+    mad.lo.s32 %r5, %r2, 4, 0;
+    mul.wide.u32 %rd9, %r5, 1;
+    add.s64 %rd10, %rd2, %rd8;
+    add.s64 %rd11, %rd10, %rd9;
+    ld.global.b32 %f3, [%rd11];
+
+    mov.f32 %f4, 0f00000000;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    mov.f32 %f7, 0f00000000;
+    mma.sync.aligned.m16n8k4.row.col.f32.tf32.tf32.f32 {%f8,%f9,%f10,%f11}, {%f1,%f2}, {%f3}, {%f4,%f5,%f6,%f7};
+
+    mad.lo.s32 %r6, %r3, 8, 0;
+    mul.wide.u32 %rd12, %r2, 32;
+    add.s64 %rd13, %rd3, %rd12;
+    mul.wide.u32 %rd14, %r6, 1;
+    add.s64 %rd15, %rd13, %rd14;
+    st.global.f32 [%rd15], %f8;
+    st.global.f32 [%rd15+4], %f9;
+    st.global.f32 [%rd15+256], %f10;
+    st.global.f32 [%rd15+260], %f11;
+    ret;
+}
+
+.visible .entry mmas8(
+    .param .u64 mmas8_param_0,       // A: 8 x 16 bytes, 16 bytes a row
+    .param .u64 mmas8_param_1,       // Bt: 8 x 16 bytes
+    .param .u64 mmas8_param_2        // D: 8 x 8 s32, 32 bytes a row
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [mmas8_param_0];
+    ld.param.u64 %rd2, [mmas8_param_1];
+    ld.param.u64 %rd3, [mmas8_param_2];
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;                // g: the only row group
+    and.b32 %r3, %r1, 3;                // t
+
+    mul.wide.u32 %rd4, %r2, 16;
+    mad.lo.s32 %r4, %r3, 4, 0;
+    mul.wide.u32 %rd6, %r4, 1;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.b32 %r5, [%rd7];          // A[g][4t..4t+3]
+    add.s64 %rd8, %rd2, %rd4;
+    add.s64 %rd9, %rd8, %rd6;
+    ld.global.b32 %r6, [%rd9];          // B[4t..4t+3][g]
+
+    mov.u32 %r7, 0;
+    mov.u32 %r8, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r9,%r10}, {%r5}, {%r6}, {%r7,%r8};
+
+    // D[g][2t] and D[g][2t+1]
+    mad.lo.s32 %r11, %r3, 8, 0;
+    mul.wide.u32 %rd10, %r2, 32;
+    add.s64 %rd11, %rd3, %rd10;
+    mul.wide.u32 %rd12, %r11, 1;
+    add.s64 %rd13, %rd11, %rd12;
+    st.global.s32 [%rd13], %r9;
+    st.global.s32 [%rd13+4], %r10;
+    ret;
+}
+
+// The four-bit form, `mma.m16n8k64.row.col.s32.s4.s4.s32`: eight nibbles a register
+// where the byte form holds four, so K is 64 and A takes four registers. The
+// standard's fragment table is `row = lane>>2` (and `+8` above the half-way point),
+// `col = 8*(lane%4) + (i&7)`, `col += 32` for the last two registers, which is the
+// eight-elements-a-register map every other shape here uses.
+//
+// The operands are signed nibbles, so a lane's four bytes hold eight values with the
+// sign in bit 3 of each: a widen that dropped it would read -3 as 13.
+.visible .entry mmak64s4(
+    .param .u64 mmak64s4_param_0,   // A: 16 x 64 nibbles, 32 bytes a row
+    .param .u64 mmak64s4_param_1,   // Bt: 8 x 64 nibbles, 32 bytes a row
+    .param .u64 mmak64s4_param_2    // D: 16 x 8 s32
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [mmak64s4_param_0];
+    ld.param.u64 %rd2, [mmak64s4_param_1];
+    ld.param.u64 %rd3, [mmak64s4_param_2];
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;                // g: the row group
+    and.b32 %r3, %r1, 3;                // t: eight columns a lane
+
+    mul.wide.u32 %rd4, %r2, 32;         // g rows of 32 bytes
+    mad.lo.s32 %r4, %r3, 4, 0;          // 4t bytes: the eight nibbles a lane holds
+    mul.wide.u32 %rd6, %r4, 1;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.b32 %r5, [%rd7];          // A[g][8t..8t+7]
+    ld.global.b32 %r6, [%rd7+256];      // A[g+8][8t..]   (eight rows of 32 bytes)
+    ld.global.b32 %r7, [%rd7+16];       // A[g][32+8t..]  (32 nibbles are 16 bytes)
+    ld.global.b32 %r8, [%rd7+272];      // A[g+8][32+8t..]
+
+    add.s64 %rd8, %rd2, %rd4;
+    add.s64 %rd9, %rd8, %rd6;
+    ld.global.b32 %r9, [%rd9];          // B[8t..8t+7][g]
+    ld.global.b32 %r10, [%rd9+16];      // B[32+8t..][g]
+
+    mov.u32 %r11, 0;
+    mov.u32 %r12, 0;
+    mov.u32 %r13, 0;
+    mov.u32 %r14, 0;
+    mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 {%r11,%r12,%r13,%r14}, {%r5,%r6,%r7,%r8}, {%r9,%r10}, {%r11,%r12,%r13,%r14};
+
+    mad.lo.s32 %r15, %r3, 8, 0;
+    mul.wide.u32 %rd10, %r2, 32;
+    add.s64 %rd11, %rd3, %rd10;
+    mul.wide.u32 %rd12, %r15, 1;
+    add.s64 %rd13, %rd11, %rd12;
+    st.global.s32 [%rd13], %r11;
+    st.global.s32 [%rd13+4], %r12;
+    st.global.s32 [%rd13+256], %r13;
+    st.global.s32 [%rd13+260], %r14;
+    ret;
+}
+
+// The narrow float operands, four a register: `mma.m16n8k32` with `.e2m1` (fp4) and
+// with `.e3m2` (fp6). Their fragment map is the byte forms', `col = 4*(lane%4) +
+// (i&3)`, `col += 16` for the last two registers, so only the decode differs, and
+// the accumulate is `f32`.
+//
+// The packing is the one the `cvt` forms of these formats already use: an fp4 code is
+// a nibble, two to a byte, and an fp6 code sits in the low six bits of its own byte.
+// The values are dyadic, so every product and every sum of them is exact in binary32
+//, a difference is the decode or the map, never a rounding.
+.visible .entry mmak32e2m1(
+    .param .u64 mmak32e2m1_param_0,   // A: 16 x 32 fp4 codes, 16 bytes a row
+    .param .u64 mmak32e2m1_param_1,   // Bt: 8 x 32 fp4 codes, 16 bytes a row
+    .param .u64 mmak32e2m1_param_2    // D: 16 x 8 floats
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [mmak32e2m1_param_0];
+    ld.param.u64 %rd2, [mmak32e2m1_param_1];
+    ld.param.u64 %rd3, [mmak32e2m1_param_2];
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;                // g
+    and.b32 %r3, %r1, 3;                // t: four codes a lane
+
+    mul.wide.u32 %rd4, %r2, 16;         // 32 codes are 16 bytes
+    mad.lo.s32 %r4, %r3, 2, 0;          // 2t bytes: four nibbles
+    mul.wide.u32 %rd6, %r4, 1;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.b16 %r5, [%rd7];          // A[g][4t..4t+3]
+    ld.global.b16 %r6, [%rd7+128];      // A[g+8][..]  (eight rows of 16 bytes)
+    ld.global.b16 %r7, [%rd7+8];        // A[g][16+4t..]
+    ld.global.b16 %r8, [%rd7+136];      // A[g+8][16+4t..]
+
+    add.s64 %rd8, %rd2, %rd4;
+    add.s64 %rd9, %rd8, %rd6;
+    ld.global.b16 %r9, [%rd9];          // B[4t..4t+3][g]
+    ld.global.b16 %r10, [%rd9+8];       // B[16+4t..][g]
+
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.f32 %f4, 0f00000000;
+    mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32 {%f5,%f6,%f7,%f8}, {%r5,%r6,%r7,%r8}, {%r9,%r10}, {%f1,%f2,%f3,%f4};
+
+    mad.lo.s32 %r11, %r3, 8, 0;
+    mul.wide.u32 %rd10, %r2, 32;
+    add.s64 %rd11, %rd3, %rd10;
+    mul.wide.u32 %rd12, %r11, 1;
+    add.s64 %rd13, %rd11, %rd12;
+    st.global.f32 [%rd13], %f5;
+    st.global.f32 [%rd13+4], %f6;
+    st.global.f32 [%rd13+256], %f7;
+    st.global.f32 [%rd13+260], %f8;
+    ret;
+}
+
+// The same fp4 code, at twice the K: `mma.m16n8k64` with `.e2m1` puts eight codes in a
+// register, which is the four-bit integer form's map, `col = 8*(lane%4) + (i&7)`,
+// `col += 32` for the last two registers. A lane's eight codes are four bytes, so the
+// load is one word.
+.visible .entry mmak64e2m1(
+    .param .u64 mmak64e2m1_param_0,   // A: 16 x 64 fp4 codes, 32 bytes a row
+    .param .u64 mmak64e2m1_param_1,   // Bt: 8 x 64 fp4 codes, 32 bytes a row
+    .param .u64 mmak64e2m1_param_2    // D: 16 x 8 floats
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [mmak64e2m1_param_0];
+    ld.param.u64 %rd2, [mmak64e2m1_param_1];
+    ld.param.u64 %rd3, [mmak64e2m1_param_2];
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;
+    and.b32 %r3, %r1, 3;
+
+    mul.wide.u32 %rd4, %r2, 32;         // 64 codes are 32 bytes
+    mad.lo.s32 %r4, %r3, 4, 0;          // 4t bytes: eight nibbles
+    mul.wide.u32 %rd6, %r4, 1;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.b32 %r5, [%rd7];          // A[g][8t..8t+7]
+    ld.global.b32 %r6, [%rd7+256];      // A[g+8][..]
+    ld.global.b32 %r7, [%rd7+16];       // A[g][32+8t..]
+    ld.global.b32 %r8, [%rd7+272];      // A[g+8][32+8t..]
+
+    add.s64 %rd8, %rd2, %rd4;
+    add.s64 %rd9, %rd8, %rd6;
+    ld.global.b32 %r9, [%rd9];          // B[8t..8t+7][g]
+    ld.global.b32 %r10, [%rd9+16];      // B[32+8t..][g]
+
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.f32 %f4, 0f00000000;
+    mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32 {%f5,%f6,%f7,%f8}, {%r5,%r6,%r7,%r8}, {%r9,%r10}, {%f1,%f2,%f3,%f4};
+
+    mad.lo.s32 %r11, %r3, 8, 0;
+    mul.wide.u32 %rd10, %r2, 32;
+    add.s64 %rd11, %rd3, %rd10;
+    mul.wide.u32 %rd12, %r11, 1;
+    add.s64 %rd13, %rd11, %rd12;
+    st.global.f32 [%rd13], %f5;
+    st.global.f32 [%rd13+4], %f6;
+    st.global.f32 [%rd13+256], %f7;
+    st.global.f32 [%rd13+260], %f8;
+    ret;
+}
+
+.visible .entry mmak32e3m2(
+    .param .u64 mmak32e3m2_param_0,   // A: 16 x 32 fp6 codes, one a byte
+    .param .u64 mmak32e3m2_param_1,   // Bt: 8 x 32 fp6 codes
+    .param .u64 mmak32e3m2_param_2    // D: 16 x 8 floats
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [mmak32e3m2_param_0];
+    ld.param.u64 %rd2, [mmak32e3m2_param_1];
+    ld.param.u64 %rd3, [mmak32e3m2_param_2];
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;
+    and.b32 %r3, %r1, 3;
+
+    mul.wide.u32 %rd4, %r2, 32;         // a code a byte, so 32 bytes a row
+    mad.lo.s32 %r4, %r3, 4, 0;          // 4t bytes: four codes
+    mul.wide.u32 %rd6, %r4, 1;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.b32 %r5, [%rd7];          // A[g][4t..4t+3]
+    ld.global.b32 %r6, [%rd7+256];      // A[g+8][..]
+    ld.global.b32 %r7, [%rd7+16];       // A[g][16+4t..]
+    ld.global.b32 %r8, [%rd7+272];      // A[g+8][16+4t..]
+
+    add.s64 %rd8, %rd2, %rd4;
+    add.s64 %rd9, %rd8, %rd6;
+    ld.global.b32 %r9, [%rd9];          // B[4t..4t+3][g]
+    ld.global.b32 %r10, [%rd9+16];      // B[16+4t..][g]
+
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.f32 %f4, 0f00000000;
+    mma.sync.aligned.m16n8k32.row.col.f32.e3m2.e3m2.f32 {%f5,%f6,%f7,%f8}, {%r5,%r6,%r7,%r8}, {%r9,%r10}, {%f1,%f2,%f3,%f4};
+
+    mad.lo.s32 %r11, %r3, 8, 0;
+    mul.wide.u32 %rd10, %r2, 32;
+    add.s64 %rd11, %rd3, %rd10;
+    mul.wide.u32 %rd12, %r11, 1;
+    add.s64 %rd13, %rd11, %rd12;
+    st.global.f32 [%rd13], %f5;
+    st.global.f32 [%rd13+4], %f6;
+    st.global.f32 [%rd13+256], %f7;
+    st.global.f32 [%rd13+260], %f8;
+    ret;
+}

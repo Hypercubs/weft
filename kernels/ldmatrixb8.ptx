@@ -1,0 +1,86 @@
+// The byte shapes: `ldmatrix.m16n16.b8` and `stmatrix.m16n8.b8`, the pair a Blackwell
+// kernel uses for fp8 and fp4 operands.
+//
+// Both write a closed form out, so what is checked is the map rather than two engines
+// agreeing with each other. The maps are CUTLASS's: `SM100_U8x8_LDSM_T` in
+// `cute/arch/copy_sm100.hpp` and its reference layout in `copy_traits_sm100.hpp` say a
+// lane's logical byte s of a 16x16 tile is
+//
+//     row = 2*(l&3) + (s&1) + 8*(s>>2),   col = (l>>2) + 8*((s>>1)&1)
+//
+// and the shuffle that same `copy()` applies to the raw result says logical byte s is
+// byte q of register r where s = 2*r + (q&1) + 4*(q>>1). A 16x16 tile holds 0..255 in
+// row-major order, so each of the sixty-four words out is four of those numbers in the
+// order the hardware hands them back.
+//
+// The store is the `m16n8` shape, one register a matrix, logical byte s at
+//
+//     row = 4*(l&3) + 2*(s&1) + ((s>>1)&1),   col = l>>2
+//
+// of a tile 16 rows by 8 bytes. Lane l's register holds 4l..4l+3, so every byte of the
+// 256-byte tile is written exactly once and each word out is the four numbers that
+// landed on those bytes.
+//
+// What this cannot check is agreement with a real GPU: these instructions are sm_100
+// and this host is not, so the fixture pins the implementation to the published map.
+.version 8.3
+.target sm_100
+.address_size 64
+
+.visible .entry ldmatrixb8(
+    .param .u64 ldmatrixb8_param_0,     // out: sixty-four words
+    .param .u64 ldmatrixb8_param_1      // the stored tile, put back: sixty-four words
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    .reg .pred %p<4>;
+
+    .shared .align 16 .b8 tile[256];
+    .shared .align 16 .b8 back[256];
+
+    ld.param.u64 %rd1, [ldmatrixb8_param_0];
+    ld.param.u64 %rd2, [ldmatrixb8_param_1];
+
+    mov.u32 %r1, %tid.x;
+
+    // ---- the tile: byte k holds k, eight a lane ----
+    shl.b32 %r2, %r1, 3;                    // 8l
+    mov.u64 %rd4, tile;
+    mov.u32 %r3, 0;
+FILL: setp.ge.u32 %p1, %r3, 8;
+    @%p1 bra FILLED;
+    add.s32 %r5, %r2, %r3;                  // the offset, which is also the value
+    cvt.u64.u32 %rd5, %r5;
+    add.s64 %rd5, %rd4, %rd5;
+    st.shared.u8 [%rd5], %r5;
+    add.u32 %r3, %r3, 1;
+    bra FILL;
+FILLED:
+
+    bar.sync 0;
+
+    // ---- the fragment: two registers a lane ----
+    ldmatrix.sync.aligned.m16n16.x1.trans.shared.b8 {%r10, %r11}, [tile];
+
+    // ---- out: the eight bytes the lane holds ----
+    shl.b32 %r6, %r1, 3;
+    cvt.u64.u32 %rd6, %r6;
+    add.s64 %rd7, %rd1, %rd6;
+    st.global.b32 [%rd7], %r10;
+    st.global.b32 [%rd7+4], %r11;
+
+    // ---- the same fragment stored as two 16x8 tiles, then read back ----
+    stmatrix.sync.aligned.m16n8.x2.trans.shared.b8 [back], {%r10, %r11};
+
+    bar.sync 0;
+
+    mov.u64 %rd8, back;
+    add.s64 %rd9, %rd8, %rd6;
+    ld.shared.b32 %r12, [%rd9];
+    ld.shared.b32 %r13, [%rd9+4];
+    add.s64 %rd10, %rd2, %rd6;
+    st.global.b32 [%rd10], %r12;
+    st.global.b32 [%rd10+4], %r13;
+    ret;
+}

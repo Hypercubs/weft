@@ -4,14 +4,14 @@
 // warp.
 //
 // The per-lane target gives each thread one lane, which is why a tensor-core
-// fragment has no form there — `mma` reads registers other lanes hold, and a
+// fragment has no form there, `mma` reads registers other lanes hold, and a
 // lane cannot read a peer's register without a shuffle that a diverging state
 // machine is not allowed to make. In this target the 32 lanes are data inside
 // one thread: a peer's register is `r[l]`, the mask is `am[l]`, and nothing
 // crosses a hardware lane at all.
 //
 // What that costs: 32 times fewer threads (one per warp, not per lane), and the
-// warp's register file lives in thread memory — `r[24][32]` is 3 KiB before the
+// warp's register file lives in thread memory, `r[24][32]` is 3 KiB before the
 // floats and the 64-bit words are counted. So this is the target for the kernels
 // that *need* a warp, not the one that is fastest for the ones that do not.
 static const char* kWWeftWarpMsl = R"WEFWARP(
@@ -25,7 +25,7 @@ namespace weft {
 static constant uint32_t kWarpLanes = 32u;
 
 // One warp's view of the launch. `lid0` is the first lane this thread owns, so
-// lane `l` of the warp is global thread `ctx.lid0 + l` — which is the whole of
+// lane `l` of the warp is global thread `ctx.lid0 + l`, which is the whole of
 // what `%tid.x` means in the warp backend.
 struct WCtx {
   uint32_t lid0;
@@ -47,7 +47,6 @@ struct WCtx {
 static constant uint32_t kWarpDone = 0xFFFFFFFFu;
 static constant uint32_t kWarpBarrier = 0xFFFFFFFEu;
 
-// ---- the threads a warp holds ----
 //
 // One thread runs the whole warp, so a slot another lane writes is a slot this
 // thread reads: a barrier inside the warp is satisfied the moment it is reached,

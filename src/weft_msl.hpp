@@ -1,3 +1,5 @@
+#include <string>
+
 #pragma once
 
 // The Metal side of the translated-kernel runtime.
@@ -39,12 +41,12 @@
 //     That is why the pair has one writer rather than a lock: the warp back end
 //     is exact because one thread owns all 32 lanes and every access is an atomic
 //     from that one thread, and the per-lane back end refuses a pair it would
-//     have to lock and keeps the shape that needs no lock — a reduction, which is
+//     have to lock and keeps the shape that needs no lock, a reduction, which is
 //     two 32-bit atomics.
 //
 // Everything here is `static inline` in one translation unit, so the compiler
 // inlines the helpers into the kernel and constant-folds the mode switches.
-static const char* kWWeftMslPreamble = R"WEFMSL(
+static const char* kWWeftMslHead = R"WEFMSL(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -72,10 +74,9 @@ static inline uint16_t weft_h16_bits(float x) { return as_type<uint16_t>((_Float
 // so the constant spelling the emitter uses for one hands the bits back unchanged.
 static inline uint64_t weft_f64(uint64_t b) { return b; }
 
-// ---- 64-bit floating point, over the integers ----
 //
 // Apple GPUs have no fp64 and Metal rejects the type outright, so a kernel carrying a
-// `double` cannot be compiled at all — that is the language, not a missing lowering.
+// `double` cannot be compiled at all, that is the language, not a missing lowering.
 // Software is how every GPU without fp64 carries one, and this is that: a double is
 // its bits in a `uint64_t` (which is the type the emitter gives it), and every
 // operation here is exact IEEE-754 binary64, round-to-nearest-even, subnormals
@@ -90,639 +91,11 @@ static inline uint64_t weft_f64(uint64_t b) { return b; }
 // bit, the sign being carried separately. The low three bits of `sig` are guard,
 // round and sticky, so one rounding at the end is enough: `round_pack` does it, and
 // each operation only has to produce that form exactly.
-namespace weft_fp64 {
+)WEFMSL";
 
-constant uint64_t kSign = 0x8000000000000000ull;
-constant uint64_t kExpMask = 0x7FF0000000000000ull;
-constant uint64_t kFracMask = 0x000FFFFFFFFFFFFFull;
-constant uint64_t kHidden = 0x0010000000000000ull;
-// The leading bit of the working form. It is not `kHidden`: that is bit 52, the
-// significand's leading bit in the *encoding*, and the working form carries three
-// spare bits below it, so its leading bit sits at 55. Normalizing on the wrong one
-// is an infinite loop, because a value whose low bits are zero can never set bit 52
-// by shifting left.
-constant uint64_t kLead = 0x0080000000000000ull;
-constant uint64_t kInf = 0x7FF0000000000000ull;
-constant uint64_t kQNaN = 0x7FF8000000000000ull;
-// The leading-zero count of a 64-bit value, in 32-bit halves. `__builtin_clzll` is
-// what this host's compiler dies on — at pipeline creation, with
-// XPC_ERROR_CONNECTION_INTERRUPTED and nothing else — and the 32-bit builtin is
-// fine, so the wide one is spelled out of the narrow one. Measured with
-// tools/msl_bisect.py: the two helpers that used it were the only ones of sixteen
-// that failed to build.
-static inline uint32_t clz64(uint64_t v) {
-  const uint32_t hi = (uint32_t)(v >> 32);
-  if (hi != 0u) return (uint32_t)__builtin_clz(hi);
-  return 32u + (uint32_t)__builtin_clz((uint32_t)(v & 0xFFFFFFFFu));
-}
+#include "weft_f64.hpp"
 
-constant uint64_t kOne = 0x3FF0000000000000ull;
-constant uint64_t kNegOne = 0xBFF0000000000000ull;
-constant uint64_t kHalf = 0x3FE0000000000000ull;
-
-static inline bool is_nan(uint64_t b) {
-  return (b & kExpMask) == kExpMask && (b & kFracMask) != 0ull;
-}
-static inline bool is_inf(uint64_t b) { return (b & ~kSign) == kInf; }
-static inline bool is_zero(uint64_t b) { return (b & ~kSign) == 0ull; }
-static inline uint64_t neg(uint64_t b) { return b ^ kSign; }
-static inline uint64_t abs_bits(uint64_t b) { return b & ~kSign; }
-
-// The working form. A subnormal is normalized here — it has fewer than 53
-// significant bits, so shifting it up loses nothing and every operation below can
-// then be written once.
-static inline void unpack(uint64_t b, thread int32_t& e, thread uint64_t& sig) {
-  const int32_t be = (int32_t)((b >> 52) & 0x7FF);
-  const uint64_t f = b & kFracMask;
-  if (be == 0) {
-    e = -1022;
-    sig = f << 3;
-    if (sig == 0ull) return;
-    while ((sig & kLead) == 0ull) { sig <<= 1; e -= 1; }
-  } else {
-    e = be - 1023;
-    sig = (f | kHidden) << 3;
-  }
-}
-
-// Round the working form into a pattern. A result below the normal range has a
-// quantum of 2^-1074, so the significand is shifted down before the same three-bit
-// rounding applies; that shift is the whole difference between the two cases.
-static inline uint64_t round_pack(uint32_t sign, int32_t e, uint64_t sig) {
-  const uint64_t sgn = sign ? kSign : 0ull;
-  if (sig == 0ull) return sgn;
-  const bool sub = e < -1022;
-  if (sub) {
-    const int32_t k = -1022 - e;
-    if (k >= 64) {
-      sig = 1u;  // every bit is below the last place, so the value is tiny and sticky
-    } else {
-      const uint64_t lost = sig & ((1ull << k) - 1ull);
-      sig = (sig >> k) | ((lost != 0ull) ? 1u : 0u);
-    }
-  }
-  const uint64_t s = sig & 1ull;
-  const uint64_t r = (sig >> 1) & 1ull;
-  const uint64_t g = (sig >> 2) & 1ull;
-  sig >>= 3;
-  if (g && (r || s || (sig & 1ull))) sig += 1ull;  // nearest, ties to even
-  if (sub) return sgn | sig;  // fraction only; a carry out of bit 52 is the smallest
-                              // normal, which those same bits already spell
-  int32_t be = e + 1023;
-  if (sig == (1ull << 53)) { sig >>= 1; be += 1; }
-  if (be >= 2047) return sgn | kInf;
-  return sgn | ((uint64_t)be << 52) | (sig & kFracMask);
-}
-
-static inline uint64_t add(uint64_t a, uint64_t b) {
-  if (is_nan(a) || is_nan(b)) return kQNaN;
-  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
-  const uint32_t ea = (uint32_t)((a >> 52) & 0x7FF), eb = (uint32_t)((b >> 52) & 0x7FF);
-  if (ea == 0x7FF) return (eb == 0x7FF && sa != sb) ? kQNaN : a;  // inf + -inf
-  if (eb == 0x7FF) return b;
-  if (is_zero(a) && is_zero(b)) return (sa == sb) ? a : 0ull;    // (+0) + (-0) = +0
-  if (is_zero(a)) return b;
-  if (is_zero(b)) return a;
-  int32_t ua, ub;
-  uint64_t Ma, Mb;
-  unpack(a, ua, Ma);
-  unpack(b, ub, Mb);
-  // Order by magnitude, so the only shifting is the smaller operand coming down.
-  const bool a_bigger = (ua > ub) || (ua == ub && Ma >= Mb);
-  const uint32_t sign = a_bigger ? sa : sb;
-  uint64_t big = a_bigger ? Ma : Mb;
-  uint64_t small = a_bigger ? Mb : Ma;
-  int32_t e = a_bigger ? ua : ub;
-  const int32_t d = a_bigger ? (ua - ub) : (ub - ua);
-  if (d > 0) {
-    if (d >= 64) {
-      small = 1u;  // nothing of it survives except the fact that it was not zero
-    } else {
-      const uint64_t lost = small & ((1ull << d) - 1ull);
-      small = (small >> d) | ((lost != 0ull) ? 1u : 0u);
-    }
-  }
-  uint64_t sum;
-  uint32_t out_sign = sign;
-  if (sa == sb) {
-    sum = big + small;
-  } else if (big > small) {
-    sum = big - small;
-  } else if (small > big) {
-    sum = small - big;
-    out_sign = a_bigger ? sb : sa;  // the larger magnitude was the negative one
-  } else {
-    return 0ull;  // equal magnitudes, opposite signs: +0 in round-to-nearest
-  }
-  if (sum >= (1ull << 56)) {
-    sum = (sum >> 1) | (sum & 1ull);  // keep the bit that leaves bit 0 as sticky
-    e += 1;
-  }
-  while ((sum & kLead) == 0ull) { sum <<= 1; e -= 1; }
-  return round_pack(out_sign, e, sum);
-}
-
-static inline uint64_t sub(uint64_t a, uint64_t b) { return add(a, neg(b)); }
-
-static inline uint64_t mul(uint64_t a, uint64_t b) {
-  if (is_nan(a) || is_nan(b)) return kQNaN;
-  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
-  const uint32_t sign = sa ^ sb;
-  const uint32_t ea = (uint32_t)((a >> 52) & 0x7FF), eb = (uint32_t)((b >> 52) & 0x7FF);
-  const bool za = is_zero(a), zb = is_zero(b);
-  if (ea == 0x7FF || eb == 0x7FF) {
-    if (za || zb) return kQNaN;  // an infinity times a zero
-    return (sign ? kSign : 0ull) | kInf;
-  }
-  if (za || zb) return sign ? kSign : 0ull;
-  int32_t ua, ub;
-  uint64_t ma, mb;
-  unpack(a, ua, ma);
-  unpack(b, ub, mb);
-  // The product of two 56-bit significands needs 112 bits, so it is built from
-  // 32-bit halves, and the top of it is shifted down with a sticky bit.
-  const uint64_t p0 = (ma & 0xFFFFFFFFull) * (mb & 0xFFFFFFFFull);
-  const uint64_t p1 = (ma >> 32) * (mb & 0xFFFFFFFFull);
-  const uint64_t p2 = (ma & 0xFFFFFFFFull) * (mb >> 32);
-  const uint64_t p3 = (ma >> 32) * (mb >> 32);
-  const uint64_t mid = (p0 >> 32) + (p1 & 0xFFFFFFFFull) + (p2 & 0xFFFFFFFFull);
-  const uint64_t lo = (mid << 32) | (p0 & 0xFFFFFFFFull);
-  const uint64_t hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
-  const int32_t lead = hi ? (127 - (int32_t)clz64(hi)) : (63 - (int32_t)clz64(lo));
-  const int32_t sh = lead - 55;  // at most 57 for a product this wide
-  uint64_t sig = (hi << (64 - sh)) | (lo >> sh);
-  const uint64_t lost = lo & ((1ull << sh) - 1ull);
-  sig |= (lost != 0ull) ? 1ull : 0ull;
-  // value(a) = m_a * 2^(ua-52) and P = (m_a<<3) * (m_b<<3), so
-  // value(a)*value(b) = P * 2^(ua+ub-110) = sig * 2^(sh+ua+ub-110), and the working
-  // form is sig * 2^(e-55): e = sh + ua + ub - 55.
-  return round_pack(sign, sh + ua + ub - 55, sig);
-}
-
-static inline uint64_t div(uint64_t a, uint64_t b) {
-  if (is_nan(a) || is_nan(b)) return kQNaN;
-  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
-  const uint32_t sign = sa ^ sb;
-  const uint32_t ea = (uint32_t)((a >> 52) & 0x7FF), eb = (uint32_t)((b >> 52) & 0x7FF);
-  if (ea == 0x7FF) return (eb == 0x7FF) ? kQNaN : ((sign ? kSign : 0ull) | kInf);
-  if (eb == 0x7FF) return sign ? kSign : 0ull;  // a finite value over an infinity
-  if (is_zero(b)) return is_zero(a) ? kQNaN : ((sign ? kSign : 0ull) | kInf);
-  if (is_zero(a)) return sign ? kSign : 0ull;
-  int32_t ua, ub;
-  uint64_t ma, mb;
-  unpack(a, ua, ma);
-  unpack(b, ub, mb);
-  // Long division of the significands: 55 quotient bits, and whatever is left over
-  // is below the last of them, which is exactly the sticky bit.
-  uint64_t q = 0ull, r = ma;
-  if (r >= mb) { r -= mb; q = 1ull; }  // the quotient is at least one
-  for (int32_t i = 0; i < 54; i++) {
-    q <<= 1;
-    r <<= 1;
-    if (r >= mb) { r -= mb; q |= 1ull; }
-  }
-  // The quotient is in [2^54, 2^55) when the dividend's significand is the larger
-  // and [2^53, 2^54) when it is not, so the leading bit belongs at 55 — and the
-  // sticky bit goes in only after that shift, or it would move with it.
-  uint64_t sig = q << 1;
-  int32_t e = ua - ub;
-  while ((sig & kLead) == 0ull) { sig <<= 1; e -= 1; }
-  if (r != 0ull) sig |= 1ull;
-  return round_pack(sign, e, sig);
-}
-
-static inline bool eq(uint64_t a, uint64_t b) {
-  if (is_nan(a) || is_nan(b)) return false;
-  if (is_zero(a) && is_zero(b)) return true;  // +0 and -0 are equal
-  return a == b;                             // with no NaNs, equal bits are equal values
-}
-static inline bool ne(uint64_t a, uint64_t b) { return !eq(a, b); }
-static inline bool lt(uint64_t a, uint64_t b) {
-  if (is_nan(a) || is_nan(b)) return false;
-  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63);
-  if (is_zero(a) && is_zero(b)) return false;
-  if (sa != sb) return sa != 0u;  // a negative value is below a positive one
-  const uint64_t ma = a & ~kSign, mb = b & ~kSign;
-  return sa ? (ma > mb) : (ma < mb);
-}
-static inline bool le(uint64_t a, uint64_t b) { return lt(a, b) || eq(a, b); }
-static inline bool gt(uint64_t a, uint64_t b) { return lt(b, a); }
-static inline bool ge(uint64_t a, uint64_t b) { return le(b, a); }
-
-// ---- fused multiply-add ----
-//
-// `a * b + c`, rounded once. A product of two 53-bit significands needs 106 bits and
-// the addition can cancel almost all of that away, which is exactly why a multiply and
-// then an add is a different answer: no 56-bit working form can hold the intermediate.
-// The three values are placed at one scale in a 192-bit accumulator instead, and the
-// rounding happens once, at the end.
-struct decon {
-  uint64_t sig;   // value = sig * 2^exp, with bit 52 set for a non-zero value
-  int32_t exp;
-};
-struct wide {
-  uint64_t h, m, l;   // (h:m:l) * 2^exp, the exponent being the caller's business
-};
-
-static inline int32_t bitlen64(uint64_t v) { return v == 0ull ? 0 : 64 - (int32_t)clz64(v); }
-
-// A value as an integer significand with its leading bit at 52, so two of them fit a
-// product exactly. A subnormal is shifted up until its leading bit is there, which
-// loses nothing: it has fewer than 53 significant bits to begin with.
-static inline decon decompose(uint64_t b) {
-  decon d;
-  const uint32_t be = (uint32_t)((b >> 52) & 0x7FF);
-  d.sig = b & kFracMask;
-  if (be == 0u) {
-    d.exp = -1074;
-    if (d.sig != 0ull)
-      while ((d.sig & kHidden) == 0ull) { d.sig <<= 1; d.exp -= 1; }
-  } else {
-    d.sig |= kHidden;
-    d.exp = (int32_t)be - 1075;
-  }
-  return d;
-}
-
-static inline bool wide_zero(wide w) { return (w.h | w.m | w.l) == 0ull; }
-
-static inline int wide_cmp(wide a, wide b) {
-  if (a.h != b.h) return a.h > b.h ? 1 : -1;
-  if (a.m != b.m) return a.m > b.m ? 1 : -1;
-  if (a.l != b.l) return a.l > b.l ? 1 : -1;
-  return 0;
-}
-
-static inline wide wide_add(wide a, wide b) {
-  wide r;
-  const uint64_t l = a.l + b.l;
-  const uint64_t carry = (l < a.l) ? 1ull : 0ull;
-  const uint64_t m0 = a.m + b.m;
-  uint64_t c2 = (m0 < a.m) ? 1ull : 0ull;
-  const uint64_t m = m0 + carry;
-  if (m < m0) c2 += 1ull;
-  r.l = l;
-  r.m = m;
-  r.h = a.h + b.h + c2;
-  return r;
-}
-
-static inline wide wide_sub(wide a, wide b) {  // a >= b
-  wide r;
-  const uint64_t br_l = (a.l < b.l) ? 1ull : 0ull;
-  const uint64_t br_m = ((a.m < b.m) || (br_l != 0ull && a.m == b.m)) ? 1ull : 0ull;
-  r.l = a.l - b.l;
-  r.m = a.m - b.m - br_l;
-  r.h = a.h - b.h - br_m;
-  return r;
-}
-
-// Shift right, folding every dropped bit into bit 0. A sticky bit only has to say
-// that something was there, which is all a rounding decision needs from it.
-static inline wide wide_shr(wide v, int32_t k) {
-  if (k <= 0) return v;
-  if (k >= 192) return wide{0ull, 0ull, ((v.h | v.m | v.l) != 0ull) ? 1ull : 0ull};
-  const int32_t wd = k >> 6, b = k & 63;
-  const uint64_t limb[3] = {v.l, v.m, v.h};
-  uint64_t out[3] = {0ull, 0ull, 0ull};
-  uint64_t sticky = 0ull;
-  for (int32_t i = 0; i < wd; i++) sticky |= limb[i];
-  for (int32_t i = 0; i < 3; i++) {
-    const uint64_t cur = (i + wd < 3) ? limb[i + wd] : 0ull;
-    const uint64_t up = (i + wd + 1 < 3) ? limb[i + wd + 1] : 0ull;
-    out[i] = (b == 0) ? cur : ((cur >> b) | (up << (64 - b)));
-  }
-  if (b != 0 && wd < 3) sticky |= limb[wd] & ((1ull << b) - 1ull);
-  wide r;
-  r.l = out[0] | ((sticky != 0ull) ? 1ull : 0ull);
-  r.m = out[1];
-  r.h = out[2];
-  return r;
-}
-
-// Lay the 128-bit `hi:lo` at the accumulator's scale. A negative shift is a value
-// entirely below the window, where only its existence survives.
-static inline wide place(uint64_t hi, uint64_t lo, int32_t sh) {
-  if (sh < 0) {
-    wide v;
-    v.h = 0ull;
-    v.m = hi;
-    v.l = lo;
-    return wide_shr(v, -sh);
-  }
-  const int32_t wd = sh >> 6, b = sh & 63;
-  uint64_t p0 = lo, p1 = hi, p2 = 0ull;
-  if (b != 0) {
-    p2 = hi >> (64 - b);
-    p1 = (hi << b) | (lo >> (64 - b));
-    p0 = lo << b;
-  }
-  wide r;
-  if (wd == 0) { r.h = p2; r.m = p1; r.l = p0; }
-  else if (wd == 1) { r.h = p1; r.m = p0; r.l = 0ull; }
-  else if (wd == 2) { r.h = p0; r.m = 0ull; r.l = 0ull; }
-  else { r.h = 0ull; r.m = 0ull; r.l = 0ull; }
-  return r;
-}
-
-static inline int32_t msb192(wide w) {
-  if (w.h != 0ull) return 191 - (int32_t)clz64(w.h);
-  if (w.m != 0ull) return 127 - (int32_t)clz64(w.m);
-  return 63 - (int32_t)clz64(w.l);
-}
-
-static inline uint64_t fma(uint64_t a, uint64_t b, uint64_t c) {
-  if (is_nan(a) || is_nan(b) || is_nan(c)) return kQNaN;
-  const uint32_t sa = (uint32_t)(a >> 63), sb = (uint32_t)(b >> 63), sc = (uint32_t)(c >> 63);
-  const uint32_t sp = sa ^ sb;
-  const bool za = is_zero(a), zb = is_zero(b), zc = is_zero(c);
-  if (is_inf(a) || is_inf(b)) {
-    if (za || zb) return kQNaN;                 // an infinity times a zero
-    if (is_inf(c) && sc != sp) return kQNaN;    // inf - inf
-    return (sp != 0u ? kSign : 0ull) | kInf;
-  }
-  if (is_inf(c)) return c;
-  if (za || zb)
-    return zc ? ((sc != 0u && sp != 0u) ? kSign : 0ull) : c;  // a zero product leaves c
-  if (zc) return mul(a, b);
-  const decon da = decompose(a), db = decompose(b), dc = decompose(c);
-  // The product, exactly: 53 by 53 bits, built from 32-bit halves.
-  const uint64_t p0 = (da.sig & 0xFFFFFFFFull) * (db.sig & 0xFFFFFFFFull);
-  const uint64_t p1 = (da.sig >> 32) * (db.sig & 0xFFFFFFFFull);
-  const uint64_t p2 = (da.sig & 0xFFFFFFFFull) * (db.sig >> 32);
-  const uint64_t p3 = (da.sig >> 32) * (db.sig >> 32);
-  const uint64_t mid = (p0 >> 32) + (p1 & 0xFFFFFFFFull) + (p2 & 0xFFFFFFFFull);
-  const uint64_t plo = (mid << 32) | (p0 & 0xFFFFFFFFull);
-  const uint64_t phi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
-  const int32_t pexp = da.exp + db.exp;
-  // One scale for both: the larger operand's top bit lands at bit 190, which leaves
-  // 84 bits below it — more than the 106-bit product spans, so nothing is lost before
-  // the sum and the rounding happens once, at the end.
-  const int32_t tbP = pexp + (phi != 0ull ? 64 + bitlen64(phi) : bitlen64(plo)) - 1;
-  const int32_t tbC = dc.exp + bitlen64(dc.sig) - 1;
-  const int32_t et = tbP > tbC ? tbP : tbC;
-  const int32_t e0 = et - 190;
-  const wide P = place(phi, plo, pexp - e0);
-  const wide C = place(0ull, dc.sig, dc.exp - e0);
-  wide r;
-  uint32_t sign;
-  if (sp == sc) {
-    r = wide_add(P, C);
-    sign = sp;
-  } else {
-    const int cmp = wide_cmp(P, C);
-    if (cmp == 0) return 0ull;                 // exact cancellation is +0
-    if (cmp > 0) { r = wide_sub(P, C); sign = sp; }
-    else { r = wide_sub(C, P); sign = sc; }
-  }
-  if (wide_zero(r)) return 0ull;
-  const int32_t mpos = msb192(r);
-  // Into the form `round_pack` takes: the top bit at 55 with three bits of guard,
-  // round and sticky under it, and the exponent of that top bit.
-  const uint64_t sig = (mpos >= 55) ? wide_shr(r, mpos - 55).l : (r.l << (55 - mpos));
-  return round_pack(sign, e0 + mpos, sig);
-}
-
-// ---- square root ----
-//
-// `sqrt` is the one function in the transcendental library that IEEE-754 pins
-// exactly: the result is the correctly rounded root, so a software one is not an
-// approximation of the host's — it is the same number, and the two can be compared
-// bit for bit. Everything else in that library rounds through whatever the vendor
-// chose and is therefore not carried here.
-//
-// The root is built from the significand as an integer: the input is written
-// `sig * 2^e` with `sig` in [2^52, 2^53) and `e` even, `sig << 54` is the radicand,
-// and `floor(sqrt(that))` is 54 bits of the answer. The restoring loop is the one
-// from pencil-and-paper long division, two radicand bits a step — its remainder is
-// below `2q + 1`, so everything after the first line fits in 64 bits.
-static inline uint64_t bit128(uint64_t hi, uint64_t lo, int b) {
-  return b >= 64 ? ((hi >> (b - 64)) & 1ull) : ((lo >> b) & 1ull);
-}
-
-// floor(sqrt(hi:lo)); `exact` says the square was a whole number.
-static inline uint64_t isqrt128(uint64_t hi, uint64_t lo, thread bool& exact) {
-  uint64_t rem = 0ull, q = 0ull;
-  for (int i = 53; i >= 0; i--) {
-    rem = (rem << 2) | ((bit128(hi, lo, 2 * i + 1) << 1) | bit128(hi, lo, 2 * i));
-    const uint64_t trial = (q << 2) | 1ull;
-    if (rem >= trial) {
-      rem -= trial;
-      q = (q << 1) | 1ull;
-    } else {
-      q <<= 1;
-    }
-  }
-  exact = (rem == 0ull);
-  return q;
-}
-
-static inline uint64_t sqrt_bits(uint64_t b) {
-  if (is_nan(b)) return kQNaN;
-  if ((b >> 63) != 0ull) return is_zero(b) ? b : kQNaN;  // -0 is -0; a negative is a NaN
-  if (is_zero(b) || is_inf(b)) return b;
-  decon d = decompose(b);
-  int32_t e = d.exp;
-  // An odd exponent moves one bit into the significand, which is exact and makes the
-  // halving below a shift rather than a rounding.
-  if ((e & 1) != 0) {
-    d.sig <<= 1;
-    e -= 1;
-  }
-  bool exact = false;
-  const uint64_t q = isqrt128(d.sig >> 10, (d.sig & 0x3FFull) << 54, exact);
-  // sqrt(value) = (q + frac) * 2^(e/2 - 27) with q in [2^53, 2^54), so the leading bit
-  // of the significand is the exponent below and `q >> 1` is the 53 bits that follow.
-  int32_t k = e / 2 + 26;
-  uint64_t s = q >> 1;
-  const uint64_t guard = q & 1ull;
-  if (guard != 0ull && ((exact ? 0ull : 1ull) != 0ull || (s & 1ull) != 0ull)) s += 1ull;
-  if (s == (1ull << 53)) {  // the rounding carried out of the field
-    s >>= 1;
-    k += 1;
-  }
-  const int32_t biased = k + 1023;
-  // No finite double roots below the smallest normal — sqrt(2^-1074) is 2^-537 — so
-  // the subnormal branch has nothing to carry.
-  if (biased >= 2047) return kInf;
-  if (biased <= 0) return kInf;
-  return ((uint64_t)biased << 52) | (s & kFracMask);
-}
-
-// minNum and maxNum: a NaN operand means the other one, and two NaNs mean a NaN.
-// Of two zeros the negative one is the smaller, which is the order IEEE gives them.
-static inline uint64_t min_bits(uint64_t a, uint64_t b) {
-  if (is_nan(a)) return is_nan(b) ? kQNaN : b;
-  if (is_nan(b)) return a;
-  if (is_zero(a) && is_zero(b)) return (a & kSign) ? a : b;
-  return lt(a, b) ? a : b;
-}
-static inline uint64_t max_bits(uint64_t a, uint64_t b) {
-  if (is_nan(a)) return is_nan(b) ? kQNaN : b;
-  if (is_nan(b)) return a;
-  if (is_zero(a) && is_zero(b)) return (a & kSign) ? b : a;
-  return gt(a, b) ? a : b;
-}
-
-static inline uint64_t from_u64(uint64_t m) {
-  if (m == 0ull) return 0ull;
-  const int32_t lead = 63 - (int32_t)clz64(m);
-  uint64_t sig;
-  if (lead <= 55) {
-    sig = m << (55 - lead);
-  } else {
-    const int32_t sh = lead - 55;
-    const uint64_t lost = m & ((1ull << sh) - 1ull);
-    sig = (m >> sh) | ((lost != 0ull) ? 1ull : 0ull);
-  }
-  return round_pack(0u, lead, sig);
-}
-static inline uint64_t from_i64(int64_t x) {
-  if (x == 0) return 0ull;
-  const uint32_t sign = x < 0 ? 1u : 0u;
-  const uint64_t m = x < 0 ? ((uint64_t)(-(x + 1)) + 1ull) : (uint64_t)x;
-  const int32_t lead = 63 - (int32_t)clz64(m);
-  uint64_t sig;
-  if (lead <= 55) {
-    sig = m << (55 - lead);
-  } else {
-    const int32_t sh = lead - 55;
-    const uint64_t lost = m & ((1ull << sh) - 1ull);
-    sig = (m >> sh) | ((lost != 0ull) ? 1ull : 0ull);
-  }
-  return round_pack(sign, lead, sig);
-}
-// Toward zero, which is what a cast does. Out-of-range and NaN are undefined in
-// SPIR-V; this saturates rather than trapping, so two targets cannot disagree by
-// accident of the host's conversion.
-static inline uint64_t to_u64(uint64_t b) {
-  if (is_nan(b)) return 0ull;
-  const uint32_t sign = (uint32_t)(b >> 63);
-  if (is_inf(b)) return sign ? 0ull : ~0ull;
-  if (is_zero(b)) return 0ull;
-  int32_t e;
-  uint64_t sig;
-  unpack(b, e, sig);
-  if (e < 0) return 0ull;
-  uint64_t m;
-  if (e >= 55) {
-    if (e >= 119) return sign ? 0ull : ~0ull;
-    m = sig << (e - 55);
-  } else {
-    m = sig >> (55 - e);
-  }
-  return sign ? (0ull - m) : m;
-}
-static inline int64_t to_i64(uint64_t b) {
-  if (is_nan(b)) return 0;
-  const bool negative = (b >> 63) != 0ull;
-  const uint64_t m = to_u64(b & ~kSign);
-  if (m > 0x8000000000000000ull) return negative ? (-0x7FFFFFFFFFFFFFFF - 1) : 0x7FFFFFFFFFFFFFFF;
-  if (m == 0x8000000000000000ull) return negative ? (-0x7FFFFFFFFFFFFFFF - 1) : 0x7FFFFFFFFFFFFFFF;
-  return negative ? -(int64_t)m : (int64_t)m;
-}
-
-static inline uint64_t from_f32(uint32_t fb) {
-  const uint32_t sign = (fb >> 31) & 1u;
-  const uint32_t be = (fb >> 23) & 0xFFu;
-  const uint32_t f = fb & 0x7FFFFFu;
-  if (be == 0xFFu) return ((uint64_t)sign << 63) | kInf | ((uint64_t)f << 29);
-  if (be == 0u) {
-    if (f == 0u) return (uint64_t)sign << 63;
-    int32_t e = -126;
-    uint32_t m = f;
-    while ((m & 0x800000u) == 0u) { m <<= 1; e -= 1; }
-    return round_pack(sign, e, (uint64_t)m << 32);
-  }
-  return round_pack(sign, (int32_t)be - 127, ((uint64_t)(f | 0x800000u)) << 32);
-}
-
-// Round into binary32: same working form, twenty-nine fewer significand bits, and
-// binary32's own bias and subnormal floor.
-static inline uint32_t round_pack32(uint32_t sign, int32_t e, uint64_t sig) {
-  const uint32_t sgn = sign << 31;
-  if (sig == 0ull) return sgn;
-  const bool sub = e < -126;
-  if (sub) {
-    const int32_t k = -126 - e;
-    if (k >= 64) {
-      sig = 1u;
-    } else {
-      const uint64_t lost = sig & ((1ull << k) - 1ull);
-      sig = (sig >> k) | ((lost != 0ull) ? 1u : 0u);
-    }
-  }
-  const uint64_t lost2 = sig & ((1ull << 29) - 1ull);
-  sig = (sig >> 29) | ((lost2 != 0ull) ? 1u : 0ull);
-  const uint64_t s = sig & 1ull, r = (sig >> 1) & 1ull, g = (sig >> 2) & 1ull;
-  sig >>= 3;
-  if (g && (r || s || (sig & 1ull))) sig += 1ull;
-  if (sub) {
-    if (sig >= (1ull << 23)) return sgn | 0x00800000u;  // the smallest normal
-    return sgn | (uint32_t)sig;
-  }
-  int32_t be = e + 127;
-  if (sig == (1ull << 24)) { sig >>= 1; be += 1; }
-  if (be >= 255) return sgn | 0x7F800000u;
-  return sgn | ((uint32_t)be << 23) | ((uint32_t)sig & 0x7FFFFFu);
-}
-
-static inline uint32_t to_f32(uint64_t b) {
-  const uint32_t sign = (uint32_t)(b >> 63);
-  if (is_nan(b)) return (sign << 31) | 0x7FC00000u;
-  if (is_inf(b)) return (sign << 31) | 0x7F800000u;
-  if (is_zero(b)) return sign << 31;
-  int32_t e;
-  uint64_t sig;
-  unpack(b, e, sig);
-  return round_pack32(sign, e, sig);
-}
-
-// Toward zero: the fraction bits below the binary point go. Everything from a value
-// already integral to an infinity is its own answer.
-static inline uint64_t trunc_bits(uint64_t b) {
-  if (is_nan(b) || is_inf(b)) return b;
-  const uint32_t be = (uint32_t)((b >> 52) & 0x7FF);
-  if (be < 1023u) return b & kSign;  // |x| < 1 has no integer part
-  const int32_t e = (int32_t)be - 1023;
-  if (e >= 52) return b;
-  return b & ~((1ull << (52 - e)) - 1ull);
-}
-static inline uint64_t floor_bits(uint64_t b) {
-  const uint64_t t = trunc_bits(b);
-  if (is_nan(b) || is_inf(b) || t == b) return t;
-  return ((b >> 63) != 0ull) ? add(t, kNegOne) : t;
-}
-static inline uint64_t ceil_bits(uint64_t b) {
-  const uint64_t t = trunc_bits(b);
-  if (is_nan(b) || is_inf(b) || t == b) return t;
-  return ((b >> 63) == 0ull) ? add(t, kOne) : t;
-}
-// To the nearest integer, ties to even — what a conversion to an integer with
-// `.rn` means, and what a cast to an integer does on the CPU. `round_bits` below is
-// GLSL's Round, which breaks a tie away from zero, so the two are not
-// interchangeable: 2.5 is 2 here and 3 there.
-static inline uint64_t rne_bits(uint64_t b) {
-  if (is_nan(b) || is_inf(b)) return b;
-  const uint64_t t = trunc_bits(b);
-  if (t == b) return t;
-  const uint64_t frac = sub(abs_bits(b), abs_bits(t));
-  bool up = gt(frac, kHalf);
-  if (!up && eq(frac, kHalf)) up = ((to_i64(t) & 1) != 0);
-  if (!up) return t;
-  return add(t, ((b >> 63) != 0ull) ? kNegOne : kOne);
-}
-
-// GLSL's Round: to the nearest integer, ties away from zero.
-static inline uint64_t round_bits(uint64_t b) {
-  if (is_nan(b) || is_inf(b)) return b;
-  const uint64_t t = trunc_bits(b);
-  const uint64_t frac = sub(abs_bits(b), abs_bits(t));
-  if (ge(frac, kHalf)) return add(t, ((b >> 63) != 0ull) ? kNegOne : kOne);
-  return t;
-}
-
-}  // namespace weft_fp64
+static const char* kWWeftMslTail = R"WEFMSL(
 static inline float weft_h16(uint32_t b, int i) {
   return (float)as_type<_Float16>((uint16_t)(b >> (16 * i)));
 }
@@ -739,6 +112,28 @@ static inline uint32_t weft_bf16x2(float hi, float lo) {
 }
 static inline float weft_bf16(uint32_t b, int i) {
   return as_type<float>((uint32_t)(uint16_t)(b >> (16 * i)) << 16);
+}
+// `.rz` truncates toward zero, and the 16-bit conversion these engines have rounds
+// to nearest: so the truncation is the rounded value walked back one step whenever
+// it landed away from zero. A finite value past the format's range truncates to
+// that format's largest finite value rather than to an infinity, infinities and
+// NaNs have no significand to drop and pass through.
+static inline uint16_t weft_h16_bits_rz(float x) {
+  uint16_t h = weft_h16_bits(x);
+  if ((h & 0x7C00u) == 0x7C00u) {
+    const uint32_t ux = weft_bitcast<uint32_t>(x);
+    if ((ux & 0x7F800000u) == 0x7F800000u) return h;   // inf or nan
+    return (uint16_t)((h & 0x8000u) | 0x7BFFu);        // a finite value too large
+  }
+  const float back = weft_h16((uint32_t)h, 0);
+  const float ax = x < 0.0f ? -x : x, ab = back < 0.0f ? -back : back;
+  if (ab > ax && (h & 0x7FFFu) != 0u) h = (uint16_t)((h & 0x8000u) | ((h & 0x7FFFu) - 1u));
+  return h;
+}
+static inline uint16_t weft_bf16_bits_rz(float x) {
+  // A bf16 has a float's exponent range, so dropping the low sixteen bits cannot
+  // overflow: it only drops their significand tail, and inf and NaN have none.
+  return (uint16_t)(weft_bitcast<uint32_t>(x) >> 16);
 }
 // e4m3 / e5m2 conversion is integer work plus an exact power-of-two scale, so
 // float arithmetic here reproduces the CPU's double arithmetic bit for bit:
@@ -771,7 +166,7 @@ static inline float weft_e4m3(uint32_t b, int i) {
   // The scale is an exponent field rather than a library call: E is 1..15 and the
   // field for 2^(E-10) is E+117, so the multiply is exact. `ldexp` was the one
   // place a decode leaned on the platform's own rounding, and it disagreed with
-  // the host's — this is the same arithmetic written out.
+  // the host's, this is the same arithmetic written out.
   const float d = (E == 0) ? (float)mag / 512.0f
                            : (float)(8u + mag) * as_type<float>((E + 117u) << 23);
   return (float)((v & 0x80u) ? -d : d);
@@ -798,6 +193,125 @@ static inline uint8_t weft_e5m2_bits(float x) {
 static inline uint32_t weft_e5m2x2(float hi, float lo) {
   return (uint32_t)weft_e5m2_bits(lo) | ((uint32_t)weft_e5m2_bits(hi) << 8);
 }
+// e2m1, e2m3 and e3m2: the MX formats, what a Blackwell fp4/fp6 convert writes.
+// Each is a sign, `eb` exponent bits and `mb` mantissa bits biased 2^(eb-1)-1, and
+// none of the three has an infinity or a NaN, so the `.satfinite` the ISA makes
+// mandatory on these converts is the whole range rule: a NaN answers the positive
+// MAX_NORM, and an infinity, whose magnitude is past MAX_NORM, answers MAX_NORM
+// keeping its sign.
+static inline uint32_t weft_mx_bits(float x, int eb, int mb) {
+  const uint32_t maxbits = (uint32_t)((((1u << eb) - 1u) << mb) | ((1u << mb) - 1u));
+  const uint32_t u = as_type<uint32_t>(x);
+  const uint32_t sign = u >> 31;
+  if (!isfinite(x)) return (x != x) ? maxbits : ((sign << (eb + mb)) | maxbits);
+  const uint32_t mag = u & 0x7FFFFFFFu;
+  if (mag == 0u) return sign << (eb + mb);
+  const int bias = (1 << (eb - 1)) - 1;
+  const int E = (int)((mag >> 23) & 0xFFu) - 127 + bias;
+  if (E >= (1 << eb) - 1) return (sign << (eb + mb)) | maxbits;
+  const uint32_t mant = mag & 0x7FFFFFu;
+  uint32_t out;
+  if (E <= 0) {
+    // A subnormal sits on a grid of 2^(1-bias-mb). Scaling the magnitude onto it
+    // is exact, because the scale is a power of two, so the rounding is the same
+    // `rint` the e4m3 path uses and the two engines agree bit for bit.
+    out = (uint32_t)rint(fabs(x) * (float)(1u << (mb + bias - 1)));
+  } else {
+    const int sh = 23 - mb;
+    uint32_t r = mant >> sh;
+    const uint32_t rem = mant & ((1u << sh) - 1u);
+    if (rem > (1u << (sh - 1)) || (rem == (1u << (sh - 1)) && (r & 1u))) r++;
+    out = ((uint32_t)E << mb) + r;
+  }
+  // A carry out of the mantissa is a carry into the exponent, and a rounding that
+  // reaches 2^mb off the subnormal grid is the smallest normal: both are already
+  // the right integer, so only the top of the range needs clamping.
+  if (out >= maxbits) out = maxbits;
+  return (sign << (eb + mb)) | out;
+}
+// The packed layouts are the ISA's: e2m1 puts the first source in d[7:4] and the
+// second in d[3:0]; the f6 formats put each six-bit value in the low bits of a
+// byte, d[13:8] then d[5:0], with the top two bits of each byte zero, which the
+// mask leaves zero rather than shifting the value up.
+static inline uint8_t weft_e2m1x2(float hi, float lo) {
+  return (uint8_t)((weft_mx_bits(lo, 2, 1) & 0xFu) | ((weft_mx_bits(hi, 2, 1) & 0xFu) << 4));
+}
+static inline uint16_t weft_e2m3x2(float hi, float lo) {
+  return (uint16_t)((weft_mx_bits(lo, 2, 3) & 0x3Fu) | ((weft_mx_bits(hi, 2, 3) & 0x3Fu) << 8));
+}
+static inline uint16_t weft_e3m2x2(float hi, float lo) {
+  return (uint16_t)((weft_mx_bits(lo, 3, 2) & 0x3Fu) | ((weft_mx_bits(hi, 3, 2) & 0x3Fu) << 8));
+}
+static inline uint16_t weft_e2m1x4(float a, float b, float e, float f) {
+  return (uint16_t)(((weft_mx_bits(a, 2, 1) & 0xFu) << 12) |
+                    ((weft_mx_bits(b, 2, 1) & 0xFu) << 8) |
+                    ((weft_mx_bits(e, 2, 1) & 0xFu) << 4) | (weft_mx_bits(f, 2, 1) & 0xFu));
+}
+static inline uint32_t weft_e2m3x4(float a, float b, float e, float f) {
+  return ((weft_mx_bits(a, 2, 3) & 0x3Fu) << 24) | ((weft_mx_bits(b, 2, 3) & 0x3Fu) << 16) |
+         ((weft_mx_bits(e, 2, 3) & 0x3Fu) << 8) | (weft_mx_bits(f, 2, 3) & 0x3Fu);
+}
+static inline uint32_t weft_e3m2x4(float a, float b, float e, float f) {
+  return ((weft_mx_bits(a, 3, 2) & 0x3Fu) << 24) | ((weft_mx_bits(b, 3, 2) & 0x3Fu) << 16) |
+         ((weft_mx_bits(e, 3, 2) & 0x3Fu) << 8) | (weft_mx_bits(f, 3, 2) & 0x3Fu);
+}
+// `.rs` is stochastic rounding: the value is truncated onto the destination's grid
+// and then stepped one ulp away from zero when adding the random bits to the
+// discarded mantissa carries out. A float leaves thirteen bits below a half and
+// sixteen below a bf16, and the ISA's figure gives exactly that many random bits per
+// value, so at those widths the test is the plain integer carry the ISA describes.
+// `dropped << w` against `(2^w - r) << shift` is that carry written as a comparison:
+// it answers true for the same `dropped` values (a tie carries, an exact grid value
+// does not), and it stays exact when a subnormal widens the dropped field past the
+// width of the random bits.
+static inline int weft_rs_carry(uint32_t mag, int e, int mb, int emin, uint32_t r, int w) {
+  int shift = 23 - mb + (e < emin ? emin - e : 0);
+  if (shift <= 0) return 0;
+  if (shift > 23) shift = 23;
+  const uint64_t dropped = (uint64_t)(mag & ((1u << shift) - 1u));
+  const uint64_t needbits = (uint64_t)((1u << w) - (r & ((1u << w) - 1u)));
+  return (dropped << w) >= (needbits << shift) ? 1 : 0;
+}
+static inline uint16_t weft_h16_bits_rs(float x, uint32_t rbits, int satfinite) {
+  const uint32_t u = as_type<uint32_t>(x);
+  const uint16_t sign = (uint16_t)((u >> 31) ? 0x8000u : 0u);
+  const uint32_t mag = u & 0x7FFFFFFFu;
+  const int e = (int)((mag >> 23) & 0xFFu) - 127;
+  // A NaN keeps its own encoding and an infinity has no significand to round;
+  // `.satfinite` is what sends a value past the half range to the largest finite
+  // half instead of to an infinity.
+  if ((mag & 0x7F800000u) == 0x7F800000u) {
+    if (mag > 0x7F800000u) return (uint16_t)(sign | 0x7E00u);
+    return (uint16_t)(sign | (satfinite ? 0x7BFFu : 0x7C00u));
+  }
+  if (e >= 16) return (uint16_t)(sign | (satfinite ? 0x7BFFu : 0x7C00u));
+  uint16_t t = weft_h16_bits_rz(x);
+  if (weft_rs_carry(mag, e, 10, -14, rbits, 13)) {
+    const uint32_t body = (uint32_t)(t & 0x7FFFu) + 1u;
+    if (body >= 0x7C00u) return (uint16_t)(sign | (satfinite ? 0x7BFFu : 0x7C00u));
+    t = (uint16_t)(sign | body);
+  }
+  return t;
+}
+static inline uint16_t weft_bf16_bits_rs(float x, uint32_t rbits, int satfinite) {
+  const uint32_t u = as_type<uint32_t>(x);
+  const uint16_t sign = (uint16_t)((u >> 31) ? 0x8000u : 0u);
+  const uint32_t mag = u & 0x7FFFFFFFu;
+  const int e = (int)((mag >> 23) & 0xFFu) - 127;
+  // A bf16 has a float's exponent range, so only a NaN or an infinity reaches here:
+  // the NaN keeps its encoding, and `.satfinite` clamps the infinity.
+  if ((mag & 0x7F800000u) == 0x7F800000u) {
+    if (mag > 0x7F800000u) return (uint16_t)(sign | 0x7FC0u);
+    return (uint16_t)(sign | (satfinite ? 0x7F7Fu : 0x7F80u));
+  }
+  uint16_t t = (uint16_t)(mag >> 16);
+  if (weft_rs_carry(mag, e, 7, -126, rbits, 16)) {
+    const uint32_t body = (uint32_t)t + 1u;
+    if (body >= 0x7F80u) return (uint16_t)(sign | (satfinite ? 0x7F7Fu : 0x7F80u));
+    t = (uint16_t)body;
+  }
+  return (uint16_t)(sign | t);
+}
 static inline float weft_e5m2(uint32_t b, int i) {
   const uint32_t v = (b >> (8 * i)) & 0xFFu;
   const uint32_t mag = v & 3u, E = (v >> 2) & 0x1Fu;
@@ -805,6 +319,177 @@ static inline float weft_e5m2(uint32_t b, int i) {
   const float d = (E == 0) ? (float)mag / 65536.0f
                            : (float)(4u + mag) * as_type<float>((E + 110u) << 23);
   return (float)((v & 0x80u) ? -d : d);
+}
+// The packed narrow formats as one code, so an instruction that names two of them is
+// a pair of small tables rather than a case for every combination: 0 e2m1, 1 e2m3,
+// 2 e3m2, 3 e4m3, 4 e5m2, 5 ue8m0, 6 e2m1p (one nibble a byte).
+static inline float weft_mx_decode(uint32_t v, int eb, int mb) {
+  const int bias = (1 << (eb - 1)) - 1;
+  const uint32_t mant = v & ((1u << mb) - 1u);
+  const uint32_t E = (v >> mb) & ((1u << eb) - 1u);
+  // 2^(E-bias-mb) as an exponent field, and E = 0 reads the format's subnormal grid
+  // instead of an implicit 1, the same arithmetic the e4m3 decode above is written
+  // with, so both engines land on the same float.
+  const int ex = (E == 0u ? 1 : (int)E) - bias - mb;
+  const float sc = as_type<float>((uint32_t)(ex + 127) << 23);
+  const float d = (float)((E == 0u ? 0u : (1u << mb)) + mant) * sc;
+  return (v >> (eb + mb)) ? -d : d;
+}
+static inline float weft_e2m1(uint32_t b, int i) {
+  return weft_mx_decode((b >> (4 * i)) & 0xFu, 2, 1);
+}
+static inline float weft_e2m3(uint32_t b, int i) {
+  return weft_mx_decode((b >> (8 * i)) & 0x3Fu, 2, 3);
+}
+static inline float weft_e3m2(uint32_t b, int i) {
+  return weft_mx_decode((b >> (8 * i)) & 0x3Fu, 3, 2);
+}
+// One lane of a packed four, by code: an eight-bit field, a six-bit one at the low end
+// of each byte, a four-bit one at the low end of each half-byte, or one nibble a byte
+// when the format is the padded fp4.
+static inline float weft_mx_get(uint32_t w, int i, int code) {
+  if (code == 0) return weft_mx_decode((w >> (4 * i)) & 0xFu, 2, 1);
+  if (code == 1) return weft_mx_decode((w >> (8 * i)) & 0x3Fu, 2, 3);
+  if (code == 2) return weft_mx_decode((w >> (8 * i)) & 0x3Fu, 3, 2);
+  if (code == 3) return weft_e4m3(w, i);
+  if (code == 4) return weft_e5m2(w, i);
+  if (code == 6) return weft_mx_decode((w >> (8 * i)) & 0xFu, 2, 1);
+  const uint32_t v = (w >> (8 * i)) & 0xFFu;
+  if (v == 0xFFu) return NAN;
+  // ue8m0 is a bare exponent, 2^(v-127), and v = 0 is the format's smallest value
+  // rather than zero: a subnormal in f32, and exact.
+  const uint32_t sb = v == 0u ? 0x00400000u : (v << 23);
+  return as_type<float>(sb);
+}
+// The two destinations the narrow arithmetic allows. `.satfinite` sends a value past
+// MAX_NORM to MAX_NORM; without it e4m3 answers a NaN, which is what the ISA says and
+// what the saturating encoder alone would get wrong.
+static inline uint32_t weft_f8_bits(float x, int code, int satfinite) {
+  if (code == 3) {
+    if (!satfinite && isfinite(x) && fabs(x) > 448.0f) return 0x7Fu;
+    return weft_e4m3_bits(x);
+  }
+  return weft_e5m2_bits(x);
+}
+// add, sub, mul and fma over four packed narrow values. The ISA computes each lane in
+// infinite precision and rounds once to the destination; every one of these formats
+// decodes to an exactly representable float and a product or a sum of two of them is
+// exact in f32, so the one rounding here is the one the instruction asks for.
+static inline uint32_t weft_mx4_op(uint32_t a, uint32_t b, uint32_t c, int ac, int bc,
+                                   int cc, int dc, int op, int sat) {
+  uint32_t out = 0;
+  for (int i = 0; i < 4; i++) {
+    const float fa = weft_mx_get(a, i, ac);
+    float r;
+    if (op == 0) r = fa + weft_mx_get(c, i, cc);
+    else if (op == 1) r = fa - weft_mx_get(c, i, cc);
+    else if (op == 2) r = fa * weft_mx_get(b, i, bc);
+    else r = fa * weft_mx_get(b, i, bc) + weft_mx_get(c, i, cc);
+    out |= (uint32_t)(weft_f8_bits(r, dc, sat) & 0xFFu) << (8 * i);
+  }
+  return out;
+}
+// `.rz` on a narrow destination: the nearest code, walked one grid step closer to
+// zero when that answer landed away from it. The codes are monotone in magnitude and
+// the nearest answer is within half a step, so one step is the most this can need,
+// and a finite value past the range has already saturated to MAX_NORM, which is
+// what truncating it gives too, so the walk only ever happens below saturation.
+static inline uint8_t weft_e4m3_bits_rz(float x) {
+  const uint8_t c = weft_e4m3_bits(x);
+  uint32_t m = c & 0x7Fu;
+  if (m != 0u && fabs(weft_e4m3((uint32_t)c, 0)) > fabs(x)) m--;
+  return (uint8_t)((c & 0x80u) | m);
+}
+static inline uint8_t weft_e5m2_bits_rz(float x) {
+  const uint8_t c = weft_e5m2_bits(x);
+  uint32_t m = c & 0x7Fu;
+  if (m != 0u && fabs(weft_e5m2((uint32_t)c, 0)) > fabs(x)) m--;
+  return (uint8_t)((c & 0x80u) | m);
+}
+static inline uint32_t weft_mx_bits_rz(float x, int eb, int mb) {
+  const uint32_t mask = (1u << (eb + mb)) - 1u;
+  const uint32_t c = weft_mx_bits(x, eb, mb);
+  uint32_t m = c & mask;
+  if (m != 0u && fabs(weft_mx_decode(m, eb, mb)) > fabs(x)) m--;
+  return (c & ~mask) | m;
+}
+static inline uint32_t weft_e2m1_bits(float x) { return weft_mx_bits(x, 2, 1); }
+static inline uint32_t weft_e2m3_bits(float x) { return weft_mx_bits(x, 2, 3); }
+static inline uint32_t weft_e3m2_bits(float x) { return weft_mx_bits(x, 3, 2); }
+static inline uint32_t weft_e2m1_rz(float x) { return weft_mx_bits_rz(x, 2, 1); }
+static inline uint32_t weft_e2m3_rz(float x) { return weft_mx_bits_rz(x, 2, 3); }
+static inline uint32_t weft_e3m2_rz(float x) { return weft_mx_bits_rz(x, 3, 2); }
+// Two narrow values into one word: the first in the high field, four bits up for the
+// nibble-wide fp4 pair and a byte up for the rest.
+static inline uint32_t weft_pack2(uint32_t hi, uint32_t lo, int bits) {
+  return lo | (hi << bits);
+}
+// `.scaled::n{1,2}::ue8m0`: a ue8m0 factor is the power of two 2^(s-127), which a
+// down conversion divides by and an up conversion multiplies by. Writing the down
+// direction as a multiply by 2^(127-s) is the same number, and exact because it is a
+// power of two. s = 0x7f is 1.0, the value the operand defaults to. The ISA flushes a
+// subnormal input to a zero of its own sign before a scaled down conversion.
+static inline float weft_ue8m0(uint32_t s) {
+  return as_type<float>(s == 0u ? 0x00400000u : (s << 23));
+}
+static inline float weft_scale_up(float x, uint32_t s) { return x * weft_ue8m0(s); }
+static inline float weft_scale_down(float x, uint32_t s) {
+  uint32_t u = as_type<uint32_t>(x);
+  if ((u & 0x7F800000u) == 0u && (u & 0x7FFFFFu) != 0u) u &= 0x80000000u;
+  x = as_type<float>(u);
+  const uint32_t sb = s >= 254u ? (s == 254u ? 0x00400000u : 0x00200000u)
+                                : (254u - s) << 23;
+  return x * as_type<float>(sb);
+}
+// `.rs` on a packed four: the truncated code, one step further from zero when the
+// integer addition of the random bits to the discarded mantissa carries out. Eight
+// random bits per operand, which is what the ISA's figure gives each of the four.
+static inline uint32_t weft_rs_step(uint32_t code, uint32_t magbits, uint32_t maxmag,
+                                    float x, int mb, int emin, uint32_t r) {
+  const uint32_t mag = as_type<uint32_t>(x) & 0x7FFFFFFFu;
+  if (mag == 0u || (mag & 0x7F800000u) == 0x7F800000u) return code;
+  if (!weft_rs_carry(mag, (int)((mag >> 23) & 0xFFu) - 127, mb, emin, r, 8)) return code;
+  const uint32_t mask = (1u << magbits) - 1u;
+  const uint32_t m = (code & mask) + 1u;
+  return (code & ~mask) | (m > maxmag ? maxmag : m);
+}
+// The rbits word splits by operand, not by value: the byte-wide destinations take a
+// and b from the upper half of the word and e and f from the lower one, the first of
+// each pair in the upper byte; the nibble-wide fp4 packs four to a half-word, so the
+// same rule puts b's random bits in the low byte of the upper half and e's in the
+// high byte of the lower one.
+static inline uint32_t weft_mx4(float a, float b, float e, float f, uint32_t r,
+                                int eb, int mb, int rs) {
+  const int nib = (eb + mb) == 3;
+  const float v[4] = {a, b, e, f};
+  const int bit[4] = {24, nib ? 8 : 16, nib ? 16 : 8, 0};
+  const int put[4] = {nib ? 12 : 24, nib ? 8 : 16, nib ? 4 : 8, 0};
+  const uint32_t magbits = (uint32_t)(eb + mb);
+  const uint32_t maxmag = (1u << magbits) - 1u;
+  const int emin = 2 - (1 << (eb - 1));
+  uint32_t w = 0;
+  for (int i = 0; i < 4; i++) {
+    const uint32_t c = rs ? weft_rs_step(weft_mx_bits_rz(v[i], eb, mb), magbits, maxmag,
+                                         v[i], mb, emin, (r >> bit[i]) & 0xFFu)
+                          : weft_mx_bits(v[i], eb, mb);
+    w |= c << put[i];
+  }
+  return w;
+}
+static inline uint32_t weft_f8x4(float a, float b, float e, float f, uint32_t r,
+                                 int code, int rs) {
+  const float v[4] = {a, b, e, f};
+  uint32_t w = 0;
+  for (int i = 0; i < 4; i++) {
+    const uint32_t rb = (r >> (24 - 8 * i)) & 0xFFu;
+    const uint32_t c = code == 3
+        ? (rs ? weft_rs_step(weft_e4m3_bits_rz(v[i]), 7u, 0x7Eu, v[i], 3, -6, rb)
+              : weft_e4m3_bits(v[i]))
+        : (rs ? weft_rs_step(weft_e5m2_bits_rz(v[i]), 7u, 0x7Bu, v[i], 2, -14, rb)
+              : weft_e5m2_bits(v[i]));
+    w |= c << (24 - 8 * i);
+  }
+  return w;
 }
 // The same bytes with an integer accumulator: exact in s32, where a float stops
 // being the same number past 2^24.
@@ -822,13 +507,35 @@ static inline float weft_s8(uint32_t b, int i) {
 static inline float weft_u8(uint32_t b, int i) {
   return (float)((b >> (8 * i)) & 0xFFu);
 }
-static inline float weft_tf32(float x) {
-  uint32_t u = as_type<uint32_t>(x);
-  if ((u & 0x7F800000u) == 0x7F800000u) return x;
-  u += 0x1000u + ((u >> 13) & 1u);
+// TF32 is a sign, an 8-bit exponent and ten mantissa bits: a float32 with the low
+// thirteen dropped, and a multiply sees the rounded value rather than the input.
+// The three modes differ only in those thirteen bits, `rna` carries a tie away
+// from zero, `rn` to even, `rz` throws them away, and a carry out of the
+// significand belongs to the exponent, which is why the add comes before the mask.
+// `.relu` maps a negative value to zero first, and `.satfinite` clamps an infinite
+// result to the largest finite tf32, with NaN becoming zero. It is written over
+// the bits because that is what the translator emits: a `.b32` register round-trips
+// through it without becoming a float at all.
+static inline uint32_t weft_tf32_bits(uint32_t u, int mode, int satfinite, int relu) {
+  if (relu && (u & 0x80000000u) != 0u && (u & 0x7FFFFFFFu) != 0u) u = 0u;
+  const uint32_t sign = u & 0x80000000u;
+  if ((u & 0x7F800000u) == 0x7F800000u) {
+    if (!satfinite) return u;
+    return (u & 0x7FFFFFFFu) > 0x7F800000u ? 0u : (sign | 0x7F7FE000u);
+  }
+  // Nearest-even is `half - 1` plus the kept bit, not `half`: adding 0x1000 by
+  // itself carries a tie upward whatever the kept bit is, which is round-half-up.
+  // This helper answered that until the tf32 fixture separated the two on a tie.
+  if (mode == 1) u += 0x1000u;
+  else if (mode == 0) u += 0x0FFFu + ((u >> 13) & 1u);
   u &= 0xFFFFE000u;
-  return as_type<float>(u);
+  if (satfinite && (u & 0x7F800000u) == 0x7F800000u) u = sign | 0x7F7FE000u;
+  return u;
 }
+static inline float weft_tf32_r(float x, int mode) {
+  return as_type<float>(weft_tf32_bits(as_type<uint32_t>(x), mode, 0, 0));
+}
+static inline float weft_tf32(float x) { return weft_tf32_r(x, 0); }
 static inline uint32_t weft_shf_l(uint32_t a, uint32_t b, uint32_t c, int clamp) {
   if (clamp) { if (c >= 32u) return a; } else c &= 31u;
   return c ? ((b << c) | (a >> (32u - c))) : b;
@@ -845,13 +552,34 @@ static inline uint32_t weft_lop3(uint32_t a, uint32_t b, uint32_t c, uint32_t lu
   }
   return out;
 }
-static inline uint32_t weft_prmt(uint32_t a, uint32_t b, uint32_t c) {
+// prmt.b32: the four bytes of the result are picked out of the eight bytes of
+// (a:b), and the mode says how. The generic form (mode -1) gives a nibble a byte
+// and its top bit asks for the *sign* of that byte instead of the byte; the six
+// named modes read one 2-bit selector `k` and are the ISA's own table:
+//   f4e  d.bj = src[(k + j) & 7]     b4e  d.bj = src[(k - j) & 7]
+//   rc8  d.bj = src[k]               rc16 d.bj = src[(k & 1) * 2 + (j & 1)]
+//   ecl  d.bj = src[max(k, j)]       ecr  d.bj = src[min(k, j)]
+static inline uint32_t weft_prmt(uint32_t a, uint32_t b, uint32_t c, int mode) {
   const uint64_t src = (uint64_t)a | ((uint64_t)b << 32);
   uint32_t out = 0;
-  for (int i = 0; i < 4; i++) {
-    const uint32_t sel = (c >> (4 * i)) & 0xFu;
-    const uint32_t byte = (uint32_t)((src >> ((sel & 7u) * 8u)) & 0xFFu);
-    out |= ((sel & 8u) ? ((byte & 0x80u) ? 0xFFu : 0u) : byte) << (8 * i);
+  if (mode < 0) {
+    for (int i = 0; i < 4; i++) {
+      const uint32_t sel = (c >> (4 * i)) & 0xFu;
+      const uint32_t byte = (uint32_t)((src >> ((sel & 7u) * 8u)) & 0xFFu);
+      out |= ((sel & 8u) ? ((byte & 0x80u) ? 0xFFu : 0u) : byte) << (8 * i);
+    }
+    return out;
+  }
+  const uint32_t k = c & 3u;
+  for (uint32_t j = 0; j < 4u; j++) {
+    uint32_t idx;
+    if (mode == 0) idx = (k + j) & 7u;
+    else if (mode == 1) idx = (k - j) & 7u;
+    else if (mode == 2) idx = k;
+    else if (mode == 3) idx = k > j ? k : j;
+    else if (mode == 4) idx = k < j ? k : j;
+    else idx = (k & 1u) * 2u + (j & 1u);
+    out |= (uint32_t)((src >> (idx * 8u)) & 0xFFu) << (8u * j);
   }
   return out;
 }
@@ -902,8 +630,8 @@ struct weft_d4 { uint64_t x, y, z, w; };
 
 // Matrices, column-major: `m[column][row]`, the way SPIR-V, Metal and every GPU lay
 // them out, so a matrix times a vector is a linear combination of its columns. One
-// template covers every shape SPIR-V allows — two to four columns of two to four
-// rows — because one shader multiplies a 4x4 by a 4-vector and a 3x4 skinning matrix
+// template covers every shape SPIR-V allows, two to four columns of two to four
+// rows, because one shader multiplies a 4x4 by a 4-vector and a 3x4 skinning matrix
 // by a 3-vector in the same file, and the square-only set refused the second. Every
 // accumulation is an explicit fused multiply-add in a fixed order, so the two engines
 // run the same instruction sequence and agree to the bit. Everything here takes its
@@ -926,7 +654,7 @@ using weft_f4x4 = weft_mat<4, 4>;
 struct weft_n { float v[4]; };
 
 // The bit a ballot says is there: the lowest and the highest one that is set.
-// A loop rather than a builtin — `ctz` is spelled differently on the two targets and
+// A loop rather than a builtin, `ctz` is spelled differently on the two targets and
 // this runs once per ballot, not once per lane.
 static inline uint32_t weft_lsb(uint32_t v) {
   for (uint32_t i = 0; i < 32u; i++)
@@ -1123,7 +851,6 @@ static inline void zero_thread(thread uint8_t* d, uint64_t n) {
   for (uint64_t i = 0; i < n; i++) d[i] = 0u;
 }
 
-// ---- images ----
 //
 // An image is the bound texture and the two numbers a kernel asks about it. It
 // travels by value because it has to: a texture is an opaque handle, and thread
@@ -1147,7 +874,7 @@ struct SampledImage {
 
 // A 2D *array* image: the handle is `texture2d_array`, whose slice count is part
 // of the binding, and every read and sample names the slice it wants. The rest
-// has the same shape as the plain form — one channel, a texel is channel 0 — so
+// has the same shape as the plain form, one channel, a texel is channel 0, so
 // these are overloads rather than a second type system.
 struct ArrayImageRef {
   texture2d_array<float, access::sample> t;
@@ -1188,7 +915,7 @@ struct SampledImage3D {
 };
 
 // A cube: six square faces, and a sample takes a direction rather than a position.
-// A cube is filterable only — there is no texel to address without a face — so
+// A cube is filterable only, there is no texel to address without a face, so
 // there is no read or write form of it here.
 struct CubeImageRef {
   texturecube<float, access::sample> t;
@@ -1246,7 +973,7 @@ static inline T tex_read(thread const R& im, uint32_t x, uint32_t y, uint32_t la
 }
 
 // The 3D form: one coordinate, three components, and a plane outside the binding
-// is nothing — the same answer the CPU runtime gives for the same coordinate.
+// is nothing, the same answer the CPU runtime gives for the same coordinate.
 template <class T>
 static inline T tex_read(thread const Image3DRef& im, uint32_t x, uint32_t y, uint32_t z) {
   if (x >= im.width || y >= im.height || z >= im.depth) return (T)0;
@@ -1289,6 +1016,32 @@ static inline void weft_cube_dir(uint32_t face, float s, float t, thread float& 
   }
 }
 
+// A direction back to a face and a place on it: the inverse of `weft_cube_dir`, and
+// the rule the sampler hardware implements, the axis the direction points along most
+// strongly picks the face, ties going to X then Y, and the other two components over
+// that length place the texel. The same text is in `runtime/weft_runtime.hpp`.
+static inline void weft_cube_uv(float dx, float dy, float dz, thread uint32_t& face,
+                                thread float& u, thread float& v) {
+  const float ax = fabs(dx), ay = fabs(dy), az = fabs(dz);
+  float sc = 0.0f, tc = 0.0f, ma = 1.0f;
+  if (ax >= ay && ax >= az) {
+    ma = ax;
+    if (dx >= 0.0f) { face = 0u; sc = -dz; tc = -dy; }
+    else { face = 1u; sc = dz; tc = -dy; }
+  } else if (ay >= az) {
+    ma = ay;
+    if (dy >= 0.0f) { face = 2u; sc = dx; tc = dz; }
+    else { face = 3u; sc = dx; tc = -dz; }
+  } else {
+    ma = az;
+    if (dz >= 0.0f) { face = 4u; sc = dx; tc = -dy; }
+    else { face = 5u; sc = -dx; tc = -dy; }
+  }
+  if (ma == 0.0f) { u = 0.5f; v = 0.5f; return; }
+  u = (sc / ma + 1.0f) * 0.5f;
+  v = (tc / ma + 1.0f) * 0.5f;
+}
+
 // A cube sample: the direction picks the face and the place on it, which is the
 // hardware's own rule and the one the CPU runtime models.
 template <class T>
@@ -1296,7 +1049,7 @@ static inline T tex_sample(thread const SampledCubeImage& si, float dx, float dy
   return weft_bitcast<T>(si.tex.t.sample(si.s, float3(dx, dy, dz)).x);
 }
 
-// A texel is channel 0 of whatever the module wrote — the format is one channel,
+// A texel is channel 0 of whatever the module wrote, the format is one channel,
 // so the other three have nowhere to go, exactly as the CPU runtime copies only
 // the first element.
 static inline float tex_chan(float v) { return v; }
@@ -1381,7 +1134,7 @@ static inline void tex_gather4(thread const SampledImage& si, float u, float v,
 
 // A 3-D gather: the 2x2 footprint of the plane the coordinate names. The plane is
 // the nearest one under w, because a gather has no filter to blend along z with,
-// and a footprint that leaves the binding answers with nothing — the CPU runtime's
+// and a footprint that leaves the binding answers with nothing, the CPU runtime's
 // text for the same instruction, arithmetic for arithmetic.
 template <class T>
 static inline void tex_gather4(thread const SampledImage3D& si, float u, float v, float w,
@@ -1405,10 +1158,10 @@ static inline void tex_gather4(thread const SampledImage3D& si, float u, float v
 // coordinate. A cube texel is addressed by `read(uint2, face)`, so the four reads
 // are exact on both engines and no sampler is involved.
 template <class T>
-static inline void tex_gather4_cube(thread const SampledCubeImage& si, float s, float v,
+static inline void tex_gather4_face(thread const SampledCubeImage& si, float u, float v,
                                     uint32_t face, thread float* out) {
-  const int x0 = (int)floor(((s + 1.0f) * 0.5f) * (float)si.tex.width - 0.5f);
-  const int y0 = (int)floor(((v + 1.0f) * 0.5f) * (float)si.tex.height - 0.5f);
+  const int x0 = (int)floor(u * (float)si.tex.width - 0.5f);
+  const int y0 = (int)floor(v * (float)si.tex.height - 0.5f);
   const uint32_t f = face % 6u;
   auto at = [&](int x, int y) -> float {
     if (x < 0 || y < 0 || (uint32_t)x >= si.tex.width || (uint32_t)y >= si.tex.height) return 0.0f;
@@ -1418,6 +1171,23 @@ static inline void tex_gather4_cube(thread const SampledCubeImage& si, float s, 
   out[1] = at(x0 + 1, y0);
   out[2] = at(x0, y0 + 1);
   out[3] = at(x0 + 1, y0 + 1);
+}
+
+template <class T>
+static inline void tex_gather4_cube(thread const SampledCubeImage& si, float s, float v,
+                                    uint32_t face, thread float* out) {
+  tex_gather4_face<T>(si, (s + 1.0f) * 0.5f, (v + 1.0f) * 0.5f, face, out);
+}
+
+// A direction instead of a face and a place: the rule the sampler implements picks
+// both, then the same four texels are read off that face.
+template <class T>
+static inline void tex_gather4_cube_dir(thread const SampledCubeImage& si, float dx, float dy,
+                                        float dz, float du, float dv, thread float* out) {
+  uint32_t face = 0;
+  float u = 0.5f, v = 0.5f;
+  weft_cube_uv(dx, dy, dz, face, u, v);
+  tex_gather4_face<T>(si, u + du, v + dv, face, out);
 }
 
 template <class R, class V>
@@ -1452,12 +1222,11 @@ static inline void atomic_store(device void* p, T v) {
 }
 static inline uint64_t param(thread const Ctx& c, int i) { return c.params[i]; }
 
-// ---- atomics ----
 // The hardware's own fetch forms, not a retry loop, and that is not a
 // micro-optimisation. A compare-exchange retry costs every contender one line
 // transfer per success, so a counter touched by n threads costs about n^2 of them:
 // at 4,096 lanes that is 16 million and at 65,536 it is 4 billion, which does not
-// finish — it reads as a hang, and it did: the reduction path below (no lock, no
+// finish, it reads as a hang, and it did: the reduction path below (no lock, no
 // 64-bit anything) hung at 65,536 lanes with the retry loop and finishes now.
 // A CAS loop is only used where no instruction exists: min and max.
 static inline uint32_t atom_add_u32(device uint32_t* p, uint32_t v) {
@@ -1489,7 +1258,7 @@ static inline uint32_t atom_cas_u32(device uint32_t* p, uint32_t cmp, uint32_t v
 static inline int32_t atom_add_s32(device int32_t* p, int32_t v) {
   return (int32_t)atom_add_u32((device uint32_t*)p, (uint32_t)v);
 }
-// min and max have instructions here too, for both integer types — the note that
+// min and max have instructions here too, for both integer types, the note that
 // they are refused at pipeline creation was about *float* atomics, and a probe
 // asking for `atomic_fetch_max_explicit` on `atomic_uint` and `atomic_int`
 // pipelines on this host. Using them matters for the same reason as add: a retry
@@ -1514,7 +1283,7 @@ static inline float atom_add_f32(device float* p, float v) {
 // Float min and max do not: `atomic_fetch_min_explicit` / `max` are constrained to
 // the integer types, and asking for `atomic_float` is a compile error. So this is
 // the only retry loop left in the runtime, and it is the one place a very large grid
-// could still grind — a hot word costs the number of contenders per success. Nothing
+// could still grind, a hot word costs the number of contenders per success. Nothing
 // in `kernels/` emits `atom.min.f32` or `atom.max.f32`; if something does, the pause
 // below is what keeps it from spinning on the line. The arithmetic is done on the
 // float the bits are, and `+.rn` is the addition this language performs.
@@ -1539,32 +1308,30 @@ static inline float cas_f32(device float* p, float v, int mode) {
 static inline float atom_min_f32(device float* p, float v) { return cas_f32(p, v, 1); }
 static inline float atom_max_f32(device float* p, float v) { return cas_f32(p, v, 2); }
 
-// ---- 64-bit reductions ----
 //
-// A `red` produces no result, so it does not need the 64 bits read as one value —
+// A `red` produces no result, so it does not need the 64 bits read as one value , 
 // it needs the pair to end up holding the fold of everything applied to it. For
 // an operation that is order-free that is two 32-bit atomics:
 //
 //   add/sub  the low half goes first and its carry (or borrow) is applied to the
 //            high half. Every thread that wraps the low word adds exactly one to
 //            the high word, so the sum is right whatever order the threads land
-//            in — and the hardware does the low half atomically, so nothing is
+//            in, and the hardware does the low half atomically, so nothing is
 //            lost in between.
 //   and/or/xor  each half is folded on its own. The two halves are independent,
 //            so the pair ends up holding the fold without either half needing to
 //            know about the other.
 //
 // What this cannot do is hand back the old pair as one value, or compare one.
-// That needs the pair read as one value, which no instruction here does — so it
+// That needs the pair read as one value, which no instruction here does, so it
 // is a lock over the two halves instead.
 
-// ---- 64-bit read-modify-write ----
 //
 // There is no 64-bit atomic on this host. `atomic_ulong` is declared, but every
 // entry point that could read, write, exchange or compare one is constrained to
 // 32-bit types, and the two that are not (`atomic_max_explicit` /
 // `atomic_min_explicit`) compile only to be refused by the device at pipeline
-// creation — tools/atom64_probe.mm asks for each of those answers separately.
+// creation, tools/atom64_probe.mm asks for each of those answers separately.
 //
 // So a 64-bit atomic is built out of the 32-bit ones the hardware does have: a
 // lock on the word, held while the pair is read, changed and written back. The
@@ -1598,13 +1365,13 @@ static inline device uint32_t* lock_of(device uint32_t* locks, device const void
 // for minutes.
 //
 // Every operation here is `memory_order_relaxed`, because this host's metal_atomic
-// constrains all of them to it. Ordering is not the obstacle — a device-scope
+// constrains all of them to it. Ordering is not the obstacle, a device-scope
 // `atomic_thread_fence` exists and a relaxed store from one threadgroup is seen by
 // a waiter in another (tools/lock_probe.mm measures both). The obstacle is
 // progress: a lane that wins this section cannot run it until the other lanes in
 // its warp leave the spin loop, and they cannot leave until it releases, because a
 // warp is one program counter. A threadgroup of one thread does not dodge that
-// either — such threadgroups are co-scheduled into one warp and deadlock across
+// either, such threadgroups are co-scheduled into one warp and deadlock across
 // each other. So the lock is only taken where at most one lane per warp can ever
 // wait, which is the single-writer walk the 64-bit pair uses; a per-lane section
 // under contention cannot complete on this hardware, and the translator refuses
@@ -1653,7 +1420,6 @@ static inline void store64(device int64_t* p, int64_t v) {
   store64((device uint64_t*)p, as_type<uint64_t>(v));
 }
 
-// ---- the relay a vote needs when one thread owns all 32 lanes ----
 //
 // A warp kernel's lanes are this thread's data, so a vote is a rendezvous with
 // itself: every lane publishes into the warp's slot array, the dispatch brings the
@@ -1828,7 +1594,7 @@ static inline int64_t rmw_cas_raw(device int64_t* p, int64_t c, int64_t v) {
 //
 // The walk that owns the launch also owns the word, so the value can live in a
 // local between the sites that use it and reach the buffer twice per launch
-// instead of twice per lane — and each of those trips is an L2 round trip. The
+// instead of twice per lane, and each of those trips is an L2 round trip. The
 // old value is still handed back in program order, so the sequence both engines
 // see is the same one; the emitter only takes this form when nothing else in the
 // kernel reads that binding, which is what makes the local a copy rather than a
@@ -1885,9 +1651,8 @@ static inline void red_xor_u64(device uint64_t* p, uint64_t v) {
   atom_xor_u32(hi32(p), (uint32_t)(v >> 32));
 }
 
-// ---- a reduction barrier ----
 // `bar.red` publishes one bit per thread, then every thread folds the group.
-// The barrier is the hardware's, so this is a publish, a barrier, and a loop —
+// The barrier is the hardware's, so this is a publish, a barrier, and a loop , 
 // no rendezvous bookkeeping, which is what the CPU side has to do by hand.
 static inline uint32_t red_fold(threadgroup uint32_t* slots, thread const Ctx& c, int mode) {
   uint32_t t = 0u;
@@ -1918,7 +1683,6 @@ static inline void copy_global(device void* dst, threadgroup const uint8_t* src,
   for (uint32_t i = 0; i < n; i++) d[i] = src[i];
 }
 
-// ---- tensor maps ----
 //
 // The same decode as `runtime/weft_runtime.hpp`, for the other back end. The object a
 // `cp.async.bulk.tensor` copy reads is 128 bytes and its layout is weft's own: NVIDIA's
@@ -1934,9 +1698,9 @@ static inline void copy_global(device void* dst, threadgroup const uint8_t* src,
 //   off 124  u32  tag               0x41544657, 'WFTA'
 //
 // A box (kind 0) is a rectangular tile: `box[5]` at 80 and `elementStride[5]` at 100.
-// A column (kind 1) is what `.im2col` copies — `channelsPerPixel` at 80,
+// A column (kind 1) is what `.im2col` copies, `channelsPerPixel` at 80,
 // `pixelsPerColumn` at 84, a pixel's `traversal[3]` at 88, the window's
-// `lowerCorner[3]` at 100 and a filter step's `dilation[3]` at 112 — and the swizzle
+// `lowerCorner[3]` at 100 and a filter step's `dilation[3]` at 112, and the swizzle
 // byte applies to the threadgroup destination either way.
 static inline uint32_t tma_word(const device uint8_t* d, uint32_t off) {
   return (uint32_t)d[off] | ((uint32_t)d[off + 1u] << 8) | ((uint32_t)d[off + 2u] << 16) |
@@ -2145,3 +1909,9 @@ static inline void tma_im2col_store(const device void* map, int32_t c0, int32_t 
 }  // namespace weft
 )WEFMSL";
 
+// The Metal side of the translated-kernel runtime, as three pieces joined once.
+// The middle one is the software double, which is its own text because the CPU
+// column compiles it too (see src/weft_f64.hpp).
+static const std::string kWWeftMslJoined =
+    std::string(kWWeftMslHead) + kWWeftF64 + kWWeftMslTail;
+static const char* kWWeftMslPreamble = kWWeftMslJoined.c_str();

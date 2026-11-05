@@ -4,7 +4,7 @@
 // The 128-byte fixture starts both tiles at multiples of 1 KiB, which is the easy
 // case: the XOR's phase and the address's own bits agree. Here B starts three rows
 // into the pattern, and the descriptor says so in its base-offset field (bits
-// 49-51, 128-byte units) instead of carrying zero — three rather than one, so the
+// 49-51, 128-byte units) instead of carrying zero, three rather than one, so the
 // field's second bit is exercised too. The phase a byte lands in is then decided
 // by its distance from the pattern's origin, not from the tile.
 //
@@ -55,7 +55,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: one value, staged at 8320 — three rows into the pattern ----
+	// ---- B: one value, staged at 8320, three rows into the pattern ----
 	shr.u32 	%r14, %r1, 4;			// n
 	and.b32 	%r15, %r1, 15;			// k
 	shl.b32 	%r16, %r15, 3;			// B's rows are eight columns wide
@@ -93,7 +93,7 @@
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
-	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1] — the Z pattern a warpgroup
+	// D[16w+g][2t], [2t+1], [16w+g+8][2t], [2t+1], the Z pattern a warpgroup
 	// lane holds for m64n8k16.
 	shr.u32 	%r21, %r1, 5;
 	shr.u32 	%r22, %r1, 2;

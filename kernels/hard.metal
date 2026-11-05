@@ -12,7 +12,7 @@ using namespace metal;
 // This is the shape a portable math library has to get right: one wrong bit in
 // `normalize` or `sqrt` sends the ray somewhere else, and after 64 steps the
 // answer is not slightly off, it is a different picture. Before the library
-// existed this kernel could be run on the CPU but not compared — its GPU answer
+// existed this kernel could be run on the CPU but not compared, its GPU answer
 // came from hardware approximations no CPU reproduces.
 
 static float sd_sphere(float3 p, float3 c, float r) {
@@ -76,7 +76,7 @@ kernel void raymarch(device const float* in [[buffer(0)]],
     const float diff = ndl < 0.0f ? 0.0f : (ndl > 1.0f ? 1.0f : ndl);
     // A highlight as repeated squaring rather than `pow(s, 24)`: the GPU folds a
     // constant exponent into multiplies but only for the exponents it was
-    // measured on (2, 3, 4), and `pow` at 24 is a general call — 3.6e-05 apart
+    // measured on (2, 3, 4), and `pow` at 24 is a general call, 3.6e-05 apart
     // from any CPU implementation. Written out, both engines run the same four
     // multiplies.
     const float s = spec < 0.0f ? 0.0f : (spec > 1.0f ? 1.0f : spec);
