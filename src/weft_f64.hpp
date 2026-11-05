@@ -1810,7 +1810,7 @@ static inline uint64_t remquo_r_bits(uint64_t x, uint64_t y) {
 // address spaces; in C++ the first is nothing and the second is `const`. The
 // definitions are undone straight after, so the module around this text is not
 // compiled with them.
-static std::string weft_f64_cpp_text() {
+inline std::string weft_f64_cpp_text() {
   return "#define thread\n#define constant const\n"
          "template <class T, class U>\n"
          "static inline T as_type(U u) { T t; std::memcpy(&t, &u, sizeof(T)); return t; }\n" +

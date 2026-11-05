@@ -202,14 +202,15 @@ cat > "$out/params.ptx" <<'PTX'
     .param .u32 params_param_2,
     .param .u8  params_param_3,
     .param .f64 params_param_4,
-    .param .u16 params_param_5
+    .param .u16 params_param_5,
+    .param .f16 params_param_6
 )
 {
-    .reg .b64 %rd<6>;
+    .reg .b64 %rd<7>;
     .reg .f32 %f<2>;
     .reg .f64 %fd<2>;
     .reg .b32 %r<2>;
-    .reg .b16 %rs<3>;
+    .reg .b16 %rs<4>;
 
     ld.param.u64 %rd1, [params_param_0];
     ld.param.f32 %f1, [params_param_1];
@@ -226,25 +227,63 @@ cat > "$out/params.ptx" <<'PTX'
     ld.param.u16 %rs2, [params_param_5];
     add.s64 %rd5, %rd1, 24;
     st.global.u16 [%rd5], %rs2;
+    ld.param.u16 %rs3, [params_param_6];
+    add.s64 %rd6, %rd1, 32;
+    st.global.u16 [%rd6], %rs3;
     ret;
 }
 PTX
 
 if run_case params "$out/params.ptx" --grid 256 --buffers 32 \
-   --arg 0=2 --arg 1=7 --arg 2=9 --arg 3=3 --arg 4=513 --bench 1; then
+   --arg 0=2 --arg 1=7 --arg 2=9 --arg 3=3 --arg 4=513 --arg 5=2 --bench 1 --dump 0="$out/f16.bin"; then
   case_rows "scalar cells at their declared widths" "$out/params.log" \
-    "cuModuleGetFunction params params=6" \
+    "cuModuleGetFunction params params=7" \
     "param0 cell=0x0000000000001000" \
     "param1 cell=0x0000000040000000" \
     "param2 cell=0x0000000000000007" \
     "param3 cell=0x0000000000000009" \
     "param4 cell=0x4008000000000000" \
     "param5 cell=0x0000000000000201" \
+    "param6 cell=0x0000000000000002" \
     "block=256x1x1"
 else
   bad "scalar cells (exit $st)"
   sed 's/^/      /' "$out/params.out" | head -6
 fi
+if [ "$(od -An -tx1 -j32 -N2 "$out/f16.bin" 2>/dev/null | tr -d ' \n')" = "0200" ]; then
+  ok "the half scalar stores what the driver was handed"
+else
+  bad "the half scalar stores what the driver was handed"
+fi
+
+# A grid smaller than the threadgroup runs as one short block of exactly the
+# lanes the CPU column runs.
+if run_case short kernels/ptxtex.ptx --grid 32 --buffers 32 --textures 64x64 --bench 1; then
+  case_rows "grid smaller than a block" "$out/short.log" "cuLaunchKernel grid=1x1x1 block=32x1x1 shared=0"
+else
+  bad "grid smaller than a block (exit $st)"
+fi
+
+# A driver that loaded but refused the module: the launcher names the refusal
+# and the CPU column still runs, which is the line the harness reads when it
+# decides whether a skip is a missing column or a broken one.
+WEFT_FAKE_REFUSE=1
+export WEFT_FAKE_REFUSE
+if run_case refuse kernels/ptxtex.ptx --grid 4096 --buffers 4096 --textures 64x64 --bench 1; then
+  case_rows "driver refusal is named" "$out/refuse.out" \
+    "no column for this kernel" \
+    "the driver refused the module: the stand-in driver refused the module"
+  case_rows "driver refusal reached the driver" "$out/refuse.log" "cuModuleLoadData REFUSED"
+  if grep -qE '^cpu ' "$out/refuse.out"; then
+    ok "driver refusal still runs the cpu column"
+  else
+    bad "driver refusal still runs the cpu column"
+  fi
+else
+  bad "driver refusal (exit $st)"
+  sed 's/^/      /' "$out/refuse.out" | head -6
+fi
+unset WEFT_FAKE_REFUSE
 
 # The launch is fed the kernel's input, not the buffer the CPU column has just
 # finished writing. A loaded 0x11 has to come back as 0x11.

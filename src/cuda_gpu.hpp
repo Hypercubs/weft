@@ -370,8 +370,11 @@ inline Column run(const std::string& ptx, const std::string& kernel,
             " threads per block, the launch asked for " + std::to_string(threads);
     return c;
   }
-  // A CUDA launch is whole blocks. A partial last block would run lanes past the
-  // grid, which is a different launch from the one the CPU column ran.
+  // A grid smaller than one block is one short block, not a refusal: a block of
+  // `grid` threads runs the same lanes the CPU column runs and no others.
+  if (grid < threads) threads = grid;
+  // Otherwise a launch is whole blocks. A partial last block would run lanes past
+  // the grid, which is a different launch from the one the CPU column ran.
   if (grid == 0 || grid % threads != 0) {
     c.why = "a CUDA launch is whole blocks: " + std::to_string(grid) +
             " lanes do not divide into blocks of " + std::to_string(threads);
@@ -516,13 +519,10 @@ inline Column run(const std::string& ptx, const std::string& kernel,
       } else if (p.type == "f64") {
         const double v = (double)raw;
         std::memcpy(&cells[i], &v, 8);
-      } else if (p.type == "f16") {
-        c.why = "a half scalar parameter has no encoding here";
-        return c;
       } else if (p.type == "u32" || p.type == "s32" || p.type == "b32") {
         const uint32_t v = (uint32_t)raw;
         std::memcpy(&cells[i], &v, 4);
-      } else if (p.type == "u16" || p.type == "s16" || p.type == "b16") {
+      } else if (p.type == "f16" || p.type == "u16" || p.type == "s16" || p.type == "b16") {
         const uint16_t v = (uint16_t)raw;
         std::memcpy(&cells[i], &v, 2);
       } else if (p.type == "u8" || p.type == "s8" || p.type == "b8") {

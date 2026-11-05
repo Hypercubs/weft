@@ -56,6 +56,20 @@ ptx_state() {
     *) echo unknown;;
   esac
 }
+
+# The classifier is what separates a skip from a failure, so its three answers
+# are checked against the shapes the launcher prints. Reading a refusal as an
+# absent driver would hide a broken install; reading an absent driver as a
+# failure would make this suite unusable on a host with no GPU.
+probe_bad=""
+[ "$(ptx_state 'gpu       no column for this kernel  no CUDA driver (libcuda) on this host')" = absent ] || probe_bad="$probe_bad absent-driver"
+[ "$(ptx_state 'gpu       no column for this kernel  the driver refused the module: invalid device function')" = refused ] || probe_bad="$probe_bad refused-module"
+[ "$(ptx_state 'gpu       no column for this kernel  the launch failed: out of resources')" = refused ] || probe_bad="$probe_bad failed-launch"
+[ "$(ptx_state 'weft: something else')" = unknown ] || probe_bad="$probe_bad unknown"
+if [ -n "$probe_bad" ]; then
+  echo "FAIL  the ptx probe misreads$probe_bad"
+  fail=1
+fi
 if [ "$host_os" = Darwin ]; then
   probe=""
   if ! probe="$("$WEFT" run kernels/cuda/saxpy.ptx --grid 16 --threads 16 \
@@ -85,7 +99,9 @@ else
       absent) GPUCOL=1;;
       refused)
         GPUREF="${gpu_line#*no column for this kernel}"
-        GPUREF="${GPUREF# }"
+        # The launcher pads the label to a column, so what follows is a run of
+        # spaces rather than one.
+        GPUREF="$(printf '%s' "$GPUREF" | sed 's/^[[:space:]]*//')"
         ;;
       *)
         echo "FAIL  the ptx column printed neither a comparison nor a reason"

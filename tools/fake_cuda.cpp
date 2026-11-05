@@ -209,6 +209,12 @@ I cuMemcpyDtoH_v2(void* dst, U64 at, size_t bytes) {
 }
 
 I cuModuleLoadData(P* m, const void* text) {
+  // A driver that loaded but will not take the module, which is the shape of an
+  // sm mismatch on a real card. The launcher turns this into a named refusal.
+  if (std::getenv("WEFT_FAKE_REFUSE")) {
+    lg("cuModuleLoadData REFUSED");
+    return 1;
+  }
   g_ptx = (const char*)text;
   g_params = 0;
   scan_textures();
@@ -257,6 +263,10 @@ I cuCtxSynchronize() {
 }
 
 I cuGetErrorString(I r, const char** s) {
+  if (r == 1) {
+    *s = "the stand-in driver refused the module";
+    return 0;
+  }
   if (r == 500) {
     *s = "the stand-in driver: the module does not declare that name";
     return 0;

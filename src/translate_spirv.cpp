@@ -768,7 +768,7 @@ class Emitter {
   // heading for becomes a case of its own, so nothing past this point runs for
   // that lane until the next sweep comes back to it.
   std::string park(uint32_t id) {
-    if (id > max_case_) max_case_ = (int)id;
+    if (id > (uint32_t)max_case_) max_case_ = (int)id;
     return "{ s->pc[l] = " + std::to_string(id) + "u; continue; }\n" + case_close() +
            case_open(id);
   }

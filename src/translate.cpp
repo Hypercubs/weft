@@ -4934,13 +4934,11 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         one.clear();
         if (it.empty()) return;
         std::string out = it;
-        bool deref = false;
         // `(*weft_c_v)` is how the body spells a member that stands for a
         // reference: what the nested closure copies is the pointer, and its own
         // use dereferences that.
         if (it.size() > 3 && it.compare(0, 2, "(*") == 0 && it.back() == ')') {
           out = it.substr(2, it.size() - 3);
-          deref = true;
         }
         // A member cannot be captured by name, only an automatic variable can , 
         // so it becomes an init-capture of itself, which copies the value the
