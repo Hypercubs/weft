@@ -2060,14 +2060,14 @@ else
   echo "FAIL  callmulti a two-slot return list was not refused by name (rc=$callmulti_rc)"; fail=1
 fi
 calldrop_rc=0
-calldrop_out=$("$WEFT" run kernels/calldrop.ptx --kernel calldrop --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || calldrop_rc=$?
+calldrop_out=$("$WEFT" run tests/refused/calldrop.ptx --kernel calldrop --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || calldrop_rc=$?
 if [ $calldrop_rc -ne 0 ] && [ "${calldrop_out#*returns nothing}" != "$calldrop_out" ]; then
   echo "ok    calldrop  a return list around a function that returns nothing is refused"
 else
   echo "FAIL  calldrop  the mismatch was not refused by name (rc=$calldrop_rc)"; fail=1
 fi
 callmiss_rc=0
-callmiss_out=$("$WEFT" run kernels/callmiss.ptx --kernel callmiss --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || callmiss_rc=$?
+callmiss_out=$("$WEFT" run tests/refused/callmiss.ptx --kernel callmiss --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || callmiss_rc=$?
 if [ $callmiss_rc -ne 0 ] && [ "${callmiss_out#*no list to put it in}" != "$callmiss_out" ]; then
   echo "ok    callmiss  a returned value the call ignores is refused, not dropped"
 else
@@ -2193,8 +2193,8 @@ fi
 # the nibble layout's own split of that word, where b's bits are the low byte of the
 # upper half. The f6 and e5m2 rows are the same carry on their own grids, and the
 # `.relu` row zeroes a negative before the convert sees it.
-runf kernels/cvtqual.ptx cvtrsx4 --grid 1 --threads 1 --buffers 5
-"$WEFT" run kernels/cvtqual.ptx --kernel cvtrsx4 --grid 1 --threads 1 --buffers 5 \
+runf tests/absent/cvtqual.ptx cvtrsx4 --grid 1 --threads 1 --buffers 5
+"$WEFT" run tests/absent/cvtqual.ptx --kernel cvtrsx4 --grid 1 --threads 1 --buffers 5 \
     --cpu-only --dump 0="$TMP/cvtrsx4.bin" >/dev/null
 if [ "$(head -c 20 "$TMP/cvtrsx4.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "393840b0 0000324a 0d0c0c34 3d3cc034 00000651 " ]; then
@@ -2206,8 +2206,8 @@ fi
 # `.rz` truncates instead of rounding: 1.1875 is three eighths of an ulp into the
 # e4m3 grid, 1.75 is a tie between two fp4 values that nearest-even takes up, and the
 # half word shows rn's 3c04bc04 one step lower.
-runf kernels/cvtqual.ptx cvtrz2 --grid 1 --threads 1 --buffers 3
-"$WEFT" run kernels/cvtqual.ptx --kernel cvtrz2 --grid 1 --threads 1 --buffers 3 \
+runf tests/absent/cvtqual.ptx cvtrz2 --grid 1 --threads 1 --buffers 3
+"$WEFT" run tests/absent/cvtqual.ptx --kernel cvtrz2 --grid 1 --threads 1 --buffers 3 \
     --cpu-only --dump 0="$TMP/cvtrz2.bin" >/dev/null
 if [ "$(head -c 12 "$TMP/cvtrz2.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "000039b9 0000003b 3c03bc03 " ]; then
@@ -2220,8 +2220,8 @@ fi
 # the same convert at 1.0 flushes two subnormal sources to zeros of their own sign,
 # the f16x2 source form halves both halves, `.pzo` folds -0.0, and the n2 up-convert
 # multiplies 1.0 by 4 and by 2 into the two halves of a bf16x2.
-runf kernels/cvtqual.ptx cvtscaled --grid 1 --threads 1 --buffers 5
-"$WEFT" run kernels/cvtqual.ptx --kernel cvtscaled --grid 1 --threads 1 --buffers 5 \
+runf tests/absent/cvtqual.ptx cvtscaled --grid 1 --threads 1 --buffers 5
+"$WEFT" run tests/absent/cvtqual.ptx --kernel cvtscaled --grid 1 --threads 1 --buffers 5 \
     --cpu-only --dump 0="$TMP/cvtscaled.bin" >/dev/null
 if [ "$(head -c 20 "$TMP/cvtscaled.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "00004840 00000080 00003830 00000000 40804000 " ]; then
@@ -2258,8 +2258,8 @@ fi
 # decode, a wrong lane offset or a missing saturation shows in a byte of the word. The
 # last two are the operands that are not the obvious format: a ue8m0 scale and an fp4
 # tile padded one nibble a byte.
-runf kernels/cvtf8x2simd.ptx cvtsimd --grid 1 --threads 1 --buffers 7
-"$WEFT" run kernels/cvtf8x2simd.ptx --kernel cvtsimd --grid 1 --threads 1 --buffers 7 \
+runf tests/absent/cvtf8x2simd.ptx cvtsimd --grid 1 --threads 1 --buffers 7
+"$WEFT" run tests/absent/cvtf8x2simd.ptx --kernel cvtsimd --grid 1 --threads 1 --buffers 7 \
     --cpu-only --dump 0="$TMP/cvtsimd.bin" >/dev/null
 if [ "$(head -c 28 "$TMP/cvtsimd.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "44444444 38383838 41414141 4b4b4b4b 7e7e7e7e 44444444 44444444 " ]; then
@@ -2314,8 +2314,8 @@ fi
 # the corner. Two channels by three pixels at the window's origin gives 0 to 5; the same
 # column one pixel to the right runs off the edge, so its third pixel is padded with zero
 # rather than read from the next row.
-runf kernels/tensormap3.ptx tensorim2col --grid 1 --threads 1 --buffers 12,18,32
-"$WEFT" run kernels/tensormap3.ptx --kernel tensorim2col --grid 1 --threads 1 --buffers 12,18,32 \
+runf tests/absent/tensormap3.ptx tensorim2col --grid 1 --threads 1 --buffers 12,18,32
+"$WEFT" run tests/absent/tensormap3.ptx --kernel tensorim2col --grid 1 --threads 1 --buffers 12,18,32 \
     --cpu-only --dump 0="$TMP/tensorim2col.bin" >/dev/null
 im_got="$(od -An -tu4 -v "$TMP/tensorim2col.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
 if [ "$im_got" = "0 1 2 3 4 5 2 3 4 5 0 0" ]; then
@@ -2328,8 +2328,8 @@ fi
 # 5; 201 to 206 one pixel to the right land on 2 to 5 and stop at the edge, where a store
 # writes nothing. The tensor is read back afterwards, so what has to agree is both the
 # elements the scatters changed and the twelve they must have left alone.
-runf kernels/tensormap4.ptx tensorim2st --grid 1 --threads 1 --buffers 18,18,32
-"$WEFT" run kernels/tensormap4.ptx --kernel tensorim2st --grid 1 --threads 1 --buffers 18,18,32 \
+runf tests/absent/tensormap4.ptx tensorim2st --grid 1 --threads 1 --buffers 18,18,32
+"$WEFT" run tests/absent/tensormap4.ptx --kernel tensorim2st --grid 1 --threads 1 --buffers 18,18,32 \
     --cpu-only --dump 0="$TMP/tensorim2st.bin" >/dev/null
 is_got="$(od -An -tu4 -v "$TMP/tensorim2st.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
 is_want="101 102 201 202 203 204 6 7 8 9 10 11 12 13 14 15 16 17"
@@ -2442,8 +2442,8 @@ else
   echo "FAIL  prmtmodes  a mode's bytes are not the ones the table names"; fail=1
 fi
 
-runf kernels/ldmatrixsub.ptx ldmsub --grid 32 --threads 32 --buffers 160
-"$WEFT" run kernels/ldmatrixsub.ptx --kernel ldmsub --grid 32 --threads 32 --buffers 160 \
+runf tests/absent/ldmatrixsub.ptx ldmsub --grid 32 --threads 32 --buffers 160
+"$WEFT" run tests/absent/ldmatrixsub.ptx --kernel ldmsub --grid 32 --threads 32 --buffers 160 \
     --cpu-only --dump 0="$TMP/lsub.bin" >/dev/null
 if od -An -tu4 -v "$TMP/lsub.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; w = 0;
       if (n < 128) { m = n % 64; l = int(m / 2); c0 = 8 * (m % 2); row = int(l / 4)
@@ -5525,7 +5525,7 @@ fi
 known_uncompared=""   # empty: every fixture has a comparison now
 self="${BASH_SOURCE[0]}"
 uncovered=""
-for fx in kernels/*.ptx kernels/cuda/*.ptx kernels/triton/*.ptx kernels/spirv/*.spv; do
+for fx in kernels/*.ptx kernels/cuda/*.ptx kernels/triton/*.ptx kernels/spirv/*.spv tests/*/*.ptx; do
   [ -e "$fx" ] || continue
   fxbase="$(basename "$fx")"; fxkey="${fxbase%.*}"
   case "$known_uncompared" in *" $fx "*) continue ;; esac
