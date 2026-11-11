@@ -402,15 +402,19 @@ Fixtures compare bytes, not tolerances.
   fp4 multiply at a k of 64 (`mma8fp4k64`), and `im2col` on `cp.async.bulk.tensor`
   (`tensormap3`, `tensormap4`). `calldrop` and `callmiss` are the other two and are
   negative tests: they call with the wrong arity on purpose, so no assembler should
-  take them. Two more versions were swept before settling on that image: CUDA 13.1's
-  `ptxas` (PTX 9.1, the newest ISA there is) refuses the same ones for the same reasons
-  and drops about twenty fixtures the 12.9 assembler takes, so it is not a drop-in
-  oracle, and the arch-specific targets (`sm_90a`, `sm_103a`, `sm_121a`) were tried in
-  case the missing forms were gated on one of them rather than absent. They are absent.
-  The qualifiers are gone too, but the destination register's width is not: a narrow
-  pair convert names a `.b8` register for fp4 and a `.b16` one for f6, and a `.b32` one
-  is the `Arguments mismatch` those files hit. With that width stated, `cvtmx4` and
-  `cvtf8x2dn` are each the same bits written as two pair converts and a shift.
+  take them. Each of the eight is an expectation in the script, matched against the
+  refusal it has to produce, so a rejection from one of them is the expected result and
+  the run passes on it; one that starts assembling is reported as stale, and a new
+  failure inside one is still a failure. Two more versions were swept before settling on
+  that image: CUDA 13.1's `ptxas` (PTX 9.1, the newest ISA there is) refuses the same
+  ones for the same reasons and drops about twenty fixtures the 12.9 assembler takes, so
+  it is not a drop-in oracle, and the arch-specific targets (`sm_90a`, `sm_103a`,
+  `sm_121a`) were tried in case the missing forms were gated on one of them rather than
+  absent. They are absent. The qualifiers are gone too, but the destination register's
+  width is not: a narrow pair convert names a `.b8` register for fp4 and a `.b16` one
+  for f6, and a `.b32` one is the `Arguments mismatch` those files hit. With that width
+  stated, `cvtmx4` and `cvtf8x2dn` are each the same bits written as two pair converts
+  and a shift.
 - Most of the fixtures that used to be refused were a missing spelling rather than a
   missing instruction, and each of these now writes one ptxas takes: integer `wgmma`
   accumulates into `.s32` (with the results converted once on the way out), a `tex.a2d`
