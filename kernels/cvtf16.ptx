@@ -15,7 +15,7 @@
 // The results stay in `b32` registers: the value of a 16-bit float convert is 16
 // bits, and a word-sized store keeps this fixture on paths that are not themselves
 // under test.
-.version 7.0
+.version 8.1
 .target sm_80
 .address_size 64
 
@@ -23,6 +23,7 @@
     .param .u64 cvtf16_param_0      // eight words, one 16-bit value in each
 )
 {
+    .reg .b16 %hs<4>;
     .reg .b32 %r<10>;
     .reg .b64 %rd<4>;
 
@@ -53,11 +54,13 @@
     st.global.u32 [%rd1+20], %r7;
 
     mov.u32 %r1, 0x3F800000;
-    cvt.rn.bf16.f32 %r8, %r1;
+    cvt.rn.bf16.f32 %hs1, %r1;
+    cvt.u32.u16 %r8, %hs1;
     st.global.u32 [%rd1+24], %r8;
 
     mov.u32 %r1, 0x7F800000;
-    cvt.rn.relu.satfinite.bf16.f32 %r9, %r1;
+    cvt.rn.relu.satfinite.bf16.f32 %hs2, %r1;
+    cvt.u32.u16 %r9, %hs2;
     st.global.u32 [%rd1+28], %r9;
     ret;
 }
@@ -73,6 +76,7 @@
     .param .u64 cvtf16rz_param_0      // five words, one 16-bit value in each
 )
 {
+    .reg .b16 %hs<4>;
     .reg .b32 %r<10>;
     .reg .b64 %rd<4>;
 
@@ -91,11 +95,13 @@
     st.global.u32 [%rd1+8], %r4;
 
     mov.u32 %r1, 0x3F80C000;
-    cvt.rz.bf16.f32 %r5, %r1;
+    cvt.rz.bf16.f32 %hs1, %r1;
+    cvt.u32.u16 %r5, %hs1;
     st.global.u32 [%rd1+12], %r5;
 
     mov.u32 %r1, 0x7FC00000;
-    cvt.rz.bf16.f32 %r6, %r1;
+    cvt.rz.bf16.f32 %hs2, %r1;
+    cvt.u32.u16 %r6, %hs2;
     st.global.u32 [%rd1+16], %r6;
     ret;
 }

@@ -1,0 +1,49 @@
+.version 7.0
+.target sm_70
+.address_size 64
+// The scalar video instructions read the same bits at the type their suffixes name and
+// cut the answer back to the word. The rows below are the ones where that reading is the
+// whole answer: the unsigned maximum against the signed minimum of 0xFFFFFFFF, a
+// subtraction that wraps, absolute differences across zero and not, a product whose low
+// word is one, and a `vset` whose two sources disagree about the sign of the same bits.
+.visible .entry vscalar(.param .u64 p0)
+{
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [p0];
+    mov.u32 %r1, 0xFFFFFFFF;
+    mov.u32 %r2, 1;
+    mov.u32 %r3, 5;
+    mov.u32 %r4, 0xFFFFFFF0;
+    mov.u32 %r5, 7;
+    mov.u32 %r6, 3;
+    vadd.u32.u32.u32 %r10, %r1, %r2;
+    vsub.u32.u32.u32 %r11, %r2, %r3;
+    vmin.s32.s32.s32 %r12, %r1, %r2;
+    vmax.u32.u32.u32 %r13, %r1, %r2;
+    vabsdiff.s32.s32.s32 %r14, %r4, %r2;
+    vabsdiff.u32.u32.u32 %r15, %r2, %r3;
+    vmad.u32.u32.u32 %r16, %r1, %r1, %r5;
+    vmad.s32.s32.s32 %r17, %r4, %r3, %r6;
+    vmin.u32.u32.u32 %r18, %r3, %r5;
+    vmax.s32.s32.s32 %r19, %r4, %r3;
+    vset.s32.u32.lt %r20, %r1, %r2;
+    vset.u32.s32.gt %r21, %r1, %r1;
+    vadd.s32.s32.s32 %r22, %r3, %r5;
+    vsub.s32.u32.s32 %r23, %r3, %r1;
+    st.u32 [%rd1], %r10;
+    st.u32 [%rd1+4], %r11;
+    st.u32 [%rd1+8], %r12;
+    st.u32 [%rd1+12], %r13;
+    st.u32 [%rd1+16], %r14;
+    st.u32 [%rd1+20], %r15;
+    st.u32 [%rd1+24], %r16;
+    st.u32 [%rd1+28], %r17;
+    st.u32 [%rd1+32], %r18;
+    st.u32 [%rd1+36], %r19;
+    st.u32 [%rd1+40], %r20;
+    st.u32 [%rd1+44], %r21;
+    st.u32 [%rd1+48], %r22;
+    st.u32 [%rd1+52], %r23;
+    ret;
+}

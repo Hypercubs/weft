@@ -1,0 +1,67 @@
+// The two instructions that answer a mask of lanes, and the one that picks a lane,
+// where the member mask is a partial warp.
+//
+//     row 0   match.any of (lane & 3)          the lanes sharing that value
+//     row 1   match.any of lane                a single bit, this lane
+//     row 2   match.all of 7, the mask         FFFFFFFF: every lane holds 7
+//     row 3   match.all of 7, the predicate    1
+//     row 4   match.all of lane, the mask      0: the values differ
+//     row 5   match.all of lane, the predicate 0
+//     rows 6..8  the same three over membermask 00FFFFFF, so the mask and the
+//                match are cut to the lanes that participate
+//     row 9   elect.sync over the full mask    d = 0, the lowest lane
+//     row 10  elect.sync over the full mask    p = 1 on lane 0 only
+//     row 11  elect.sync over 00FFFFFC         d = 2, the lowest lane of that mask
+//     row 12  elect.sync over 00FFFFFC         p = 1 on lane 2 only
+//
+// A `match.any` that compared against lane 0's value, an `all` that ignored the member
+// mask, or an election that picked any lane but the lowest would each move one row.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry warpmask(.param .u64 out)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p<6>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 52;
+    add.u64 %rd2, %rd1, %rd2;
+
+    and.b32 %r2, %r1, 3;
+    match.any.sync.b32 %r3, %r2, -1;
+    match.any.sync.b32 %r4, %r1, -1;
+
+    mov.u32 %r5, 7;
+    match.all.sync.b32 %r6|%p1, %r5, -1;
+    selp.u32 %r7, 1, 0, %p1;
+    match.all.sync.b32 %r8|%p2, %r1, -1;
+    selp.u32 %r9, 1, 0, %p2;
+
+    match.any.sync.b32 %r10, %r2, 0x00FFFFFF;
+    match.all.sync.b32 %r11|%p3, %r5, 0x00FFFFFF;
+    selp.u32 %r12, 1, 0, %p3;
+
+    elect.sync %r13|%p4, -1;
+    selp.u32 %r14, 1, 0, %p4;
+    elect.sync %r15|%p5, 0x00FFFFFC;
+    selp.u32 %r16, 1, 0, %p5;
+
+    st.global.b32 [%rd2+0], %r3;
+    st.global.b32 [%rd2+4], %r4;
+    st.global.b32 [%rd2+8], %r6;
+    st.global.b32 [%rd2+12], %r7;
+    st.global.b32 [%rd2+16], %r8;
+    st.global.b32 [%rd2+20], %r9;
+    st.global.b32 [%rd2+24], %r10;
+    st.global.b32 [%rd2+28], %r11;
+    st.global.b32 [%rd2+32], %r12;
+    st.global.b32 [%rd2+36], %r13;
+    st.global.b32 [%rd2+40], %r14;
+    st.global.b32 [%rd2+44], %r15;
+    st.global.b32 [%rd2+48], %r16;
+    ret;
+}

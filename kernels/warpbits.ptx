@@ -1,0 +1,49 @@
+// Two instructions only the warp body can answer.
+//
+//     actm: out[gid] = activemask.b32            -- one bit per lane that is executing
+//     mvi:  out[gid] = movmatrix(m8n8, in[gid])  -- `.trans` is the only form PTX has,
+//           so the answer is the fragment read out of the transposed matrix
+//
+// The launch is a full warp of 32 lanes, which is what the warp body runs as one
+// thread. A mask that came back as a constant other than 0xFFFFFFFF would be wrong,
+// and a move that skipped the transpose would hand the fragment back unchanged.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry actm(
+    .param .u64 out
+)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    activemask.b32 %r2;
+    st.global.b32 [%rd2], %r2;
+    ret;
+}
+
+.visible .entry mvi(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<7>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd3, %rd1, %rd3;
+    ld.global.b32 %r2, [%rd3];
+    movmatrix.sync.aligned.m8n8.trans.b16 %r5, %r2;
+    mul.wide.u32 %rd5, %r1, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    st.global.b32 [%rd6], %r5;
+    ret;
+}

@@ -1,25 +1,25 @@
 //
-// A short immediate list, and the one flag that changes a sign.
+// A negative operand scale, and the sign it changes.
 //
-// PTX says the immediates after the descriptors, scale-d, then scale-a scale-b,
-// then transpose-a transpose-b, may be left off from the end, so a run of one to
-// five is legal. This kernel gives two: `1, 1`, which is accumulate into D and
-// negate A. A translator that only accepted one, three or five immediates refused
-// this outright; one that read them positionally but always applied zero would
-// return the product instead of its negative.
+// The immediates after the descriptors are scale-d, scale-a, scale-b, then
+// transpose-a transpose-b. The two scales are multipliers: 1 leaves the operand and
+// -1 negates it, which is why ptxas takes only those two values there. This kernel
+// gives `1, -1, 1, 0, 0`: accumulate into D, and negate A. A translator that read
+// the field positionally but always applied the positive value would return the
+// product instead of its negative.
 //
 // The tiles are the unswizzled layout, the same bytes the plain fixture stages.
 .version 8.1
-.target sm_90
+.target sm_90a
 .address_size 64
-
-.maxntid 128, 1, 1
 
 .visible .entry wgmma_shortimm_kernel(
 	.param .u64 wgmma_shortimm_kernel_param_0,
 	.param .u64 wgmma_shortimm_kernel_param_1,
 	.param .u64 wgmma_shortimm_kernel_param_2
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .b32 	%r<40>;
 	.reg .f32 	%f<12>;
@@ -88,7 +88,7 @@
 	mov.f32 	%f7, 0f00000000;
 	mov.f32 	%f8, 0f00000000;
 	wgmma.fence.sync.aligned;
-	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 1;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, -1, 1, 0, 0;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 

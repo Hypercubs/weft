@@ -11,8 +11,8 @@
 // would expect thirty-two times. `tile[0]` is the input buffer's first float, so a copy
 // that never happened reads the arena and a copy that moved the wrong address reads the
 // wrong word, both show up in the number.
-.version 7.0
-.target sm_70
+.version 8.0
+.target sm_90
 .address_size 64
 
 .visible .entry mbarbulk(

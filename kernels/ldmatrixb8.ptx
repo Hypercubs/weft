@@ -23,8 +23,8 @@
 //
 // What this cannot check is agreement with a real GPU: these instructions are sm_100
 // and this host is not, so the fixture pins the implementation to the published map.
-.version 8.3
-.target sm_100
+.version 8.8
+.target sm_100a
 .address_size 64
 
 .visible .entry ldmatrixb8(

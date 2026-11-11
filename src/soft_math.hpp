@@ -28,6 +28,55 @@ static const char* const kWSoftMath = R"WEFTMATH(
 #else
 #define WEFT_SQRT(x) std::sqrt(x)
 #endif
+// The 32-bit atomics a 16-bit atomic is built from. Metal spells them as functions of
+// the pointer in `device`, this host as members of `weft::`; the load has to be a real
+// atomic load, because a compare-exchange used as one would write what it compares.
+// The MSL atomics are in `metal` and this text is at global scope, where nothing
+// imports them, so the compare-exchange is written out here and named in full. It
+// hands back the value the word held, whether or not it matched, which is the
+// answer both the load and the cas need.
+#ifdef __METAL_VERSION__
+static inline uint32_t weft_cas_u32(device uint32_t* p, uint32_t cmp, uint32_t v) {
+  uint32_t expect = cmp;
+  (void)metal::atomic_compare_exchange_weak_explicit(
+      (device metal::atomic_uint*)p, &expect, v, metal::memory_order_relaxed,
+      metal::memory_order_relaxed);
+  return expect;
+}
+#define WEFT_DEVICE device
+// MSL makes the address space part of the pointer type, so the same two operations
+// exist twice: a device word and a word in the threadgroup window. The atomics below
+// then have one body each and the pointer a call passes picks the space -- a `.shared`
+// atomic is not the device atomic with a cast, it is the same result on other memory.
+static inline uint32_t weft_aload_u32(device uint32_t* p) {
+  return metal::atomic_load_explicit((device metal::atomic_uint*)p, metal::memory_order_relaxed);
+}
+static inline uint32_t weft_aload_u32(threadgroup uint32_t* p) {
+  return metal::atomic_load_explicit((threadgroup metal::atomic_uint*)p,
+                                     metal::memory_order_relaxed);
+}
+static inline uint32_t weft_cas_u32(threadgroup uint32_t* p, uint32_t cmp, uint32_t v) {
+  uint32_t expect = cmp;
+  (void)metal::atomic_compare_exchange_weak_explicit(
+      (threadgroup metal::atomic_uint*)p, &expect, v, metal::memory_order_relaxed,
+      metal::memory_order_relaxed);
+  return expect;
+}
+#define WEFT_ALOAD(p) weft_aload_u32(p)
+#define WEFT_CAS(p, c, v) weft_cas_u32((p), (c), (v))
+#else
+// The same two operations from the compiler's own atomics. This text is also
+// compiled where no host runtime is in scope (tools/f32_math.py builds it into a
+// harness of its own), so nothing here may name `weft::`.
+static inline uint32_t weft_cas_u32(uint32_t* p, uint32_t cmp, uint32_t v) {
+  uint32_t expect = cmp;
+  (void)__atomic_compare_exchange_n(p, &expect, v, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+  return expect;
+}
+#define WEFT_DEVICE
+#define WEFT_ALOAD(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+#define WEFT_CAS(p, c, v) weft_cas_u32((p), (c), (v))
+#endif
 
 #define WEFT_LN2 0.6931471805599453f
 #define WEFT_INF 3.402823466e38f
@@ -37,6 +86,35 @@ static const char* const kWSoftMath = R"WEFTMATH(
 #define weft_bits(x) as_type<uint32_t>(x)
 #define weft_float(x) as_type<float>(x)
 #else
+// A 128-bit value: two 64-bit halves, low first. PTX names the type `.b128` and no
+// arithmetic is defined on it -- the only instructions that carry one are the 16-byte
+// load, the 16-byte store and the compare-exchange -- so the struct is a pair of
+// words and nothing else. Both halves are read and written in one access, which is
+// what makes the load and store exact rather than two halves that can be torn.
+struct weft_u128 {
+  uint64_t lo;
+  uint64_t hi;
+};
+
+// `atom.cas.b128` compares and writes sixteen bytes as one value, and no atomic
+// instruction here is that wide. The four 32-bit words are read, compared and written
+// under a lock keyed on the address, so a lane asking at the same moment waits rather
+// than seeing half a swap. The lock is a stripe table rather than one word: two lanes
+// on unrelated buffers would otherwise take turns for no reason, and a collision only
+// costs time. The value itself is copied whole in each half, never word by word.
+inline char weft_b128_locks[64];
+
+static inline weft_u128 weft_atom_cas_b128(weft_u128* p, weft_u128 c, weft_u128 v) {
+  const uintptr_t a = (uintptr_t)p;
+  char* l = &weft_b128_locks[((a >> 4) ^ (a >> 12)) & 63u];
+  while (__atomic_test_and_set(l, __ATOMIC_ACQUIRE)) {
+  }
+  const weft_u128 o = *p;
+  if (o.lo == c.lo && o.hi == c.hi) *p = v;
+  __atomic_clear(l, __ATOMIC_RELEASE);
+  return o;
+}
+
 static inline uint32_t weft_bits(float x) {
   uint32_t u;
   std::memcpy(&u, &x, 4);
@@ -858,6 +936,540 @@ inline half4 weft_fma(half4 a, half4 b, half4 c) {
   return half4(weft_fma(a.x, b.x, c.x), weft_fma(a.y, b.y, c.y),
                weft_fma(a.z, b.z, c.z), weft_fma(a.w, b.w, c.w));
 }
+//
+// The 16-bit float bit helpers. A PTX `b16` register holds the *bits* of a half, so a
+// `.f16` instruction has to reinterpret them, compute, and put the bits back. Add,
+// subtract and multiply are exact in a float and round once on the way back, so those
+// are written in the narrow type and the compiler lowers them to the hardware's own
+// half operation on both engines; `fma` is not, and is computed exactly below.
+// The reinterpret is spelled here rather than through `weft_bitcast`, because this
+// text is also spliced into the Metal front end's module ahead of that template.
+#ifdef __METAL_VERSION__
+#define weft_f16_of(b) as_type<half>(b)
+#define weft_f16_bits(h) as_type<uint16_t>(h)
+#else
+static inline half weft_f16_of(uint16_t b) {
+  half h;
+  memcpy(&h, &b, 2);
+  return h;
+}
+static inline uint16_t weft_f16_bits(half h) {
+  uint16_t b;
+  memcpy(&b, &h, 2);
+  return b;
+}
+#endif
+// A 16-bit float constant as the emitter spells it: the type is `_Float16` on a host
+// and `half` on a GPU, and this is the one name both texts know.
+static inline half weft_h16v(uint16_t b) { return weft_f16_of(b); }
+
+static inline uint16_t weft_f16_add(uint16_t a, uint16_t b) {
+  return weft_f16_bits(weft_f16_of(a) + weft_f16_of(b));
+}
+static inline uint16_t weft_f16_sub(uint16_t a, uint16_t b) {
+  return weft_f16_bits(weft_f16_of(a) - weft_f16_of(b));
+}
+static inline uint16_t weft_f16_mul(uint16_t a, uint16_t b) {
+  return weft_f16_bits(weft_f16_of(a) * weft_f16_of(b));
+}
+// minNum/maxNum, the ISA's rule: a NaN operand hands back the other one, and two
+// zeros of opposite sign keep the sign the operator's identity wants, -0 for a
+// minimum and +0 for a maximum, which the bitwise answer gives exactly.
+static inline uint16_t weft_f16_min(uint16_t a, uint16_t b) {
+  const half x = weft_f16_of(a), y = weft_f16_of(b);
+  if (x != x) return b;
+  if (y != y) return a;
+  if (x == y) return (uint16_t)(a & b);
+  return x < y ? a : b;
+}
+static inline uint16_t weft_f16_max(uint16_t a, uint16_t b) {
+  const half x = weft_f16_of(a), y = weft_f16_of(b);
+  if (x != x) return b;
+  if (y != y) return a;
+  if (x == y) return (uint16_t)(a | b);
+  return x < y ? b : a;
+}
+// neg and abs are the sign bit, so they are exact on a NaN as well.
+static inline uint16_t weft_f16_neg(uint16_t a) { return (uint16_t)(a ^ 0x8000u); }
+static inline uint16_t weft_f16_abs(uint16_t a) { return (uint16_t)(a & 0x7FFFu); }
+// `.sat` on a floating-point destination is the [0, 1] clamp with a NaN flushed to
+// positive zero, not the destination's range.
+static inline uint16_t weft_f16_sat(uint16_t a) {
+  const half v = weft_f16_of(a);
+  if (v != v) return 0u;
+  if (v < (half)0) return 0u;
+  if (v > (half)1) return 0x3C00u;
+  return a;
+}
+// fma on a half, rounded once. Two 11-bit significands multiply to 22 bits, exact in
+// an integer, and the sum with the addend is exact in 64 once both sit on a common
+// exponent. `_Float16` on a host without fp16 arithmetic widens the product to float
+// and rounds the sum twice, which lands one ulp off the GPU's single-rounded answer
+// on a tie, so the rounding is written here instead of trusted.
+//
+// The window keeps the top 61 bits of the exact sum and remembers anything dropped in
+// one sticky flag, which is everything a nearest-even decision needs: the term that
+// sets the window is placed whole, so an exact zero can never carry a sticky bit.
+// The last step every narrow operation shares: a significand `mag` sitting at `lsb`,
+// with anything below it folded into `sticky`, rounded once to nearest even on the
+// width's own grid and encoded. A division, a square root and a fused multiply-add
+// all end here, so none of them can round differently from the others.
+static inline uint32_t weft_narrow_pack(uint64_t mag, int lsb, bool sticky, int sign,
+                                        int mbits, int ebits) {
+  const int sbit = ebits + mbits;
+  const uint32_t xmask = ((uint32_t)1 << ebits) - 1u;
+  const uint32_t lead = (uint32_t)1 << mbits;
+  const int bias = (1 << (ebits - 1)) - 1;
+  const int sube = 1 - bias - mbits;
+  const uint32_t qinf = xmask << mbits;
+  const int sub = sube - lsb;         // the subnormal grid, or the coarse one it takes
+  int bl = 0;
+  for (uint64_t t = mag; t; t >>= 1) bl++;
+  int drop = bl - (mbits + 1);        // one implicit bit plus the significand
+  if (sub > drop) drop = sub;
+  while (drop < 0) { mag <<= 1; lsb--; drop++; }
+  uint64_t q = mag;
+  int round_bit = 0;
+  if (drop > 0) {
+    if (drop >= 64) { sticky = sticky || (mag != 0u); q = 0u; }
+    else {
+      // The bit just below the kept ones is the round bit and the bits under it
+      // are sticky; counting the round bit as sticky rounded every exact tie up,
+      // where nearest-even sometimes keeps the lower candidate.
+      const uint64_t low = drop > 1 ? ((1ull << (drop - 1)) - 1ull) : 0ull;
+      if ((mag & low) != 0u) sticky = true;
+      round_bit = (int)((mag >> (drop - 1)) & 1ull);
+      q = mag >> drop;
+    }
+  }
+  if (round_bit && (sticky || (q & 1ull))) q += 1ull;
+  const int ex = lsb + drop;          // the value is q * 2^ex
+  if (q >= lead) {
+    int E = ex + bias + mbits;
+    if (q >= 2u * lead) { q = lead; E += 1; }
+    if (E >= (int)xmask) return (uint32_t)((sign << sbit) | qinf);
+    return (uint32_t)((sign << sbit) | ((uint32_t)E << mbits) | (uint32_t)(q - lead));
+  }
+  return (uint32_t)((sign << sbit) | (uint32_t)q);
+}
+
+// The integer square root, restoring one bit at a time: the remainder left in `n` is
+// what tells a division or a root whether anything sits below the significand.
+static inline uint64_t weft_isqrt64(uint64_t n) {
+  uint64_t r = 0;
+  uint64_t bit = (uint64_t)1 << 62;
+  while (bit > n) bit >>= 2;
+  while (bit) {
+    if (n >= r + bit) {
+      n -= r + bit;
+      r = (r >> 1) + bit;
+    } else {
+      r >>= 1;
+    }
+    bit >>= 2;
+  }
+  return r;
+}
+
+// A division: the quotient of the two significands at their exponent difference, with
+// the remainder as the sticky bit. The quotient keeps 48 bits above the grid, so the
+// round bit and the sticky are both real and the one rounding in `pack` is exact.
+static inline uint32_t weft_narrow_div(uint32_t ab, uint32_t bb, int mbits, int ebits) {
+  const int sbit = ebits + mbits;
+  const uint32_t xmask = ((uint32_t)1 << ebits) - 1u;
+  const uint32_t mmask = ((uint32_t)1 << mbits) - 1u;
+  const uint32_t lead = (uint32_t)1 << mbits;
+  const int bias = (1 << (ebits - 1)) - 1;
+  const int sube = 1 - bias - mbits;
+  const uint32_t qnan = (xmask << mbits) | mmask;
+  const uint32_t qinf = xmask << mbits;
+  const uint32_t sgn = (uint32_t)1 << sbit;
+  const uint32_t ea = (ab >> mbits) & xmask, eb = (bb >> mbits) & xmask;
+  const uint32_t fa = ab & mmask, fb = bb & mmask;
+  const int rs = (int)((ab ^ bb) >> sbit);
+  if ((ea == xmask && fa) || (eb == xmask && fb)) return qnan;
+  const bool infa = ea == xmask, infb = eb == xmask;
+  const bool zera = ea == 0u && fa == 0u, zerb = eb == 0u && fb == 0u;
+  if (infa && infb) return qnan;
+  if (infa) return (uint32_t)((rs << sbit) | qinf);
+  if (infb) return (uint32_t)(rs ? sgn : 0u);
+  if (zerb) return zera ? qnan : (uint32_t)((rs << sbit) | qinf);
+  if (zera) return (uint32_t)(rs ? sgn : 0u);
+  const uint64_t ma = ea == 0u ? fa : fa + lead;
+  const uint64_t mb = eb == 0u ? fb : fb + lead;
+  const int xa = ea == 0u ? sube : (int)ea - bias - mbits;
+  const int xb = eb == 0u ? sube : (int)eb - bias - mbits;
+  const uint64_t num = ma << 48;
+  const uint64_t q = num / mb;
+  const bool sticky = (num % mb) != 0u;
+  return weft_narrow_pack(q, xa - xb - 48, sticky, rs, mbits, ebits);
+}
+
+// A square root: the significand on an even exponent, the integer root of it shifted up
+// for guard bits, and the remainder as sticky. A root is never exactly a grid midpoint
+// (a midpoint squared needs twice as many significand bits as the grid has), but the
+// rounding is the same nearest-even one anyway, so there is nothing special here.
+static inline uint32_t weft_narrow_sqrt(uint32_t ab, int mbits, int ebits) {
+  const int sbit = ebits + mbits;
+  const uint32_t xmask = ((uint32_t)1 << ebits) - 1u;
+  const uint32_t mmask = ((uint32_t)1 << mbits) - 1u;
+  const uint32_t lead = (uint32_t)1 << mbits;
+  const int bias = (1 << (ebits - 1)) - 1;
+  const int sube = 1 - bias - mbits;
+  const uint32_t qnan = (xmask << mbits) | mmask;
+  const uint32_t qinf = xmask << mbits;
+  const uint32_t ea = (ab >> mbits) & xmask;
+  const uint32_t fa = ab & mmask;
+  if (ea == xmask && fa) return qnan;
+  if (ea == xmask) return qinf;
+  if ((ab >> sbit) && ab != (uint32_t)(1 << sbit)) return qnan;   // negative, and not -0
+  if (ea == 0u && fa == 0u) return ab;                            // a zero keeps its sign
+  uint64_t ma = ea == 0u ? fa : fa + lead;
+  int xa = ea == 0u ? sube : (int)ea - bias - mbits;
+  if (xa & 1) {
+    ma <<= 1;
+    xa -= 1;
+  }
+  const int sh = 2 * (mbits + 3);
+  const uint64_t n = ma << sh;
+  const uint64_t s = weft_isqrt64(n);
+  return weft_narrow_pack(s, xa / 2 - (mbits + 3), (n - s * s) != 0u, 0, mbits, ebits);
+}
+
+// It is one routine for both narrow floats, at their own widths: `mbits`
+// significand bits and `ebits` exponent bits describe a half as 10 and 5, and a
+// bf16 as 7 and 8. Only the field masks and the exponent bias differ.
+static inline uint32_t weft_narrow_fma(uint32_t ab, uint32_t bb, uint32_t cb, int mbits,
+                                      int ebits) {
+  const int sbit = ebits + mbits;
+  const uint32_t xmask = ((uint32_t)1 << ebits) - 1u;
+  const uint32_t mmask = ((uint32_t)1 << mbits) - 1u;
+  const uint32_t lead = (uint32_t)1 << mbits;
+  const int bias = (1 << (ebits - 1)) - 1;
+  const int sube = 1 - bias - mbits;   // the exponent of the subnormal grid's LSB
+  const uint32_t qnan = (xmask << mbits) | mmask;
+  const uint32_t qinf = xmask << mbits;
+  const uint32_t sgn = (uint32_t)1 << sbit;
+  const uint32_t ea = (ab >> mbits) & xmask, eb = (bb >> mbits) & xmask,
+                 ec = (cb >> mbits) & xmask;
+  const uint32_t fa = ab & mmask, fb = bb & mmask, fc = cb & mmask;
+  const int sa = (int)(ab >> sbit), sb = (int)(bb >> sbit), sc = (int)(cb >> sbit);
+  // A NaN anywhere, an infinity times a zero, or two infinities of opposite signs
+  // answer the canonical NaN: sign 0, exponent all ones, every mantissa bit set.
+  if ((ea == xmask && fa) || (eb == xmask && fb) || (ec == xmask && fc)) return qnan;
+  const bool infa = ea == xmask, infb = eb == xmask, infc = ec == xmask;
+  const bool zera = ea == 0u && fa == 0u, zerb = eb == 0u && fb == 0u;
+  if ((infa && zerb) || (infb && zera)) return qnan;
+  if (infa || infb) {
+    if (infc && ((sa ^ sb) != sc)) return qnan;
+    return (uint32_t)(((sa ^ sb) << sbit) | qinf);
+  }
+  if (infc) return (uint32_t)((sc << sbit) | qinf);
+
+  const uint64_t ma = ea == 0u ? fa : fa + lead;
+  const uint64_t mb = eb == 0u ? fb : fb + lead;
+  const uint64_t mc = ec == 0u ? fc : fc + lead;
+  const int xa = ea == 0u ? sube : (int)ea - bias - mbits;
+  const int xb = eb == 0u ? sube : (int)eb - bias - mbits;
+  const int xc = ec == 0u ? sube : (int)ec - bias - mbits;
+  const uint64_t mp = ma * mb;
+  const int ep = xa + xb;
+  const bool negp = (sa ^ sb) != 0;
+  if (mp == 0u && mc == 0u) return (uint32_t)((negp && sc) ? sgn : 0u);
+
+  // The window is set from the *top bit* of the larger term, not from its
+  // exponent: a product has up to 22 significand bits above its own exponent, and
+  // a window set from the exponent alone shifted the product out of the 64-bit
+  // sum entirely, which answered zero.
+  int blp = 0, blc = 0;
+  for (uint64_t t = mp; t; t >>= 1) blp++;
+  for (uint64_t t = mc; t; t >>= 1) blc++;
+  int hi = -100000;
+  if (mp) hi = ep + blp - 1;
+  if (mc) { const int q = xc + blc - 1; if (q > hi) hi = q; }
+  const int es = hi - 60;
+  bool sticky = false;
+  // One term placed on the window: shifted up when it sits above it, down (with the
+  // lost bits remembered) when it sits below.
+  uint64_t pp = 0u, pc = 0u;
+  {
+    int sh = ep - es;
+    if (mp != 0u) {
+      if (sh >= 0) pp = mp << sh;
+      else if (-sh < 64) {
+        if ((mp & ((1ull << -sh) - 1ull)) != 0u) sticky = true;
+        pp = mp >> -sh;
+      } else sticky = true;
+    }
+    sh = xc - es;
+    if (mc != 0u) {
+      if (sh >= 0) pc = mc << sh;
+      else if (-sh < 64) {
+        if ((mc & ((1ull << -sh) - 1ull)) != 0u) sticky = true;
+        pc = mc >> -sh;
+      } else sticky = true;
+    }
+  }
+  const int64_t sum = (negp ? -(int64_t)pp : (int64_t)pp) + (sc ? -(int64_t)pc : (int64_t)pc);
+  if (sum == 0) return (uint32_t)((negp && sc) ? sgn : 0u);
+
+  const int sign = sum < 0 ? 1 : 0;
+  const uint64_t mag = sum < 0 ? (uint64_t)(-sum) : (uint64_t)sum;
+  return weft_narrow_pack(mag, es, sticky, sign, mbits, ebits);
+}
+
+static inline uint16_t weft_f16_fma(uint16_t ab, uint16_t bb, uint16_t cb) {
+  return (uint16_t)weft_narrow_fma(ab, bb, cb, 10, 5);
+}
+static inline uint16_t weft_bf16_fma(uint16_t ab, uint16_t bb, uint16_t cb) {
+  return (uint16_t)weft_narrow_fma(ab, bb, cb, 7, 8);
+}
+static inline uint16_t weft_f16_div(uint16_t a, uint16_t b) {
+  return (uint16_t)weft_narrow_div(a, b, 10, 5);
+}
+static inline uint16_t weft_f16_rcp(uint16_t a) {
+  return (uint16_t)weft_narrow_div(0x3C00u, a, 10, 5);
+}
+static inline uint16_t weft_f16_sqrt(uint16_t a) {
+  return (uint16_t)weft_narrow_sqrt(a, 10, 5);
+}
+static inline uint16_t weft_bf16_div(uint16_t a, uint16_t b) {
+  return (uint16_t)weft_narrow_div(a, b, 7, 8);
+}
+static inline uint16_t weft_bf16_rcp(uint16_t a) {
+  return (uint16_t)weft_narrow_div(0x3F80u, a, 7, 8);
+}
+static inline uint16_t weft_bf16_sqrt(uint16_t a) {
+  return (uint16_t)weft_narrow_sqrt(a, 7, 8);
+}
+// The packed `f16x2` forms are the same operation twice, low half then high.
+static inline uint32_t weft_f16x2_add(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_add((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_add((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_sub(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_sub((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_sub((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_mul(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_mul((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_mul((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_fma(uint32_t a, uint32_t b, uint32_t c) {
+  return (uint32_t)weft_f16_fma((uint16_t)a, (uint16_t)b, (uint16_t)c) |
+         ((uint32_t)weft_f16_fma((uint16_t)(a >> 16), (uint16_t)(b >> 16),
+                                 (uint16_t)(c >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_min(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_min((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_min((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_max(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_max((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_max((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_neg(uint32_t a) {
+  return weft_f16_neg((uint16_t)a) | ((uint32_t)weft_f16_neg((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_abs(uint32_t a) {
+  return weft_f16_abs((uint16_t)a) | ((uint32_t)weft_f16_abs((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_sat(uint32_t a) {
+  return weft_f16_sat((uint16_t)a) | ((uint32_t)weft_f16_sat((uint16_t)(a >> 16)) << 16);
+}
+
+// The two `min`/`max` forms that are not the plain one. `.NaN` answers a canonical
+// NaN where the plain form hands the other operand back, and `.xorsign.abs` compares
+// magnitudes and keeps the exclusive or of the two signs, which is how a sign fold
+// survives a magnitude compare in one instruction.
+static inline uint16_t weft_f16_min_nan(uint16_t a, uint16_t b) {
+  const half x = weft_f16_of(a), y = weft_f16_of(b);
+  if (x != x || y != y) return 0x7FFFu;
+  return weft_f16_min(a, b);
+}
+static inline uint16_t weft_f16_max_nan(uint16_t a, uint16_t b) {
+  const half x = weft_f16_of(a), y = weft_f16_of(b);
+  if (x != x || y != y) return 0x7FFFu;
+  return weft_f16_max(a, b);
+}
+static inline uint16_t weft_f16_min_xorabs(uint16_t a, uint16_t b) {
+  const uint16_t mag = weft_f16_min((uint16_t)(a & 0x7FFFu), (uint16_t)(b & 0x7FFFu));
+  if ((mag & 0x7C00u) == 0x7C00u && (mag & 0x03FFu) != 0u) return 0x7FFFu;
+  return (uint16_t)(mag | ((a ^ b) & 0x8000u));
+}
+static inline uint16_t weft_f16_max_xorabs(uint16_t a, uint16_t b) {
+  const uint16_t mag = weft_f16_max((uint16_t)(a & 0x7FFFu), (uint16_t)(b & 0x7FFFu));
+  if ((mag & 0x7C00u) == 0x7C00u && (mag & 0x03FFu) != 0u) return 0x7FFFu;
+  return (uint16_t)(mag | ((a ^ b) & 0x8000u));
+}
+static inline uint32_t weft_f16x2_min_nan(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_min_nan((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_min_nan((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_max_nan(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_max_nan((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_max_nan((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_min_xorabs(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_min_xorabs((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_min_xorabs((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_max_xorabs(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_max_xorabs((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_max_xorabs((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+
+// bf16 is the top half of a float: eight significand bits and a float's exponent
+// range. Its bits are therefore a float a shift away, and add, sub and mul are exact
+// in a float before the one rounding back, so only the fused form needs the integer
+// routine above.
+#ifdef __METAL_VERSION__
+#define weft_b16_of(b) as_type<float>((uint32_t)(b) << 16)
+#define weft_b16_u32(f) as_type<uint32_t>(f)
+#else
+static inline float weft_b16_of(uint16_t b) {
+  const uint32_t u = (uint32_t)b << 16;
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
+static inline uint32_t weft_b16_u32(float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  return u;
+}
+#endif
+// One rounding back to bf16, nearest even on the bit below the kept ones. A NaN or
+// an infinity keeps its bits, and an inexact one would carry into the exponent and
+// answer an infinity, which is the round-to-nearest answer anyway.
+static inline uint16_t weft_bf16_round(float f) {
+  uint32_t u = weft_b16_u32(f);
+  if ((u & 0x7F800000u) != 0x7F800000u) u += 0x7FFFu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+static inline uint16_t weft_bf16_add(uint16_t a, uint16_t b) {
+  return weft_bf16_round(weft_b16_of(a) + weft_b16_of(b));
+}
+static inline uint16_t weft_bf16_sub(uint16_t a, uint16_t b) {
+  return weft_bf16_round(weft_b16_of(a) - weft_b16_of(b));
+}
+static inline uint16_t weft_bf16_mul(uint16_t a, uint16_t b) {
+  return weft_bf16_round(weft_b16_of(a) * weft_b16_of(b));
+}
+static inline uint16_t weft_bf16_min(uint16_t a, uint16_t b) {
+  const float x = weft_b16_of(a), y = weft_b16_of(b);
+  if (x != x) return b;
+  if (y != y) return a;
+  if (x == y) return (uint16_t)(a & b);
+  return x < y ? a : b;
+}
+static inline uint16_t weft_bf16_max(uint16_t a, uint16_t b) {
+  const float x = weft_b16_of(a), y = weft_b16_of(b);
+  if (x != x) return b;
+  if (y != y) return a;
+  if (x == y) return (uint16_t)(a | b);
+  return x < y ? b : a;
+}
+static inline uint16_t weft_bf16_neg(uint16_t a) { return (uint16_t)(a ^ 0x8000u); }
+static inline uint16_t weft_bf16_abs(uint16_t a) { return (uint16_t)(a & 0x7FFFu); }
+static inline uint16_t weft_bf16_sat(uint16_t a) {
+  const float v = weft_b16_of(a);
+  if (v != v) return 0u;
+  if (v < 0.0f) return 0u;
+  if (v > 1.0f) return 0x3F80u;
+  return a;
+}
+static inline uint16_t weft_bf16_min_nan(uint16_t a, uint16_t b) {
+  const float x = weft_b16_of(a), y = weft_b16_of(b);
+  if (x != x || y != y) return 0x7FFFu;
+  return weft_bf16_min(a, b);
+}
+static inline uint16_t weft_bf16_max_nan(uint16_t a, uint16_t b) {
+  const float x = weft_b16_of(a), y = weft_b16_of(b);
+  if (x != x || y != y) return 0x7FFFu;
+  return weft_bf16_max(a, b);
+}
+static inline uint16_t weft_bf16_min_xorabs(uint16_t a, uint16_t b) {
+  const uint16_t mag = weft_bf16_min((uint16_t)(a & 0x7FFFu), (uint16_t)(b & 0x7FFFu));
+  if ((mag & 0x7F80u) == 0x7F80u && (mag & 0x007Fu) != 0u) return 0x7FFFu;
+  return (uint16_t)(mag | ((a ^ b) & 0x8000u));
+}
+static inline uint16_t weft_bf16_max_xorabs(uint16_t a, uint16_t b) {
+  const uint16_t mag = weft_bf16_max((uint16_t)(a & 0x7FFFu), (uint16_t)(b & 0x7FFFu));
+  if ((mag & 0x7F80u) == 0x7F80u && (mag & 0x007Fu) != 0u) return 0x7FFFu;
+  return (uint16_t)(mag | ((a ^ b) & 0x8000u));
+}
+static inline uint32_t weft_bf16x2_add(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_add((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_add((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_sub(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_sub((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_sub((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_mul(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_mul((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_mul((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_fma(uint32_t a, uint32_t b, uint32_t c) {
+  return (uint32_t)weft_bf16_fma((uint16_t)a, (uint16_t)b, (uint16_t)c) |
+         ((uint32_t)weft_bf16_fma((uint16_t)(a >> 16), (uint16_t)(b >> 16),
+                                  (uint16_t)(c >> 16))
+          << 16);
+}
+static inline uint32_t weft_bf16x2_min(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_min((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_min((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_max(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_max((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_max((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_neg(uint32_t a) {
+  return weft_bf16_neg((uint16_t)a) | ((uint32_t)weft_bf16_neg((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_abs(uint32_t a) {
+  return weft_bf16_abs((uint16_t)a) | ((uint32_t)weft_bf16_abs((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_sat(uint32_t a) {
+  return weft_bf16_sat((uint16_t)a) | ((uint32_t)weft_bf16_sat((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_min_nan(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_min_nan((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_min_nan((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_max_nan(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_max_nan((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_max_nan((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_min_xorabs(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_min_xorabs((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_min_xorabs((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_max_xorabs(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_max_xorabs((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_max_xorabs((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_div(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_f16_div((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_f16_div((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_rcp(uint32_t a) {
+  return weft_f16_rcp((uint16_t)a) | ((uint32_t)weft_f16_rcp((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_f16x2_sqrt(uint32_t a) {
+  return weft_f16_sqrt((uint16_t)a) | ((uint32_t)weft_f16_sqrt((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_div(uint32_t a, uint32_t b) {
+  return (uint32_t)weft_bf16_div((uint16_t)a, (uint16_t)b) |
+         ((uint32_t)weft_bf16_div((uint16_t)(a >> 16), (uint16_t)(b >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_rcp(uint32_t a) {
+  return weft_bf16_rcp((uint16_t)a) | ((uint32_t)weft_bf16_rcp((uint16_t)(a >> 16)) << 16);
+}
+static inline uint32_t weft_bf16x2_sqrt(uint32_t a) {
+  return weft_bf16_sqrt((uint16_t)a) | ((uint32_t)weft_bf16_sqrt((uint16_t)(a >> 16)) << 16);
+}
 
 inline float weft_smoothstep(float e0, float e1, float x) {
   const float t = (x < e0) ? 0.0f : (x > e1 ? 1.0f : (x - e0) / (e1 - e0));
@@ -1176,6 +1788,10 @@ inline uint4 weft_select(uint4 a, uint4 b, bool c) { return c ? b : a; }
 #define WEFT_DF_LOG10E   weft_df{0x1.bcb7b20000000p-2f, -0x1.5b235e0000000p-27f}
 #define WEFT_DF_PI       weft_df{0x1.921fb60000000p+1f, -0x1.777a5c0000000p-24f}
 #define WEFT_DF_PI_2     weft_df{0x1.921fb60000000p+0f, -0x1.777a5c0000000p-25f}
+// What that pair leaves on the table, as a bound: the reduction multiplies it by the
+// quarter turns it took, so an input used as it came in (no quarter turn) carries no
+// reduction error at all, and a small result is not charged for one it never had.
+#define WEFT_PI_2_RESID  1.77635702e-15f
 #define WEFT_DF_INV3     weft_df{0x1.5555560000000p-2f, -0x1.5555560000000p-27f}
 #define WEFT_DF_INV5     weft_df{0x1.99999a0000000p-3f, -0x1.99999a0000000p-29f}
 #define WEFT_DF_INV7     weft_df{0x1.24924a0000000p-3f, -0x1.b6db6e0000000p-28f}
@@ -1392,24 +2008,28 @@ inline weft_df weft_log1p_df(weft_df u) {
   return weft_df_scale(weft_atanh_series(t), 2.0f);
 }
 inline float weft_log(float v) {
+  if (v == 1.0f) return 0.0f;   // an exact zero is not a rounding
   if (!(v > 1.0e-28f) || !(v < 3.0e38f)) return weft_log_wide(v);
   const weft_df d = weft_log_df(weft_df_of(v));
   if (weft_cr(d, 0.0f)) return d.hi;
   return weft_log_wide(v);
 }
 inline float weft_log2(float v) {
+  if (v == 1.0f) return 0.0f;   // an exact zero is not a rounding
   if (!(v > 1.0e-28f) || !(v < 3.0e38f)) return weft_log2_wide(v);
   const weft_df d = weft_df_mul(weft_log_df(weft_df_of(v)), WEFT_DF_LOG2E);
   if (weft_cr(d, 0.0f)) return d.hi;
   return weft_log2_wide(v);
 }
 inline float weft_log10(float v) {
+  if (v == 1.0f) return 0.0f;   // an exact zero is not a rounding
   if (!(v > 1.0e-28f) || !(v < 3.0e38f)) return weft_log10_wide(v);
   const weft_df d = weft_df_mul(weft_log_df(weft_df_of(v)), WEFT_DF_LOG10E);
   if (weft_cr(d, 0.0f)) return d.hi;
   return weft_log10_wide(v);
 }
 inline float weft_log1p(float v) {
+  if (v == 0.0f) return v;   // an exact zero is not a rounding
   if (!(v > -1.0f) || !(v < 3.0e38f)) return weft_log1p_wide(v);
   const weft_df d = weft_log1p_df(weft_df_of(v));
   if (weft_cr(d, 0.0f)) return d.hi;
@@ -1491,12 +2111,13 @@ inline float weft_hypot(float x, float y) {
 
 // The reduction to [-pi/4, pi/4] and its quarter turn, in a pair: pi/2 is a pair, so
 // k*pi/2 keeps its digits while k stays under 2^8. Past that the fp64 text reduces.
-struct weft_red { weft_df r; int q; };
+struct weft_red { weft_df r; int q; float err; };
 inline weft_red weft_trig_red(float x) {
   const float k = weft_rint_even(x * 0.63661975f);
   weft_red out;
   out.r = weft_df_sub(weft_df_of(x), weft_df_mul(weft_df_of(k), WEFT_DF_PI_2));
   out.q = ((int)(k - 4.0f * weft_rint_even(k * 0.25f))) & 3;
+  out.err = (k < 0.0f ? -k : k) * WEFT_PI_2_RESID;
   return out;
 }
 // sin r = r(1 - r^2/6 + ... + r^12/13!), the coefficients in pairs.
@@ -1520,19 +2141,24 @@ inline weft_df weft_cos_core(weft_df r2) {
   p = weft_df_sum(weft_df_mul(p, r2), weft_df_neg(WEFT_DF_IF2));
   return weft_df_sum(weft_df_mul(p, r2), WEFT_DF_ONE);
 }
+// The pair's pi/2 is good to a few times 2^-48, so at k near 41,700 (the top of a
+// half's range) the reduced angle is still inside 2e-10, and a float ulp of the sine is
+// 6e-8: the range that used to hand everything above 256 to the fp64 text reduces here,
+// and weft_cr still refuses any lane whose last bit it cannot prove.
 inline bool weft_trig_ok(float x) {
   const float ax = x < 0.0f ? -x : x;
-  return ax <= 256.0f;
+  return ax <= 65536.0f;
 }
 // A pair of pairs, returned by value: a pointer parameter would need an address space
 // in Metal, and the two engines have to compile the same text.
-struct weft_sc { weft_df s, c; bool ok; };
+struct weft_sc { weft_df s, c; bool ok; float err; };
 // A pair and whether there is one, returned by value: a pointer parameter would need an
 // address space in Metal.
 struct weft_dfr { weft_df d; bool ok; };
 inline weft_sc weft_trig_pair(float x) {
   weft_sc out;
   out.ok = false;
+  out.err = 0.0f;
   out.s = weft_df_of(0.0f);
   out.c = weft_df_of(0.0f);
   if (!weft_trig_ok(x)) return out;
@@ -1545,20 +2171,23 @@ inline weft_sc weft_trig_pair(float x) {
   else if (red.q == 1) { out.s = co; out.c = weft_df_neg(si); }
   else if (red.q == 2) { out.s = weft_df_neg(si); out.c = weft_df_neg(co); }
   else { out.s = weft_df_neg(co); out.c = si; }
+  out.err = red.err;
   out.ok = true;
   return out;
 }
 inline float weft_sin(float x) {
+  if (x == 0.0f) return x;                 // an exact zero keeps its sign
   const weft_sc p = weft_trig_pair(x);
-  if (p.ok && weft_cr(p.s, 6.0e-15f)) return p.s.hi;
+  if (p.ok && weft_cr(p.s, p.err)) return p.s.hi;
   return weft_sin_wide(x);
 }
 inline float weft_cos(float x) {
   const weft_sc p = weft_trig_pair(x);
-  if (p.ok && weft_cr(p.c, 6.0e-15f)) return p.c.hi;
+  if (p.ok && weft_cr(p.c, p.err)) return p.c.hi;
   return weft_cos_wide(x);
 }
 inline float weft_tan(float x) {
+  if (x == 0.0f) return x;                 // an exact zero keeps its sign
   const weft_sc p = weft_trig_pair(x);
   if (p.ok) {
     const weft_df c = p.c;
@@ -2018,5 +2647,352 @@ inline float weft_tgamma(float v) {
     if (weft_cr(d, ad * 1.5e-11f)) return d.hi;
   }
   return weft_tgamma_wide(v);
+}
+
+// sin(z) for |z| <= pi/2 from its own series: the pair keeps the relative accuracy that
+// the logarithm of a small sine needs, and a float argument reduced from a whole turn
+// cannot give it.
+inline weft_df weft_small_sin_df(weft_df z) {
+  const weft_df z2 = weft_df_mul(z, z);
+  weft_df term = z;
+  weft_df s = z;
+  for (int k = 1; k <= 12; k++) {
+    term = weft_df_quot(weft_df_mul(term, z2), weft_df_of((float)((2 * k) * (2 * k + 1))));
+    s = (k & 1) ? weft_df_sub(s, term) : weft_df_sum(s, term);
+  }
+  return s;
+}
+
+// A pair whose high part has just cancelled: the answer is in the low part, so it is put
+// back together before anyone reads it. Near gamma's two zeros the subtraction is the
+// whole value, and a `hi` read on its own would answer zero.
+inline weft_df weft_df_renorm(weft_df a) {
+  const float s = a.hi + a.lo;
+  return weft_df{s, a.lo - (s - a.hi)};
+}
+
+// ln Gamma on the positive side: gamma's own climb, with the logarithm of the product
+// taken off the end instead of the product itself. The subtraction at the top is where
+// the bits below the pair's own precision would go, which is why it is renormalised.
+inline weft_dfr weft_lgamma_pos_df(weft_df vd) {
+  weft_dfr out;
+  out.d = weft_df_of(0.0f);
+  out.ok = false;
+  const float v = vd.hi;
+  int k = 0;
+  if (v < 8.0f) {
+    const float need = 8.0f - v;
+    k = (int)need;
+    if ((float)k < need) k += 1;
+  }
+  if (k > 8) return out;
+  weft_df p = WEFT_DF_ONE;
+  for (int j = 0; j < k; j++) p = weft_df_mul(p, weft_df_sum(vd, weft_df_of((float)j)));
+  const weft_df z = weft_df_sum(vd, weft_df_of((float)k));
+  const weft_df l = weft_lgamma_df(z);
+  out.d = k > 0 ? weft_df_renorm(weft_df_sub(l, weft_log_df(p))) : l;
+  out.ok = true;
+  return out;
+}
+
+// `lgamma` answers ln|Gamma|, the one number gamma cannot give once the gamma itself has
+// overflowed, which is why a kernel asks for the log instead. The positive side is the
+// climb gamma takes; the negative side reflects through ln(pi) - ln|sin(pi x)| - ln
+// Gamma(1 - x). The sine comes from the argument's own fraction, because `ln` of a sine
+// near a pole needs the sine's relative accuracy; below -2^23 every float is an integer
+// and so a pole, where `rint` is no longer exact and is not asked.
+inline float weft_lgamma(float v) {
+  if (!(v == v)) return v + v;                      // NaN in, NaN out
+  if (!(v > 0.0f)) {
+    if (v == 0.0f) return weft_float(0x7F800000u);  // either zero is the pole
+    if (!(v > -8388608.0f)) return weft_float(0x7F800000u);  // all integers: all poles
+    if (v == weft_rint_even(v)) return weft_float(0x7F800000u);
+    const weft_dfr g = weft_lgamma_pos_df(weft_df_sub(WEFT_DF_ONE, weft_df_of(v)));
+    if (!g.ok) return weft_float(0xFF800000u);
+    float f = v - WEFT_FLOOR(v);                       // 0 <= f < 1, exact below 2^23
+    if (f > 0.5f) f = 1.0f - f;                     // sin(pi f) = sin(pi (1 - f))
+    const weft_df a = weft_small_sin_df(weft_df_mul(weft_df_of(f), WEFT_DF_PI));
+    const weft_df r = weft_df_sub(weft_log_df(WEFT_DF_PI), weft_log_df(a));
+    return weft_df_renorm(weft_df_sub(r, g.d)).hi;
+  }
+  if (v == 1.0f || v == 2.0f) return 0.0f;          // the two exact zeros
+  if (!(v < 4.2e36f)) return weft_float(0x7F800000u);  // ln Gamma past the float's range
+  const weft_dfr p = weft_lgamma_pos_df(weft_df_of(v));
+  return p.ok ? p.d.hi : weft_float(0x7F800000u);
+}
+
+// The sign gamma had, which the reflection inside `weft_lgamma` loses: on the negative
+// side it is the parity of the whole part, since sin(pi (f + n)) = (-1)^n sin(pi f) and
+// the fraction's own sine is positive. It is its own function because a pointer here
+// would have to name the caller's address space, and this text belongs to neither.
+inline int weft_lgamma_sign(float v) {
+  if (!(v < 0.0f) || !(v > -8388608.0f)) return 1;  // positive, a pole, or not a number
+  const float w = WEFT_FLOOR(v);
+  if (!(v - w > 0.0f)) return 1;                    // a pole answers the same sign
+  return ((int)w & 1) ? -1 : 1;
+}
+
+// A narrow value as the float it names, for a comparison: the widening is exact, so the
+// operator on the pair is the comparison the ISA means.
+inline float weft_f16_val(uint16_t a) { return (float)weft_f16_of(a); }
+inline float weft_bf16_val(uint16_t a) { return weft_b16_of(a); }
+
+// The approximate transcendentals answer the portable library rounded once to the
+// narrow grid, the same bargain the f32 forms strike: the silicon's own polynomial is
+// not reproduced on a CPU, so the two columns agree with each other and with the
+// library inside the one rounding.
+inline uint16_t weft_f16_rnd(float v) { return weft_f16_bits((half)v); }
+inline uint16_t weft_f16_ex2(uint16_t a) { return weft_f16_rnd(weft_exp2(weft_f16_val(a))); }
+inline uint16_t weft_f16_lg2(uint16_t a) { return weft_f16_rnd(weft_log2(weft_f16_val(a))); }
+inline uint16_t weft_f16_rsqrt(uint16_t a) {
+  return weft_f16_rnd(weft_rsqrt(weft_f16_val(a)));
+}
+inline uint16_t weft_f16_sin(uint16_t a) { return weft_f16_rnd(weft_sin(weft_f16_val(a))); }
+inline uint16_t weft_f16_cos(uint16_t a) { return weft_f16_rnd(weft_cos(weft_f16_val(a))); }
+inline uint16_t weft_f16_tanh(uint16_t a) { return weft_f16_rnd(weft_tanh(weft_f16_val(a))); }
+inline uint16_t weft_bf16_ex2(uint16_t a) {
+  return weft_bf16_round(weft_exp2(weft_bf16_val(a)));
+}
+inline uint16_t weft_bf16_lg2(uint16_t a) {
+  return weft_bf16_round(weft_log2(weft_bf16_val(a)));
+}
+inline uint16_t weft_bf16_rsqrt(uint16_t a) {
+  return weft_bf16_round(weft_rsqrt(weft_bf16_val(a)));
+}
+inline uint16_t weft_bf16_sin(uint16_t a) {
+  return weft_bf16_round(weft_sin(weft_bf16_val(a)));
+}
+inline uint16_t weft_bf16_cos(uint16_t a) {
+  return weft_bf16_round(weft_cos(weft_bf16_val(a)));
+}
+inline uint16_t weft_bf16_tanh(uint16_t a) {
+  return weft_bf16_round(weft_tanh(weft_bf16_val(a)));
+}
+// The packed forms are the same answer twice, low half then high. Each half is widened,
+// answered and rounded on its own, so a pair is two roundings and not one rounding of a
+// wider expression: the low answer cannot move the high one, which is what the ISA's
+// per-half instruction does too.
+inline uint32_t weft_f16x2_ex2(uint32_t a) {
+  return (uint32_t)weft_f16_ex2((uint16_t)a) |
+         ((uint32_t)weft_f16_ex2((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_f16x2_lg2(uint32_t a) {
+  return (uint32_t)weft_f16_lg2((uint16_t)a) |
+         ((uint32_t)weft_f16_lg2((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_f16x2_rsqrt(uint32_t a) {
+  return (uint32_t)weft_f16_rsqrt((uint16_t)a) |
+         ((uint32_t)weft_f16_rsqrt((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_f16x2_sin(uint32_t a) {
+  return (uint32_t)weft_f16_sin((uint16_t)a) |
+         ((uint32_t)weft_f16_sin((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_f16x2_cos(uint32_t a) {
+  return (uint32_t)weft_f16_cos((uint16_t)a) |
+         ((uint32_t)weft_f16_cos((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_f16x2_tanh(uint32_t a) {
+  return (uint32_t)weft_f16_tanh((uint16_t)a) |
+         ((uint32_t)weft_f16_tanh((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_bf16x2_ex2(uint32_t a) {
+  return (uint32_t)weft_bf16_ex2((uint16_t)a) |
+         ((uint32_t)weft_bf16_ex2((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_bf16x2_lg2(uint32_t a) {
+  return (uint32_t)weft_bf16_lg2((uint16_t)a) |
+         ((uint32_t)weft_bf16_lg2((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_bf16x2_rsqrt(uint32_t a) {
+  return (uint32_t)weft_bf16_rsqrt((uint16_t)a) |
+         ((uint32_t)weft_bf16_rsqrt((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_bf16x2_sin(uint32_t a) {
+  return (uint32_t)weft_bf16_sin((uint16_t)a) |
+         ((uint32_t)weft_bf16_sin((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_bf16x2_cos(uint32_t a) {
+  return (uint32_t)weft_bf16_cos((uint16_t)a) |
+         ((uint32_t)weft_bf16_cos((uint16_t)(a >> 16)) << 16);
+}
+inline uint32_t weft_bf16x2_tanh(uint32_t a) {
+  return (uint32_t)weft_bf16_tanh((uint16_t)a) |
+         ((uint32_t)weft_bf16_tanh((uint16_t)(a >> 16)) << 16);
+}
+// A 16-bit float atomic add. The atomics this host has are 32 bits wide, and two
+// halves can share one of those words, so the add is a compare-exchange on the word
+// with only the half being added replaced: the neighbor keeps its value whatever
+// order the threads land in, and the sum is the one rounding the narrow add gives.
+// `shift` is 0 for the low half and 16 for the high one, `bf` picks the grid, and the
+// return is the value the slot held before this add, as `atom.add` promises.
+template <typename W_PTR>
+static inline uint16_t weft_atom_add_narrow(W_PTR w, uint32_t shift,
+                                            uint16_t v, int bf) {
+  uint32_t old = WEFT_ALOAD(w);
+  for (;;) {
+    const uint16_t cur = (uint16_t)(old >> shift);
+    const uint16_t nv = bf ? weft_bf16_add(cur, v) : weft_f16_add(cur, v);
+    const uint32_t want = (old & ~(0xFFFFu << shift)) | ((uint32_t)nv << shift);
+    const uint32_t seen = WEFT_CAS(w, old, want);
+    if (seen == old) return cur;
+    old = seen;
+  }
+}
+// The packed form fills its whole word, so the pair goes round as one value.
+template <typename W_PTR>
+static inline uint32_t weft_atom_add_pack(W_PTR w, uint32_t v, int bf) {
+  uint32_t old = WEFT_ALOAD(w);
+  for (;;) {
+    const uint32_t want = bf ? weft_bf16x2_add(old, v) : weft_f16x2_add(old, v);
+    const uint32_t seen = WEFT_CAS(w, old, want);
+    if (seen == old) return old;
+    old = seen;
+  }
+}
+// The vector half atomics: `atom.global.v4.f16.max.noftz` and its `.v2` and `.v8`
+// siblings. Table 41 keeps the vector forms in a table of their own, where `.add`,
+// `.min` and `.max` of a half exist, and the isa says the atomicity is per element and
+// not for the group: so each element is its own compare-exchange on the word that holds
+// it, the element beside it keeps its value, and two lanes landing on one element leave
+// the same answer whatever order they land in. The min and max are the non-atomic
+// instructions' rule -- a NaN hands back the other operand, and two zeros of opposite
+// sign keep the sign the identity wants -- because the isa defines the atomic ones as
+// exactly those instructions.
+template <typename W_PTR>
+static inline uint16_t weft_atom_minmax_narrow(W_PTR w, uint32_t shift,
+                                               uint16_t v, int bf, int maxv) {
+  uint32_t old = WEFT_ALOAD(w);
+  for (;;) {
+    const uint16_t cur = (uint16_t)(old >> shift);
+    uint16_t nv;
+    if (bf) nv = maxv ? weft_bf16_max(cur, v) : weft_bf16_min(cur, v);
+    else nv = maxv ? weft_f16_max(cur, v) : weft_f16_min(cur, v);
+    const uint32_t want = (old & ~(0xFFFFu << shift)) | ((uint32_t)nv << shift);
+    const uint32_t seen = WEFT_CAS(w, old, want);
+    if (seen == old) return cur;
+    old = seen;
+  }
+}
+// A packed pair is its whole word, so it goes round as one value.
+template <typename W_PTR>
+static inline uint32_t weft_atom_minmax_pack(W_PTR w, uint32_t v, int bf,
+                                             int maxv) {
+  uint32_t old = WEFT_ALOAD(w);
+  for (;;) {
+    uint32_t want;
+    if (bf) want = maxv ? weft_bf16x2_max(old, v) : weft_bf16x2_min(old, v);
+    else want = maxv ? weft_f16x2_max(old, v) : weft_f16x2_min(old, v);
+    const uint32_t seen = WEFT_CAS(w, old, want);
+    if (seen == old) return old;
+    old = seen;
+  }
+}
+// The one atomic the isa names at 16 bits is a compare-exchange, and the hardware's
+// atomics are 32 bits, so the half addressed is compared and written on its own and
+// the half beside it keeps its value. The return is the half the slot held before,
+// matched or not, which is what atom.cas promises.
+template <typename W_PTR>
+static inline uint16_t weft_atom_cas_b16(W_PTR w, uint32_t shift,
+                                         uint16_t cmp, uint16_t v) {
+  uint32_t old = WEFT_ALOAD(w);
+  for (;;) {
+    const uint16_t cur = (uint16_t)(old >> shift);
+    if (cur != cmp) return cur;
+    const uint32_t want = (old & ~(0xFFFFu << shift)) | ((uint32_t)v << shift);
+    const uint32_t seen = WEFT_CAS(w, old, want);
+    if (seen == old) return cur;
+    old = seen;
+  }
+}
+// atom.inc and atom.dec have one width, .u32, and no instruction on this host: the
+// successor is a single step round a cycle bounded by b, so it is a compare-exchange
+// loop like the 16-bit forms. The isa's definitions, exactly: inc(r, b) is 0 when
+// r >= b and r + 1 otherwise, and dec(r, b) is b when r is 0 or above b and r - 1
+// otherwise. N lanes landing in any order leave the start advanced N steps, because
+// the step depends only on the value it reads.
+template <typename W_PTR>
+static inline uint32_t weft_atom_inc_u32(W_PTR p, uint32_t b) {
+  uint32_t old = WEFT_ALOAD(p);
+  for (;;) {
+    const uint32_t nv = (old >= b) ? 0u : old + 1u;
+    const uint32_t seen = WEFT_CAS(p, old, nv);
+    if (seen == old) return old;
+    old = seen;
+  }
+}
+template <typename W_PTR>
+static inline uint32_t weft_atom_dec_u32(W_PTR p, uint32_t b) {
+  uint32_t old = WEFT_ALOAD(p);
+  for (;;) {
+    const uint32_t nv = (old == 0u || old > b) ? b : old - 1u;
+    const uint32_t seen = WEFT_CAS(p, old, nv);
+    if (seen == old) return old;
+    old = seen;
+  }
+}
+// A 16-bit integer atomic. Same word trick as the float add and the 16-bit
+// compare-exchange: the half addressed is read and written on its own, so the half
+// beside it in the word keeps its value. One helper carries every operation the two
+// front ends name at this width, because each of them is a step on the 16-bit value
+// under a compare-exchange. The codes are the order of the switch, and the return is
+// the half the slot held before, as an atomic promises.
+#define WEFT_A16_ADD 0
+#define WEFT_A16_SUB 1
+#define WEFT_A16_MINU 2
+#define WEFT_A16_MAXU 3
+#define WEFT_A16_MINS 4
+#define WEFT_A16_MAXS 5
+#define WEFT_A16_AND 6
+#define WEFT_A16_OR 7
+#define WEFT_A16_XOR 8
+#define WEFT_A16_EXCH 9
+#define WEFT_A16_CAS 10
+template <typename W_PTR>
+static inline uint16_t weft_atom_int16(W_PTR w, uint32_t shift,
+                                       uint16_t v, uint16_t cmp, int op) {
+  uint32_t old = WEFT_ALOAD(w);
+  for (;;) {
+    const uint16_t cur = (uint16_t)(old >> shift);
+    uint16_t nv;
+    switch (op) {
+      case WEFT_A16_ADD: nv = (uint16_t)(cur + v); break;
+      case WEFT_A16_SUB: nv = (uint16_t)(cur - v); break;
+      case WEFT_A16_MINU: nv = (cur < v) ? cur : v; break;
+      case WEFT_A16_MAXU: nv = (cur > v) ? cur : v; break;
+      case WEFT_A16_MINS: nv = ((int16_t)cur < (int16_t)v) ? cur : v; break;
+      case WEFT_A16_MAXS: nv = ((int16_t)cur > (int16_t)v) ? cur : v; break;
+      case WEFT_A16_AND: nv = (uint16_t)(cur & v); break;
+      case WEFT_A16_OR: nv = (uint16_t)(cur | v); break;
+      case WEFT_A16_XOR: nv = (uint16_t)(cur ^ v); break;
+      case WEFT_A16_EXCH: nv = v; break;
+      default: if (cur != cmp) return cur; nv = v; break;
+    }
+    const uint32_t want = (old & ~(0xFFFFu << shift)) | ((uint32_t)nv << shift);
+    const uint32_t seen = WEFT_CAS(w, old, want);
+    if (seen == old) return cur;
+    old = seen;
+  }
+}
+// Bit scans, shared by both columns so the two cannot answer differently.
+// `bfind.u32` is the position of the highest set bit, counted from 0 at the least
+// significant end, and 0xFFFFFFFF when there is no set bit. `bfind.s32` searches
+// for the highest bit that differs from the sign, so a negative value is searched
+// inverted and both 0 and -1 have no such bit. `fns.b32` walks upward from `base`
+// and answers the offset-th set bit it meets, or 0xFFFFFFFF if it never meets one.
+// `__builtin_clz(0)` is undefined, which is why the zero case is answered first.
+static inline uint32_t weft_bfind_u32(uint32_t a) {
+  return a ? (uint32_t)(31 - __builtin_clz(a)) : 0xFFFFFFFFu;
+}
+static inline uint32_t weft_bfind_s32(int32_t a) {
+  return weft_bfind_u32(a < 0 ? ~(uint32_t)a : (uint32_t)a);
+}
+static inline uint32_t weft_fns_b32(uint32_t mask, uint32_t base, uint32_t offset) {
+  for (uint32_t p = (base & 31u); p < 32u; p++) {
+    if (((mask >> p) & 1u) == 0u) continue;
+    if (offset == 0u) return p;
+    offset--;
+  }
+  return 0xFFFFFFFFu;
 }
 )WEFTMATH";

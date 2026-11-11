@@ -1,0 +1,100 @@
+// The same instruction with a 128-byte swizzle, which is the pattern a `wgmma` fragment
+// read is laid out in. The tensor is two rows of thirty-two, so the box is 256 bytes and
+// its second row starts at byte 128, which the swizzle moves sixteen bytes along, to
+// 144. Reading there has to give element (1, 0), which is 32; a decode that ignored the
+// swizzle would leave element 32 at 128 and hand back 36 instead.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry tensorswz(
+    .param .u64 tensorswz_param_0,      // out
+    .param .u64 tensorswz_param_1,      // the tensor
+    .param .u64 tensorswz_param_2       // the 128-byte map
+)
+{
+    .shared .align 16 .b64 mbr[1];
+    .shared .align 16 .b32 tile[64];
+
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [tensorswz_param_0];
+    ld.param.u64 %rd2, [tensorswz_param_1];
+    ld.param.u64 %rd3, [tensorswz_param_2];
+
+    mov.u32 %r6, 0;
+FILL: setp.ge.u32 %p1, %r6, 64;
+    @%p1 bra FILLED;
+    mul.wide.s32 %rd6, %r6, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    st.global.b32 [%rd7], %r6;
+    add.u32 %r6, %r6, 1;
+    bra FILL;
+FILLED:
+
+    mov.b64 {%r1, %r2}, %rd2;
+    st.global.b32 [%rd3], %r1;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r2;
+    add.s64 %rd4, %rd3, 8;                 // rank
+    mov.u32 %r3, 2;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 12;                // element size
+    mov.u32 %r4, 4;
+    st.global.b32 [%rd4], %r4;
+    add.s64 %rd4, %rd3, 16;                // thirty-two columns
+    mov.u32 %r5, 32;
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 20;                // two rows
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 48;                // 128 bytes between rows
+    mov.u64 %rd8, 128;
+    st.global.b64 [%rd4], %rd8;
+    add.s64 %rd4, %rd3, 80;                // the whole first dimension in the box
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 84;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 100;
+    mov.u32 %r7, 1;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 104;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 8;                 // rank 2, a box, and a 128-byte swizzle
+    mov.u32 %r8, 0x800002;                 // 2 | (128 << 16)
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 124;
+    mov.u32 %r9, 0x41544657;
+    st.global.b32 [%rd4], %r9;
+
+    mbarrier.init.shared.b64 [mbr], 1;
+    bar.sync 0;
+
+    mbarrier.expect_tx.shared.b64 [mbr], 256;
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [tile], [%rd3, {0, 0}], [mbr];
+    mbarrier.arrive.shared.b64 %rd9, [mbr];
+
+WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
+    @!%p2 bra WAIT;
+
+    // Byte 0 is its own place; byte 128 is the second row, which the swizzle moved to
+    // 144, so 148 is the element after it.
+    ld.shared.b32 %r10, [tile];
+    st.global.b32 [%rd1], %r10;
+    ld.shared.b32 %r11, [tile + 144];
+    add.s64 %rd4, %rd1, 4;
+    st.global.b32 [%rd4], %r11;
+    ld.shared.b32 %r12, [tile + 148];
+    add.s64 %rd4, %rd1, 8;
+    st.global.b32 [%rd4], %r12;
+
+    // Same as the box kernel: the address cannot agree across the two engines, and it is
+    // not part of the answer.
+    mov.u32 %r13, 0;
+    st.global.b32 [%rd3], %r13;
+    add.s64 %rd10, %rd3, 4;
+    st.global.b32 [%rd10], %r13;
+    ret;
+}

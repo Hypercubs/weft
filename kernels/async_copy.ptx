@@ -9,8 +9,10 @@
 // `extern .shared` has no extent in the module: the size comes from the launch,
 // and goc's launch gives every threadgroup the whole 48 KiB arena.
 .version 7.0
-.target sm_70
+.target sm_80
 .address_size 64
+
+.extern .shared .align 4 .b8 tile[];
 
 .visible .entry async_copy(
     .param .u64 async_copy_param_0,
@@ -20,7 +22,6 @@
     .reg .b32 %r<14>;
     .reg .f32 %f<4>;
     .reg .b64 %rd<8>;
-    .extern .shared .align 4 .b8 tile[];
 
     ld.param.u64 %rd1, [async_copy_param_0];
     ld.param.u64 %rd2, [async_copy_param_1];

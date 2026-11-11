@@ -531,7 +531,8 @@ static inline uint64_t from_i64(int64_t x) {
 }
 // Toward zero, which is what a cast does. Out-of-range and NaN are undefined in
 // SPIR-V; this saturates rather than trapping, so two targets cannot disagree by
-// accident of the host's conversion.
+// accident of the host's conversion. An unsigned destination takes zero for any
+// negative value, the way `F2I` does, rather than the two's complement of it.
 static inline uint64_t to_u64(uint64_t b) {
   if (is_nan(b)) return 0ull;
   const uint32_t sign = (uint32_t)(b >> 63);
@@ -543,12 +544,15 @@ static inline uint64_t to_u64(uint64_t b) {
   if (e < 0) return 0ull;
   uint64_t m;
   if (e >= 55) {
-    if (e >= 119) return sign ? 0ull : ~0ull;
+    // 2^(e+1) already reaches past 2^64 at e = 63, so anything from e = 64 up is out
+    // of range and has to clamp before the shift: the shift itself is undefined past
+    // 63, and the old guard at 119 let 1e20 wrap to 0x6BC75E2D63100000.
+    if (e >= 64) return sign ? 0ull : ~0ull;
     m = sig << (e - 55);
   } else {
     m = sig >> (55 - e);
   }
-  return sign ? (0ull - m) : m;
+  return sign ? 0ull : m;
 }
 static inline int64_t to_i64(uint64_t b) {
   if (is_nan(b)) return 0;
@@ -557,6 +561,18 @@ static inline int64_t to_i64(uint64_t b) {
   if (m > 0x8000000000000000ull) return negative ? (-0x7FFFFFFFFFFFFFFF - 1) : 0x7FFFFFFFFFFFFFFF;
   if (m == 0x8000000000000000ull) return negative ? (-0x7FFFFFFFFFFFFFFF - 1) : 0x7FFFFFFFFFFFFFFF;
   return negative ? -(int64_t)m : (int64_t)m;
+}
+// A 32-bit destination saturates to its own range. Narrowing the 64-bit answer would
+// wrap it, and 1e20 came back as 0x63100000 instead of INT32_MAX.
+static inline int32_t to_i32(uint64_t b) {
+  const int64_t n = to_i64(b);
+  if (n > 2147483647) return 2147483647;
+  if (n < (-2147483647 - 1)) return (-2147483647 - 1);
+  return (int32_t)n;
+}
+static inline uint32_t to_u32(uint64_t b) {
+  const uint64_t n = to_u64(b);
+  return n > 4294967295ull ? 4294967295u : (uint32_t)n;
 }
 
 static inline uint64_t from_f32(uint32_t fb) {

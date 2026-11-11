@@ -1,0 +1,73 @@
+.version 7.0
+.target sm_70
+.address_size 64
+// The answer is a byte order, and the edges are where the two orders could be confused:
+// a register with a single byte set, one with everything set, zero, and the two ends of
+// the width, where the byte has to cross the register rather than move inside it. The
+// 64-bit form repeats all of that one size up, and its two 32-bit halves trade places as
+// well.
+//
+// PTX has no `bswap`, so the word is `prmt` with the picking order that reverses the
+// four bytes, and the double word is two of those with the two halves exchanged.
+.visible .entry bswap(.param .u64 p0)
+{
+    .reg .b32 %r<20>;
+    .reg .b32 %rs<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p0];
+    mov.u32 %r1, 0x12345678;
+    mov.u32 %r2, 0x000000FF;
+    mov.u32 %r3, 0xFF000000;
+    mov.u32 %r4, 0;
+    mov.u32 %r5, 0xFFFFFFFF;
+    mov.u32 %r6, 0x0000FF00;
+    mov.u32 %r7, 0x00000080;
+    mov.u32 %r8, 0x00FF00FF;
+    prmt.b32 %r11, %r1, 0, 0x0123;
+    prmt.b32 %r12, %r2, 0, 0x0123;
+    prmt.b32 %r13, %r3, 0, 0x0123;
+    prmt.b32 %r14, %r4, 0, 0x0123;
+    prmt.b32 %r15, %r5, 0, 0x0123;
+    prmt.b32 %r16, %r6, 0, 0x0123;
+    prmt.b32 %r17, %r7, 0, 0x0123;
+    prmt.b32 %r18, %r8, 0, 0x0123;
+    st.u32 [%rd1], %r11;
+    st.u32 [%rd1+4], %r12;
+    st.u32 [%rd1+8], %r13;
+    st.u32 [%rd1+12], %r14;
+    st.u32 [%rd1+16], %r15;
+    st.u32 [%rd1+20], %r16;
+    st.u32 [%rd1+24], %r17;
+    st.u32 [%rd1+28], %r18;
+    mov.b64 %rd2, 0x0123456789ABCDEF;
+    mov.b64 %rd3, 0xFFFFFFFFFFFFFFFF;
+    mov.b64 %rd4, 0x00000000000000FF;
+    mov.b64 %rd5, 0xFF00000000000000;
+    mov.b64 %rd6, 0x1122334455667788;
+    mov.b64 {%rs0, %rs1}, %rd2;
+    prmt.b32 %rs2, %rs1, 0, 0x0123;
+    prmt.b32 %rs3, %rs0, 0, 0x0123;
+    mov.b64 %rd7, {%rs2, %rs3};
+    mov.b64 {%rs0, %rs1}, %rd3;
+    prmt.b32 %rs2, %rs1, 0, 0x0123;
+    prmt.b32 %rs3, %rs0, 0, 0x0123;
+    mov.b64 %rd8, {%rs2, %rs3};
+    mov.b64 {%rs0, %rs1}, %rd4;
+    prmt.b32 %rs2, %rs1, 0, 0x0123;
+    prmt.b32 %rs3, %rs0, 0, 0x0123;
+    mov.b64 %rd9, {%rs2, %rs3};
+    mov.b64 {%rs0, %rs1}, %rd5;
+    prmt.b32 %rs2, %rs1, 0, 0x0123;
+    prmt.b32 %rs3, %rs0, 0, 0x0123;
+    mov.b64 %rd10, {%rs2, %rs3};
+    mov.b64 {%rs0, %rs1}, %rd6;
+    prmt.b32 %rs2, %rs1, 0, 0x0123;
+    prmt.b32 %rs3, %rs0, 0, 0x0123;
+    mov.b64 %rd11, {%rs2, %rs3};
+    st.u64 [%rd1+32], %rd7;
+    st.u64 [%rd1+40], %rd8;
+    st.u64 [%rd1+48], %rd9;
+    st.u64 [%rd1+56], %rd10;
+    st.u64 [%rd1+64], %rd11;
+    ret;
+}

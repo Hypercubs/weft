@@ -61,6 +61,13 @@ static inline T weft_bitcast(U u) {
 }
 static inline float weft_f32(uint32_t b) { return as_type<float>(b); }
 static inline uint32_t weft_bits(float f) { return as_type<uint32_t>(f); }
+// A 16-byte value: two 64-bit halves, low first. `ld`/`st.b128` move all sixteen
+// bytes in one access, so the register is a struct rather than two words a lane
+// could read apart, and nothing computes with it.
+struct weft_u128 {
+  uint64_t lo;
+  uint64_t hi;
+};
 static inline uint32_t weft_bitrev32(uint32_t v) {
   v = ((v >> 1) & 0x55555555u) | ((v & 0x55555555u) << 1);
   v = ((v >> 2) & 0x33333333u) | ((v & 0x33333333u) << 2);
@@ -68,11 +75,50 @@ static inline uint32_t weft_bitrev32(uint32_t v) {
   v = ((v >> 8) & 0x00FF00FFu) | ((v & 0x00FF00FFu) << 8);
   return (v >> 16) | (v << 16);
 }
+// `bswap` is the byte order, not the bit order: each byte keeps its bits and the four
+// (or eight) bytes trade places. Masks rather than `__builtin_bswap32`, which the
+// shader language does not have.
+static inline uint32_t weft_bswap32(uint32_t v) {
+  return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+         ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+static inline uint64_t weft_bswap64(uint64_t v) {
+  return ((uint64_t)weft_bswap32((uint32_t)v) << 32) |
+         (uint64_t)weft_bswap32((uint32_t)(v >> 32));
+}
 static inline uint16_t weft_h16_bits(float x) { return as_type<uint16_t>((_Float16)x); }
 
 // A double on this target is its bit pattern: the type itself does not exist here,
 // so the constant spelling the emitter uses for one hands the bits back unchanged.
 static inline uint64_t weft_f64(uint64_t b) { return b; }
+
+// `F2I` saturates: a float past the destination's range clamps to its end and a
+// NaN answers zero. The float form is all this side needs -- a double source is
+// the software fp64 path above, whose own helpers do the conversion.
+static inline int32_t weft_f2i32(float x) {
+  if (x != x) return 0;
+  if (x >= 2147483648.0f) return 2147483647;
+  if (x <= -2147483649.0f) return (-2147483647 - 1);
+  return (int32_t)x;
+}
+static inline uint32_t weft_f2u32(float x) {
+  if (x != x) return 0;
+  if (x >= 4294967296.0f) return 4294967295u;
+  if (x <= -1.0f) return 0u;
+  return (uint32_t)x;
+}
+static inline int64_t weft_f2i64(float x) {
+  if (x != x) return 0;
+  if (x >= 9223372036854775808.0f) return (int64_t)9223372036854775807ll;
+  if (x <= -9223372036854775808.0f) return (int64_t)(-9223372036854775807ll - 1);
+  return (int64_t)x;
+}
+static inline uint64_t weft_f2u64(float x) {
+  if (x != x) return 0;
+  if (x >= 18446744073709551616.0f) return 18446744073709551615ull;
+  if (x <= -1.0f) return 0u;
+  return (uint64_t)x;
+}
 
 //
 // Apple GPUs have no fp64 and Metal rejects the type outright, so a kernel carrying a
@@ -1229,6 +1275,125 @@ static inline uint64_t param(thread const Ctx& c, int i) { return c.params[i]; }
 // finish, it reads as a hang, and it did: the reduction path below (no lock, no
 // 64-bit anything) hung at 65,536 lanes with the retry loop and finishes now.
 // A CAS loop is only used where no instruction exists: min and max.
+// The same atomics in threadgroup memory. A `.shared` atomic addresses the window this
+// threadgroup owns, and on the GPU the window is not the heap: the address space is
+// part of the pointer type, so these are separate functions rather than the device ones
+// with a cast. Every one of them is a compare-exchange loop over a threadgroup word --
+// the one operation the language guarantees in that space, and a pure function of the
+// value it reads, so the answer is the native instruction's answer whatever order the
+// threads land in. The device forms keep their own instructions above this line.
+static inline uint32_t atom_cas_u32(threadgroup uint32_t* p, uint32_t cmp, uint32_t v) {
+  threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+  uint32_t expect = cmp;
+  (void)atomic_compare_exchange_weak_explicit(a, &expect, v, memory_order_relaxed,
+                                              memory_order_relaxed);
+  return expect;
+}
+static inline uint32_t atom_exch_u32(threadgroup uint32_t* p, uint32_t v) {
+  threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+  uint32_t old = atomic_load_explicit(a, memory_order_relaxed);
+  while (!atomic_compare_exchange_weak_explicit(a, &old, v, memory_order_relaxed,
+                                                memory_order_relaxed)) {
+  }
+  return old;
+}
+// One macro for the read-modify-write forms: `want` is built from the value the word
+// held, which is the whole difference between them.
+#define WEFT_TG_RMW(name, want)                                                  \
+  static inline uint32_t name(threadgroup uint32_t* p, uint32_t v) {              \
+    threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;                     \
+    uint32_t old = atomic_load_explicit(a, memory_order_relaxed);                 \
+    for (;;) {                                                                    \
+      uint32_t expect = old;                                                      \
+      if (atomic_compare_exchange_weak_explicit(a, &expect, (want),               \
+                                                memory_order_relaxed,             \
+                                                memory_order_relaxed))            \
+        return old;                                                               \
+      old = expect;                                                               \
+    }                                                                             \
+  }
+WEFT_TG_RMW(atom_add_u32, old + v)
+WEFT_TG_RMW(atom_sub_u32, old - v)
+WEFT_TG_RMW(atom_and_u32, old & v)
+WEFT_TG_RMW(atom_or_u32, old | v)
+WEFT_TG_RMW(atom_xor_u32, old ^ v)
+WEFT_TG_RMW(atom_min_u32, old < v ? old : v)
+WEFT_TG_RMW(atom_max_u32, old > v ? old : v)
+#undef WEFT_TG_RMW
+static inline int32_t atom_add_s32(threadgroup int32_t* p, int32_t v) {
+  return (int32_t)atom_add_u32((threadgroup uint32_t*)p, (uint32_t)v);
+}
+static inline int32_t atom_min_s32(threadgroup int32_t* p, int32_t v) {
+  threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+  uint32_t old = atomic_load_explicit(a, memory_order_relaxed);
+  for (;;) {
+    uint32_t expect = old;
+    const int32_t o = (int32_t)old;
+    if (atomic_compare_exchange_weak_explicit(a, &expect,
+                                              (uint32_t)(o < v ? o : v),
+                                              memory_order_relaxed, memory_order_relaxed))
+      return o;
+    old = expect;
+  }
+}
+static inline int32_t atom_max_s32(threadgroup int32_t* p, int32_t v) {
+  threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+  uint32_t old = atomic_load_explicit(a, memory_order_relaxed);
+  for (;;) {
+    uint32_t expect = old;
+    const int32_t o = (int32_t)old;
+    if (atomic_compare_exchange_weak_explicit(a, &expect,
+                                              (uint32_t)(o > v ? o : v),
+                                              memory_order_relaxed, memory_order_relaxed))
+      return o;
+    old = expect;
+  }
+}
+// A float in the window is compared on its bits and written back through them, so the
+// answer is the one the device form gives: the comparison is the CPU's (a NaN hands
+// back the operand it was asked with) and the add rounds once, on each successful step.
+static inline uint32_t atom_add_f32_bits(threadgroup float* p, uint32_t vbits) {
+  threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+  const float v = as_type<float>(vbits);
+  uint32_t old = atomic_load_explicit(a, memory_order_relaxed);
+  for (;;) {
+    uint32_t expect = old;
+    if (atomic_compare_exchange_weak_explicit(a, &expect,
+                                              as_type<uint32_t>(as_type<float>(old) + v),
+                                              memory_order_relaxed, memory_order_relaxed))
+      return old;
+    old = expect;
+  }
+}
+static inline float atom_add_f32(threadgroup float* p, float v) {
+  return as_type<float>(atom_add_f32_bits(p, as_type<uint32_t>(v)));
+}
+static inline float atom_min_f32(threadgroup float* p, float v) {
+  threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+  uint32_t old = atomic_load_explicit(a, memory_order_relaxed);
+  for (;;) {
+    uint32_t expect = old;
+    const float o = as_type<float>(old);
+    const float want = (o < v) ? o : v;
+    if (atomic_compare_exchange_weak_explicit(a, &expect, as_type<uint32_t>(want),
+                                              memory_order_relaxed, memory_order_relaxed))
+      return o;
+    old = expect;
+  }
+}
+static inline float atom_max_f32(threadgroup float* p, float v) {
+  threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+  uint32_t old = atomic_load_explicit(a, memory_order_relaxed);
+  for (;;) {
+    uint32_t expect = old;
+    const float o = as_type<float>(old);
+    const float want = (o > v) ? o : v;
+    if (atomic_compare_exchange_weak_explicit(a, &expect, as_type<uint32_t>(want),
+                                              memory_order_relaxed, memory_order_relaxed))
+      return o;
+    old = expect;
+  }
+}
 static inline uint32_t atom_add_u32(device uint32_t* p, uint32_t v) {
   return atomic_fetch_add_explicit((device atomic_uint*)p, v, memory_order_relaxed);
 }
@@ -1404,6 +1569,41 @@ static inline uint64_t load64(device uint64_t* p) {
   const uint32_t lo = atomic_load_explicit(a, memory_order_relaxed);
   const uint32_t hi = atomic_load_explicit(a + 1, memory_order_relaxed);
   return as_type<uint64_t>(uint2{lo, hi});
+}
+
+// A 64-bit max or min moves the word one way only, so a value the word already holds
+// changes nothing and needs no lock. Proving that takes no lock either: the halves are
+// read with the 32-bit atomics the hardware does have, and each half moves in the same
+// direction as the pair, so a read that is at or past the value stays there whatever
+// another thread does meanwhile. That makes "no update needed" a safe answer without a
+// lock, and turns a reduction onto one word from a lock per thread into a lock per
+// change. Measured on 1,048,576 threads writing the same 64-bit maximum: 481 ms before
+// the lock was hoisted out of the lane loop and this skip was added, 28 ms after. A
+// reduction whose value changes as it goes still takes a lock per warp, which is
+// measured: 1,048,576 distinct values, one warp each, is 363 ms.
+static inline bool satisfied_max_s64(device int64_t* p, int64_t v) {
+  const uint2 c = as_type<uint2>(load64((device uint64_t*)p));
+  const int32_t vh = (int32_t)((uint64_t)v >> 32);
+  if ((int32_t)c.y != vh) return (int32_t)c.y > vh;
+  return c.x >= (uint32_t)v;
+}
+static inline bool satisfied_max_u64(device uint64_t* p, uint64_t v) {
+  const uint2 c = as_type<uint2>(load64(p));
+  const uint32_t vh = (uint32_t)(v >> 32);
+  if (c.y != vh) return c.y > vh;
+  return c.x >= (uint32_t)v;
+}
+static inline bool satisfied_min_s64(device int64_t* p, int64_t v) {
+  const uint2 c = as_type<uint2>(load64((device uint64_t*)p));
+  const int32_t vh = (int32_t)((uint64_t)v >> 32);
+  if ((int32_t)c.y != vh) return (int32_t)c.y < vh;
+  return c.x <= (uint32_t)v;
+}
+static inline bool satisfied_min_u64(device uint64_t* p, uint64_t v) {
+  const uint2 c = as_type<uint2>(load64(p));
+  const uint32_t vh = (uint32_t)(v >> 32);
+  if (c.y != vh) return c.y < vh;
+  return c.x <= (uint32_t)v;
 }
 static inline int64_t load64(device int64_t* p) {
   return as_type<int64_t>(load64((device uint64_t*)p));
@@ -1588,6 +1788,45 @@ static inline uint64_t rmw_cas_raw(device uint64_t* p, uint64_t c, uint64_t v) {
 static inline int64_t rmw_cas_raw(device int64_t* p, int64_t c, int64_t v) {
   const int64_t o = load64(p);
   if (eq_bits64(as_type<uint64_t>(o), as_type<uint64_t>(c))) store64(p, v);
+  return o;
+}
+
+// `atom.cas.b128` compares and writes sixteen bytes as one value, and no atomic on
+// this host is that wide. The four 32-bit words are read, compared and written under
+// the same lock the 64-bit pair takes, so a lane that asks at the same moment waits
+// instead of seeing half a swap, and the compare covers all sixteen bytes rather than a
+// prefix of them. The words go through `uint2` and `as_type` for the reason `load64`
+// states: a 64-bit shift feeding an atomic is the shape this compiler dies on.
+static inline weft_u128 load_u128(device weft_u128* p) {
+  device atomic_uint* a = (device atomic_uint*)p;
+  const uint32_t w0 = atomic_load_explicit(a, memory_order_relaxed);
+  const uint32_t w1 = atomic_load_explicit(a + 1, memory_order_relaxed);
+  const uint32_t w2 = atomic_load_explicit(a + 2, memory_order_relaxed);
+  const uint32_t w3 = atomic_load_explicit(a + 3, memory_order_relaxed);
+  weft_u128 r;
+  r.lo = as_type<uint64_t>(uint2{w0, w1});
+  r.hi = as_type<uint64_t>(uint2{w2, w3});
+  return r;
+}
+static inline void store_u128(device weft_u128* p, weft_u128 v) {
+  device atomic_uint* a = (device atomic_uint*)p;
+  const uint2 l = as_type<uint2>(v.lo), h = as_type<uint2>(v.hi);
+  atomic_store_explicit(a, l.x, memory_order_relaxed);
+  atomic_store_explicit(a + 1, l.y, memory_order_relaxed);
+  atomic_store_explicit(a + 2, h.x, memory_order_relaxed);
+  atomic_store_explicit(a + 3, h.y, memory_order_relaxed);
+}
+static inline weft_u128 rmw_cas_b128_raw(device weft_u128* p, weft_u128 c, weft_u128 v) {
+  const weft_u128 o = load_u128(p);
+  if (eq_bits64(o.lo, c.lo) & eq_bits64(o.hi, c.hi)) store_u128(p, v);
+  return o;
+}
+static inline weft_u128 rmw_cas_b128(device uint32_t* locks, device weft_u128* p,
+                                     weft_u128 c, weft_u128 v) {
+  device uint32_t* l = lock_of(locks, p);
+  lock_take(l);
+  const weft_u128 o = rmw_cas_b128_raw(p, c, v);
+  lock_drop(l);
   return o;
 }
 // A 64-bit read-modify-write when this thread is the only one touching the word.

@@ -1,0 +1,50 @@
+// The two min/max forms that are not the plain one. `.NaN` answers a canonical NaN
+// where the plain form hands the other operand back, and `.xorsign.abs` compares the
+// magnitudes and keeps the exclusive or of the two signs. Six answers, each picked so
+// the plain form would differ:
+//
+//   0  min.NaN  NaN, 1.0          the payload is replaced, not passed through
+//   1  min.NaN  1.0, 2.0          no NaN, so the plain answer
+//   2  min.xorsign.abs  -1, 2     magnitude 1 under the xor of the signs: -1
+//   3  max.xorsign.abs  -1, 2     magnitude 2, same sign: -2
+//   4  min.xorsign.abs  +0, -0    both magnitudes 0, xor of the signs: -0
+//   5  min.xorsign.abs  3, -4     magnitude 3, signs cancel: +3
+.version 7.2
+.target sm_86
+.address_size 64
+
+.visible .entry halfmin(
+    .param .u64 halfmin_param_0     // out: six halfs
+)
+{
+    .reg .b16 %hs<8>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [halfmin_param_0];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 12;
+    add.u64 %rd3, %rd1, %rd2;
+
+    mov.b16 %hs1, 0x7E00;     // a NaN payload
+    mov.b16 %hs2, 0x3C00;     // 1.0
+    min.NaN.f16 %hs3, %hs1, %hs2;
+    st.global.b16 [%rd3], %hs3;
+    mov.b16 %hs4, 0x4000;     // 2.0
+    min.NaN.f16 %hs3, %hs2, %hs4;
+    st.global.b16 [%rd3+2], %hs3;
+    mov.b16 %hs5, 0xBC00;     // -1.0
+    min.xorsign.abs.f16 %hs3, %hs5, %hs4;
+    st.global.b16 [%rd3+4], %hs3;
+    max.xorsign.abs.f16 %hs3, %hs5, %hs4;
+    st.global.b16 [%rd3+6], %hs3;
+    mov.b16 %hs6, 0x0000;     // +0
+    mov.b16 %hs7, 0x8000;     // -0
+    min.xorsign.abs.f16 %hs3, %hs6, %hs7;
+    st.global.b16 [%rd3+8], %hs3;
+    mov.b16 %hs2, 0x4200;     // 3.0
+    mov.b16 %hs4, 0xC400;     // -4.0
+    min.xorsign.abs.f16 %hs3, %hs2, %hs4;
+    st.global.b16 [%rd3+10], %hs3;
+    ret;
+}

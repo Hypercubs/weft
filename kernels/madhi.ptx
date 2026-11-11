@@ -1,0 +1,56 @@
+.version 7.0
+.target sm_70
+.address_size 64
+// A wide multiply is a pair of products: the low word and the high one. `mad.hi` picks
+// the high word and adds to it, `mad.lo` the low one, and `madc` folds the carry in as
+// well. The rows below are the ones that separate the two words: a product that fills
+// both words, a high word that overflows when the addend lands on it, a signed product
+// whose high word is all ones, and the same four shapes one size up.
+.visible .entry madhi(.param .u64 p0)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    ld.param.u64 %rd1, [p0];
+    mov.u32 %r1, 0xFFFFFFFF;
+    mov.u32 %r2, 0x40000000;
+    mov.u32 %r3, 3;
+    mov.u32 %r4, 5;
+    mov.u32 %r5, 7;
+    mov.u32 %r6, 1;
+    // The high word of the largest product, which is not the low word.
+    mul.hi.u32 %r10, %r1, %r1;
+    st.u32 [%rd1], %r10;
+    // 3*5 + 7, and the high word of 0xFFFFFFFF^2 plus 7, which overflows its word.
+    mad.lo.u32 %r11, %r3, %r4, %r5;
+    mad.hi.u32 %r12, %r1, %r1, %r5;
+    st.u32 [%rd1+4], %r11;
+    st.u32 [%rd1+8], %r12;
+    // One low word that fills its register, so the addend carries out of the top.
+    mad.lo.cc.u32 %r13, %r6, %r1, %r6;
+    st.u32 [%rd1+12], %r13;
+    // The carry from that row is what these two add: it is still set.
+    madc.lo.u32 %r14, %r3, %r4, %r5;
+    madc.hi.u32 %r15, %r1, %r1, %r5;
+    st.u32 [%rd1+16], %r14;
+    st.u32 [%rd1+20], %r15;
+    // -1 * 2^30 is negative, so its high word is all ones and the addend moves it to 2.
+    mad.hi.s32 %r16, %r1, %r2, %r3;
+    st.u32 [%rd1+24], %r16;
+    // The low word of the same product, for the pair to be read against each other.
+    mul.lo.u32 %r17, %r1, %r3;
+    st.u32 [%rd1+28], %r17;
+    mov.b64 %rd2, 0xFFFFFFFFFFFFFFFF;
+    mov.b64 %rd3, 0xFFFFFFFF00000000;
+    mov.b64 %rd4, 2;
+    mov.b64 %rd5, 7;
+    mov.b64 %rd6, 1;
+    mad.lo.u64 %rd8, %rd3, %rd4, %rd5;
+    mad.hi.u64 %rd9, %rd2, %rd2, %rd5;
+    mad.lo.cc.u64 %rd10, %rd6, %rd2, %rd6;
+    madc.hi.u64 %rd11, %rd2, %rd2, %rd5;
+    st.u64 [%rd1+32], %rd8;
+    st.u64 [%rd1+40], %rd9;
+    st.u64 [%rd1+48], %rd10;
+    st.u64 [%rd1+56], %rd11;
+    ret;
+}

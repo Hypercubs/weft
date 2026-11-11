@@ -1,0 +1,51 @@
+// Threadgroup memory of a 16-bit float: the arena is byte addressed, so a half
+// array is two bytes an element. Lane l writes its input and reads the next
+// lane's, which a write to the wrong offset or a barrier that lets the read past
+// would both answer wrong.
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry halfops_tg(
+    .param .u64 halfops_tg_param_0,
+    .param .u64 halfops_tg_param_1
+)
+{
+    .shared .align 2 .b8 halfops_tg_tile[64];
+
+    .reg .b16 %hs<4>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [halfops_tg_param_0];
+    ld.param.u64 %rd2, [halfops_tg_param_1];
+    mov.u32 %r1, %tid.x;
+    and.b32 %r1, %r1, 31;
+
+    mul.wide.u32 %rd3, %r1, 2;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b16 %hs1, [%rd4];
+
+    // A shared address is a 32-bit offset: the symbol is materialised once and the
+    // lane's byte offset added to it. A 64-bit register is not a shared address, and
+    // `[symbol + %reg]` is not a legal operand either.
+    mov.u32 %r3, halfops_tg_tile;
+    add.u32 %r4, %r1, %r1;
+    add.u32 %r4, %r3, %r4;
+    st.shared.b16 [%r4], %hs1;
+    bar.sync 0;
+
+    add.s32 %r2, %r1, 1;
+    and.b32 %r2, %r2, 31;
+    mov.u32 %r5, halfops_tg_tile;
+    add.u32 %r6, %r2, %r2;
+    add.u32 %r6, %r5, %r6;
+    ld.shared.b16 %hs2, [%r6];
+    mov.b16 %hs3, 0x3C00;
+    add.rn.f16 %hs2, %hs2, %hs3;
+
+    mul.wide.u32 %rd6, %r1, 2;
+    add.u64 %rd7, %rd2, %rd6;
+    st.global.b16 [%rd7], %hs2;
+    ret;
+}

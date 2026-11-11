@@ -1,0 +1,95 @@
+// The same warp instructions where the warp is neither full nor uniform.
+//
+// `c` packs two fields: a clamp value in bits 4:0 and a sub-segment mask in bits
+// 12:8. The spec's model is that a lane reads only inside its segment, the source
+// index is clamped at the segment's end, and a lane whose source falls outside the
+// clamp keeps its own value. A predicated instruction also deactivates its lane, and
+// `activemask` counts a predicated-off lane as a zero bit.
+//
+//     row 0   activemask under @%p1            00FFFFFF, the 24 lanes that ran
+//     row 1   ballot over membermask 00FFFFFF  00AAAAAA
+//     row 2   vote.all over that mask          1
+//     row 3   vote.any of lane 27              0: lane 27 is outside the mask
+//     row 4   shfl.idx over that mask          30, the source lane's value
+//     row 5   shfl.bfly over that mask         lane xor 2
+//     row 6   shfl.up   1, clamp 8             lanes 0..8 keep their own value
+//     row 7   shfl.down 1, clamp 15            lanes 15.. keep their own value
+//     row 8   shfl.down by (lane & 7) + 1, clamp 31
+//     row 9   shfl.up   by the same register distance, clamp 0
+//     row 10  shfl.idx  from lane xor 5
+//     row 11  ballot of lane 3 over the partial mask  8
+//     row 12  shfl.bfly 8 with c = 0x1f1f      the segment mask is bit 4, so the
+//             clamp is the lane itself and a lane reads its partner only where the
+//             partner is below it, which is bit 3 set
+//     row 13  shfl.up   2, clamp 0
+//     row 14  shfl.down 2, clamp 31
+//     row 15  shfl.idx  from lane 0            0
+//     row 16  shfl.idx  from lane 3, c = 0x0f0f  minLane is lane & 15, so a lane
+//             reads lane & 15 and never leaves its own segment
+//
+// A lane outside the membermask has no defined answer to write, so lanes 24..31 do not
+// store and the comparison only reads the low 24.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry warpseg(.param .u64 out)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 68;
+    add.u64 %rd2, %rd1, %rd2;
+    setp.lt.u32 %p1, %r1, 24;
+
+    @%p1 activemask.b32 %r2;
+    and.b32 %r3, %r1, 1;
+    setp.ne.u32 %p2, %r3, 0;
+    vote.sync.ballot.b32 %r4, %p2, 0x00FFFFFF;
+    setp.lt.u32 %p3, %r1, 30;
+    vote.sync.all.pred %p4, %p3, 0x00FFFFFF;
+    selp.u32 %r20, 1, 0, %p4;
+    setp.eq.u32 %p5, %r1, 27;
+    vote.sync.any.pred %p6, %p5, 0x00FFFFFF;
+    selp.u32 %r21, 1, 0, %p6;
+    mul.lo.u32 %r5, %r1, 10;
+    shfl.sync.idx.b32 %r6, %r5, 3, 31, 0x00FFFFFF;
+    shfl.sync.bfly.b32 %r7, %r1, 2, 31, 0x00FFFFFF;
+    shfl.sync.up.b32 %r8, %r1, 1, 8, -1;
+    shfl.sync.down.b32 %r9, %r1, 1, 15, -1;
+    and.b32 %r10, %r1, 7;
+    add.u32 %r10, %r10, 1;
+    shfl.sync.down.b32 %r11, %r1, %r10, 31, -1;
+    shfl.sync.up.b32 %r12, %r1, %r10, 0, -1;
+    xor.b32 %r13, %r1, 5;
+    shfl.sync.idx.b32 %r14, %r1, %r13, 31, -1;
+    setp.eq.u32 %p7, %r1, 3;
+    vote.sync.ballot.b32 %r15, %p7, 0x00FFFFFF;
+    shfl.sync.bfly.b32 %r16, %r1, 8, 0x1f1f, -1;
+    shfl.sync.up.b32 %r17, %r1, 2, 0, -1;
+    shfl.sync.down.b32 %r18, %r1, 2, 31, -1;
+    shfl.sync.idx.b32 %r19, %r5, 0, 31, -1;
+    shfl.sync.idx.b32 %r22, %r1, 3, 0x0f0f, -1;
+
+    @%p1 st.global.b32 [%rd2+0], %r2;
+    @%p1 st.global.b32 [%rd2+4], %r4;
+    @%p1 st.global.b32 [%rd2+8], %r20;
+    @%p1 st.global.b32 [%rd2+12], %r21;
+    @%p1 st.global.b32 [%rd2+16], %r6;
+    @%p1 st.global.b32 [%rd2+20], %r7;
+    @%p1 st.global.b32 [%rd2+24], %r8;
+    @%p1 st.global.b32 [%rd2+28], %r9;
+    @%p1 st.global.b32 [%rd2+32], %r11;
+    @%p1 st.global.b32 [%rd2+36], %r12;
+    @%p1 st.global.b32 [%rd2+40], %r14;
+    @%p1 st.global.b32 [%rd2+44], %r15;
+    @%p1 st.global.b32 [%rd2+48], %r16;
+    @%p1 st.global.b32 [%rd2+52], %r17;
+    @%p1 st.global.b32 [%rd2+56], %r18;
+    @%p1 st.global.b32 [%rd2+60], %r19;
+    @%p1 st.global.b32 [%rd2+64], %r22;
+    ret;
+}

@@ -1,0 +1,119 @@
+// bf16 division, reciprocal and square root, on the same one-rounding path as the half:
+// the quotient keeps 48 bits above the 8-bit significand so the round bit and the
+// sticky are both real. ptxas has no bf16 `div`, `rcp` or `sqrt`, so each is the bf16
+// widened (exact) to a float, then a double, the double form, and one rounding back.
+// Eight results a lane:
+//
+//   0  div  2.0 / 3.0
+//   1  div  1.0 / 3.0
+//   2  div  1.0 / (1+2^-7)
+//   3  rcp  3.0                 the same quotient as slot 1
+//   4  sqrt 2.0
+//   5  sqrt largest finite      about 1.84e19, still finite
+//   6  div  2^-133 / 3.0        a subnormal result, rounded on its own grid
+//   7  div  0.0 / 0.0           the canonical NaN
+.version 8.0
+.target sm_90
+.address_size 64
+
+.visible .entry bf16div(
+    .param .u64 bf16div_param_0     // out: eight bf16s a lane
+)
+{
+    .reg .b16 %hs<10>;
+    .reg .b32 %r<4>;
+    .reg .f32 %f<4>;
+    .reg .f64 %df<4>;
+    .reg .pred %ps<2>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [bf16div_param_0];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 16;
+    add.u64 %rd3, %rd1, %rd2;
+
+    mov.b16 %hs1, 0x4000;     // 2.0
+    mov.b16 %hs2, 0x4040;     // 3.0
+    mov.b16 %hs3, 0x3F80;     // 1.0
+    mov.b16 %hs4, 0x3F81;     // 1 + 2^-7
+    mov.b16 %hs5, 0x7F7F;     // the largest finite bf16
+    mov.b16 %hs6, 0x0001;     // the smallest subnormal, 2^-133
+    mov.b16 %hs7, 0x0000;     // +0
+
+    cvt.f32.bf16 %f1, %hs1;
+    cvt.f32.bf16 %f2, %hs2;
+    cvt.f64.f32 %df1, %f1;
+    cvt.f64.f32 %df2, %f2;
+    div.rn.f64 %df3, %df1, %df2;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3], %hs0;
+    cvt.f32.bf16 %f1, %hs3;
+    cvt.f32.bf16 %f2, %hs2;
+    cvt.f64.f32 %df1, %f1;
+    cvt.f64.f32 %df2, %f2;
+    div.rn.f64 %df3, %df1, %df2;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3+2], %hs0;
+    cvt.f32.bf16 %f1, %hs3;
+    cvt.f32.bf16 %f2, %hs4;
+    cvt.f64.f32 %df1, %f1;
+    cvt.f64.f32 %df2, %f2;
+    div.rn.f64 %df3, %df1, %df2;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3+4], %hs0;
+    cvt.f32.bf16 %f1, %hs2;
+    cvt.f64.f32 %df1, %f1;
+    mov.f64 %df2, 0d3FF0000000000000;
+    div.rn.f64 %df3, %df2, %df1;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3+6], %hs0;
+    cvt.f32.bf16 %f1, %hs1;
+    cvt.f64.f32 %df1, %f1;
+    sqrt.rn.f64 %df3, %df1;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3+8], %hs0;
+    cvt.f32.bf16 %f1, %hs5;
+    cvt.f64.f32 %df1, %f1;
+    sqrt.rn.f64 %df3, %df1;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3+10], %hs0;
+    cvt.f32.bf16 %f1, %hs6;
+    cvt.f32.bf16 %f2, %hs2;
+    cvt.f64.f32 %df1, %f1;
+    cvt.f64.f32 %df2, %f2;
+    div.rn.f64 %df3, %df1, %df2;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3+12], %hs0;
+    cvt.f32.bf16 %f1, %hs7;
+    cvt.f32.bf16 %f2, %hs7;
+    cvt.f64.f32 %df1, %f1;
+    cvt.f64.f32 %df2, %f2;
+    div.rn.f64 %df3, %df1, %df2;
+    cvt.rn.f32.f64 %f3, %df3;
+    setp.nan.f32 %ps1, %f3, %f3;
+    cvt.rn.bf16.f32 %hs0, %f3;
+    selp.b16 %hs0, 0x7FFF, %hs0, %ps1;
+    st.global.b16 [%rd3+14], %hs0;
+    ret;
+}

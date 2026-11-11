@@ -15,8 +15,8 @@
 // is, the owed count and the phase word, and `data[4]` is sixteen bytes after them.
 // Spelling it `.b32 mbr[8]` would reserve the same bytes but read them in the wrong
 // width, and the phase lives in the object's second word.
-.version 7.0
-.target sm_70
+.version 7.8
+.target sm_90
 .address_size 64
 
 .visible .entry mbar(

@@ -1,0 +1,61 @@
+// `redux.sync` folds one value across the lanes of the warp and hands every lane the
+// same answer. Eleven words per lane, all lane-independent by definition, so a fold
+// that dropped a lane, used the wrong identity for a masked-out lane, or confused the
+// signed and unsigned forms moves a whole column.
+//
+//     row 0  add.u32 of lane            496, the sum 0..31
+//     row 1  min.u32 of lane            0
+//     row 2  max.u32 of lane            31
+//     row 3  and.b32 of lane            0
+//     row 4  or.b32  of lane            31
+//     row 5  xor.b32 of lane            0
+//     row 6  add.s32 of lane-16         -16
+//     row 7  min.s32 of lane-16         -16, which the unsigned form would call huge
+//     row 8  max.s32 of lane-16         15
+//     row 9  add.u32 over mask 0x0000FFFF   120, the sum 0..15
+//     row 10 or.b32  over mask 0x0000000F   3, the four low lanes
+//
+// The two masked rows are what prove the member mask: a fold that included the lanes
+// outside it would answer 496 and 31 there instead.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry reduxk(.param .u64 out)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 44;
+    add.u64 %rd2, %rd1, %rd2;
+
+    redux.sync.add.u32 %r2, %r1, -1;
+    redux.sync.min.u32 %r3, %r1, -1;
+    redux.sync.max.u32 %r4, %r1, -1;
+    redux.sync.and.b32 %r5, %r1, -1;
+    redux.sync.or.b32 %r6, %r1, -1;
+    redux.sync.xor.b32 %r7, %r1, -1;
+
+    sub.s32 %r8, %r1, 16;
+    redux.sync.add.s32 %r9, %r8, -1;
+    redux.sync.min.s32 %r10, %r8, -1;
+    redux.sync.max.s32 %r11, %r8, -1;
+
+    redux.sync.add.u32 %r12, %r1, 0x0000FFFF;
+    redux.sync.or.b32 %r13, %r1, 0x0000000F;
+
+    st.global.b32 [%rd2+0], %r2;
+    st.global.b32 [%rd2+4], %r3;
+    st.global.b32 [%rd2+8], %r4;
+    st.global.b32 [%rd2+12], %r5;
+    st.global.b32 [%rd2+16], %r6;
+    st.global.b32 [%rd2+20], %r7;
+    st.global.b32 [%rd2+24], %r9;
+    st.global.b32 [%rd2+28], %r10;
+    st.global.b32 [%rd2+32], %r11;
+    st.global.b32 [%rd2+36], %r12;
+    st.global.b32 [%rd2+40], %r13;
+    ret;
+}

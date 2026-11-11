@@ -312,12 +312,17 @@ kernel void logic(device const float* in [[buffer(0)]],
     uint pinf = 0x7f800000u;
     uint pnan = 0x7fc00000u;
     uint psub = 0x00000001u;
+    uint pzero = 0x00000000u;
+    uint nzero = 0x80000000u;
     auto is_finite = [](uint b) { return (b & 0x7f800000u) != 0x7f800000u; };
     auto is_inf = [](uint b) { return (b & 0x7fffffffu) == 0x7f800000u; };
     auto is_nan = [](uint b) { return (b & 0x7fffffffu) > 0x7f800000u; };
+    // A zero exponent is only disqualifying when the mantissa is not zero: that is a
+    // subnormal. The isa counts positive and negative zero as normal, and the first
+    // version of this lambda did not, which is why the two zeros are tested below.
     auto is_norm = [](uint b) {
         const uint e = b & 0x7f800000u;
-        return e != 0u && e != 0x7f800000u;
+        return e != 0x7f800000u && (e != 0u || (b & 0x007fffffu) == 0u);
     };
     auto is_sub = [](uint b) { return (b & 0x7f800000u) == 0u && (b & 0x007fffffu) != 0u; };
     uint cls = 1u   * (is_finite(one) ? 1u : 0u)
@@ -327,7 +332,9 @@ kernel void logic(device const float* in [[buffer(0)]],
              + 16u  * (is_sub(psub) ? 1u : 0u)
              + 32u  * (!is_nan(pinf) ? 1u : 0u)
              + 64u  * (is_norm(psub) ? 1u : 0u)
-             + 128u * (is_finite(pinf) ? 1u : 0u);
+             + 128u * (is_finite(pinf) ? 1u : 0u)
+             + 256u * (is_norm(pzero) ? 1u : 0u)
+             + 512u * (is_norm(nzero) ? 1u : 0u);
     out[gid] = xor3 + maj + cls;
 }
 

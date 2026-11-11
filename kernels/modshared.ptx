@@ -1,0 +1,60 @@
+// Two `.shared` arrays declared at module scope. PTX makes them file scope, one
+// instance per threadgroup, so the arena the launch hands the kernel has to hold
+// both and a kernel that names them addresses them by their place in it.
+//
+//     a[j] = j + 1        b[j] = j + 100
+//     out[i] = a[(i+1)%16] * 1000 + b[(i+1)%16]
+//
+// Both arrays are read, so a layout that put the second one on the first one's
+// bytes answers with 100 wherever `a` should be, and an arena that was never
+// declared for a module-scope tile has no GPU column at all.
+//
+// The address is a 32-bit offset: `mov.u32 %r, ms_a` materialises where the array
+// starts and the index is added to it. A 64-bit register will not do -- ptxas reads
+// `[ms_a + %rd2]` as a syntax error -- because the shared window is addressed at 32
+// bits.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.shared .align 4 .b32 ms_a[16];
+.shared .align 4 .b32 ms_b[16];
+
+.visible .entry modshared(
+    .param .u64 modshared_param_0
+)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [modshared_param_0];
+    mov.u32 %r1, %tid.x;
+    and.b32 %r1, %r1, 15;
+
+    mov.u32 %r8, ms_a;
+    mov.u32 %r9, ms_b;
+    shl.b32 %r10, %r1, 2;
+    add.u32 %r11, %r8, %r10;
+    add.s32 %r2, %r1, 1;
+    st.shared.b32 [%r11], %r2;
+    add.u32 %r12, %r9, %r10;
+    add.s32 %r3, %r1, 100;
+    st.shared.b32 [%r12], %r3;
+
+    bar.sync 0;
+
+    add.s32 %r4, %r1, 1;
+    and.b32 %r4, %r4, 15;
+    shl.b32 %r6, %r4, 2;
+    add.u32 %r7, %r8, %r6;
+    ld.shared.b32 %r13, [%r7];
+    add.u32 %r14, %r9, %r6;
+    ld.shared.b32 %r15, [%r14];
+
+    mad.lo.s32 %r16, %r13, 1000, %r15;
+
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd5, %rd1, %rd4;
+    st.global.b32 [%rd5], %r16;
+    ret;
+}

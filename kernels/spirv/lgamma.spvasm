@@ -1,0 +1,32 @@
+; `lgamma` (OpenCL.std 35): ln|Gamma|, which stays finite where gamma itself overflows.
+;   buffer 0: one argument per lane
+;   buffer 1: ln|Gamma| of it
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+       %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "lgamma" %gid
+               OpName %main "lgamma"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %u64 = OpTypeInt 64 0
+       %f32 = OpTypeFloat 32
+      %f32p = OpTypePointer CrossWorkgroup %f32
+    %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %f32p %f32p
+       %gid = OpVariable %pin Input
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f32p
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %pa = OpPtrAccessChain %f32p %a0 %gi
+        %vv = OpLoad %f32 %pa
+         %r = OpExtInst %f32 %ocl lgamma %vv
+        %po = OpPtrAccessChain %f32p %a1 %gi
+               OpStore %po %r
+               OpReturn
+               OpFunctionEnd

@@ -22,7 +22,7 @@
 {
     .reg .b32 %r<16>;
     .reg .b64 %rd<6>;
-    .reg .pred %p<8>;
+    .reg .pred %p<12>;
 
     ld.param.u64 %rd1, [bred_param_0];
     ld.param.u64 %rd2, [bred_param_1];
@@ -41,10 +41,12 @@
     bar.red.popc.u32 %r8, 0, %p2;
 
     setp.lt.s32 %p3, %r1, 200;
-    bar.red.and.pred %r9, 0, %p3;
+    bar.red.and.pred %p7, 0, %p3;
+    selp.b32 %r9, 1, 0, %p7;
 
     setp.eq.s32 %p4, %r1, 7;
-    bar.red.or.pred %r10, 0, %p4;
+    bar.red.or.pred %p8, 0, %p4;
+    selp.b32 %r10, 1, 0, %p8;
 
     // two passes over the reduction inside one loop body
     mov.u32 %r11, 0;                // sum

@@ -1,0 +1,133 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A function with a register file of its own: its `%rd1` is not the caller's
+// `%rd1`, so a translation that pasted the body in would make the two one slot and
+// the pointer would be overwritten by the word it read.
+.visible .func addone(
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<3>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    ld.global.u32 %r1, [%rd1];
+    add.u32 %r1, %r1, 1;
+    st.global.u32 [%rd2], %r1;
+    ret;
+}
+
+.visible .entry callk(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd1, %rd1, %rd3;
+    add.u64 %rd2, %rd2, %rd3;
+    call.uni addone, (%rd1, %rd2);
+    ret;
+}
+
+// A function that branches: a forward branch past a loop and a backward one inside it.
+// The callee body is the same switch a kernel body is, so a branch is a write to the
+// state's program counter and the case it names is the case it lands on. The loop
+// counts down from the value it read, so a kernel whose lane read zero must answer
+// zero rather than running one step before the test.
+.visible .func sumstep(
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<3>;
+    .reg .b32 %r<4>;
+    .reg .pred %p<3>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    ld.global.u32 %r1, [%rd1];
+    setp.ge.u32 %p1, %r1, 10;
+    @%p1 bra BIG;
+
+    mov.u32 %r2, 0;
+    mov.u32 %r3, %r1;
+    setp.eq.u32 %p2, %r3, 0;
+    @%p2 bra DONE;
+LOOP:
+    add.u32 %r2, %r2, %r3;
+    sub.u32 %r3, %r3, 1;
+    setp.ne.u32 %p2, %r3, 0;
+    @%p2 bra LOOP;
+DONE:
+    st.global.u32 [%rd2], %r2;
+    ret;
+
+BIG:
+    add.u32 %r2, %r1, 100;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+
+.visible .entry callbr(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd1, %rd1, %rd3;
+    add.u64 %rd2, %rd2, %rd3;
+    call.uni sumstep, (%rd1, %rd2);
+    ret;
+}
+
+// A function that calls two others: `nestadd` sits between the kernel and both
+// callees, so its state carries theirs. `sumstep` loops, so if the two levels
+// shared one program counter the loop would resume in the wrong case and the answer
+// would be the count rather than the sum.
+.visible .func nestadd(
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    call.uni sumstep, (%rd1, %rd2);
+    call.uni addone, (%rd2, %rd2);
+    ret;
+}
+
+.visible .entry callnest(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd1, %rd1, %rd3;
+    add.u64 %rd2, %rd2, %rd3;
+    call.uni nestadd, (%rd1, %rd2);
+    ret;
+}

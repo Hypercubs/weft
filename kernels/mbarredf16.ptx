@@ -10,7 +10,7 @@
 // kernel fills a tile: 0x3C00 is 1.0 and the pairs run from there. A reduce that
 // added the words as 32-bit integers, or that walked four elements instead of
 // eight, lands somewhere else entirely.
-.version 7.0
+.version 8.0
 .target sm_90
 .address_size 64
 

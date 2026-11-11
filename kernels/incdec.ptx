@@ -1,0 +1,70 @@
+// atom.inc and atom.dec: table 41 gives them one width, .u32, and this host has no
+// instruction for either. The successor is one step round a cycle bounded by b, as
+// the isa defines it:
+//
+//   inc(r, b) = (r >= b) ? 0 : r + 1
+//   dec(r, b) = (r == 0 || r > b) ? b : r - 1
+//
+// so each is a compare-exchange loop, and N lanes leave the start advanced N steps
+// whatever order they land in. The bound is 3 here, so the cycle is 0, 1, 2, 3 and a
+// test that never wrote the word is a different answer from the right one:
+//
+//   inc     3 lanes from 0: 1, 2, 3
+//   inc     5 lanes from 0: 1, 2, 3, 0, 1 -- the wrap, five steps round
+//   dec     3 lanes from 3: 2, 1, 0
+//   dec     2 lanes from 0: 3, 2 -- the wrap goes up to the bound, not below zero
+//   incgrab 1 lane from 0: value 0 comes back, the word becomes 1
+//   redinc  3 lanes from 0: the reduction form, same 3 with no result
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry inc(
+    .param .u64 inc_param_0        // in/out: the counter
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [inc_param_0];
+    atom.global.inc.u32 %r1, [%rd1], 3;
+    ret;
+}
+
+.visible .entry dec(
+    .param .u64 dec_param_0
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [dec_param_0];
+    atom.global.dec.u32 %r1, [%rd1], 3;
+    ret;
+}
+
+.visible .entry incgrab(
+    .param .u64 incgrab_param_0,   // in/out: the counter
+    .param .u64 incgrab_param_1    // out: the value the counter held before
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [incgrab_param_0];
+    ld.param.u64 %rd2, [incgrab_param_1];
+    atom.global.inc.u32 %r1, [%rd1], 3;
+    st.global.b32 [%rd2], %r1;
+    ret;
+}
+
+.visible .entry redinc(
+    .param .u64 redinc_param_0
+)
+{
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [redinc_param_0];
+    red.global.inc.u32 [%rd1], 3;
+    ret;
+}

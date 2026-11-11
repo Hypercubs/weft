@@ -1,0 +1,90 @@
+// 16-bit float arithmetic. A `b16` register holds the *bits* of a half, and the
+// instruction's `.f16` is what says to read them as one. Sixteen results a lane,
+// each on a grid point chosen so a wrong reading is visible:
+//
+//   0  add 1.0 + b
+//   1  sub 1.0 - b
+//   2  mul 0.5 * b
+//   3  fma 2.0 * b + 1.0        one rounding of the product and the sum
+//   4  min 1.0, b               NaN hands back the other operand
+//   5  max 1.0, b
+//   6  neg b                    the sign bit, exact on a NaN
+//   7  abs b
+//   8  add.sat 0.75, b          the [0, 1] clamp, not the destination's range
+//   9  mul.sat 1.0, b
+//  10  fma 1.0, 1.0, 2^-11      exactly halfway between 1 and 1+2^-10: ties to even
+//  11  fma 1+2^-10, 1.0, 2^-11  halfway again, one ulp up, and even is two ulp
+//  12  add 65504, 1.0           inside the range, so still 65504
+//  13  mul 0.5, 65504           32752, exactly
+//  14  add 2^-24, 2^-24         the subnormal grid: 2^-23
+//  15  sub 2^-24, 2^-24         +0, not -0
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry halfops(
+    .param .u64 halfops_param_0,    // in: one half a lane
+    .param .u64 halfops_param_1     // out: sixteen halfs a lane
+)
+{
+    .reg .b16 %hs<12>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [halfops_param_0];
+    ld.param.u64 %rd2, [halfops_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mul.wide.u32 %rd3, %r1, 2;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b16 %hs1, [%rd4];
+
+    mul.wide.u32 %rd5, %r1, 32;
+    add.u64 %rd6, %rd2, %rd5;
+
+    mov.b16 %hs2, 0x3C00;     // 1.0
+    mov.b16 %hs3, 0x3800;     // 0.5
+    mov.b16 %hs4, 0x4000;     // 2.0
+
+    add.rn.f16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6], %hs5;
+    sub.rn.f16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6+2], %hs5;
+    mul.rn.f16 %hs5, %hs3, %hs1;
+    st.global.b16 [%rd6+4], %hs5;
+    fma.rn.f16 %hs5, %hs4, %hs1, %hs2;
+    st.global.b16 [%rd6+6], %hs5;
+    min.f16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6+8], %hs5;
+    max.f16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6+10], %hs5;
+    neg.f16 %hs5, %hs1;
+    st.global.b16 [%rd6+12], %hs5;
+    abs.f16 %hs5, %hs1;
+    st.global.b16 [%rd6+14], %hs5;
+
+    mov.b16 %hs6, 0x3A00;     // 0.75
+    add.rn.sat.f16 %hs5, %hs6, %hs1;
+    st.global.b16 [%rd6+16], %hs5;
+    mul.rn.sat.f16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6+18], %hs5;
+
+    mov.b16 %hs7, 0x1000;     // 2^-11
+    fma.rn.f16 %hs5, %hs2, %hs2, %hs7;
+    st.global.b16 [%rd6+20], %hs5;
+    mov.b16 %hs8, 0x3C01;     // 1 + 2^-10
+    fma.rn.f16 %hs5, %hs8, %hs2, %hs7;
+    st.global.b16 [%rd6+22], %hs5;
+
+    mov.b16 %hs9, 0x7BFF;     // the largest finite half
+    add.rn.f16 %hs5, %hs9, %hs2;
+    st.global.b16 [%rd6+24], %hs5;
+    mul.rn.f16 %hs5, %hs3, %hs9;
+    st.global.b16 [%rd6+26], %hs5;
+    mov.b16 %hs10, 0x0001;    // the smallest subnormal, 2^-24
+    add.rn.f16 %hs5, %hs10, %hs10;
+    st.global.b16 [%rd6+28], %hs5;
+    sub.rn.f16 %hs5, %hs10, %hs10;
+    st.global.b16 [%rd6+30], %hs5;
+    ret;
+}

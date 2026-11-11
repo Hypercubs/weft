@@ -1,0 +1,33 @@
+.version 7.0
+.target sm_70
+.address_size 64
+// The lane masks and the warp's place in the block. The output is indexed by %tid.x, the
+// lane, and %laneid is written too: below a 32-lane block the two are the same number, and
+// above it they are not, which is the difference this fixture exists to show.
+//   eight words per lane: eq, lt, le, gt, ge, warpid, nwarpid, laneid
+.visible .entry lanemask(.param .u64 p0)
+{
+    .reg .u32 %r<20>;
+    .reg .b64 %rd<5>;
+    ld.param.u64 %rd1, [p0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r10, %laneid;
+    mov.u32 %r2, %lanemask_eq;
+    mov.u32 %r3, %lanemask_lt;
+    mov.u32 %r4, %lanemask_le;
+    mov.u32 %r5, %lanemask_gt;
+    mov.u32 %r6, %lanemask_ge;
+    mov.u32 %r7, %warpid;
+    mov.u32 %r8, %nwarpid;
+    mul.wide.u32 %rd2, %r1, 32;
+    add.u64 %rd4, %rd1, %rd2;
+    st.u32 [%rd4], %r2;
+    st.u32 [%rd4+4], %r3;
+    st.u32 [%rd4+8], %r4;
+    st.u32 [%rd4+12], %r5;
+    st.u32 [%rd4+16], %r6;
+    st.u32 [%rd4+20], %r7;
+    st.u32 [%rd4+24], %r8;
+    st.u32 [%rd4+28], %r10;
+    ret;
+}

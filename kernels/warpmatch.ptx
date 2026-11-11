@@ -1,0 +1,89 @@
+// match.any, match.all and elect, on an 8-lane warp.
+//
+//     electk     elect.sync over the full mask, then `p ? 1000 : 0` plus the elected
+//                lane's index, so lane 0 answers 1000 and every other lane answers 0
+//     matchny    match.any of the input value: the mask of lanes holding that value
+//     matchalld  match.all's mask: all ones when every lane agrees, zero otherwise
+//     matchallp  match.all's predicate, as 7 when true and 3 when false
+//
+// Two inputs: `wmmix.bin` (3,3,5,3,5,7,7,3) and `wmeq.bin` (eight 4s), so each kernel
+// runs once on values that agree and once on values that do not. A `match.any` that
+// compared against the wrong lane, an `all` that ignored the mask, or an election that
+// picked any lane but the lowest moves a whole row.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry electk(.param .u64 pout)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<3>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    elect.sync %r2|%p1, -1;
+    selp.u32 %r3, 1000, 0, %p1;
+    add.u32 %r3, %r3, %r2;
+    st.global.b32 [%rd2], %r3;
+    ret;
+}
+
+.visible .entry matchny(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd3, [pout];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    ld.global.b32 %r2, [%rd2];
+    match.any.sync.b32 %r3, %r2, -1;
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd4, %rd3, %rd4;
+    st.global.b32 [%rd4], %r3;
+    ret;
+}
+
+.visible .entry matchalld(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<5>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd3, [pout];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    ld.global.b32 %r2, [%rd2];
+    match.all.sync.b32 %r3|%p1, %r2, -1;
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd4, %rd3, %rd4;
+    st.global.b32 [%rd4], %r3;
+    ret;
+}
+
+.visible .entry matchallp(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<5>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd3, [pout];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    ld.global.b32 %r2, [%rd2];
+    match.all.sync.b32 %r3|%p1, %r2, -1;
+    selp.u32 %r4, 7, 3, %p1;
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd4, %rd3, %rd4;
+    st.global.b32 [%rd4], %r4;
+    ret;
+}

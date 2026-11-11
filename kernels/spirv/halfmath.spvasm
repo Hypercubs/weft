@@ -1,0 +1,58 @@
+; 16-bit float arithmetic in SPIR-V. The type is 16 bits wide, so the value is a
+; `_Float16` on the host and a `half` on the GPU, and the arithmetic is the
+; narrow operation rather than a widening to float and back. A workgroup array of
+; the same type is the threadgroup half memory a compute shader declares, and the
+; barrier between the write and the neighbouring read is what makes it a
+; rendezvous rather than a race: out[i] = in[(i+1) mod 32] * 2 + 2.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Float16
+               OpCapability Int16
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "halfmath" %gid
+               OpName %main "halfmath"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %f16 = OpTypeFloat 16
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+        %ph = OpTypePointer CrossWorkgroup %f16
+       %c32 = OpConstant %u32 32
+        %c2 = OpConstant %u32 2
+        %c8 = OpConstant %u32 8
+        %c1 = OpConstant %u32 1
+      %arrty = OpTypeArray %f16 %c32
+        %pw = OpTypePointer Workgroup %f16
+       %pwa = OpTypePointer Workgroup %arrty
+    %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %ph %ph
+       %gid = OpVariable %pin Input
+      %tile = OpVariable %pwa Workgroup
+       %one = OpConstant %f16 1
+       %two = OpConstant %f16 2
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %ph
+         %o = OpFunctionParameter %ph
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+      %gi32 = OpUConvert %u32 %gi
+      %lane = OpUMod %u32 %gi32 %c32
+        %pa = OpPtrAccessChain %ph %a %gi
+        %va = OpLoad %f16 %pa
+        %m1 = OpFMul %f16 %va %two
+         %r = OpFAdd %f16 %m1 %one
+        %sl = OpAccessChain %pw %tile %lane
+              OpStore %sl %r
+              OpControlBarrier %c2 %c2 %c8
+        %nx = OpIAdd %u32 %lane %c1
+        %nm = OpUMod %u32 %nx %c32
+        %sn = OpAccessChain %pw %tile %nm
+      %back = OpLoad %f16 %sn
+       %sum = OpFAdd %f16 %back %one
+        %po = OpPtrAccessChain %ph %o %gi
+              OpStore %po %sum
+              OpReturn
+              OpFunctionEnd

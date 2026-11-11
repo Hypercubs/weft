@@ -1,0 +1,46 @@
+; `mad` (OpenCL.std 42) with the latitude to fuse: this engine answers the fused form,
+; one rounding of the exact product and sum, so the three operands arrive in one buffer
+; and the answer leaves in the other.
+;   buffer 0: a, b, c per lane (three floats)
+;   buffer 1: a*b+c per lane
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+       %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "mad3" %gid
+               OpName %main "mad3"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %u64 = OpTypeInt 64 0
+       %f32 = OpTypeFloat 32
+      %f32p = OpTypePointer CrossWorkgroup %f32
+    %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %f32p %f32p
+       %gid = OpVariable %pin Input
+      %c0u = OpConstant %u64 0
+      %c1u = OpConstant %u64 1
+      %c2u = OpConstant %u64 2
+      %c3u = OpConstant %u64 3
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f32p
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+      %base = OpIMul %u64 %gi %c3u
+       %ia = OpIAdd %u64 %base %c0u
+       %ib = OpIAdd %u64 %base %c1u
+       %ic = OpIAdd %u64 %base %c2u
+       %pa = OpPtrAccessChain %f32p %a0 %ia
+       %pb = OpPtrAccessChain %f32p %a0 %ib
+       %pc = OpPtrAccessChain %f32p %a0 %ic
+       %va = OpLoad %f32 %pa
+       %vb = OpLoad %f32 %pb
+       %vc = OpLoad %f32 %pc
+        %r = OpExtInst %f32 %ocl mad %va %vb %vc
+       %po = OpPtrAccessChain %f32p %a1 %gi
+               OpStore %po %r
+               OpReturn
+               OpFunctionEnd

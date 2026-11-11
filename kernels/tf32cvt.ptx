@@ -12,8 +12,8 @@
 // The second entry is the two modifiers: `.relu` zeroes a negative, `.satfinite`
 // clamps an infinity to the largest finite tf32 and turns a NaN into zero, and the
 // last line has both on a value that neither should touch.
-.version 7.0
-.target sm_80
+.version 8.6
+.target sm_100a
 .address_size 64
 
 .visible .entry tf32cvt(

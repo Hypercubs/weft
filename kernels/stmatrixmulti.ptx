@@ -1,0 +1,93 @@
+// `stmatrix.x4` is four tiles back into shared memory. The `.x1` fixture proves the
+// map for a tile at offset zero, so what this adds is the 128-byte stride between
+// tiles and the transposed form at the same time: a store that put every tile at
+// offset zero, or ignored `.trans` for the tiles past the first, passes the `.x1`
+// row and fails here.
+//
+// The tile is four 8x8 tiles of halves holding 0..255 in row-major order, so half h
+// holds h. `ldmatrix.x4` reads them, `stmatrix.x4` writes them back into `back4`,
+// which therefore has to be the tile again, and `stmatrix.x4.trans` writes the
+// transposed fragment into `flip4`, which as a linear array of halves answers with
+//     half h holds  (h & ~63) | 8 (h & 7) | ((h >> 3) & 7)
+// -- each tile's element (r, c) holding what element (c, r) held. The first block
+// out is `back4` read back, the second `flip4`, both
+// sixteen bytes a lane, so the two blocks pin the plain and the transposed store.
+.version 8.8
+.target sm_100a
+.address_size 64
+
+.visible .entry stmatrixmulti(
+    .param .u64 stmatrixmulti_param_0   // out: two blocks of 128 words
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+
+    .shared .align 128 .b8 tile4[512];
+    .shared .align 128 .b8 back4[512];
+    .shared .align 128 .b8 flip4[512];
+
+    ld.param.u64 %rd1, [stmatrixmulti_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd4, tile4;
+
+    // ---- the tile: half h holds h, four words a lane at 16l ----
+    shl.b32 %r2, %r1, 4;
+    cvt.u64.u32 %rd5, %r2;
+    add.s64 %rd5, %rd4, %rd5;
+    shl.b32 %r3, %r1, 3;
+    add.u32 %r6, %r3, 1;
+    shl.b32 %r6, %r6, 16;
+    or.b32 %r6, %r6, %r3;
+    st.shared.u32 [%rd5], %r6;
+    add.u32 %r3, %r3, 2;
+    add.u32 %r7, %r3, 1;
+    shl.b32 %r7, %r7, 16;
+    or.b32 %r7, %r7, %r3;
+    st.shared.u32 [%rd5+4], %r7;
+    add.u32 %r3, %r3, 2;
+    add.u32 %r8, %r3, 1;
+    shl.b32 %r8, %r8, 16;
+    or.b32 %r8, %r8, %r3;
+    st.shared.u32 [%rd5+8], %r8;
+    add.u32 %r3, %r3, 2;
+    add.u32 %r9, %r3, 1;
+    shl.b32 %r9, %r9, 16;
+    or.b32 %r9, %r9, %r3;
+    st.shared.u32 [%rd5+12], %r9;
+    bar.sync 0;
+
+    // ---- four tiles out of the load, and back through both stores ----
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r10, %r11, %r12, %r13}, [tile4];
+    stmatrix.sync.aligned.m8n8.x4.shared.b16 [back4], {%r10, %r11, %r12, %r13};
+    stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [flip4], {%r10, %r11, %r12, %r13};
+    bar.sync 0;
+
+    // ---- out: sixteen bytes of each tile, a lane each ----
+    mul.wide.s32 %rd2, %r1, 16;
+    add.s64 %rd3, %rd1, %rd2;
+    mov.u64 %rd6, back4;
+    add.s64 %rd7, %rd6, %rd2;
+    ld.shared.b32 %r20, [%rd7];
+    ld.shared.b32 %r21, [%rd7+4];
+    ld.shared.b32 %r22, [%rd7+8];
+    ld.shared.b32 %r23, [%rd7+12];
+    st.global.b32 [%rd3], %r20;
+    st.global.b32 [%rd3+4], %r21;
+    st.global.b32 [%rd3+8], %r22;
+    st.global.b32 [%rd3+12], %r23;
+
+    mov.u64 %rd8, flip4;
+    add.s64 %rd9, %rd8, %rd2;
+    ld.shared.b32 %r24, [%rd9];
+    ld.shared.b32 %r25, [%rd9+4];
+    ld.shared.b32 %r26, [%rd9+8];
+    ld.shared.b32 %r27, [%rd9+12];
+    add.s64 %rd10, %rd3, 512;
+    st.global.b32 [%rd10], %r24;
+    st.global.b32 [%rd10+4], %r25;
+    st.global.b32 [%rd10+8], %r26;
+    st.global.b32 [%rd10+12], %r27;
+    ret;
+}

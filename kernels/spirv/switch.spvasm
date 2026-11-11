@@ -1,0 +1,92 @@
+; OpSwitch: the selector chooses a label out of a table, and the table is an
+; operand list with a shape of its own. The default label comes *first*, right
+; after the selector, and every entry after it is a pair of literal and label,
+; so the first literal is the second thing after the selector, not the first.
+; A selector wider than 32 bits makes each literal wider too: a 64-bit literal
+; takes two words, and a front end that reads one word per entry pairs a
+; literal's high half with the label of the entry before it.
+;
+;   sw32  a u32 selector: cases 0, 1 and 7, and a default for everything else
+;   sw64  a u64 selector whose literals have bits above 32, so a truncated
+;         literal matches the wrong entry and the answer says so
+;
+; A signed selector cannot live in this module: the Kernel capability forbids a
+; signed OpTypeInt, so `switchs.spvasm` carries that one in the shader dialect.
+;
+; The values are distinct numbers, so a switch that lands on the wrong label
+; writes a different number rather than the same one.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "sw32" %gid
+               OpEntryPoint Kernel %main2 "sw64" %gid
+               OpName %main "sw32"
+               OpName %main2 "sw64"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+      %pu32 = OpTypePointer CrossWorkgroup %u32
+      %pu64 = OpTypePointer CrossWorkgroup %u64
+   %v3u64 = OpTypeVector %u64 3
+      %pin = OpTypePointer Input %v3u64
+   %fnty32 = OpTypeFunction %void %pu32 %pu32
+   %fnty64 = OpTypeFunction %void %pu64 %pu64
+      %gid = OpVariable %pin Input
+       %ten = OpConstant %u32 10
+    %eleven = OpConstant %u32 11
+    %twelve = OpConstant %u32 12
+       %d32 = OpConstant %u32 99
+    %twe20 = OpConstant %u64 20
+    %twe21 = OpConstant %u64 21
+    %twe22 = OpConstant %u64 22
+       %d64 = OpConstant %u64 99
+      %main = OpFunction %void None %fnty32
+        %in = OpFunctionParameter %pu32
+       %out = OpFunctionParameter %pu32
+     %entry = OpLabel
+         %g = OpLoad %v3u64 %gid
+        %gi = OpCompositeExtract %u64 %g 0
+        %pi = OpPtrAccessChain %pu32 %in %gi
+         %v = OpLoad %u32 %pi
+               OpSelectionMerge %merge None
+               OpSwitch %v %deflt 0 %k0 1 %k1 7 %k7
+        %k0 = OpLabel
+               OpBranch %merge
+        %k1 = OpLabel
+               OpBranch %merge
+        %k7 = OpLabel
+               OpBranch %merge
+     %deflt = OpLabel
+               OpBranch %merge
+     %merge = OpLabel
+         %r = OpPhi %u32 %ten %k0 %eleven %k1 %twelve %k7 %d32 %deflt
+        %po = OpPtrAccessChain %pu32 %out %gi
+               OpStore %po %r
+               OpReturn
+               OpFunctionEnd
+     %main2 = OpFunction %void None %fnty64
+       %in64 = OpFunctionParameter %pu64
+      %out64 = OpFunctionParameter %pu64
+    %entry64 = OpLabel
+        %g64 = OpLoad %v3u64 %gid
+       %gi64 = OpCompositeExtract %u64 %g64 0
+       %pi64 = OpPtrAccessChain %pu64 %in64 %gi64
+        %v64 = OpLoad %u64 %pi64
+               OpSelectionMerge %merge64 None
+               OpSwitch %v64 %deflt64 4294967298 %m0 1 %m1 4294967295 %m2
+        %m0 = OpLabel
+               OpBranch %merge64
+        %m1 = OpLabel
+               OpBranch %merge64
+        %m2 = OpLabel
+               OpBranch %merge64
+    %deflt64 = OpLabel
+               OpBranch %merge64
+    %merge64 = OpLabel
+        %r64 = OpPhi %u64 %twe20 %m0 %twe21 %m1 %twe22 %m2 %d64 %deflt64
+       %po64 = OpPtrAccessChain %pu64 %out64 %gi64
+               OpStore %po64 %r64
+               OpReturn
+               OpFunctionEnd

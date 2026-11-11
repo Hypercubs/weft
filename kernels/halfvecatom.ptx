@@ -1,0 +1,84 @@
+// The vector half atomics. Table 41 keeps them in a table of their own: `.add`, `.min`
+// and `.max` of a half at `.v2`, `.v4` and `.v8`, and of a packed pair at `.v2` and
+// `.v4`. No scalar half carries `.min` at all, so the only way to ask for one is here.
+//
+// The isa says an atomic on a vector is atomic per element and not for the group, so
+// the two halves of the one word this fixture contends are separate values: a
+// translation that wrote the whole word would put the second answer in both halves.
+//
+// Every lane works on the same address. Min and max are idempotent, and the add moves
+// powers of two that stay exact at every step, so the answer after eight lanes is the
+// same whatever order they land in.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry hvmax(
+    .param .u64 hvmax_param_0        // in/out: 1.0 low, 4.0 high
+)
+{
+    .reg .f16 %hs<4>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [hvmax_param_0];
+    mov.b16 %hs2, 0x3E00;     // 1.5
+    mov.b16 %hs3, 0x4100;     // 2.5
+    atom.global.v2.f16.max.noftz {%hs0, %hs1}, [%rd1], {%hs2, %hs3};
+    ret;
+}
+
+.visible .entry hvmin(
+    .param .u64 hvmin_param_0
+)
+{
+    .reg .f16 %hs<4>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [hvmin_param_0];
+    mov.b16 %hs2, 0x3E00;     // 1.5
+    mov.b16 %hs3, 0x4100;     // 2.5
+    atom.global.v2.f16.min.noftz {%hs0, %hs1}, [%rd1], {%hs2, %hs3};
+    ret;
+}
+
+.visible .entry hvadd(
+    .param .u64 hvadd_param_0        // in/out: starts at zero
+)
+{
+    .reg .f16 %hs<4>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [hvadd_param_0];
+    mov.b16 %hs2, 0x3400;     // 0.25
+    mov.b16 %hs3, 0x3800;     // 0.5
+    atom.global.v2.f16.add.noftz {%hs0, %hs1}, [%rd1], {%hs2, %hs3};
+    ret;
+}
+
+.visible .entry hvbf(
+    .param .u64 hvbf_param_0         // in/out: starts at zero, bfloat16
+)
+{
+    .reg .b16 %hs<4>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [hvbf_param_0];
+    mov.b16 %hs2, 0x3F80;     // 1.0
+    mov.b16 %hs3, 0x4000;     // 2.0
+    atom.global.v2.bf16.add.noftz {%hs0, %hs1}, [%rd1], {%hs2, %hs3};
+    ret;
+}
+
+.visible .entry hvpack(
+    .param .u64 hvpack_param_0       // in/out: two words of half pairs
+)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [hvpack_param_0];
+    mov.b32 %r2, 0x3C004000;  // the pair (2.0 low, 0.5 high) in each element
+    mov.b32 %r3, 0x3C004000;
+    atom.global.v2.f16x2.max.noftz {%r0, %r1}, [%rd1], {%r2, %r3};
+    ret;
+}

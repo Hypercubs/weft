@@ -12,7 +12,7 @@
 .target sm_70
 .address_size 64
 
-.tex .u32 vol, 1, 1, 1, 1;
+.global .texref vol;
 
 .visible .entry ptx3d(
     .param .u64 ptx3d_param_0
@@ -55,7 +55,9 @@
     div.rn.f32 %f11, %f5, %f8;          // v
     div.rn.f32 %f12, %f6, %f9;          // w
 
-    tex.3d.v4.f32.f32 {%f13,%f14,%f15,%f16}, [vol, {%f10,%f11,%f12}];
+    // PTX wants four coordinates here; q = 1 is the exact projective identity.
+    mov.f32 %f20, 0f3F800000;
+    tex.3d.v4.f32.f32 {%f13,%f14,%f15,%f16}, [vol, {%f10,%f11,%f12,%f20}];
 
     mul.f32 %f17, %f13, 0f40000000;
     cvt.rn.f32.u32 %f18, %r7;           // the depth, folded in

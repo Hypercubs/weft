@@ -1,0 +1,43 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// Two values through one return list. PTX allows it; the state struct here has one
+// field to hold an answer, so this is refused by name rather than half-carried.
+//
+// The list is `.reg`, not `.param`, which ptxas accepts only as `Multiple return
+// parameters require .register state space`, and each value arrives by `mov.b32`.
+// The `.reg` count is one past the last name used: `%rd<4>` is the four registers
+// `%rd0` to `%rd3`, and `%rd<3>` leaves `%rd3` undeclared.
+.visible .func (.reg .b32 lo, .reg .b32 hi) split(
+    .param .u64 src
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<2>;
+
+    ld.param.u64 %rd1, [src];
+    ld.global.u32 %r1, [%rd1];
+    mov.b32 lo, %r1;
+    mov.b32 hi, %r1;
+    ret;
+}
+
+.visible .entry callmulti(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<4>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    call.uni (%r2, %r3), split, (%rd1);
+    add.u32 %r2, %r2, %r3;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd2, %rd2, %rd3;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}

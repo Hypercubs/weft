@@ -8,20 +8,20 @@
 // groups along M (SBO = 256 bytes). A is a 64x16 f16 tile, B is 16x8, D is 64x8
 // f32 spread over the warpgroup in the usual Z pattern.
 .version 8.1
-.target sm_90
+.target sm_90a
 .address_size 64
 
 // A `wgmma` is a warpgroup instruction: the four warps of the block cooperate, so
 // the block is 128 lanes and `%tid.x` runs 0..127. Triton writes this line from
 // `num_warps = 4`, and it is the only record of the geometry the fragment map was
 // compiled against.
-.maxntid 128, 1, 1
-
 .visible .entry wgmma_kernel(
 	.param .u64 wgmma_kernel_param_0,
 	.param .u64 wgmma_kernel_param_1,
 	.param .u64 wgmma_kernel_param_2
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .b32 	%r<40>;
 	.reg .f32 	%f<12>;
@@ -91,7 +91,7 @@
 	mov.f32 	%f7, 0f00000000;
 	mov.f32 	%f8, 0f00000000;
 	wgmma.fence.sync.aligned;
-	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 1, 1, 0, 0;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 

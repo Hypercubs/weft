@@ -8,7 +8,7 @@
 // Descriptor-free like the plain bulk store: the size is in the instruction and the
 // group commit is a no-op. A copy that overwrote instead of adding would read
 // 10, 20, 30, 40, and one that added the wrong address would not land on 11, 22, 33, 44.
-.version 7.0
+.version 8.0
 .target sm_90
 .address_size 64
 

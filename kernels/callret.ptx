@@ -1,0 +1,87 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A function that hands a value back through its parenthesised list. The answer is
+// written into the return slot with `st.param`, which is a store to a parameter and
+// not to memory, so a translation that aimed it at address zero would fault instead
+// of answering.
+.visible .func (.param .b32 tri) trisum(
+    .param .u64 src
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<3>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [src];
+    ld.global.u32 %r1, [%rd1];
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra ZERO;
+
+    // 3 * r1 + 1, as three adds: no multiply form to get wrong.
+    add.u32 %r2, %r1, %r1;
+    add.u32 %r2, %r2, %r1;
+    add.u32 %r2, %r2, 1;
+    st.param.b32 [tri], %r2;
+    ret;
+
+ZERO:
+    mov.u32 %r2, 0;
+    st.param.b32 [tri], %r2;
+    ret;
+}
+
+// A second level: this function calls the one above and hands back its own answer,
+// so a value carried only as far as the first call would be lost here.
+.visible .func (.param .b32 dbl) twice(
+    .param .u64 src
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [src];
+    call.uni (%r1), trisum, (%rd1);
+    add.u32 %r2, %r1, %r1;
+    st.param.b32 [dbl], %r2;
+    ret;
+}
+
+.visible .entry callret(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<4>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd1, %rd1, %rd3;
+    add.u64 %rd2, %rd2, %rd3;
+    call.uni (%r2), trisum, (%rd1);
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+
+.visible .entry callret2(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<4>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd1, %rd1, %rd3;
+    add.u64 %rd2, %rd2, %rd3;
+    call.uni (%r2), twice, (%rd1);
+    st.global.u32 [%rd2], %r2;
+    ret;
+}

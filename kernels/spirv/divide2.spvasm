@@ -1,0 +1,41 @@
+; `half_divide` (68) and `native_divide` (82): both are the one division here, and they
+; were refused by number until they were wired. Lanes 0..3 take the half spelling and
+; 4..7 the native one, so one run covers both.
+;   buffer 0: numerator, buffer 1: denominator, buffer 2: quotient
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+       %ocl = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "divide2" %gid
+               OpName %main "divide2"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %bool = OpTypeBool
+       %u64 = OpTypeInt 64 0
+       %f32 = OpTypeFloat 32
+      %f32p = OpTypePointer CrossWorkgroup %f32
+    %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %f32p %f32p %f32p
+       %gid = OpVariable %pin Input
+       %c4u = OpConstant %u64 4
+       %main = OpFunction %void None %fnty
+         %a0 = OpFunctionParameter %f32p
+         %a1 = OpFunctionParameter %f32p
+         %a2 = OpFunctionParameter %f32p
+      %entry = OpLabel
+          %g = OpLoad %v3u64 %gid
+         %gi = OpCompositeExtract %u64 %g 0
+        %pa = OpPtrAccessChain %f32p %a0 %gi
+        %pb = OpPtrAccessChain %f32p %a1 %gi
+        %va = OpLoad %f32 %pa
+        %vb = OpLoad %f32 %pb
+        %hd = OpExtInst %f32 %ocl half_divide %va %vb
+        %nd = OpExtInst %f32 %ocl native_divide %va %vb
+       %cmp = OpULessThan %bool %gi %c4u
+         %r = OpSelect %f32 %cmp %hd %nd
+        %po = OpPtrAccessChain %f32p %a2 %gi
+               OpStore %po %r
+               OpReturn
+               OpFunctionEnd

@@ -13,8 +13,13 @@
 //        flushes to a zero of its own sign, while the n2 pair scales each value of an
 //        up-convert by its own byte, the upper byte for the upper value
 //   pzo  -0.0 becomes +0.0
-.version 7.0
-.target sm_80
+//
+// The header names the version the qualifiers arrived in, so ptxas reads the `.rs`
+// forms and stops only at what is genuinely absent: it takes no four-bit convert at
+// all (`cvt.rs.satfinite.e2m1x4` answers `Arguments mismatch`), no `.rz` on the
+// narrow pair forms, no `.pzo`, and no `.scaled::n1`/`::n2` block.
+.version 8.8
+.target sm_100a
 .address_size 64
 
 .visible .entry cvtrsx4(

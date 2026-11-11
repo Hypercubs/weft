@@ -1,0 +1,147 @@
+// Atomics in the shared window. `atom.shared`, `.shared::cta` and `.shared::cluster` are
+// the same window to a launch this wide, and its address is an offset inside that
+// window rather than a pointer -- which is what the device form used to be handed, an
+// atomic on address zero. Every kernel here is order-free by construction (an add of
+// powers of two, a max over a fixed set, a compare-exchange only the first match takes),
+// and every one sets its own words first: the window arrives holding whatever the last
+// launch left there, and the harness runs a kernel more than once to time it.
+//
+//   satadd   a u32 add, a float add, a u32 max and a u32 min, each on its own word
+//   satb16   atom.cas.b16 on the low half of a word whose high half must survive
+//   satpack  atom.add.noftz.f16x2, the whole word, both halves at once
+//   satret   the value the add returned: each lane's is its own, so the sum of the eight
+//            is 0+1+...+7 whatever order they landed in
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry satadd(
+    .param .u64 satadd_param_0       // out: four words
+)
+{
+    .shared .align 16 .b32 w[4];
+
+    .reg .b32 %r<6>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [satadd_param_0];
+    mov.u32 %r1, %tid.x;
+
+    // Zero, zero, zero, and all ones for the min to come down from. An f32 atomic is not
+    // a `.min` ptxas takes, and neither is a scalar half one -- the float types it names
+    // for `.min` are the halves, and those want a vector modifier, which it allows only
+    // in global memory. So the fourth word is a u32 min, and its lanes ask for 1..8 so
+    // the answer is not the zero every word starts at.
+    setp.eq.u32 %p1, %r1, 0;
+    mov.u32 %r2, 0;
+    @%p1 st.shared.b32 [w], %r2;
+    @%p1 st.shared.b32 [w+4], %r2;
+    @%p1 st.shared.b32 [w+8], %r2;
+    mov.u32 %r2, 0xFFFFFFFF;
+    @%p1 st.shared.b32 [w+12], %r2;
+    bar.sync 0;
+
+    cvt.rn.f32.u32 %f1, %r1;
+    add.f32 %f1, %f1, 0f3F800000;    // lane + 1
+
+    atom.shared.add.u32 %r3, [w], 1;
+    mov.f32 %f2, 0f3F000000;         // 0.5
+    red.shared.add.f32 [w+4], %f2;
+    atom.shared.max.u32 %r4, [w+8], %r1;
+    add.u32 %r5, %r1, 1;
+    atom.shared.min.u32 %r3, [w+12], %r5;
+
+    bar.sync 0;
+
+    ld.shared.b32 %r5, [w];
+    @%p1 st.global.b32 [%rd1], %r5;
+    ld.shared.b32 %r5, [w+4];
+    add.s64 %rd2, %rd1, 4;
+    @%p1 st.global.b32 [%rd2], %r5;
+    ld.shared.b32 %r5, [w+8];
+    add.s64 %rd2, %rd1, 8;
+    @%p1 st.global.b32 [%rd2], %r5;
+    ld.shared.b32 %r5, [w+12];
+    add.s64 %rd2, %rd1, 12;
+    @%p1 st.global.b32 [%rd2], %r5;
+    ret;
+}
+
+.visible .entry satb16(
+    .param .u64 satb16_param_0       // out: the word the halves share
+)
+{
+    .shared .align 16 .b32 w[1];
+
+    .reg .b16 %hs<4>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [satb16_param_0];
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    mov.u32 %r2, 0x38003C00;         // 1.0 low, 0.5 high
+    @%p1 st.shared.b32 [w], %r2;
+    bar.sync 0;
+
+    mov.b16 %hs1, 0x3C00;            // compare 1.0
+    mov.b16 %hs2, 0x4000;            // swap in 2.0
+    atom.shared.cas.b16 %hs3, [w], %hs1, %hs2;
+
+    bar.sync 0;
+    ld.shared.b32 %r3, [w];
+    @%p1 st.global.b32 [%rd1], %r3;
+    ret;
+}
+
+.visible .entry satpack(
+    .param .u64 satpack_param_0      // out: the pair the adds summed
+)
+{
+    .shared .align 16 .b32 w[1];
+
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [satpack_param_0];
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    mov.u32 %r2, 0;
+    @%p1 st.shared.b32 [w], %r2;
+    bar.sync 0;
+
+    mov.b32 %r3, 0x3C003C00;         // add 1.0 to each half, eight times
+    atom.shared.add.noftz.f16x2 %r4, [w], %r3;
+
+    bar.sync 0;
+    ld.shared.b32 %r4, [w];
+    @%p1 st.global.b32 [%rd1], %r4;
+    ret;
+}
+
+.visible .entry satret(
+    .param .u64 satret_param_0       // out: the sum of the eight values returned
+)
+{
+    .shared .align 16 .b32 w[1];
+
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [satret_param_0];
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    mov.u32 %r2, 0;
+    @%p1 st.shared.b32 [w], %r2;
+    @%p1 st.global.b32 [%rd1], %r2;  // the sum starts at zero, not at what the last run left
+    bar.sync 0;
+
+    atom.shared.add.u32 %r2, [w], 1;
+    red.global.add.u32 [%rd1], %r2;
+    ret;
+}

@@ -1,0 +1,40 @@
+// The clamp in a register, which is how a front end writes a `width` below 32: the
+// segment end differs per lane, so `c` cannot be an immediate.
+//
+//     row 0  shfl.up   1 with c = lane & ~7   lane i reads i-1 unless it starts a segment
+//     row 1  shfl.down 1 with c = lane |  7   lane i reads i+1 unless it ends a segment
+//     row 2  shfl.bfly 4 with c = lane |  7   i xor 4, inside the 8-lane segment
+//     row 3  shfl.bfly 2 with c = lane |  7   i xor 2
+//
+// A clamp read as one number would put these on the whole warp, so lane 7 would read
+// lane 8 in row 0 and lane 8 would read lane 9 in row 1; both are segment crossings.
+// The clamp in a register: a front end writes a `width` below 32 this way, because the
+// segment end differs per lane.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry warpreg(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 16;
+    add.u64 %rd2, %rd1, %rd2;
+
+    and.b32 %r3, %r1, 7;
+    xor.b32 %r4, %r1, %r3;      // lane & ~7: the start of this 8-lane segment
+    or.b32 %r5, %r1, 7;         // lane | 7: the end of it
+    shfl.sync.up.b32 %r6, %r1, 1, %r4, -1;
+    shfl.sync.down.b32 %r7, %r1, 1, %r5, -1;
+    shfl.sync.bfly.b32 %r8, %r1, 4, %r5, -1;
+    shfl.sync.bfly.b32 %r9, %r1, 2, %r5, -1;
+
+    st.global.b32 [%rd2+0], %r6;
+    st.global.b32 [%rd2+4], %r7;
+    st.global.b32 [%rd2+8], %r8;
+    st.global.b32 [%rd2+12], %r9;
+    ret;
+}

@@ -386,6 +386,12 @@ bool parse_module(Mod& m, const std::string& bytes, std::string& err) {
         } else if (t.kind == KFloat && t.width == 64) {
           const uint64_t bits = ((uint64_t)ins.a[3] << 32) | ins.a[2];
           std::snprintf(buf, sizeof buf, "weft_f64(0x%016llxull)", (unsigned long long)bits);
+        } else if (t.kind == KFloat && t.width == 16) {
+          // A 16-bit float constant. The type is `_Float16` on the host and `half`
+          // on the GPU, so the spelling is a helper both texts already carry: the
+          // bits are decoded as the half they name, not cast as an integer, which
+          // would read 0x3C00 as 15360.
+          std::snprintf(buf, sizeof buf, "weft_h16v(0x%04xu)", ins.a[2] & 0xFFFFu);
         } else if (t.kind == KInt && t.width == 64) {
           const uint64_t bits = ((uint64_t)ins.a[3] << 32) | ins.a[2];
           std::snprintf(buf, sizeof buf, "0x%016llxull", (unsigned long long)bits);
@@ -813,6 +819,12 @@ class Emitter {
   bool f64_type(uint32_t tid) const;
   bool shfl_pub(uint32_t tid, const std::string& e, std::string& out);
   bool wide_shfl(uint32_t tid, const std::string& e, const std::string& peer, std::string& out);
+  // The extended integer operations answer two words, and a kernel takes them apart one
+  // at a time with OpCompositeExtract, so the pair is kept as two expressions rather than
+  // built into a value. Each is pure, so reading it twice is the same answer, and no C++
+  // type has to exist for a struct that only ever exists to be taken apart.
+  std::map<uint32_t, std::pair<std::string, std::string>> multi_;
+
   bool chain(const Instr& ins);
   bool emit_one(const Instr& ins);
   bool emit_import(const Instr& ins, const std::string& sym);
@@ -1362,8 +1374,12 @@ bool Emitter::emit_one(const Instr& ins) {
   const uint32_t rt = res ? a[0] : 0;
   const uint32_t rd = res ? a[1] : 0;
 
+  // The extended integer operations answer a struct rather than a word, and the pair is
+  // kept as two expressions, so their result type is not one a field could hold.
+  const bool pair_op = op == OpIAddCarry || op == OpISubBorrow || op == OpUMulExtended ||
+                       op == OpSMulExtended;
   std::string rty;
-  if (res && !ctype(rt, rty)) {
+  if (res && !pair_op && !ctype(rt, rty)) {
     err = "result of opcode " + std::to_string(op) + " has an unsupported type";
     return false;
   }
@@ -1567,8 +1583,14 @@ bool Emitter::emit_one(const Instr& ins) {
           set("(!weft_fp64::is_nan(" + V(2) + ") && !weft_fp64::is_inf(" + V(2) + "))");
           return true;
         case OpSignBitSet: set("((" + V(2) + ") >> 63) != 0ull"); return true;
-        case OpConvertFToS: set("weft_fp64::to_i64(" + V(2) + ")"); return true;
-        case OpConvertFToU: set("weft_fp64::to_u64(" + V(2) + ")"); return true;
+        // A 32-bit destination has its own range to clamp to; the 64-bit answer
+        // narrowed to 32 bits would wrap instead.
+        case OpConvertFToS:
+          set(std::string("weft_fp64::to_i") + (r64 ? "64(" : "32(") + V(2) + ")");
+          return true;
+        case OpConvertFToU:
+          set(std::string("weft_fp64::to_u") + (r64 ? "64(" : "32(") + V(2) + ")");
+          return true;
         case OpConvertSToF: set("weft_fp64::from_i64(" + V(2) + ")"); return true;
         case OpConvertUToF: set("weft_fp64::from_u64(" + V(2) + ")"); return true;
         case OpFConvert:
@@ -1765,6 +1787,17 @@ bool Emitter::emit_one(const Instr& ins) {
     }
 
     case OpCompositeExtract: {
+      // A word of an extended integer operation's pair, which was kept as an expression
+      // rather than as a value: index 0 is the result and index 1 is what came out of it.
+      auto mul = multi_.find(a[2]);
+      if (mul != multi_.end()) {
+        if (a.size() != 4 || a[3] > 1) {
+          err = "an extended integer result read as something other than its two words";
+          return false;
+        }
+        set(a[3] == 0 ? mul->second.first : mul->second.second);
+        return true;
+      }
       std::string src = V(2);
       uint32_t cur = vtype(a[2]);
       const char* k = "xyzw";
@@ -1887,6 +1920,75 @@ bool Emitter::emit_one(const Instr& ins) {
       return true;
     }
 
+    //
+    // The four extended integer operations answer a struct of two words: the low half of
+    // the result and the bit that came out of it, both at the operand's own type (the
+    // spec's struct is {T, T}, not {T, i1}). A kernel reads them one member at a time, so
+    // the pair is kept as two expressions. The low word is the operation's own answer cut
+    // back to the operand width; the second word is what left it, and each is read off the
+    // definition rather than off what an overflow flag would say: a carry is the sum
+    // below an addend when it wraps, a borrow is Operand 1 below Operand 2 read unsigned,
+    // and the high word of a product is the product above its low word.
+    case OpIAddCarry: case OpISubBorrow: case OpUMulExtended: case OpSMulExtended: {
+      auto struct_ty = m_.types.find(rt);
+      if (struct_ty == m_.types.end() || struct_ty->second.kind != KStruct ||
+          struct_ty->second.members.size() != 2) {
+        err = "an extended integer operation whose result is not a struct of two words";
+        return false;
+      }
+      auto op_ty = m_.types.find(vtype(a[2]));
+      if (op_ty == m_.types.end() || op_ty->second.kind != KInt) {
+        err = "an extended integer operation over something that is not an integer";
+        return false;
+      }
+      const uint32_t w = op_ty->second.width;
+      std::string lt, ht;
+      if (!ctype(struct_ty->second.members[0], lt) || !ctype(struct_ty->second.members[1], ht)) {
+        err = "an extended integer operation with an unsupported member type";
+        return false;
+      }
+      const std::string ut = "uint" + std::to_string(w) + "_t";
+      const std::string A = "((" + ut + ")(" + V(2) + "))";
+      const std::string B = "((" + ut + ")(" + V(3) + "))";
+      std::string low, high;
+      if (op == OpIAddCarry) {
+        if (w != 32 && w != 64) {
+          err = "OpIAddCarry at a width other than 32 or 64";
+          return false;
+        }
+        low = "(" + lt + ")(" + A + " + " + B + ")";
+        high = (w == 32)
+                   ? ("(" + ht + ")((uint64_t)(" + A + ") + (uint64_t)(" + B + ") >> 32)")
+                   : ("(" + ht + ")(uint64_t)((" + A + " + " + B + ") < " + A + ")");
+      } else if (op == OpISubBorrow) {
+        if (w != 32 && w != 64) {
+          err = "OpISubBorrow at a width other than 32 or 64";
+          return false;
+        }
+        low = "(" + lt + ")(" + A + " - " + B + ")";
+        high = "(" + ht + ")(uint64_t)(" + A + " < " + B + ")";
+      } else if (w == 32) {
+        // A signed product is signed *before* it is multiplied: sign-extending the two
+        // operands and multiplying in 64 bits gives the same low word and a different
+        // high one, and only the second of those is what this operation asks for.
+        const std::string prod =
+            (op == OpSMulExtended)
+                ? ("((uint64_t)((int64_t)(int32_t)(" + A + ") * (int64_t)(int32_t)(" + B + ")))")
+                : ("((uint64_t)(" + A + ") * (uint64_t)(" + B + "))");
+        low = "(" + lt + ")(uint32_t)(" + prod + ")";
+        high = "(" + ht + ")(uint32_t)((" + prod + ") >> 32)";
+      } else {
+        // A 128-bit product is a type neither target can name from a kernel, so this one
+        // is refused by name rather than answered with half of the product.
+        err = std::string(op == OpUMulExtended ? "OpUMulExtended" : "OpSMulExtended") +
+              " over 64-bit operands: the high word needs a 128-bit product, which neither"
+              " target can name; the 32-bit form and OpIAddCarry/OpISubBorrow are here";
+        return false;
+      }
+      multi_[rd] = {low, high};
+      return true;
+    }
+
     case OpIAdd: case OpFAdd: set(is_vec(rt) ? compwise(V(2), V(3), "+") : V(2) + " + " + V(3)); return true;
     case OpISub: case OpFSub: set(is_vec(rt) ? compwise(V(2), V(3), "-") : V(2) + " - " + V(3)); return true;
     case OpIMul: case OpFMul: set(is_vec(rt) ? compwise(V(2), V(3), "*") : V(2) + " * " + V(3)); return true;
@@ -1949,8 +2051,23 @@ bool Emitter::emit_one(const Instr& ins) {
       return true;
     }
 
-    case OpConvertFToS: set("(int64_t)" + V(2)); return true;
-    case OpConvertFToU: set("(uint64_t)" + V(2)); return true;
+    // The device's conversion clamps: a value past the destination's range takes its
+    // end and a NaN answers zero. A bare cast is undefined for those and answered 0
+    // for an infinity, which is the same bug the PTX `cvt` had. The two instructions
+    // are separate cases because the spelling of the helper is the signedness and
+    // this dispatch reads its operands from `a[2]` on, not the opcode.
+    case OpConvertFToS: {
+      const uint32_t w = m_.types[rt].width;
+      if (w != 32u && w != 64u) { set("(int" + std::to_string(w) + "_t)" + V(2)); return true; }
+      set("weft_f2i" + std::to_string(w) + "(" + V(2) + ")");
+      return true;
+    }
+    case OpConvertFToU: {
+      const uint32_t w = m_.types[rt].width;
+      if (w != 32u && w != 64u) { set("(uint" + std::to_string(w) + "_t)" + V(2)); return true; }
+      set("weft_f2u" + std::to_string(w) + "(" + V(2) + ")");
+      return true;
+    }
     case OpConvertSToF: case OpConvertUToF: set("(" + rty + ")" + V(2)); return true;
     case OpUConvert: case OpSConvert: case OpFConvert: {
       uint32_t en = 0, n = 0;
@@ -2045,14 +2162,53 @@ bool Emitter::emit_one(const Instr& ins) {
       return true;
     }
     case OpSwitch: {
-      const std::string sel = "((uint64_t)" + V(0) + ")";
-      body_ += "  switch (" + sel + ") {\n";
-      for (size_t k = 1; k + 1 < a.size(); k += 2) {
-        body_ += "    case " + std::to_string((unsigned long long)a[k]) + "ull: { " +
-                 edge_copies(cur_block_, a[k + 1]) + jump(label_of_[a[k + 1]]) + " }\n";
+      // The operands are the selector, then the *default* label, then pairs of
+      // literal and label. The default comes first, not last, and reading the list
+      // from there pairs every literal with the label of the entry beside it. A
+      // literal is as wide as the selector, so a 64-bit selector writes each one
+      // as two words and the pairs sit three words apart, which is the second way
+      // this list is not the obvious shape.
+      if (a.size() < 2) { err = "a switch with no default label"; return false; }
+      auto st = m_.types.find(vtype(a[0]));
+      if (st == m_.types.end() || st->second.kind != KInt) {
+        err = "a switch on something that is not an integer";
+        return false;
       }
-      body_ += "    default: { " + edge_copies(cur_block_, a.back()) + jump(label_of_[a.back()]) +
-               " }\n  }\n";
+      const uint32_t w = st->second.width;
+      const bool wide = w == 64;
+      const size_t step = wide ? 3u : 2u;
+      // A literal is the selector's bit pattern at the selector's own width, so the
+      // comparison masks the value to that width: a signed 32-bit `-1` widens to
+      // 0xFFFFFFFFFFFFFFFF in C++ and would miss the 0xFFFFFFFF the module holds,
+      // while the same value masked to 32 bits is exactly what the module wrote.
+      const uint64_t wmask = (w >= 64) ? ~0ull : ((1ull << w) - 1ull);
+      if ((a.size() - 2u) % step != 0u) {
+        err = "a switch whose literal list does not fill its instruction";
+        return false;
+      }
+      auto known = [&](uint32_t l) {
+        if (label_of_.count(l)) return true;
+        err = "a switch to label " + std::to_string(l) + ", which this function does not define";
+        return false;
+      };
+      if (!known(a[1])) return false;
+      // A chain rather than a C++ `switch`: the literals are the module's, and a
+      // list paired wrongly compiles into duplicate `case`s, which reads as a
+      // compile error in generated code rather than as what it is. The selector is
+      // compared as its bit pattern, so a signed one matches its literal too.
+      body_ += "  {\n    const uint64_t weft_sel = ((uint64_t)(" + V(0) + ")) & " +
+               std::to_string(wmask) + "ull;\n";
+      bool first = true;
+      for (size_t k = 2; k + step - 1 < a.size(); k += step) {
+        uint64_t lit = (wide ? ((uint64_t)a[k] | ((uint64_t)a[k + 1] << 32)) : (uint64_t)a[k]) & wmask;
+        const uint32_t target = a[k + step - 1];
+        if (!known(target)) return false;
+        body_ += "    " + std::string(first ? "if" : "else if") + " (weft_sel == " +
+                 std::to_string(lit) + "ull) { " + edge_copies(cur_block_, target) +
+                 jump(label_of_[target]) + " }\n";
+        first = false;
+      }
+      body_ += "    else { " + edge_copies(cur_block_, a[1]) + jump(label_of_[a[1]]) + " }\n  }\n";
       return true;
     }
     case OpReturn: case OpReturnValue: case OpKill: case OpUnreachable:
@@ -2428,9 +2584,16 @@ bool Emitter::emit_one(const Instr& ins) {
       // to move as one value under a lock. That decision is made below, once the
       // operand and the type are in hand.
       const bool dropped = unused_anywhere(rd);
+      // A compare-exchange is the one atomic with two memory-semantics operands, one
+      // for the equal case and one for the unequal case, so on a well-formed module
+      // its value and comparator are the last two operands rather than the first two
+      // after the scope. Reading them at fixed indices takes the unequal semantics
+      // literal as the compare value, which is a wrong answer rather than a refusal.
+      const bool cas = op == OpAtomicCompareExchange || op == OpAtomicCompareExchangeWeak;
       if (op == OpAtomicIIncrement || op == OpAtomicIDecrement) val_ = "1";
+      else if (cas) val_ = V(a.size() - 2);
       else val_ = V(5);
-      if (op == OpAtomicCompareExchange || op == OpAtomicCompareExchangeWeak) cmp = V(6);
+      if (cas) cmp = V(a.size() - 1);
 
       std::string suf = flt ? "" : (wide ? (sgn ? "_s64" : "_u64") : (sgn ? "_s32" : "_u32"));
       if (flt) suf = "_f32";
@@ -2608,6 +2771,55 @@ bool Emitter::emit_one(const Instr& ins) {
         err = "float atomic compare-exchange does not exist in SPIR-V: its result is "
               "constrained to an integer scalar";
         return false;
+      }
+      // A 16-bit atomic. This host's atomics are 32 bits wide and two halves can share
+      // one of those words, so the half addressed is read and written on its own and
+      // the half beside it keeps its value -- the same word the PTX front end moves,
+      // through the same helpers, so both front ends answer identically at this width.
+      // The integer codes are `weft_atom_int16`'s switch in src/soft_math.hpp, and a
+      // float half goes to the narrow add, whose one rounding is what a 16-bit add is.
+      const unsigned tw = m_.types[vtype(rd)].width;
+      if (tw == 16) {
+        const std::string as = addr_space("device", false);
+        // `ptr` is a pointer expression in this front end, not an address, so it goes
+        // through uintptr_t before the mask: which word holds the half, and where in
+        // that word it sits, are both properties of the address.
+        const std::string word =
+            "(" + as + "uint32_t*)(uintptr_t)((uintptr_t)(" + ptr + ") & ~3ull)";
+        const std::string shift = "(uint32_t)(((uintptr_t)(" + ptr + ") & 2ull) * 8u)";
+        std::string inner;
+        if (flt) {
+          if (op != OpAtomicFAddEXT) {
+            err = "a 16-bit float atomic is an add: only OpAtomicFAddEXT is named at "
+                  "that width, and the 16-bit min and max extensions are the 32-bit ones";
+            return false;
+          }
+          inner = "weft_f16_of(weft_atom_add_narrow(" + word + ", " + shift +
+                  ", weft_f16_bits(" + val_ + "), 0))";
+        } else {
+          int code = -1;
+          switch (op) {
+            case OpAtomicIAdd: code = 0; break;
+            case OpAtomicISub: code = 1; break;
+            case OpAtomicUMin: code = 2; break;
+            case OpAtomicUMax: code = 3; break;
+            case OpAtomicSMin: code = 4; break;
+            case OpAtomicSMax: code = 5; break;
+            case OpAtomicAnd: code = 6; break;
+            case OpAtomicOr: code = 7; break;
+            case OpAtomicXor: code = 8; break;
+            case OpAtomicExchange: code = 9; break;
+            case OpAtomicCompareExchange: case OpAtomicCompareExchangeWeak: code = 10; break;
+            default: break;
+          }
+          if (code < 0) { err = "unsupported atomic at 16 bits: " + fn; return false; }
+          inner = "weft_atom_int16(" + word + ", " + shift + ", (uint16_t)(" + val_ + "), " +
+                  (code == 10 ? ("(uint16_t)(" + (cmp.empty() ? std::string("0") : cmp) + ")")
+                              : std::string("0")) +
+                  ", " + std::to_string(code) + ")";
+        }
+        set((sgn && !flt) ? ("(int16_t)(" + inner + ")") : inner);
+        return true;
       }
       std::string call = "weft::" + fn + suf + "((" + addr_space("device", false) + tyop +
                          "*)(" + addr_space("device", false) + "void*)(" + ptr + "), " + val_;
@@ -3170,6 +3382,35 @@ bool Emitter::emit_one(const Instr& ins) {
         set("weft_fract(" + arg(0) + ")");
         return true;
       }
+      // `mad` is a*b+c with the latitude to fuse it, and this is the fused form: the
+      // library's own `fma`, one rounding. A plain `a * b + c` would be contracted by
+      // one compiler and not the other, and the columns would part in the last bit.
+      if (num == 42) {
+        set("weft_fma(" + arg(0) + ", " + arg(1) + ", " + arg(2) + ")");
+        return true;
+      }
+      // `nan` answers the quiet NaN that carries the caller's payload. The operand is a
+      // Nancode, an integer, and the validator is the authority on that: a module passing a
+      // float is refused before it reaches this decoder. The top of the significand is set,
+      // so the value is quiet rather than signalling.
+      if (num == 46) {
+        set("weft_float(0x7FC00000u | (" + arg(0) + " & 0x3FFFFFu))");
+        return true;
+      }
+      // `lgamma` is ln|Gamma|, which stays finite where the gamma itself has overflowed.
+      // `lgamma_r` is the same value plus the sign gamma had, and the sign travels the
+      // way `frexp`'s exponent does: the runtime writes it through the pointer, because
+      // the library text cannot name an address space the caller chose.
+      if (num == 35) { set("weft_lgamma(" + arg(0) + ")"); return true; }
+      if (num == 36) {
+        if (!store_out("weft_lgamma_sign(" + arg(0) + ")")) return false;
+        set("weft_lgamma(" + arg(0) + ")");
+        return true;
+      }
+      // The two divide spellings the numbered list also carries. `half_divide` and
+      // `native_divide` are the same division here, and refusing them refused a kernel
+      // over its spelling rather than over anything the runtime cannot do.
+      if (num == 68 || num == 82) { set("(" + arg(0) + " / " + arg(1) + ")"); return true; }
       if (num == 55) { set(math("round", arg(0))); return true; }
       if (num == 105) {  // clamp
         set(math("min", math("max", arg(0) + ", " + arg(1)) + ", " + arg(2)));
@@ -3777,6 +4018,11 @@ bool Emitter::run() {
 
   for (const Instr& ins : B) {
     if (no_result(ins.op) || ins.a.size() < 2 || ins.op == OpFunctionParameter) continue;
+    // An extended integer operation's result is a pair that is taken apart where it is
+    // read, so it is never a field of its own and its struct type needs no C++ shape.
+    if (ins.op == OpIAddCarry || ins.op == OpISubBorrow || ins.op == OpUMulExtended ||
+        ins.op == OpSMulExtended)
+      continue;
     vt_[ins.a[1]] = ins.a[0];
   }
   // A helper function is inlined where it is called, so its values are fields of this
@@ -4596,8 +4842,41 @@ static TranslateResult translate_spirv_impl(const std::string& raw,
       "}\n"
       "static inline float weft_f32(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }\n"
       "static inline double weft_f64(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }\n"
+      // The device's float-to-integer conversion saturates: the destination's end
+      // for a value past it, zero for a NaN. A C++ cast is undefined for both and
+      // answered 0 for an infinity, where the hardware answers the end of the range.
+      "static inline int32_t weft_f2i32(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 2147483648.0) return 2147483647;\n"
+      "  if (x <= -2147483649.0) return (-2147483647 - 1);\n"
+      "  return (int32_t)x;\n"
+      "}\n"
+      "static inline uint32_t weft_f2u32(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 4294967296.0) return 4294967295u;\n"
+      "  if (x <= -1.0) return 0u;\n"
+      "  return (uint32_t)x;\n"
+      "}\n"
+      "static inline int64_t weft_f2i64(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 9223372036854775808.0) return (int64_t)9223372036854775807ll;\n"
+      "  if (x <= -9223372036854775808.0) return (int64_t)(-9223372036854775807ll - 1);\n"
+      "  return (int64_t)x;\n"
+      "}\n"
+      "static inline uint64_t weft_f2u64(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 18446744073709551616.0) return 18446744073709551615ull;\n"
+      "  if (x <= -1.0) return 0u;\n"
+      "  return (uint64_t)x;\n"
+      "}\n"
       "template <class T, class U>\n"
-      "static inline T weft_bitcast(U u) { T t; std::memcpy(&t, &u, sizeof(T)); return t; }\n"
+      "// A narrow source -- an integer literal under a 64-bit destination -- fills the low\n"
+      "// bytes of a zeroed destination instead of reading past itself.\n"
+      "static inline T weft_bitcast(U u) {\n"
+      "  T t{};\n"
+      "  std::memcpy(&t, &u, sizeof(U) < sizeof(T) ? sizeof(U) : sizeof(T));\n"
+      "  return t;\n"
+      "}\n"
       // A bit reversal written as masks, not as a builtin: `__builtin_bitreverse32`
       // is clang's alone, and this is the same eight swaps everywhere, gcc folds
       // it back to `rbit` on aarch64 by itself.

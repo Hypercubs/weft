@@ -451,6 +451,1683 @@ else
   echo "FAIL  cvtsat  read $(head -c 24 "$TMP/cvtsat.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
 fi
 
+# 16-bit float arithmetic on the PTX and SPIR-V front ends. A `b16` register holds
+# the *bits* of a half and the instruction's `.f16` is what says to read them as
+# one; the generic integer path added the patterns, so 1.0 + 2.0 answered 0x7C00,
+# an infinity, and both columns agreed on it because both run this translation.
+# The reference below is therefore Python's binary16 grid (`struct.pack('<e')`),
+# not the GPU: an agreement between two copies of one mistranslation is not a
+# check. The fixtures also cover the packed `.f16x2` forms, `.sat`, the two ties
+# that decide whether `fma` rounds once, and `half` in threadgroup memory.
+python3 - "$TMP" <<'PYEOF'
+import struct, sys
+d = sys.argv[1]
+def h(x): return struct.pack('<e', x)
+vals = [0.5, 1.5, -2.0, 4.0, 0.25, -0.5, 8.0, -0.0]
+open(d + '/hin.bin', 'wb').write(b''.join(h(v) for v in vals))
+vals2 = vals + [3.0, -3.0, 0.125, 6.0, -0.75, 2.5, 1.0, 16.0]
+open(d + '/hin2.bin', 'wb').write(b''.join(h(v) for v in vals2))
+v32 = [(i % 7 - 3) * 0.5 for i in range(32)]
+open(d + '/hin32.bin', 'wb').write(b''.join(h(v) for v in v32))
+def sat(x): return 0.0 if x != x else (0.0 if x < 0 else (1.0 if x > 1 else x))
+exp = []
+for b in vals:
+    # The two `fma` ties: 1 + 2^-11 is halfway between 1 and 1+2^-10 and takes the
+    # even one; 1 + 3*2^-11 is halfway one ulp up and takes two ulp. Both are one
+    # rounding of the exact product and sum, which a float intermediate is not.
+    exp += [1 + b, 1 - b, 0.5 * b, 2 * b + 1, min(1, b), max(1, b), -b, abs(b),
+            sat(0.75 + b), sat(b), 1 + 2**-11, 1 + 2**-10 + 2**-11,
+            65504.0, 32752.0, 2.0**-23, 0.0]
+open(d + '/exp_ha.bin', 'wb').write(b''.join(h(v) for v in exp))
+w = []
+for i in range(8):
+    lo, hi = vals2[2 * i], vals2[2 * i + 1]
+    for op in (lambda x, y: x + y, lambda x, y: x - y, lambda x, y: x * y,
+               lambda x, y: y * x + y, min, max):
+        w.append(h(op(lo, 0.5)) + h(op(hi, 1.0)))
+open(d + '/exp_ha2.bin', 'wb').write(b''.join(w))
+open(d + '/exp_hs.bin', 'wb').write(b''.join(h(v32[(i + 1) % 32] + 1.0) for i in range(32)))
+open(d + '/exp_spvh.bin', 'wb').write(b''.join(h(v32[(i + 1) % 32] * 2 + 2.0) for i in range(32)))
+# bf16 is the top half of a float, so the reference is the same float arithmetic
+# rounded once, nearest even, at the 8-significand-bit grid the hardware rounds at.
+def bfb(x):
+    u = struct.unpack('<I', struct.pack('<f', x))[0]
+    if (u & 0x7F800000) != 0x7F800000:
+        u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFFFFFF
+    return struct.pack('<H', (u >> 16) & 0xFFFF)
+def bfv(b):
+    return struct.unpack('<f', struct.pack('<I', b << 16))[0]
+open(d + '/hbin.bin', 'wb').write(b''.join(bfb(v) for v in vals))
+open(d + '/hbin2.bin', 'wb').write(b''.join(bfb(v) for v in vals2))
+mx, mn = bfv(0x7F7F), bfv(0x0001)
+expb = []
+for b in vals:
+    # The two fused ties: 1 + 2^-9 is halfway between 1 and 1+2^-8 and takes the even
+    # one; 1 + 3*2^-9 is halfway one ulp up and takes two ulp.
+    expb += [1 + b, 1 - b, 0.5 * b, 2 * b + 1, min(1, b), max(1, b), -b, abs(b),
+             sat(0.75 + b), sat(b), 1 + 2**-9, 1 + 2**-8 + 2**-9, mx + 1.0,
+             0.5 * mx, 2 * mn, 0.0]
+open(d + '/exp_bf.bin', 'wb').write(b''.join(bfb(v) for v in expb))
+wb = []
+for i in range(8):
+    lo, hi = vals2[2 * i], vals2[2 * i + 1]
+    for op in (lambda x, y: x + y, lambda x, y: x - y, lambda x, y: x * y,
+               lambda x, y: y * x + y, min, max):
+        wb.append(bfb(op(lo, 0.5)) + bfb(op(hi, 1.0)))
+open(d + '/exp_bf2.bin', 'wb').write(b''.join(wb))
+open(d + '/exp_hmin.bin', 'wb').write(b''.join(struct.pack('<H', v) for v in
+    [0x7FFF, 0x3C00, 0xBC00, 0xC000, 0x8000, 0xC200]))
+# Division, reciprocal and square root of a narrow float, against an exact grid: the
+# expected value is the nearest representable one, found by comparing integers, not a
+# second copy of the significand routine the C++ side runs. A half's grid is uniform at
+# 2^-24 and a bf16's at 2^-133, so every value is an integer count of that step.
+from bisect import bisect_left
+def narrow_grid(mbits, ebits):
+    lead = 1 << mbits
+    xmax = (1 << ebits) - 1
+    sube = 1 - ((1 << (ebits - 1)) - 1) - mbits
+    ks = []
+    for b in range(xmax << mbits):
+        e = (b >> mbits) & xmax
+        f = b & (lead - 1)
+        ks.append(f if e == 0 else (f + lead) << (e - 1))
+    return ks, -sube
+def nearest_k(K, scale, A, B=1):
+    tgt = A << scale
+    row = [k * B for k in K]
+    i = bisect_left(row, tgt)
+    if i < len(row) and row[i] == tgt: return i
+    if i == 0: return 0
+    if i == len(row): return len(row) - 1
+    lo, hi = i - 1, i
+    d1, d2 = tgt - row[lo], row[hi] - tgt
+    if d1 != d2: return lo if d1 < d2 else hi
+    return lo if (lo & 1) == 0 else hi
+def nearest_sqrt(K, scale, ka):
+    tgt = ka << scale
+    row = [k * k for k in K]
+    i = bisect_left(row, tgt)
+    if i < len(row) and row[i] == tgt: return i
+    lo, hi = i - 1, i
+    if lo < 0: return 0
+    if hi >= len(row): return len(row) - 1
+    four, mid = 4 * tgt, (K[lo] + K[hi]) ** 2
+    if four != mid: return lo if four < mid else hi
+    return lo if (lo & 1) == 0 else hi
+HK, HS = narrow_grid(10, 5)
+BK, BS = narrow_grid(7, 8)
+def q16(a, b): return nearest_k(HK, HS, HK[a], HK[b])
+def r16(a): return nearest_sqrt(HK, HS, HK[a])
+def qbf(a, b): return nearest_k(BK, BS, BK[a], BK[b])
+def rbf(a): return nearest_sqrt(BK, BS, BK[a])
+nd = [q16(0x4000, 0x4200), q16(0x3C00, 0x4200), q16(0x3C00, 0x4700),
+      q16(0x3C00, 0x3C01), q16(0x3C00, 0x4200), q16(0x3C00, 0x3C02),
+      r16(0x4000), r16(0x4200), r16(0x7BFF), r16(0x0001),
+      q16(0x0001, 0x4200), q16(0x0001, 0x3E00), q16(0x3C00, 0x7BFF),
+      0x7C00, 0x7FFF, 0x7FFF]
+open(d + '/exp_nd.bin', 'wb').write(b''.join(struct.pack('<H', v) for v in nd))
+open(d + '/exp_nd2.bin', 'wb').write(b''.join(struct.pack('<H', v) for v in
+    [0x0000, 0x8000, 0x7FFF, 0xFC00, 0x7C00, 0x8000,
+     q16(0x0001, 0x4000), r16(0x3C01)]))
+open(d + '/exp_bfd.bin', 'wb').write(b''.join(struct.pack('<H', v) for v in
+    [qbf(0x4000, 0x4040), qbf(0x3F80, 0x4040), qbf(0x3F80, 0x3F81),
+     qbf(0x3F80, 0x4040), rbf(0x4000), rbf(0x7F7F), qbf(0x0001, 0x4040), 0x7FFF]))
+# Comparisons are of the values, so the reference compares the halfs as Python floats
+# (exact for all of these) and writes the masks `set` answers: all ones or zero.
+cv = [-2.0, -0.5, -0.0, 0.0, 0.25, 1.0, 2.0, 65504.0]
+open(d + '/hcmpin.bin', 'wb').write(b''.join(h(v) for v in cv))
+cmp = []
+for x in cv:
+    cmp += [int(x < 1.0), int(x >= -0.5), 0xFFFFFFFF, 0xFFFFFFFF if x != 0.0 else 0,
+            int(x != x), int(x == x), 0xFFFFFFFF if x <= -0.0 else 0, int(x > -2.0)]
+open(d + '/exp_cmp.bin', 'wb').write(b''.join(struct.pack('<I', v) for v in cmp))
+# Four small angles and four a half can hold up to its top: the reduction above 256
+# used to hand every one of those lanes to the fp64 text, so the reference has to see them.
+tv = [0.5, 2.0, 0.25, 3.0, 1000.0, 4000.0, 16000.0, 65504.0]
+open(d + '/htranin.bin', 'wb').write(b''.join(h(v) for v in tv))
+# A double's tangent, for the one `tan` the isa has.
+tv32 = [0.5, 1.0, -0.5, 0.25, 2.0, -1.5, 0.75, 3.0]
+open(d + '/tan32in.bin', 'wb').write(b''.join(struct.pack('<f', v) for v in tv32))
+# bf16 comparisons, and the packed forms. A packed `set` answers a 0xFFFF per half
+# that is true; a lane equal to the pair (1.0, 0.5) answers all ones.
+bv = [-3.0, -1.0, -0.0, 0.5, 1.0, 2.0, 100.0, -7.5]
+open(d + '/hbfcmpin.bin', 'wb').write(b''.join(bfb(v) for v in bv))
+bc = []
+for x in bv:
+    bc += [int(x < 1.0), int(x >= -1.0), 0xFFFFFFFF if x != 0.0 else 0, 0xFFFFFFFF]
+open(d + '/exp_bfcmp.bin', 'wb').write(b''.join(struct.pack('<I', v) for v in bc))
+open(d + '/hpairin.bin', 'wb').write(b''.join(h(v) for v in vals2))
+pc = []
+for i in range(0, len(vals2), 2):
+    lo, hi = vals2[i], vals2[i + 1]
+    pc += [(0xFFFF if lo == 0.5 else 0) | (0xFFFF0000 if hi == 1.0 else 0),
+           int(lo < 0.5), int(hi < 1.0)]
+open(d + '/exp_pcmp.bin', 'wb').write(b''.join(struct.pack('<I', v) for v in pc))
+# 64 lanes add 1.0 to the low half of one word and 0.5 to the high one: 64.0 and
+# 32.0, and the packed form adds (1.0, 0.5) sixty-four times.
+# The atomics run over a word that starts at zero, so the totals are the sum and
+# nothing else, and the word beside it has to stay zero: the second word of the
+# narrowatom buffer is compared too, which is the neighbour the atom must not touch.
+open(d + '/exp_natom.bin', 'wb').write(struct.pack('<HHHH', 0x5400, 0x5000, 0, 0))
+open(d + '/exp_ratom.bin', 'wb').write(struct.pack('<I', 0x54005000))
+open(d + '/zatom8.bin', 'wb').write(b'\x00' * 8)
+open(d + '/zatom4.bin', 'wb').write(b'\x00' * 4)
+# slct: the sign of c picks the argument, and -0.0 is not less than zero, so it
+# picks the first one. The float pair is 111 and 222, a number that is neither.
+open(d + '/slin.bin', 'wb').write(struct.pack('<iiii', 5, -5, 0, 0))
+open(d + '/slinf.bin', 'wb').write(struct.pack('<ffff', 1.5, -2.5, 0.0, -0.0))
+open(d + '/exp_slcti.bin', 'wb').write(struct.pack('<IIII', 0x3C00, 0x4000, 0x3C00, 0x3C00))
+open(d + '/exp_slctf.bin', 'wb').write(struct.pack('<IIII', 111, 222, 111, 111))
+# atom.cas.b16: 1.0 above 0.5 in one word. A matching compare swaps the low half to
+# 2.0 and leaves 0.5 alone, a miss writes nothing, and either way the half that was
+# there comes back -- so buffer 1 holds 1.0 in both cases.
+open(d + '/casin.bin', 'wb').write(struct.pack('<I', 0x38003C00))
+open(d + '/exp_cas16.bin', 'wb').write(struct.pack('<I', 0x38004000))
+open(d + '/exp_cas16miss.bin', 'wb').write(struct.pack('<I', 0x38003C00))
+open(d + '/exp_cas16ret.bin', 'wb').write(struct.pack('<I', 0x3C00))
+# atom.inc and atom.dec count round a cycle bounded by 3: from 0, three steps are 3
+# and five wrap back to 1; from 3, three steps down are 0 and from 0, two steps wrap
+# up to the bound and then down to 2. A translation that never wrote the word would
+# answer with the start every time, so each of these is a different number.
+open(d + '/inc0.bin', 'wb').write(struct.pack('<I', 0))
+open(d + '/inc3in.bin', 'wb').write(struct.pack('<I', 3))
+open(d + '/exp_inc3.bin', 'wb').write(struct.pack('<I', 3))
+open(d + '/exp_inc5.bin', 'wb').write(struct.pack('<I', 1))
+open(d + '/exp_dec3.bin', 'wb').write(struct.pack('<I', 0))
+open(d + '/exp_dec2.bin', 'wb').write(struct.pack('<I', 2))
+open(d + '/exp_incgrab.bin', 'wb').write(struct.pack('<I', 0))
+# 16-bit integer atomics through SPIR-V: the buffer is the operand half and a 0xABCD
+# sentinel above it, so writing the whole 32-bit word shows up as a wrong top half.
+# The mix is and, or, xor, a signed min of -2, an unsigned min of 0x0100, an exchange
+# to 0x1234, and a compare-exchange that matches it.
+def sm(v):
+    return v - 0x10000 if v >= 0x8000 else v
+open(d + '/a16in.bin', 'wb').write(struct.pack('<HH', 0x0001, 0xABCD))
+open(d + '/a16in0.bin', 'wb').write(struct.pack('<HH', 0x0000, 0xABCD))
+open(d + '/exp_a16add.bin', 'wb').write(struct.pack('<HH', 8, 0xABCD))
+vmix = 0x0001 & 0x00FF
+vmix |= 0x3000
+vmix ^= 0x0001
+vmix = min(sm(vmix), sm(0xFFFE)) & 0xFFFF
+vmix = min(vmix, 0x0100)
+vmix = 0x1234
+vmix = 0xBEEF if vmix == 0x1234 else vmix
+open(d + '/exp_a16mix.bin', 'wb').write(struct.pack('<HH', vmix, 0xABCD))
+# OpSwitch: the selector picks a label out of a table whose default comes first and
+# whose literals are as wide as the selector. `sw64`'s literals have bits above 32
+# and one input is 0xFFFFFFFF00000001, whose low half is the case `1`: a front end
+# that reads one word per literal lands on the wrong entry and writes its number.
+open(d + '/sw32in.bin', 'wb').write(struct.pack('<8I', 0, 7, 1, 99, 2, 7, 0, 5))
+open(d + '/exp_sw32.bin', 'wb').write(struct.pack('<8I', 10, 12, 11, 99, 99, 12, 10, 99))
+open(d + '/sw64in.bin', 'wb').write(b''.join(struct.pack('<Q', v) for v in
+    [1, 4294967298, 4294967295, 7, 0xFFFFFFFF00000001, 0, 1, 4294967298]))
+open(d + '/exp_sw64.bin', 'wb').write(b''.join(struct.pack('<Q', v) for v in
+    [21, 20, 22, 99, 99, 99, 21, 20]))
+# The signed selector: `(int)gid - 3` selects with -3, -2, -1 and 0, and the cases
+# are -1 and -2. A literal is 0xFFFFFFFF, so a comparison that sign-extends the
+# selector to 64 bits first misses its own case and answers the default: lane 2
+# writes 9 where the module asked for 5, and lane 1 writes 9 instead of 6.
+open(d + '/exp_sws.bin', 'wb').write(struct.pack('<4i', 9, 6, 5, 9))
+# brx.idx: the index picks a label out of the `.branchtargets` table, and an index
+# past the end falls through to the instruction after it. `brxpred` puts the same
+# table in the compact `M<3>` form behind a guard, so an index of 3 or more is 99
+# and 2 is 22: a table that ignored the guard, or a range that expanded to the
+# wrong labels, answers a number the reference does not.
+open(d + '/brxin.bin', 'wb').write(struct.pack('<8I', 0, 1, 2, 3, 2, 0, 1, 9))
+open(d + '/exp_brx.bin', 'wb').write(struct.pack('<8I', 10, 11, 12, 99, 12, 10, 11, 99))
+open(d + '/exp_brxp.bin', 'wb').write(struct.pack('<8I', 20, 21, 22, 99, 22, 20, 21, 99))
+# Bit scans. `bfind` is the highest set bit, counted from 0, or 0xFFFFFFFF when
+# there is none; `.s32` searches for the highest bit that differs from the sign, so
+# a negative value is searched inverted and 0 and -1 have none; `fns` is the nth
+# set bit at or above a starting position. Both references are computed from the
+# inputs rather than written out, so the expectation follows the definition.
+def bfind_u(v):
+    return 0xFFFFFFFF if v == 0 else v.bit_length() - 1
+def bfind_s(v):
+    a = (~v) & 0xFFFFFFFF if v >= 0x80000000 else v
+    return 0xFFFFFFFF if a == 0 else a.bit_length() - 1
+def fns(mask, base, off):
+    for p in range(base & 31, 32):
+        if (mask >> p) & 1:
+            if off == 0:
+                return p
+            off -= 1
+    return 0xFFFFFFFF
+bi = [0, 1, 0x80000000, 0x00010000, 0xFFFFFFFF, 0x00000002, 0x40000000, 0x0000000C]
+open(d + '/bfindu_in.bin', 'wb').write(struct.pack('<8I', *bi))
+open(d + '/exp_bfindu.bin', 'wb').write(struct.pack('<8I', *[bfind_u(v) for v in bi]))
+bs = [0xFFFFFFFF, 0, 1, 0xFFFFFFFE, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFD, 5]
+open(d + '/bfinds_in.bin', 'wb').write(struct.pack('<8I', *bs))
+open(d + '/exp_bfinds.bin', 'wb').write(struct.pack('<8I', *[bfind_s(v) for v in bs]))
+fm = [0x0000000B, 0x000000F0, 0, 0xFFFFFFFF, 0x0F0F0F0F, 0x80000000, 0x0000FFFF, 1]
+open(d + '/fns_in.bin', 'wb').write(struct.pack('<8I', *fm))
+open(d + '/exp_fns3.bin', 'wb').write(struct.pack('<8I', *[fns(m, 0, 2) for m in fm]))
+open(d + '/exp_fnsb4.bin', 'wb').write(struct.pack('<8I', *[fns(m, 4, 1) for m in fm]))
+# A half register declared `.reg .f16`: doubling is exact until it overflows, so
+# 65504 doubles to infinity, a subnormal doubles to the next subnormal, and -0
+# stays -0.
+open(d + '/h16in.bin', 'wb').write(struct.pack('<8H', 0x3C00, 0x3800, 0x4000, 0xBC00,
+                                               0x7BFF, 0x0001, 0x7C00, 0x8000))
+open(d + '/exp_h16reg.bin', 'wb').write(struct.pack('<8H', 0x4000, 0x3C00, 0x4400, 0xC000,
+                                                    0x7C00, 0x0002, 0x7C00, 0x8000))
+# Warp-wide agreement: `elect.sync` picks the lowest live lane of the mask, so the
+# elected one adds 1000, and `match` answers the mask of lanes holding this lane's
+# value. Lanes 8 to 31 never ran, so the member mask naming them changes nothing.
+wm = [3, 3, 5, 3, 5, 7, 7, 3]
+open(d + '/wmmix.bin', 'wb').write(struct.pack('<8I', *wm))
+open(d + '/wmeq.bin', 'wb').write(struct.pack('<8I', *([4] * 8)))
+open(d + '/exp_elect.bin', 'wb').write(struct.pack('<8I', 1000, 0, 0, 0, 0, 0, 0, 0))
+same = []
+for v in wm:
+    m = 0
+    for k, w in enumerate(wm):
+        if w == v:
+            m |= 1 << k
+    same.append(m)
+open(d + '/exp_matchny.bin', 'wb').write(struct.pack('<8I', *same))
+open(d + '/exp_matchall.bin', 'wb').write(struct.pack('<8I', *([0] * 8)))
+open(d + '/exp_matchallq.bin', 'wb').write(struct.pack('<8I', *([0xFFFFFFFF] * 8)))
+open(d + '/exp_matchallp.bin', 'wb').write(struct.pack('<8I', *([3] * 8)))
+open(d + '/exp_matchallpq.bin', 'wb').write(struct.pack('<8I', *([7] * 8)))
+# dp2a: two 16-bit lanes of a against two bytes of b, `.lo` taking bytes 0 and 1 and
+# `.hi` bytes 2 and 3, each lane folded in at the signedness its suffix names. The
+# reference is the definition, so an implementation that used the wrong byte pair,
+# or that zero-extended a signed lane, answers a number this does not.
+def s16(v):
+    return v - 0x10000 if v & 0x8000 else v
+def s8(v):
+    return v - 0x100 if v & 0x80 else v
+def dp2a(a, b, hi, saa, sbb):
+    a0, a1 = a & 0xFFFF, (a >> 16) & 0xFFFF
+    if saa:
+        a0, a1 = s16(a0), s16(a1)
+    base = 2 if hi else 0
+    b0, b1 = (b >> (8 * base)) & 0xFF, (b >> (8 * (base + 1))) & 0xFF
+    if sbb:
+        b0, b1 = s8(b0), s8(b1)
+    return (a0 * b0 + a1 * b1) & 0xFFFFFFFF
+dpa = [0x00020003, 0x0000FFFF, 0xFFFF0001, 0x80007FFF, 0x12345678, 1, 0xFFFFFFFF, 0x00010002]
+dpb = [0x04030201, 0xFF0201FF, 0x00000000, 0xFFFFFFFF, 0x807F7F80, 0x01020304, 0x00000005, 0xFE00FF01]
+open(d + '/dpin.bin', 'wb').write(struct.pack('<16I', *(dpa + dpb)))
+open(d + '/exp_dp2alo.bin', 'wb').write(struct.pack('<8I', *[dp2a(x, y, False, False, False) for x, y in zip(dpa, dpb)]))
+open(d + '/exp_dp2ahi.bin', 'wb').write(struct.pack('<8I', *[dp2a(x, y, True, False, False) for x, y in zip(dpa, dpb)]))
+open(d + '/exp_dp2aslo.bin', 'wb').write(struct.pack('<8I', *[dp2a(x, y, False, True, True) for x, y in zip(dpa, dpb)]))
+open(d + '/exp_dp2ashi.bin', 'wb').write(struct.pack('<8I', *[dp2a(x, y, True, True, True) for x, y in zip(dpa, dpb)]))
+# movmatrix: lane l holds row l>>2 at columns 2(l&3) and 2(l&3)+1, and the result is
+# that fragment of the transposed matrix. The input is a fragment, so the reference
+# transposes the matrix it encodes rather than the words.
+def vfrag(m):
+    w = []
+    for l in range(32):
+        r, c = l >> 2, 2 * (l & 3)
+        w.append(m[r][c] | (m[r][c + 1] << 16))
+    return w
+vmi = [[(r * 8 + c + 1) & 0xFFFF for c in range(8)] for r in range(8)]
+vmt = [[vmi[j][i] for j in range(8)] for i in range(8)]
+open(d + '/mvin.bin', 'wb').write(struct.pack('<32I', *vfrag(vmi)))
+open(d + '/exp_movtx.bin', 'wb').write(struct.pack('<32I', *vfrag(vmt)))
+# Video instructions: packed lanes that do not carry into their neighbour. Each lane is
+# widened at the signedness its suffix names, the operation runs in 32 bits, and the
+# answer is cut back to the lane width.
+def vlanes(w, n, width, sgn):
+    m = (1 << width) - 1
+    out = []
+    for i in range(n):
+        v = (w >> (width * i)) & m
+        if sgn and v >> (width - 1):
+            v -= 1 << width
+        out.append(v)
+    return out
+def vpacked(ts, width):
+    m = (1 << width) - 1
+    acc = 0
+    for i, t in enumerate(ts):
+        acc |= (t & m) << (width * i)
+    return acc
+def vcal(name, a, b, n, width, sa, sb):
+    x, y = vlanes(a, n, width, sa), vlanes(b, n, width, sb)
+    if name == 'add':
+        ts = [p + q for p, q in zip(x, y)]
+    elif name == 'min':
+        ts = [min(p, q) for p, q in zip(x, y)]
+    elif name == 'absdiff':
+        ts = [abs(p - q) for p, q in zip(x, y)]
+    else:
+        ts = [(p + q + 1) >> 1 if p + q >= 0 else (p + q) >> 1 for p, q in zip(x, y)]
+    return vpacked(ts, width)
+vva = [0x00010002, 0xFFFF0001, 0x80007FFF, 0x12345678, 0xFFFFFFFF, 0x0000FFFF, 0x7FFF8000, 0x00020005]
+vvb = [0x00030004, 0x0002FFFF, 0x7FFF8000, 0xF0E0D0C0, 0x01010101, 0xFFFF0000, 0x80007FFF, 0x00050002]
+open(d + '/vidin.bin', 'wb').write(struct.pack('<16I', *(vva + vvb)))
+# multimem: this runtime binds one replica, so a reduce across the replicas of a value
+# is that value under every operation, and a multicast store writes the one copy there
+# is. All three kernels therefore answer the input unchanged.
+mmv = [0x10203040, 0x00000001, 0xFFFFFFFE, 0x7FFFFFFF, 0x80000000, 0x0BADF00D, 0x0000FFFF, 0xAAAAAAAA]
+open(d + '/mmin.bin', 'wb').write(struct.pack('<8I', *mmv))
+open(d + '/mmexp.bin', 'wb').write(struct.pack('<8I', *mmv))
+# b128: one 16-byte value, two 64-bit halves, read and written as one access. Four
+# threads each move one value, so the dump only matches when every lane's sixteen
+# bytes arrive.
+bv = [0x1122334455667788, 0x99AABBCCDDEEFF00, 0x0123456789ABCDEF, 0xFEDCBA9876543210,
+      0xFFFFFFFFFFFFFFFF, 0x0F0F0F0F0F0F0F0F, 0xDEADBEEFCAFEF00D, 0x0000000000000001]
+open(d + '/b128in.bin', 'wb').write(struct.pack('<8Q', *bv))
+open(d + '/b128exp.bin', 'wb').write(struct.pack('<8Q', *bv))
+# call.uni: the callee adds one through its own pointer argument. The answer is the
+# input plus one; a pasted body that shared the caller's register file would lose
+# the pointer to the word it had just read.
+cv = [0x10, 0x20, 0x7FFFFFFF, 0xFFFFFFFF, 0, 1, 0xDEADBEEF, 0x12345678]
+open(d + '/callin.bin', 'wb').write(struct.pack('<8I', *cv))
+open(d + '/callexp.bin', 'wb').write(struct.pack('<8I', *[(v + 1) & 0xFFFFFFFF for v in cv]))
+for vn, vc, vn_lanes, vwd, vsa, vsb in [
+    ('vadd2u', 'add', 2, 16, False, False),
+    ('vadd2s', 'add', 2, 16, True, True),
+    ('vmin4s', 'min', 4, 8, True, True),
+    ('vabs4u', 'absdiff', 4, 8, False, False),
+    ('vadd4u', 'add', 4, 8, False, False),
+    ('vavg4s', 'avg', 4, 8, True, True),
+]:
+    open(d + '/exp_' + vn + '.bin', 'wb').write(
+        struct.pack('<8I', *[vcal(vc, x, y, vn_lanes, vwd, vsa, vsb) for x, y in zip(vva, vvb)]))
+PYEOF
+narrowref() {  # name, file, kernel, grid, threads, buffers, dump index, input, expected
+  local name="$1" file="$2" kern="$3" grid="$4" thr="$5" bufs="$6" idx="$7" in="$8"
+  local exp="$9"
+  if [ -n "$in" ]; then
+    "$WEFT" run "$file" --kernel "$kern" --grid "$grid" --threads "$thr" \
+        --buffers "$bufs" --load 0="$TMP/$in" --cpu-only --dump "$idx=$TMP/$name.bin" >/dev/null
+  else
+    "$WEFT" run "$file" --kernel "$kern" --grid "$grid" --threads "$thr" \
+        --buffers "$bufs" --cpu-only --dump "$idx=$TMP/$name.bin" >/dev/null
+  fi
+  if cmp -s "$TMP/$name.bin" "$TMP/$exp"; then
+    echo "ok    $name  the narrow arithmetic is the grid, bit for bit"
+  else
+    echo "FAIL  $name  $(cmp "$TMP/$name.bin" "$TMP/$exp" 2>&1 | head -1)"; fail=1
+  fi
+}
+# The same shape for a select: it takes an input as well as an expected answer, so
+# it is not one of the rows above, and the message says what was checked.
+slctref() {  # name, file, kernel, grid, threads, buffers, dump index, input, expected
+  local name="$1" file="$2" kern="$3" grid="$4" thr="$5" bufs="$6" idx="$7" in="$8"
+  local exp="$9"
+  "$WEFT" run "$file" --kernel "$kern" --grid "$grid" --threads "$thr" \
+      --buffers "$bufs" --load 0="$TMP/$in" --cpu-only --dump "$idx=$TMP/$name.bin" >/dev/null
+  if cmp -s "$TMP/$name.bin" "$TMP/$exp"; then
+    echo "ok    $name  slct picks the argument the sign of c asks for, bit for bit"
+  else
+    echo "FAIL  $name  $(cmp "$TMP/$name.bin" "$TMP/$exp" 2>&1 | head -1)"; fail=1
+  fi
+}
+narrowref halfops    kernels/halfops.ptx halfops    8  8  8,128  1 hin.bin   exp_ha.bin
+narrowref halfops2   kernels/halfops2.ptx halfops2   8  8  8,48   1 hin2.bin  exp_ha2.bin
+narrowref halfops_tg kernels/halfops3.ptx halfops_tg 32 32 32,32  1 hin32.bin exp_hs.bin
+narrowref halfmin    kernels/halfops4.ptx halfmin    1  1  6      0 ""        exp_hmin.bin
+narrowref bf16ops    kernels/bf16ops.ptx bf16ops    8  8  8,128  1 hbin.bin  exp_bf.bin
+narrowref bf16ops2   kernels/bf16ops.ptx bf16ops2   8  8  8,48   1 hbin2.bin exp_bf2.bin
+narrowref narrowdiv  kernels/narrowdiv.ptx narrowdiv  1 1 16  0 "" exp_nd.bin
+narrowref narrowdiv2 kernels/narrowdiv.ptx narrowdiv2 1 1 8   0 "" exp_nd2.bin
+narrowref bf16div    kernels/bf16div.ptx bf16div      1 1 8   0 "" exp_bfd.bin
+narrowref narrowcmp  kernels/narrowcmp.ptx narrowcmp 8 8 8,64 1 hcmpin.bin exp_cmp.bin
+narrowref narrowcmp_bf16 kernels/narrowcmp2.ptx narrowcmp_bf16 8 8 8,32 1 hbfcmpin.bin exp_bfcmp.bin
+narrowref narrowcmp2 kernels/narrowcmp3.ptx narrowcmp2 8 8 8,24 1 hpairin.bin exp_pcmp.bin
+narrowref narrowatom kernels/narrowatom.ptx narrowatom 64 64 2 0 zatom8.bin exp_natom.bin
+narrowref redatom    kernels/narrowatom2.ptx redatom    64 64 1 0 zatom4.bin exp_ratom.bin
+slctref  slcti       kernels/slct.ptx slcti 4 4 4,4 1 slin.bin  exp_slcti.bin
+slctref  slctf       kernels/slct.ptx slctf 4 4 4,4 1 slinf.bin exp_slctf.bin
+narrowref cas16     kernels/casb16.ptx casb16     1 1 1,1 0 casin.bin exp_cas16.bin
+narrowref cas16miss kernels/casb16.ptx casb16miss 1 1 1,1 0 casin.bin exp_cas16miss.bin
+narrowref cas16ret  kernels/casb16.ptx casb16     1 1 1,1 1 casin.bin exp_cas16ret.bin
+narrowref cas16race kernels/casb16.ptx casb16race 8 8 1   0 casin.bin exp_cas16.bin
+# The vector half atomics: `.add`, `.min` and `.max` of a half at `.v2`, which no
+# scalar half spelling carries. Eight lanes on one address, so the answer is the one
+# the whole group leaves; min and max are idempotent and the add moves powers of two
+# that stay exact at every step, so the order they land in cannot change it. The two
+# halves of the word are separate atomics, so a translation that wrote the word would
+# put one answer in both halves and each of these would miss.
+python3 - "$TMP" <<'PYH'
+import struct, sys, os
+d = sys.argv[1]
+def w(n, *vals):
+    open(os.path.join(d, n), 'wb').write(b''.join(struct.pack('<I', v) for v in vals))
+w('hvmax_in.bin', 0x44003C00);  w('hvmax_ex.bin', 0x44003E00)
+w('hvmin_in.bin', 0x44003C00);  w('hvmin_ex.bin', 0x41003C00)
+w('hvadd_in.bin', 0x00000000);  w('hvadd_ex.bin', 0x44004000)
+w('hvbf_in.bin',  0x00000000);  w('hvbf_ex.bin',  0x41804100)
+w('hvpack_in.bin', 0x3C003C00, 0x42004200)
+w('hvpack_ex.bin', 0x3C004000, 0x42004200)
+PYH
+narrowref hvmax  kernels/halfvecatom.ptx hvmax  8 8 1 0 hvmax_in.bin  hvmax_ex.bin
+narrowref hvmin  kernels/halfvecatom.ptx hvmin  8 8 1 0 hvmin_in.bin  hvmin_ex.bin
+narrowref hvadd  kernels/halfvecatom.ptx hvadd  8 8 1 0 hvadd_in.bin  hvadd_ex.bin
+narrowref hvbf   kernels/halfvecatom.ptx hvbf   8 8 1 0 hvbf_in.bin   hvbf_ex.bin
+narrowref hvpack kernels/halfvecatom.ptx hvpack 8 8 2 0 hvpack_in.bin hvpack_ex.bin
+# The cluster forms of shared memory. A cluster is one CTA wide here, so
+# `.shared::cluster` is the same window as `.shared`, and the two instructions that
+# have to place that address are the vector access -- whose operand is a list in
+# braces -- and `mapa`, whose answer is used as an address. Lane l reads lane (l+1)&7,
+# so an address that lost the lane, or a store that wrote the window's first bytes
+# every time, answers with a different set rather than the same one.
+python3 - "$TMP" <<'PYC'
+import struct, sys, os
+d = sys.argv[1]
+out = []
+for l in range(8):
+    m = (l + 1) % 8
+    out += [10 * m + 1, 10 * m + 4, 10 * m + 7, 10 * m + 10]
+open(os.path.join(d, 'sclv4_ex.bin'), 'wb').write(b''.join(struct.pack('<I', v) for v in out))
+open(os.path.join(d, 'sclmapa_ex.bin'), 'wb').write(
+    b''.join(struct.pack('<I', l * 5 + 3) for l in range(8)))
+PYC
+narrowref sclv4   kernels/scluster.ptx sclv4   8 8 32 0 "" sclv4_ex.bin
+narrowref sclmapa kernels/scluster.ptx sclmapa 8 8 8  0 "" sclmapa_ex.bin
+# Atomics in the shared window, whose address is an offset rather than a pointer. Each
+# kernel sets its own words first, because the window keeps what the last launch left and
+# the harness runs a kernel more than once to time it, and each is order-free by
+# construction: an add of powers of two, a max over a fixed set, a compare-exchange only
+# the first match takes. The b16 case shares its word with a half that must survive, and
+# satret takes the value the add returned, whose eight different answers sum to
+# 0+1+...+7 whatever order they landed in.
+python3 - "$TMP" <<'PYA'
+import struct, sys, os
+d = sys.argv[1]
+open(os.path.join(d, 'satadd_ex.bin'), 'wb').write(
+    struct.pack('<IIII', 8, 0x40800000, 7, 1))
+open(os.path.join(d, 'satb16_ex.bin'), 'wb').write(struct.pack('<I', 0x38004000))
+open(os.path.join(d, 'satpack_ex.bin'), 'wb').write(struct.pack('<I', 0x48004800))
+open(os.path.join(d, 'satret_ex.bin'), 'wb').write(struct.pack('<I', 28))
+PYA
+narrowref shatadd  kernels/shatom.ptx satadd  8 8 4 0 "" satadd_ex.bin
+narrowref shatb16  kernels/shatom.ptx satb16  8 8 1 0 "" satb16_ex.bin
+narrowref shatpack kernels/shatom.ptx satpack 8 8 1 0 "" satpack_ex.bin
+narrowref shatret  kernels/shatom.ptx satret  8 8 1 0 "" satret_ex.bin
+narrowref inc3     kernels/incdec.ptx inc     3 3 1   0 inc0.bin   exp_inc3.bin
+narrowref inc5     kernels/incdec.ptx inc     5 5 1   0 inc0.bin   exp_inc5.bin
+narrowref dec3     kernels/incdec.ptx dec     3 3 1   0 inc3in.bin exp_dec3.bin
+narrowref dec2     kernels/incdec.ptx dec     2 2 1   0 inc0.bin   exp_dec2.bin
+narrowref incgrab  kernels/incdec.ptx incgrab 1 1 1,1 1 inc0.bin   exp_incgrab.bin
+narrowref redinc   kernels/incdec.ptx redinc  3 3 1   0 inc0.bin   exp_inc3.bin
+narrowref a16add    kernels/spirv/atom16.spv a16add 8 8 2 0 a16in0.bin exp_a16add.bin
+narrowref a16mix    kernels/spirv/atom16.spv a16mix 1 1 2 0 a16in.bin exp_a16mix.bin
+narrowref sw32      kernels/spirv/switch.spv sw32 8 8 8,8 1 sw32in.bin exp_sw32.bin
+narrowref sw64      kernels/spirv/switch.spv sw64 8 8 8,8 1 sw64in.bin exp_sw64.bin
+narrowref sws       kernels/spirv/switchs.spv sws 4 4 4 0 "" exp_sws.bin
+# An indirect branch through a jump table, on the PTX column.
+"$WEFT" run kernels/brxidx.ptx --kernel brxidx --grid 8 --threads 8 --buffers 8,8 \
+    --load 0="$TMP/brxin.bin" --cpu-only --dump 1="$TMP/brx.bin" >/dev/null
+"$WEFT" run kernels/brxidx.ptx --kernel brxpred --grid 8 --threads 8 --buffers 8,8 \
+    --load 0="$TMP/brxin.bin" --cpu-only --dump 1="$TMP/brxp.bin" >/dev/null
+if cmp -s "$TMP/brx.bin" "$TMP/exp_brx.bin" && cmp -s "$TMP/brxp.bin" "$TMP/exp_brxp.bin"; then
+  echo "ok    brxidx  a jump table picks the label the index names, guard included"
+else
+  echo "FAIL  brxidx  $(cmp "$TMP/brx.bin" "$TMP/exp_brx.bin" 2>&1 | head -1) $(cmp "$TMP/brxp.bin" "$TMP/exp_brxp.bin" 2>&1 | head -1)"; fail=1
+fi
+# Bit scans, and a half register declared `.reg .f16`. Each kernel is one answer
+# per lane, compared byte for byte against the reference above.
+bitok=1
+for row in "bfindu:bfindu_in:exp_bfindu" "bfinds:bfinds_in:exp_bfinds" \
+           "fns3:fns_in:exp_fns3" "fnsbase:fns_in:exp_fnsb4" "f16reg:h16in:exp_h16reg"; do
+  bkn="${row%%:*}"; brest="${row#*:}"; bin="${brest%%:*}"; bexp="${brest##*:}"
+  "$WEFT" run kernels/bitfind.ptx --kernel "$bkn" --grid 8 --threads 8 --buffers 8,8 \
+      --load 0="$TMP/$bin.bin" --cpu-only --dump 1="$TMP/bf_$bkn.bin" >/dev/null
+  if ! cmp -s "$TMP/bf_$bkn.bin" "$TMP/$bexp.bin"; then
+    echo "FAIL  bitfind:$bkn  $(cmp "$TMP/bf_$bkn.bin" "$TMP/$bexp.bin" 2>&1 | head -1)"; fail=1; bitok=0
+  fi
+done
+[ "$bitok" = 1 ] && echo "ok    bitfind  bfind, fns and a .reg .f16 declaration are exact"
+narrowref electk     kernels/warpmatch.ptx electk    8 8 8    0 ""       exp_elect.bin
+narrowref matchny    kernels/warpmatch.ptx matchny   8 8 8,8  1 wmmix.bin exp_matchny.bin
+narrowref matchalld  kernels/warpmatch.ptx matchalld 8 8 8,8  1 wmmix.bin exp_matchall.bin
+narrowref matchalleq kernels/warpmatch.ptx matchalld 8 8 8,8  1 wmeq.bin  exp_matchallq.bin
+narrowref matchallp  kernels/warpmatch.ptx matchallp 8 8 8,8  1 wmmix.bin exp_matchallp.bin
+narrowref matchallpe kernels/warpmatch.ptx matchallp 8 8 8,8  1 wmeq.bin  exp_matchallpq.bin
+narrowref dp2alo     kernels/dp2a.ptx dp2alo  8 8 16,8 1 dpin.bin exp_dp2alo.bin
+narrowref dp2ahi     kernels/dp2a.ptx dp2ahi  8 8 16,8 1 dpin.bin exp_dp2ahi.bin
+narrowref dp2aslo    kernels/dp2a.ptx dp2aslo 8 8 16,8 1 dpin.bin exp_dp2aslo.bin
+narrowref dp2ashi    kernels/dp2a.ptx dp2ashi 8 8 16,8 1 dpin.bin exp_dp2ashi.bin
+narrowref movmtx     kernels/movmatrix.ptx movmtx  32 32 32,32 1 mvin.bin exp_movtx.bin
+narrowref movmtx2    kernels/movmatrix.ptx movmtx2 32 32 32,32 1 mvin.bin mvin.bin
+narrowref vadd2u     kernels/video.ptx vadd2u  8 8 16,8 1 vidin.bin exp_vadd2u.bin
+narrowref vadd2s     kernels/video.ptx vadd2s  8 8 16,8 1 vidin.bin exp_vadd2s.bin
+narrowref vmin4s     kernels/video.ptx vmin4s  8 8 16,8 1 vidin.bin exp_vmin4s.bin
+narrowref vabs4u     kernels/video.ptx vabs4u  8 8 16,8 1 vidin.bin exp_vabs4u.bin
+narrowref vadd4u     kernels/video.ptx vadd4u  8 8 16,8 1 vidin.bin exp_vadd4u.bin
+narrowref vavg4s     kernels/video.ptx vavg4s  8 8 16,8 1 vidin.bin exp_vavg4s.bin
+narrowref mmld       kernels/multimem.ptx mmld  8 8 8,8 1 mmin.bin mmexp.bin
+narrowref mmmin      kernels/multimem.ptx mmmin 8 8 8,8 1 mmin.bin mmexp.bin
+narrowref mmst       kernels/multimem.ptx mmst  8 8 8,8 1 mmin.bin mmexp.bin
+narrowref b128mv     kernels/b128.ptx b128mv 4 4 4,4 1 b128in.bin b128exp.bin
+narrowref callk      kernels/call.ptx callk 8 8 8,8 1 callin.bin callexp.bin
+# The same call, to a function that branches: a forward jump past a loop and a backward
+# one inside it. The body is the switch a kernel body is, so the loop is what proves the
+# case a branch writes is the case it lands on. A lane that reads zero has to answer
+# zero, which catches a loop that runs its body before its test.
+python3 - "$TMP" <<'PYC'
+import struct, sys, os
+d = sys.argv[1]
+vals = [3, 5, 12, 0, 7, 100, 1, 9]
+exp = [v + 100 if v >= 10 else v * (v + 1) // 2 for v in vals]
+open(os.path.join(d, 'callbrin.bin'), 'wb').write(struct.pack('<8I', *vals))
+open(os.path.join(d, 'callbrexp.bin'), 'wb').write(struct.pack('<8I', *exp))
+PYC
+narrowref callbr     kernels/call.ptx callbr 8 8 8,8 1 callbrin.bin callbrexp.bin
+# sad, mul24/mad24 and cvt.pack. The reference is written here from the isa's own
+# definitions, not from the translator's arithmetic, so the two are independent
+# statements of the same four answers.
+python3 - "$TMP/morein.bin" "$TMP/moreexp.bin" <<'PY'
+import struct, sys
+ins = [0x7FFFFFFF, 0x00FFFFFF, 0xFFFF0000, 0x00000005,
+       0x12345678, 0x800000FF, 0x00010000, 0xFFFFFFFF]
+open(sys.argv[1], 'wb').write(struct.pack('<8I', *ins))
+M = 0xFFFFFFFF
+def s32(v):
+    v &= M
+    return v - (1 << 32) if v & 0x80000000 else v
+def s24(v):
+    v &= 0xFFFFFF
+    return v - (1 << 24) if v & 0x800000 else v
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+out = []
+for x in ins:
+    sad = sum(abs(((x >> (8 * k)) & 0xFF) - ((0x01020304 >> (8 * k)) & 0xFF))
+              for k in range(4))
+    lo24 = (s24(x) * s24(0x1234)) & M
+    hi24 = ((s24(x) * s24(0x1234) + s32(x)) >> 32) & M
+    packed = (0xFFFF0000
+              | (clamp(s32(x), 0, 255) & 0xFF)
+              | ((clamp(s32((x >> 8) & M), 0, 255) & 0xFF) << 8)) & M
+    out += [sad & M, lo24, hi24, packed]
+open(sys.argv[2], 'wb').write(struct.pack('<32I', *out))
+PY
+narrowref m4         kernels/more.ptx m4 8 8 8,32 1 morein.bin moreexp.bin
+# activemask: a full warp of 32 lanes is launched, which is what the warp body runs
+# as one thread, so every lane is executing and the answer is 0xFFFFFFFF.
+python3 - "$TMP/actexp.bin" <<'PY'
+import struct, sys
+open(sys.argv[1], 'wb').write(struct.pack('<32I', *[0xFFFFFFFF] * 32))
+PY
+narrowref actm      kernels/warpbits.ptx actm 32 32 32 0 "" actexp.bin
+# The same kernel at a short launch: eight lanes exist, so the mask is 0x000000FF and
+# not all 32 bits. Before the lanes past the launch were marked finished this answered
+# 0xFFFFFFFF, and a store from those lanes wrote 128 bytes into a 32-byte buffer.
+python3 - "$TMP/actexp8.bin" <<'PY'
+import struct, sys
+open(sys.argv[1], 'wb').write(struct.pack('<8I', *[0xFF] * 8))
+PY
+narrowref actm8     kernels/warpbits.ptx actm 8 8 8 0 "" actexp8.bin
+# `movmatrix` is `.trans`-only in PTX: the answer is the same fragment read out of the
+# transposed matrix, so the reference decodes the words into a matrix, swaps it and
+# encodes the fragment again.
+python3 - "$TMP/wbin.bin" "$TMP/wbexp.bin" <<'PYX'
+import struct, sys
+words = [0x10000000 + i for i in range(32)]
+m = [[0] * 8 for _ in range(8)]
+for l in range(32):
+    r, c = l >> 2, 2 * (l & 3)
+    m[r][c], m[r][c + 1] = words[l] & 0xFFFF, words[l] >> 16
+mt = [[m[j][i] for j in range(8)] for i in range(8)]
+out = []
+for l in range(32):
+    r, c = l >> 2, 2 * (l & 3)
+    out.append(mt[r][c] | (mt[r][c + 1] << 16))
+open(sys.argv[1], 'wb').write(struct.pack('<32I', *words))
+open(sys.argv[2], 'wb').write(struct.pack('<32I', *out))
+PYX
+narrowref mvi       kernels/warpbits.ptx mvi 32 32 32,32 1 wbin.bin wbexp.bin
+# The packed half transcendentals are the scalar answer per half: each half is widened,
+# answered and rounded on its own, and the low half's rounding cannot move the high one.
+# The reference is the double-precision library rounded once to the half grid, so this is
+# an independent answer rather than this library run twice.
+python3 - "$TMP" <<'PYX'
+import struct, math, sys, os
+d = sys.argv[1]
+vals = [i / 16.0 for i in range(1, 65)]
+pack = lambda xs: b''.join(struct.pack('<e', x) for x in xs)
+half = lambda v: struct.unpack('<e', struct.pack('<e', v))[0]
+open(os.path.join(d, 'p16in.bin'), 'wb').write(pack(vals))
+open(os.path.join(d, 'p16ex.bin'), 'wb').write(pack([2.0 ** half(v) for v in vals]))
+open(os.path.join(d, 'p16lg.bin'), 'wb').write(pack([math.log2(half(v)) for v in vals]))
+open(os.path.join(d, 'p16th.bin'), 'wb').write(pack([math.tanh(half(v)) for v in vals]))
+PYX
+narrowref p16ex2    kernels/f16x2_trans.ptx p16tx 32 32 32,32,32,32 1 p16in.bin p16ex.bin
+narrowref p16lg2    kernels/f16x2_trans.ptx p16tx 32 32 32,32,32,32 2 p16in.bin p16lg.bin
+narrowref p16tanh   kernels/f16x2_trans.ptx p16tx 32 32 32,32,32,32 3 p16in.bin p16th.bin
+
+
+# suq: the surface's own extents, read from the binding the launcher made (64x64).
+# The expected answer is written here rather than derived from the kernel, so the
+# fixture is checked against the launch it was given and not against itself.
+python3 - "$TMP/surfqexp.bin" <<'PY'
+import struct, sys
+open(sys.argv[1], 'wb').write(struct.pack('<4I', 64, 64, 1, 129))
+PY
+"$WEFT" run kernels/surfq.ptx --kernel surfq --grid 1 --threads 1 --buffers 4 \
+    --textures 64x64 --cpu-only --dump 0="$TMP/surfq.bin" >/dev/null
+if cmp -s "$TMP/surfq.bin" "$TMP/surfqexp.bin"; then
+  echo "ok    surfq  a surface answers its own width, height and depth"
+else
+  echo "FAIL  surfq  $(cmp "$TMP/surfq.bin" "$TMP/surfqexp.bin" 2>&1 | head -1)"; fail=1
+fi
+# The approximate forms are within one ulp of the half grid's nearest value, checked
+# against a double-precision reference rather than against this engine's own library.
+"$WEFT" run kernels/narrowtran.ptx --kernel narrowtran --grid 8 --threads 8 --buffers 8,48 \
+    --load 0="$TMP/htranin.bin" --cpu-only --dump 1="$TMP/ntran.bin" >/dev/null
+if python3 - "$TMP/ntran.bin" <<'PY'
+import struct, math, sys
+raw = open(sys.argv[1], 'rb').read()
+def val(b): return struct.unpack('<e', struct.pack('<H', b))[0]
+def bits(x): return struct.unpack('<H', struct.pack('<e', x))[0]
+vals = [0.5, 2.0, 0.25, 3.0, 1000.0, 4000.0, 16000.0, 65504.0]
+refs = [lambda x: 2.0 ** x, lambda x: math.log2(x), lambda x: 1.0 / math.sqrt(x),
+        math.sin, math.cos, math.tanh]
+names = ['ex2', 'lg2', 'rsqrt', 'sin', 'cos', 'tanh']
+got = struct.unpack('<%dH' % (len(raw) // 2), raw)
+bad = 0
+for i, x in enumerate(vals):
+    for j, f in enumerate(refs):
+        b = got[i * 6 + j]
+        r = val(b)
+        try:
+            want = f(x)
+        except OverflowError:      # 2**1000 is past a double, let alone a half
+            want = float('inf')
+        if math.isinf(want) or abs(want) > 65504.0:
+            # The half grid ends there, so the reference's answer is the infinite one.
+            if not math.isinf(r):
+                print('  lane %d %s: got %r want %r' % (i, names[j], r, want))
+                bad += 1
+            continue
+        ulp = abs(val(bits(r) + 1) - r)
+        if not (abs(r - want) <= ulp * 1.0001 + 1e-12):
+            print('  lane %d %s: got %r want %r (ulp %r)' % (i, names[j], r, want, ulp))
+            bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    narrowtran  the approximate forms are within one ulp of the library"
+else
+  echo "FAIL  narrowtran  an approximate form is off by more than one ulp"; fail=1
+fi
+# The same six operations on random values drawn across the whole half grid, against a
+# double's answer. Eight fixed inputs cannot see a path that only the top of the range
+# or a value near zero takes, and those are the paths this library branches on.
+if python3 - "$WEFT" "$TMP" <<'PY'
+import math, random, struct, subprocess, sys
+weft, tmp = sys.argv[1], sys.argv[2]
+def hround(v):
+    try: return struct.unpack('<e', struct.pack('<e', v))[0]
+    except OverflowError: return 65504.0 if v > 0 else -65504.0
+def val(b): return struct.unpack('<e', struct.pack('<H', b))[0]
+def bits(x): return struct.unpack('<H', struct.pack('<e', x))[0]
+random.seed(20261107)
+vals = []
+while len(vals) < 256:
+    v = hround((10.0 ** random.uniform(-22, 4.7)) * random.choice([1, -1]))
+    if v != 0 and math.isfinite(v): vals.append(v)
+refs = [lambda x: 2.0 ** x, math.log2, lambda x: 1.0 / math.sqrt(x), math.sin, math.cos, math.tanh]
+names = ['ex2', 'lg2', 'rsqrt', 'sin', 'cos', 'tanh']
+bad = 0
+for gi in range(0, len(vals), 8):
+    g = vals[gi:gi + 8]
+    open(tmp + '/rndin.bin', 'wb').write(b''.join(struct.pack('<e', v) for v in g))
+    subprocess.run([weft, 'run', 'kernels/narrowtran.ptx', '--kernel', 'narrowtran', '--grid', '8',
+                    '--threads', '8', '--buffers', '8,48', '--load', '0=' + tmp + '/rndin.bin',
+                    '--cpu-only', '--dump', '1=' + tmp + '/rndout.bin'], capture_output=True)
+    got = struct.unpack('<48H', open(tmp + '/rndout.bin', 'rb').read())
+    for i, x in enumerate(g):
+        for j, f in enumerate(refs):
+            r = val(got[i * 6 + j])
+            try: want = f(x)
+            except OverflowError: want = float('inf')
+            except (ValueError, ZeroDivisionError): want = float('nan')
+            if math.isnan(want): ok = math.isnan(r)
+            elif math.isinf(want) or abs(want) > 65504.0: ok = math.isinf(r) and ((r > 0) == (want > 0))
+            else:
+                step = abs(val((bits(r) + 1) & 0xFFFF) - r) if (r == r and 0 < abs(r) < 65504.0) else 1e-3
+                ok = abs(r - want) <= step * 1.0001 + 1e-12
+            if not ok:
+                print('  x=%r %s: got %r want %r' % (x, names[j], r, want)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    narrowrnd  256 random halfs answer a double, six ways each"
+else
+  echo "FAIL  narrowrnd  a random half disagrees with a double's answer"; fail=1
+fi
+# `lgamma` answers ln|Gamma| where the gamma itself has overflowed, and `lgamma_r` hands
+# the sign back too. The reference is the log of the double of the *float* argument:
+# near a pole the slope is a hundred, so rounding the argument first is the difference
+# between a 1 ulp and a 60 ulp "error". A measured sweep of 2,048 values peaked at 7 ulp,
+# which is the bound below. `-2^24` and below are all integers and so all poles.
+python3 - "$TMP/lg_in.bin" <<'PY'
+import struct, sys
+vals = [0.5, 1.0, 2.0, 3.5, 10.0, -0.5, -1.5, 1e5, 1e-3, 1.001,
+        -8.0089, 4.2e36, 0.0, -0.0, -1.0, -2.0, -3.0, -1e8, 2.5, -0.25]
+open(sys.argv[1], 'wb').write(struct.pack('<20f', *vals))
+PY
+"$WEFT" run kernels/spirv/lgamma.spv --kernel lgamma --grid 20 --threads 20 --buffers 20,20 \
+    --load 0="$TMP/lg_in.bin" --cpu-only --dump 1="$TMP/lg_out.bin" >/dev/null
+if python3 - "$TMP/lg_out.bin" <<'PY'
+import struct, math, sys
+vals = [0.5, 1.0, 2.0, 3.5, 10.0, -0.5, -1.5, 1e5, 1e-3, 1.001,
+        -8.0089, 4.2e36, 0.0, -0.0, -1.0, -2.0, -3.0, -1e8, 2.5, -0.25]
+got = struct.unpack('<20f', open(sys.argv[1], 'rb').read())
+def bits(x): return struct.unpack('<I', struct.pack('<f', x))[0]
+def roundf(x): return struct.unpack('<f', struct.pack('<f', x))[0]
+bad, worst = 0, 0.0
+for v, g in zip(vals, got):
+    v = roundf(v)
+    if v == 0.0 or (v == math.floor(v) and v < 0.0):
+        if not math.isinf(g):
+            print('  lgamma(%r) answered %r, not the pole' % (v, g)); bad += 1
+        continue
+    try:
+        w = roundf(math.lgamma(v))
+    except OverflowError:
+        if not math.isinf(g):
+            print('  lgamma(%r) answered %r, not the overflow' % (v, g)); bad += 1
+        continue
+    u = abs(bits(g) - bits(w))
+    worst = max(worst, u)
+    if u > 8:
+        print('  lgamma(%r) got %r want %r, %d ulp' % (v, g, w, u)); bad += 1
+print('  the worst of the rest is %.0f ulp, inside the 8 this holds it to' % worst)
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    lgamma  ln|Gamma| within 8 ulp, and the poles answer infinity"
+else
+  echo "FAIL  lgamma  a value or a pole is wrong"; fail=1
+fi
+"$WEFT" run kernels/spirv/lgammar.spv --kernel lgammar --grid 20 --threads 20 --buffers 20,20,20 \
+    --load 0="$TMP/lg_in.bin" --cpu-only --dump 1="$TMP/lgr_v.bin" --dump 2="$TMP/lgr_s.bin" >/dev/null
+if python3 - "$TMP/lgr_v.bin" "$TMP/lgr_s.bin" <<'PY'
+import struct, math, sys
+vals = [0.5, 1.0, 2.0, 3.5, 10.0, -0.5, -1.5, 1e5, 1e-3, 1.001,
+        -8.0089, 4.2e36, 0.0, -0.0, -1.0, -2.0, -3.0, -1e8, 2.5, -0.25]
+val = struct.unpack('<20f', open(sys.argv[1], 'rb').read())
+sgn = struct.unpack('<20i', open(sys.argv[2], 'rb').read())
+def roundf(x): return struct.unpack('<f', struct.pack('<f', x))[0]
+bad = 0
+for v, a, s in zip(vals, val, sgn):
+    v = roundf(v)
+    pole = v == 0.0 or (v == math.floor(v) and v < 0.0)
+    want = 1 if (pole or v > 0.0) else (-1 if (int(math.floor(v)) & 1) else 1)
+    if s != want:
+        print('  lgamma_r(%r) sign %d, want %d' % (v, s, want)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    lgammar  the sign is gamma's own on both sides of zero"
+else
+  echo "FAIL  lgammar  a sign disagrees with the parity of the whole part"; fail=1
+fi
+runf kernels/spirv/lgamma.spv lgamma --grid 20 --threads 20 --buffers 20,20 --load 0="$TMP/lg_in.bin" --exact
+runf kernels/spirv/lgammar.spv lgammar --grid 20 --threads 20 --buffers 20,20,20 --load 0="$TMP/lg_in.bin" --exact
+# `bmsk` is a run of bits, and its edges are the whole answer: a width of exactly the
+# type's size is all ones rather than a shift by the size, a width of zero or less sets
+# nothing, and a width past the type is still all ones. Nothing here is a table: each row
+# below is the run written out, and the 64-bit form is read the same way. The run from
+# bit 24 to 40 is the one row that crosses the top: a .b32 keeps bits 24 to 31 of it.
+"$WEFT" run kernels/bmsk.ptx --kernel bmsk --grid 1 --threads 1 --buffers 76 \
+    --cpu-only --dump 0="$TMP/bmsk.bin" >/dev/null
+if python3 - "$TMP/bmsk.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+# Eight .b32 rows, five .b64 rows, then the one .b32 row whose width runs past the type.
+want32 = [0xFFFFFFFF, 0x7FFFFFFF, 0x00000FE0, 0, 0, 0x80000000, 1, 0xFF000000]
+got32 = list(struct.unpack('<8I', data[:32]))
+want64 = [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF00000000, ((1 << 35) - 1) << 5, 1 << 63, 0]
+got64 = list(struct.unpack('<5Q', data[32:72]))
+tail = struct.unpack('<I', data[72:76])[0]
+bad = 0
+for i, (g, w) in enumerate(zip(got32, want32)):
+    if g != w:
+        print('  b32 row %d got 0x%08X want 0x%08X' % (i, g, w)); bad += 1
+for i, (g, w) in enumerate(zip(got64, want64)):
+    if g != w:
+        print('  b64 row %d got 0x%016X want 0x%016X' % (i, g, w)); bad += 1
+if tail != 0xFFFFFFFF:
+    print('  b32 row 8 got 0x%08X want 0xFFFFFFFF' % tail); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    bmsk        the run of bits is the run, and every edge clamps the isa way"
+else
+  echo "FAIL  bmsk        a mask came out as a shifted one instead of the run"; fail=1
+fi
+# The packed comparisons answer 1 or 0 per field, not all ones, so the answer is the
+# packing of the comparisons. Two rows compare the same bits as signed halves and as
+# unsigned halves, where the two readings disagree; the byte rows repeat it four wide.
+"$WEFT" run kernels/vsetpack.ptx --kernel vsetpack --grid 1 --threads 1 --buffers 28 \
+    --cpu-only --dump 0="$TMP/vsetpack.bin" >/dev/null
+if python3 - "$TMP/vsetpack.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+
+def vs(n, op, a, at, b, bt):
+    width = 32 // n
+    field = (1 << width) - 1
+    out = 0
+    for i in range(n):
+        xa = (a >> (width * i)) & field
+        xb = (b >> (width * i)) & field
+        if at == "s32" and xa >> (width - 1):
+            xa -= 1 << width
+        if bt == "s32" and xb >> (width - 1):
+            xb -= 1 << width
+        hit = {"eq": xa == xb, "ne": xa != xb, "lt": xa < xb,
+               "le": xa <= xb, "gt": xa > xb, "ge": xa >= xb}[op]
+        if hit:
+            out |= 1 << (width * i)
+    return out
+
+want = [
+    vs(2, "eq", 0x00010002, "u32", 0x00010003, "u32"),
+    vs(2, "lt", 0xFFFF0001, "s32", 0x00000002, "s32"),
+    vs(2, "lt", 0xFFFF0001, "u32", 0x00000002, "u32"),
+    vs(2, "ne", 0x00000000, "u32", 0x0000FFFF, "u32"),
+    vs(4, "eq", 0x01020304, "u32", 0x01020305, "u32"),
+    vs(4, "lt", 0x0A0B0C0D, "u32", 0x00010003, "u32"),
+    vs(4, "gt", 0x80FF7F01, "s32", 0x00000000, "s32"),
+]
+got = list(struct.unpack('<7I', data[:28]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    vsetpack    each half or byte answers 1 or 0, and the signed reading differs"
+else
+  echo "FAIL  vsetpack    a packed comparison packed or compared the wrong way"; fail=1
+fi
+runf kernels/vsetpack.ptx vsetpack --grid 1 --threads 1 --buffers 28 --exact
+# The scalar video instructions read the same bits at the type their suffixes name, and
+# that reading is the whole answer: the unsigned maximum of 0xFFFFFFFF is a different
+# number from its signed minimum. Each row below is the isa's own definition with the
+# operands widened at their types first, then cut back to the word, and the two `vset`
+# rows give the same bits a signed and an unsigned reading where the two disagree.
+"$WEFT" run kernels/vscalar.ptx --kernel vscalar --grid 1 --threads 1 --buffers 56 \
+    --cpu-only --dump 0="$TMP/vscalar.bin" >/dev/null
+if python3 - "$TMP/vscalar.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+M32 = 0xFFFFFFFF
+
+def widen(v, t):
+    v &= M32
+    return v - (1 << 32) if (t == "s32" and v >> 31) else v
+
+def arith(op, a, at, b, bt):
+    ta, tb = widen(a, at), widen(b, bt)
+    if op == "add":
+        r = ta + tb
+    elif op == "sub":
+        r = ta - tb
+    elif op == "min":
+        r = min(ta, tb)
+    elif op == "max":
+        r = max(ta, tb)
+    else:
+        r = abs(ta - tb)
+    return r & M32
+
+def madv(a, b, c):
+    return ((a & M32) * (b & M32) + (c & M32)) & M32
+
+def sett(cmp, a, at, b, bt):
+    ta, tb = widen(a, at), widen(b, bt)
+    return 1 if {"lt": ta < tb, "gt": ta > tb, "eq": ta == tb, "ne": ta != tb}[cmp] else 0
+
+want = [
+    arith("add", M32, "u32", 1, "u32"),
+    arith("sub", 1, "u32", 5, "u32"),
+    arith("min", M32, "s32", 1, "s32"),
+    arith("max", M32, "u32", 1, "u32"),
+    arith("absdiff", 0xFFFFFFF0, "s32", 1, "s32"),
+    arith("absdiff", 1, "u32", 5, "u32"),
+    madv(M32, M32, 7),
+    madv(0xFFFFFFF0, 5, 3),
+    arith("min", 5, "u32", 7, "u32"),
+    arith("max", 0xFFFFFFF0, "s32", 5, "s32"),
+    sett("lt", M32, "s32", 1, "u32"),
+    sett("gt", M32, "u32", M32, "s32"),
+    arith("add", 5, "s32", 7, "s32"),
+    arith("sub", 5, "u32", M32, "s32"),
+]
+got = list(struct.unpack('<14I', data[:56]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    vscalar     the types decide the answer, and a mixed vset reads both signs"
+else
+  echo "FAIL  vscalar     a scalar video operation answered at the wrong signedness"; fail=1
+fi
+runf kernels/vscalar.ptx vscalar --grid 1 --threads 1 --buffers 56 --exact
+# The scalar video shifts are not the C shift in two places. A count wider than the word
+# is clamped to 32 or wrapped to five bits depending on the mode, which is a zero against
+# a shift for the same count of 36, and a count of exactly 32 is a real answer. The nine
+# rows below are the two modes, the signed fill, a shift that sets the sign bit, and the
+# `vset` pair that reads the same bits as signed and as unsigned, where they disagree.
+"$WEFT" run kernels/vshift.ptx --kernel vshift --grid 1 --threads 1 --buffers 48 \
+    --cpu-only --dump 0="$TMP/vshift.bin" >/dev/null
+if python3 - "$TMP/vshift.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+M32 = 0xFFFFFFFF
+
+def count(n, mode):
+    return (n & 31) if mode == "wrap" else (32 if n > 32 else n)
+
+def shl(a, n, mode):
+    return (a << count(n, mode)) & M32
+
+def shr_u(a, n, mode):
+    return (a & M32) >> count(n, mode)
+
+def shr_s(a, n, mode):
+    sa = a - (1 << 32) if a >> 31 else a
+    return (sa >> count(n, mode)) & M32
+
+neg1 = M32
+want = [shl(1, 4, "clamp"), shl(1, 36, "wrap"), shl(1, 40, "clamp"),
+        shr_u(0x80000000, 4, "clamp"), shr_s(0x80000000, 4, "clamp"),
+        shr_s(0x80000000, 40, "clamp"), shl(0x40000000, 1, "clamp"),
+        shr_u(0x80000000, 36, "wrap"),   # .s32 destination, .u32 source: zero fill
+        1 if -1 < 1 else 0, 1 if neg1 < 1 else 0, 1 if -1 >= -1 else 0,
+        1 if neg1 != 1 else 0]
+got = list(struct.unpack('<12I', data[:48]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    vshift      a count past the word clamps or wraps, and a signed shift fills"
+else
+  echo "FAIL  vshift      a video shift answered like a plain C shift"; fail=1
+fi
+runf kernels/vshift.ptx vshift --grid 1 --threads 1 --buffers 48 --exact
+# A wide multiply is a pair of words, and `mad.hi` picking the low one would still look
+# like arithmetic. So each row is checked against the isa's own definition, the product
+# shifted down before the addend lands on it, and the pair that overflows its own word is
+# here to make the difference visible: `mad.hi` of 0xFFFFFFFF^2 plus 7 is 5, while the low
+# word of the same product plus 7 is 6. The signed row and the 64-bit rows are the same
+# two questions one width up, and the carry from `mad.lo.cc` is what the two `madc` rows
+# then add.
+"$WEFT" run kernels/madhi.ptx --kernel madhi --grid 1 --threads 1 --buffers 64 \
+    --cpu-only --dump 0="$TMP/madhi.bin" >/dev/null
+if python3 - "$TMP/madhi.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+M32, M64 = 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF
+
+def lo(a, b, c, cin=0, mask=M32):
+    t = a * b + c + cin
+    return t & mask, 1 if t > mask else 0
+
+def hi(a, b, c, cin=0, mask=M32):
+    t = ((a * b) >> (32 if mask == M32 else 64)) + c + cin
+    return t & mask, 1 if t > mask else 0
+
+def hi_s32(a, b, c, cin=0):
+    sa = a - (1 << 32) if a >> 31 else a
+    sb = b - (1 << 32) if b >> 31 else b
+    t = ((sa * sb) >> 32) + c + cin
+    return t & M32, 1 if t > M32 else 0
+
+want = [(M32 * M32) >> 32]
+s, _ = lo(3, 5, 7); want.append(s)
+s, _ = hi(M32, M32, 7); want.append(s)
+s, c = lo(1, M32, 1); want.append(s)
+s, _ = lo(3, 5, 7, c); want.append(s)
+s, _ = hi(M32, M32, 7, c); want.append(s)
+s, _ = hi_s32(M32, 0x40000000, 3); want.append(s)
+want.append((M32 * 3) & M32)
+got = list(struct.unpack('<8I', data[:32]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+want64 = []
+s, _ = lo(0xFFFFFFFF00000000, 2, 7, 0, M64); want64.append(s)
+s, _ = hi(M64, M64, 7, 0, M64); want64.append(s)
+s, c = lo(1, M64, 1, 0, M64); want64.append(s)
+s, _ = hi(M64, M64, 7, c, M64); want64.append(s)
+got64 = list(struct.unpack('<4Q', data[32:64]))
+for i, (g, x) in enumerate(zip(got64, want64)):
+    if g != x:
+        print('  word64 %d got 0x%016X want 0x%016X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    madhi       the high word is the high one, and its addend carries out on its own"
+else
+  echo "FAIL  madhi       a high word came out as the low one"; fail=1
+fi
+runf kernels/madhi.ptx madhi --grid 1 --threads 1 --buffers 64 --exact
+# A carry chain is a wide addition written a word at a time, so the answer is a pair:
+# the word and the flag. Each chain here is checked against the isa's own definitions,
+# `d = a + b + cc` and `d = a - (b + cc)`, rather than against the comparison forms the
+# translator emits, and the flag travels from one row to the next the way the kernel
+# carries it: the pair that wraps out of the top of a word, the pair that does not, a
+# borrow, the low word of a product, and the 64-bit chains a 32-bit flag cannot serve.
+"$WEFT" run kernels/carry.ptx --kernel carry --grid 1 --threads 1 --buffers 64 \
+    --cpu-only --dump 0="$TMP/carry.bin" >/dev/null
+if python3 - "$TMP/carry.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+M32, M64 = 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF
+
+def add(a, b, cin=0, mask=M32):
+    t = a + b + cin
+    return t & mask, 1 if t > mask else 0
+
+def sub(a, b, cin=0, mask=M32):
+    t = a - b - cin
+    return t & mask, 1 if t < 0 else 0
+
+def madc(a, b, c, cin=0, mask=M32):
+    t = a * b + c + cin
+    return t & mask, 1 if t > mask else 0
+
+want = []
+s, c = add(M32, 1); want.append(s)          # the word wraps, the flag goes to the next
+s, c = add(1, 1, c); want.append(s)         # and the next word adds it
+s, c = add(5, 7); want.append(s)            # no carry
+s, c = add(5, 5, c); want.append(s)
+s, c = sub(1, 3); want.append(s)            # a borrow out
+s, c = sub(3, 1, c); want.append(s)         # and the borrow taken off the next word
+s, c = add(M32, 1)                          # the flag back to one for the product
+s, c = madc(3, 5, 7, c); want.append(s)     # 3*5 + 7 + 1
+s, c = add(M32, M32)
+s, c = add(M32, M32, c); want.append(s)
+got = list(struct.unpack('<8I', data[:32]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+want64 = []
+s, c = add(M64, 1, 0, M64); want64.append(s)
+s, c = add(M64, M64, c, M64); want64.append(s)
+s, c = sub(0, 1 << 63, 0, M64); want64.append(s)
+s, c = sub(1 << 63, 0, c, M64); want64.append(s)
+got64 = list(struct.unpack('<4Q', data[32:64]))
+for i, (g, x) in enumerate(zip(got64, want64)):
+    if g != x:
+        print('  word64 %d got 0x%016X want 0x%016X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    carry       the flag travels between words, and the 64-bit chain is its own"
+else
+  echo "FAIL  carry       a carry chain came out one word short"; fail=1
+fi
+runf kernels/carry.ptx carry --grid 1 --threads 1 --buffers 64 --exact
+# `cnot` is the C logical negation and `not` is the bitwise one, so the rows that tell
+# them apart are the ones with bits set: all ones, the top bit, a single low bit and the
+# largest non-zero value all answer 0 here. The answer for zero is 1 whatever the width,
+# which is why the 64-bit rows only have to add one with a bit beyond the first word.
+"$WEFT" run kernels/cnot.ptx --kernel cnot --grid 1 --threads 1 --buffers 64 \
+    --cpu-only --dump 0="$TMP/cn.bin" >/dev/null
+if python3 - "$TMP/cn.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+in32 = [0, 1, 0xFFFFFFFF, 0x80000000, 0, 42, 0, 0x7FFFFFFF]
+in64 = [0, 0x0000000100000000, 0xFFFFFFFFFFFFFFFF, 0x8000000000000000]
+# The whole definition: one for zero, zero for anything else.
+want = [1 if v == 0 else 0 for v in in32 + in64]
+got = list(struct.unpack('<8I', data[:32])) + list(struct.unpack('<4Q', data[32:64]))
+bad = 0
+for i, (g, w) in enumerate(zip(got, want)):
+    if g != w:
+        print('  row %d got %d want %d' % (i, g, w)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    cnot        zero answers one and every non-zero answers zero, not not's answer"
+else
+  echo "FAIL  cnot        a logical negation came out as the bitwise one"; fail=1
+fi
+runf kernels/cnot.ptx cnot --grid 1 --threads 1 --buffers 64 --exact
+# `bswap` is the byte order, not the bit order, so the row that tells it apart from
+# `brev` is a register with one byte set: it comes back with that byte at the other end
+# rather than with one bit moved. The 64-bit form reverses the eight bytes as a whole, so
+# its two halves trade places as well. Nothing here is a table either: each row is its
+# input with those bytes read backwards.
+"$WEFT" run kernels/bswap.ptx --kernel bswap --grid 1 --threads 1 --buffers 72 \
+    --cpu-only --dump 0="$TMP/bs.bin" >/dev/null
+if python3 - "$TMP/bs.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+in32 = [0x12345678, 0x000000FF, 0xFF000000, 0, 0xFFFFFFFF, 0x0000FF00, 0x00000080,
+        0x00FF00FF]
+in64 = [0x0123456789ABCDEF, 0xFFFFFFFFFFFFFFFF, 0x00000000000000FF,
+        0xFF00000000000000, 0x1122334455667788]
+# The input's bytes read the other way round, which is the whole definition.
+flip = lambda v, n: int.from_bytes(v.to_bytes(n, 'little'), 'big')
+want32 = [flip(v, 4) for v in in32]
+want64 = [flip(v, 8) for v in in64]
+got32 = list(struct.unpack('<8I', data[:32]))
+got64 = list(struct.unpack('<5Q', data[32:72]))
+bad = 0
+for i, (g, w) in enumerate(zip(got32, want32)):
+    if g != w:
+        print('  b32 row %d got 0x%08X want 0x%08X' % (i, g, w)); bad += 1
+for i, (g, w) in enumerate(zip(got64, want64)):
+    if g != w:
+        print('  b64 row %d got 0x%016X want 0x%016X' % (i, g, w)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    bswap       the bytes trade places, and the halves of a word trade with them"
+else
+  echo "FAIL  bswap       a reversal came out as a shift or a bit reversal"; fail=1
+fi
+runf kernels/bswap.ptx bswap --grid 1 --threads 1 --buffers 72 --exact
+# The lane masks are pure shifts of `laneid`, and `warpid`/`nwarpid` are the block's own
+# geometry; all of them were refused by name while the ISA says exactly what they are. A
+# 64-lane block is two warps, so `warpid` splits at lane 32, `nwarpid` is 2, and `laneid`
+# restarts at zero there while `%tid.x` keeps counting: that last word is the check that
+# the two are not the same register.
+"$WEFT" run kernels/lanemask.ptx --kernel lanemask --grid 64 --threads 64 --buffers 512 \
+    --cpu-only --dump 0="$TMP/lm.bin" >/dev/null
+if python3 - "$TMP/lm.bin" <<'PY'
+import struct, sys
+words = struct.unpack('<512I', open(sys.argv[1], 'rb').read())
+bad = 0
+for lane in range(64):
+    w = lane & 31
+    lt = ((1 << w) - 1) & 0xFFFFFFFF
+    le = ((2 << w) - 1) & 0xFFFFFFFF
+    want = [1 << w, lt, le, (~le) & 0xFFFFFFFF, (~lt) & 0xFFFFFFFF, lane // 32, 2, w]
+    got = list(words[lane * 8:(lane + 1) * 8])
+    if got != want:
+        print('  lane %d got %s want %s' % (lane, got, want)); bad += 1
+    if bad > 6:
+        break
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    lanemask  the five masks, warpid, nwarpid and laneid are the warp's own"
+else
+  echo "FAIL  lanemask  a mask, a warp id or laneid is wrong"; fail=1
+fi
+runf kernels/lanemask.ptx lanemask --grid 64 --threads 64 --buffers 512 --exact
+# The GPU flushes subnormal fp32 multiply and divide, and this row says so instead of
+# pretending the columns always meet. The CPU column has to be exactly IEEE, and the GPU
+# may part from it only on lanes where a subnormal operand or a subnormal result is
+# involved: the same eight shapes scaled out of that range must agree everywhere, which
+# is what proves the parting is the flush and not a wrong answer. The GPU side is read
+# from the comparison, not from a dump, because a dump is the host's buffers.
+if python3 - "$WEFT" "$TMP" <<'PY'
+import struct, subprocess, sys
+weft, tmp = sys.argv[1], sys.argv[2]
+sub = [(1e-20, 1e-20), (1e-40, 1e18), (3.0, 3.0), (2.0, 0.5),
+       (1e-30, 1e10), (3.0, 2.0), (1e-38, 1e-1), (1.1754944e-38, 2.0)]
+scaled = [(1e-14, 1e-14), (1e-30, 1e18), (3.0, 3.0), (2.0, 0.5),
+          (1e-20, 1e10), (3.0, 2.0), (1e-28, 1e-1), (1.1754944e-28, 2.0)]
+MIN_NORMAL = 1.17549435e-38
+def f32(x): return struct.unpack('<f', struct.pack('<f', x))[0]
+def is_sub(x): return x != 0.0 and abs(x) < MIN_NORMAL
+def files(pairs, tag):
+    a = '%s/sn_%s_a.bin' % (tmp, tag); b = '%s/sn_%s_b.bin' % (tmp, tag)
+    open(a, 'wb').write(struct.pack('<8f', *[p[0] for p in pairs]))
+    open(b, 'wb').write(struct.pack('<8f', *[p[1] for p in pairs]))
+    return a, b
+def cpu(pairs, tag):
+    a, b = files(pairs, tag)
+    out = '%s/sn_%s.bin' % (tmp, tag)
+    subprocess.run([weft, 'run', 'kernels/subnorm.ptx', '--kernel', 'subnorm', '--grid', '8',
+                    '--threads', '8', '--buffers', '8,8,8', '--load', '0=' + a, '--load', '1=' + b,
+                    '--cpu-only', '--dump', '2=' + out],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return struct.unpack('<8f', open(out, 'rb').read())
+def parted(tag):
+    a = '%s/sn_%s_a.bin' % (tmp, tag); b = '%s/sn_%s_b.bin' % (tmp, tag)
+    r = subprocess.run([weft, 'run', 'kernels/subnorm.ptx', '--kernel', 'subnorm', '--grid', '8',
+                        '--threads', '8', '--buffers', '8,8,8', '--load', '0=' + a, '--load', '1=' + b,
+                        '--exact'], capture_output=True, text=True)
+    for line in (r.stdout + r.stderr).splitlines():
+        if line.startswith('compare'):
+            return int(line.split()[3])
+    return -1
+bad = 0
+for pairs, tag in ((sub, 'sub'), (scaled, 'scaled')):
+    got = cpu(pairs, tag)
+    expect = 0
+    for i, (a, b) in enumerate(pairs):
+        a, b = f32(a), f32(b)
+        want = f32(a * b if i < 4 else a / b)
+        if got[i] != want:
+            print('  lane %d cpu %.9g want %.9g' % (i, got[i], want)); bad += 1
+        if is_sub(want) or is_sub(a) or is_sub(b): expect += 1
+    k = parted(tag)
+    if k != expect:
+        print('  %s: %d lanes part, the subnormal count is %d' % (tag, k, expect)); bad += 1
+    else:
+        print('  %s: the cpu column is ieee and %d of 8 lanes part' % (tag, k))
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    subnorm  the cpu is ieee and the gpu parts only on the subnormal lanes"
+else
+  echo "FAIL  subnorm  a lane parted outside the subnormal range, or the cpu is not ieee"; fail=1
+fi
+# `half_divide` and `native_divide` were refused by number while the runtime's division
+# was already here. Both spellings answer the same IEEE quotient, so the cpu column is
+# pinned against the division of the float operands and the columns are compared as words.
+python3 - "$TMP/dv_a.bin" "$TMP/dv_b.bin" <<'PY'
+import struct, sys
+pairs = [(6.0, 3.0), (1.0, 3.0), (-7.5, 2.5), (0.0, 5.0),
+         (1e-30, 1e-20), (3.0, 7.0), (2.5, 0.5), (9.75, 0.25)]
+open(sys.argv[1], 'wb').write(struct.pack('<8f', *[p[0] for p in pairs]))
+open(sys.argv[2], 'wb').write(struct.pack('<8f', *[p[1] for p in pairs]))
+PY
+"$WEFT" run kernels/spirv/divide2.spv --kernel divide2 --grid 8 --threads 8 --buffers 8,8,8 \
+    --load 0="$TMP/dv_a.bin" --load 1="$TMP/dv_b.bin" --cpu-only --dump 2="$TMP/dv_out.bin" >/dev/null
+if python3 - "$TMP/dv_out.bin" <<'PY'
+import struct, sys
+pairs = [(6.0, 3.0), (1.0, 3.0), (-7.5, 2.5), (0.0, 5.0),
+         (1e-30, 1e-20), (3.0, 7.0), (2.5, 0.5), (9.75, 0.25)]
+def f32(x): return struct.unpack('<f', struct.pack('<f', x))[0]
+got = struct.unpack('<8f', open(sys.argv[1], 'rb').read())
+bad = 0
+for i, (a, b) in enumerate(pairs):
+    want = f32(f32(a) / f32(b))
+    if got[i] != want:
+        print('  lane %d got %r want %r' % (i, got[i], want)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    divide2  half_divide and native_divide both answer the ieee quotient"
+else
+  echo "FAIL  divide2  a spelling answered something other than a / b"; fail=1
+fi
+runf kernels/spirv/divide2.spv divide2 --grid 8 --threads 8 --buffers 8,8,8 --load 0="$TMP/dv_a.bin" --load 1="$TMP/dv_b.bin" --exact
+# `mad` is one rounding of the exact product and sum, and `nan` carries its operand's
+# payload: instructions 42 and 46 had no answer at all, so both are pinned against a
+# reference rather than only against the other column. The mad values stay clear of the
+# subnormal range, which the GPU flushes (see the row on that below).
+python3 - "$TMP/mad3in.bin" "$TMP/nanb.bin" <<'PY'
+import struct, sys
+v = [3.0, 0.3333333432674408, -1.0, 1.5, 2.0, 0.25, 0.5, -3.0, 4.0, 2.0, 2.0, -1.0,
+     -1.5, 1.5, 0.5, 0.0, 5.0, 1.25, 7.0, 0.125, -0.5, 1.0, 1.0, 0.0]
+open(sys.argv[1], 'wb').write(b''.join(struct.pack('<f', x) for x in v))
+words = [0x00000000, 0x3F800001, 0x3FFFFF00, 0x3FFFFFFF, 0x3F000000, 0x41200000,
+         0x40480000, 0x501502F9]
+open(sys.argv[2], 'wb').write(b''.join(struct.pack('<I', w) for w in words))
+PY
+"$WEFT" run kernels/spirv/mad3.spv --kernel mad3 --grid 8 --threads 8 --buffers 24,8 \
+    --load 0="$TMP/mad3in.bin" --cpu-only --dump 1="$TMP/mad3.bin" >/dev/null
+if python3 - "$TMP/mad3.bin" <<'PY'
+import struct, sys
+from fractions import Fraction
+v = [3.0, 0.3333333432674408, -1.0, 1.5, 2.0, 0.25, 0.5, -3.0, 4.0, 2.0, 2.0, -1.0,
+     -1.5, 1.5, 0.5, 0.0, 5.0, 1.25, 7.0, 0.125, -0.5, 1.0, 1.0, 0.0]
+got = struct.unpack('<8f', open(sys.argv[1], 'rb').read())
+bad = 0
+for i in range(8):
+    a, b, c = v[i * 3:i * 3 + 3]
+    want = struct.unpack('<f', struct.pack('<f', float(Fraction(a) * Fraction(b) + Fraction(c))))[0]
+    if got[i] != want:
+        print('  lane %d %r*%r+%r: got %r want %r' % (i, a, b, c, got[i], want)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    mad3  mad is one rounding of the exact product and sum"
+else
+  echo "FAIL  mad3  mad is not the fused result"; fail=1
+fi
+"$WEFT" run kernels/spirv/nanbits.spv --kernel nanbits --grid 8 --threads 8 --buffers 8,8 \
+    --load 0="$TMP/nanb.bin" --cpu-only --dump 1="$TMP/nanb.out" >/dev/null
+if python3 - "$TMP/nanb.bin" "$TMP/nanb.out" <<'PY'
+import struct, sys
+inp = struct.unpack('<8I', open(sys.argv[1], 'rb').read())
+got = struct.unpack('<8I', open(sys.argv[2], 'rb').read())
+bad = 0
+for i, w in enumerate(inp):
+    want = 0x7FC00000 | (w & 0x3FFFFF)
+    if got[i] != want:
+        print('  lane %d from 0x%08X got 0x%08X want 0x%08X' % (i, w, got[i], want)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    nanbits  nan carries its operand's payload in a quiet NaN"
+else
+  echo "FAIL  nanbits  nan did not carry its payload"; fail=1
+fi
+runf kernels/spirv/mad3.spv mad3 --grid 8 --threads 8 --buffers 24,8 --load 0="$TMP/mad3in.bin" --exact
+runf kernels/spirv/nanbits.spv nanbits --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/nanb.bin" --exact
+# `tan.approx.f32` is the library's tangent rather than the unit's polynomial, so both
+# columns run one expression and the reference is a double's tangent, at one ulp.
+"$WEFT" run kernels/ftan.ptx --kernel ftan --grid 8 --threads 8 --buffers 8 \
+    --load 0="$TMP/tan32in.bin" --cpu-only --dump 0="$TMP/tan32.bin" >/dev/null
+if python3 - "$TMP/tan32.bin" <<'PY'
+import struct, math, sys
+vals = [0.5, 1.0, -0.5, 0.25, 2.0, -1.5, 0.75, 3.0]
+raw = open(sys.argv[1], 'rb').read()
+got = struct.unpack('<%df' % (len(raw) // 4), raw)
+bad = 0
+for i, x in enumerate(vals):
+    r = got[i]
+    step = abs(struct.unpack('<f', struct.pack('<I', struct.unpack('<I', struct.pack('<f', abs(r)))[0] + 1))[0] - abs(r))
+    if not (abs(r - math.tan(x)) <= step * 1.0001 + 1e-12):
+        print('  lane %d tan(%r): got %r want %r' % (i, x, r, math.tan(x))); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    ftan  tan.approx.f32 is within an ulp of a double's tangent"
+else
+  echo "FAIL  ftan  tan.approx.f32 is off by more than an ulp"; fail=1
+fi
+runf kernels/ftan.ptx ftan --grid 8 --threads 8 --buffers 8
+# The GPU column on the same fixture: the shader builds and agrees with the CPU
+# run. The reference above is what catches a mistranslation; this says the Metal
+# text of the same kernel compiles and lands on the same bytes.
+runf kernels/halfops.ptx halfops --grid 8 --threads 8 --buffers 8,128
+runf kernels/halfops3.ptx halfops_tg --grid 32 --threads 32 --buffers 32,32
+runf kernels/halfops4.ptx halfmin --grid 1 --threads 1 --buffers 6
+runf kernels/bf16ops.ptx bf16ops --grid 8 --threads 8 --buffers 8,128
+runf kernels/narrowdiv.ptx narrowdiv --grid 1 --threads 1 --buffers 16
+runf kernels/narrowdiv.ptx narrowdiv2 --grid 1 --threads 1 --buffers 8
+runf kernels/narrowcmp.ptx narrowcmp --grid 8 --threads 8 --buffers 8,64
+runf kernels/narrowcmp2.ptx narrowcmp_bf16 --grid 8 --threads 8 --buffers 8,32
+runf kernels/narrowcmp3.ptx narrowcmp2 --grid 8 --threads 8 --buffers 8,24
+runf kernels/narrowatom.ptx narrowatom --grid 64 --threads 64 --buffers 2 --load 0="$TMP/zatom8.bin"
+runf kernels/narrowatom2.ptx redatom --grid 64 --threads 64 --buffers 1 --load 0="$TMP/zatom4.bin"
+runf kernels/slct.ptx slcti --grid 4 --threads 4 --buffers 4,4 --load 0="$TMP/slin.bin"
+runf kernels/slct.ptx slctf --grid 4 --threads 4 --buffers 4,4 --load 0="$TMP/slinf.bin"
+runf kernels/casb16.ptx casb16 --grid 1 --threads 1 --buffers 1,1 --load 0="$TMP/casin.bin"
+runf kernels/casb16.ptx casb16miss --grid 1 --threads 1 --buffers 1,1 --load 0="$TMP/casin.bin"
+runf kernels/casb16.ptx casb16race --grid 8 --threads 8 --buffers 1 --load 0="$TMP/casin.bin"
+runf kernels/halfvecatom.ptx hvmax --grid 8 --threads 8 --buffers 1 --load 0="$TMP/hvmax_in.bin"
+runf kernels/halfvecatom.ptx hvmin --grid 8 --threads 8 --buffers 1 --load 0="$TMP/hvmin_in.bin"
+runf kernels/halfvecatom.ptx hvadd --grid 8 --threads 8 --buffers 1 --load 0="$TMP/hvadd_in.bin"
+runf kernels/halfvecatom.ptx hvbf --grid 8 --threads 8 --buffers 1 --load 0="$TMP/hvbf_in.bin"
+runf kernels/halfvecatom.ptx hvpack --grid 8 --threads 8 --buffers 2 --load 0="$TMP/hvpack_in.bin"
+runf kernels/scluster.ptx sclv4 --grid 8 --threads 8 --buffers 32
+runf kernels/scluster.ptx sclmapa --grid 8 --threads 8 --buffers 8
+runf kernels/shatom.ptx satadd --grid 8 --threads 8 --buffers 4
+runf kernels/shatom.ptx satb16 --grid 8 --threads 8 --buffers 1
+runf kernels/shatom.ptx satpack --grid 8 --threads 8 --buffers 1
+runf kernels/shatom.ptx satret --grid 8 --threads 8 --buffers 1
+# One width stays refused: a 64-bit atomic in the window. This host's GPU has no atomic
+# at that width in threadgroup memory, and the lock the device form takes orders the
+# heap, not the window -- two 32-bit words would tear. The row asks that the refusal
+# name the width, so the gap stays visible instead of becoming a wrong answer.
+cat > "$TMP/satom64.ptx" <<'SA64EOF'
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry satom64(.param .u64 p)
+{
+    .shared .align 16 .b64 v[1];
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [p];
+    mov.b64 %rd2, 1;
+    atom.shared.add.u64 %rd2, [v], %rd2;
+    ret;
+}
+SA64EOF
+# Taken with `||` so the expected failure cannot end the run under `set -e`.
+satom64_rc=0
+satom64_out=$("$WEFT" run "$TMP/satom64.ptx" --kernel satom64 --grid 4 --threads 4 \
+    --buffers 1 --cpu-only 2>&1) || satom64_rc=$?
+if [ $satom64_rc -ne 0 ] && [ "${satom64_out#*64-bit atomic in shared memory}" != "$satom64_out" ]; then
+  echo "ok    satom64  a 64-bit atomic in the window is refused by name, at the width"
+else
+  echo "FAIL  satom64  a 64-bit shared atomic was not refused by name (rc=$satom64_rc)"; fail=1
+fi
+
+# atom.cas.b128: sixteen bytes compared and written as one value, under the lock the
+# 64-bit pair already takes. The case that matters is the high half -- an expected value
+# that differs only there must write nothing, which a compare on a prefix would get
+# wrong -- and the swap itself moves both halves, which the answer being B shows.
+python3 - "$TMP" <<'PYX'
+import struct, sys, os
+d = sys.argv[1]
+A = (0x0123456789ABCDEF, 0xFEDCBA9876543210)
+B = (0x0F0E0D0C0B0A0908, 0x0706050403020100)
+files = {
+    'c128_a.bin': A,
+    'c128_b.bin': B,
+    'c128_cl.bin': (0x0123456789ABCDEE, A[1]),      # one low byte off
+    'c128_ch.bin': (A[0], 0xFEDCBA9876543211),      # one high byte off
+    'c128_ok.bin': B,
+    'c128_stay.bin': A,
+}
+for name, w in files.items():
+    open(os.path.join(d, name), 'wb').write(struct.pack('<QQ', *w))
+PYX
+cas128_ref() {  # name, compare file, expected file, message
+  "$WEFT" run kernels/cas128.ptx --kernel cas128 --grid 8 --threads 8 --buffers 1,1,1 \
+      --load 0="$TMP/c128_a.bin" --load 1="$TMP/$2" --load 2="$TMP/c128_b.bin" \
+      --cpu-only --dump 0="$TMP/$1.bin" >/dev/null
+  if cmp -s "$TMP/$1.bin" "$TMP/$3"; then
+    echo "ok    $1  $4"
+  else
+    echo "FAIL  $1  $(cmp "$TMP/$1.bin" "$TMP/$3" 2>&1 | head -1)"; fail=1
+  fi
+}
+cas128_ref cas128   c128_a.bin  c128_ok.bin   "sixteen bytes compared and written as one value"
+cas128_ref cas128lo c128_cl.bin c128_stay.bin "a compare off in the low half writes nothing"
+cas128_ref cas128hi c128_ch.bin c128_stay.bin "a compare off in the high half writes nothing"
+runf kernels/cas128.ptx cas128 --grid 8 --threads 8 --buffers 1,1,1 \
+    --load 0="$TMP/c128_a.bin" --load 1="$TMP/c128_a.bin" --load 2="$TMP/c128_b.bin"
+# The window has an instruction at neither wide width, so both are refused by name.
+cat > "$TMP/cas128s.ptx" <<'CS128'
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry cas128s(.param .u64 p)
+{
+    .shared .align 16 .b128 v[1];
+    .reg .b128 %q<2>;
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [p];
+    atom.shared.cas.b128 %q1, [v], %q1, %q1;
+    ret;
+}
+CS128
+cas128s_rc=0
+cas128s_out=$("$WEFT" run "$TMP/cas128s.ptx" --kernel cas128s --grid 4 --threads 4 \
+    --buffers 1 --cpu-only 2>&1) || cas128s_rc=$?
+if [ $cas128s_rc -ne 0 ] && [ "${cas128s_out#*128-bit atomic in shared memory}" != "$cas128s_out" ]; then
+  echo "ok    cas128sm  a 128-bit atomic in the window is refused by name, at the width"
+else
+  echo "FAIL  cas128sm  a 128-bit shared atomic was not refused by name (rc=$cas128s_rc)"; fail=1
+fi
+runf kernels/incdec.ptx inc --grid 5 --threads 5 --buffers 1 --load 0="$TMP/inc0.bin"
+runf kernels/incdec.ptx dec --grid 2 --threads 2 --buffers 1 --load 0="$TMP/inc0.bin"
+runf kernels/incdec.ptx incgrab --grid 1 --threads 1 --buffers 1,1 --load 0="$TMP/inc0.bin"
+runf kernels/incdec.ptx redinc --grid 3 --threads 3 --buffers 1 --load 0="$TMP/inc0.bin"
+runf kernels/spirv/atom16.spv a16add --grid 8 --threads 8 --buffers 2 --load 0="$TMP/a16in0.bin"
+runf kernels/spirv/atom16.spv a16mix --grid 1 --threads 1 --buffers 2 --load 0="$TMP/a16in.bin"
+runf kernels/spirv/switch.spv sw32 --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/sw32in.bin"
+runf kernels/spirv/switch.spv sw64 --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/sw64in.bin"
+runf kernels/spirv/switchs.spv sws --grid 4 --threads 4 --buffers 4
+runf kernels/brxidx.ptx brxidx --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/brxin.bin"
+runf kernels/brxidx.ptx brxpred --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/brxin.bin"
+runf kernels/bitfind.ptx bfindu --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/bfindu_in.bin"
+runf kernels/bitfind.ptx bfinds --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/bfinds_in.bin"
+runf kernels/bitfind.ptx fns3 --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/fns_in.bin"
+runf kernels/bitfind.ptx fnsbase --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/fns_in.bin"
+runf kernels/bitfind.ptx f16reg --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/h16in.bin"
+runf kernels/warpmatch.ptx electk --grid 8 --threads 8 --buffers 8
+runf kernels/warpmatch.ptx matchny --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/wmmix.bin"
+runf kernels/warpmatch.ptx matchalld --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/wmmix.bin"
+runf kernels/warpmatch.ptx matchallp --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/wmeq.bin"
+runf kernels/dp2a.ptx dp2alo --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/dpin.bin"
+runf kernels/dp2a.ptx dp2ahi --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/dpin.bin"
+runf kernels/dp2a.ptx dp2aslo --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/dpin.bin"
+runf kernels/dp2a.ptx dp2ashi --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/dpin.bin"
+runf kernels/movmatrix.ptx movmtx --grid 32 --threads 32 --buffers 32,32 --load 0="$TMP/mvin.bin"
+runf kernels/movmatrix.ptx movmtx2 --grid 32 --threads 32 --buffers 32,32 --load 0="$TMP/mvin.bin"
+runf kernels/video.ptx vadd2u --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/vidin.bin"
+runf kernels/video.ptx vadd2s --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/vidin.bin"
+runf kernels/video.ptx vmin4s --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/vidin.bin"
+runf kernels/video.ptx vabs4u --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/vidin.bin"
+runf kernels/video.ptx vadd4u --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/vidin.bin"
+runf kernels/video.ptx vavg4s --grid 8 --threads 8 --buffers 16,8 --load 0="$TMP/vidin.bin"
+runf kernels/multimem.ptx mmld --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/mmin.bin"
+runf kernels/multimem.ptx mmmin --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/mmin.bin"
+runf kernels/multimem.ptx mmst --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/mmin.bin"
+runf kernels/b128.ptx b128mv --grid 4 --threads 4 --buffers 4,4 --load 0="$TMP/b128in.bin"
+runf kernels/call.ptx callk --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/callin.bin"
+runf kernels/call.ptx callbr --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/callbrin.bin"
+# Nested calls: the kernel calls a function that calls two others, one of which loops.
+# The middle function's state carries both callees' by value, so a shared program
+# counter would resume sumstep's loop in the wrong case and the answer would be the
+# count rather than the sum.
+python3 - "$TMP" <<'PYC'
+import struct, sys, os
+d = sys.argv[1]
+vals = [3, 5, 12, 0, 7, 100, 1, 9]
+sums = [v + 100 if v >= 10 else v * (v + 1) // 2 for v in vals]
+open(os.path.join(d, 'callnestin.bin'), 'wb').write(struct.pack('<8I', *vals))
+open(os.path.join(d, 'callnestexp.bin'), 'wb').write(struct.pack('<8I', *[s + 1 for s in sums]))
+PYC
+narrowref callnest   kernels/call.ptx callnest 8 8 8,8 1 callnestin.bin callnestexp.bin
+runf kernels/call.ptx callnest --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/callnestin.bin"
+
+# A call is carried as a state struct embedded by value, so a cycle has no finite
+# shape. Both spellings are refused by name: two functions that call each other, and
+# one that calls itself.
+callrec_rc=0
+callrec_out=$("$WEFT" run kernels/callrec.ptx --kernel callrec --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || callrec_rc=$?
+if [ $callrec_rc -ne 0 ] && [ "${callrec_out#*calls it back}" != "$callrec_out" ]; then
+  echo "ok    callrec   two functions that call each other are refused by name, not given a depth"
+else
+  echo "FAIL  callrec   a mutual call was not refused by name (rc=$callrec_rc)"; fail=1
+fi
+callself_rc=0
+callself_out=$("$WEFT" run kernels/callself.ptx --kernel callself --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || callself_rc=$?
+if [ $callself_rc -ne 0 ] && [ "${callself_out#*calls itself}" != "$callself_out" ]; then
+  echo "ok    callself  a function that calls itself is the same case, named"
+else
+  echo "FAIL  callself  a self-call was not refused by name (rc=$callself_rc)"; fail=1
+fi
+
+# A function that hands a value back through its parenthesised list. The answer rides
+# in the callee's state, not in a C++ return, because the generated body is a switch
+# over a program counter and its `ret` returns from the middle of that switch.
+# `callret2` reaches the same answer through a second function, so a value carried
+# only to the depth of the first call would be lost rather than merely wrong.
+python3 - "$TMP" <<'PYR'
+import struct, sys, os
+d = sys.argv[1]
+vals = [0, 1, 2, 5, 7, 10, 255, 4096]
+tri = [0 if v == 0 else 3 * v + 1 for v in vals]
+open(os.path.join(d, 'callretin.bin'), 'wb').write(struct.pack('<8I', *vals))
+open(os.path.join(d, 'callretexp.bin'), 'wb').write(struct.pack('<8I', *tri))
+open(os.path.join(d, 'callret2exp.bin'), 'wb').write(struct.pack('<8I', *[2 * t for t in tri]))
+PYR
+narrowref callret    kernels/callret.ptx callret  8 8 8,8 1 callretin.bin callretexp.bin
+runf kernels/callret.ptx callret  --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/callretin.bin"
+narrowref callret2   kernels/callret.ptx callret2 8 8 8,8 1 callretin.bin callret2exp.bin
+runf kernels/callret.ptx callret2 --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/callretin.bin"
+
+# A rendezvous inside the called function: lane i publishes v[i]+1, waits, then reads
+# the lane after it, so the answer is v[i] + v[next] + 2. A callee that resumed at its
+# top instead of at its counter would publish twice and answer + 4, and one that did
+# not wait at all would read the old v[next] and answer + 1.
+python3 - "$TMP" <<'PYB'
+import struct, sys, os
+d = sys.argv[1]
+vals = [3, 11, 7, 0, 19, 5, 24, 2]
+n = len(vals)
+out = [(vals[i] + 1) + (vals[(i + 1) % n] + 1) for i in range(n)]
+open(os.path.join(d, 'callbarin.bin'), 'wb').write(struct.pack('<8I', *vals))
+open(os.path.join(d, 'callbarexp.bin'), 'wb').write(struct.pack('<8I', *out))
+PYB
+narrowref callbar    kernels/callbar.ptx callbar 8 8 8,8 1 callbarin.bin callbarexp.bin
+runf kernels/callbar.ptx callbar --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/callbarin.bin"
+
+# A return list is one slot, and the call and the declaration have to agree about
+# whether there is one. Each mismatch is refused by name.
+callmulti_rc=0
+callmulti_out=$("$WEFT" run kernels/callmulti.ptx --kernel callmulti --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || callmulti_rc=$?
+if [ $callmulti_rc -ne 0 ] && [ "${callmulti_out#*returns 2 values}" != "$callmulti_out" ]; then
+  echo "ok    callmulti two values through one return list are refused by name"
+else
+  echo "FAIL  callmulti a two-slot return list was not refused by name (rc=$callmulti_rc)"; fail=1
+fi
+calldrop_rc=0
+calldrop_out=$("$WEFT" run kernels/calldrop.ptx --kernel calldrop --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || calldrop_rc=$?
+if [ $calldrop_rc -ne 0 ] && [ "${calldrop_out#*returns nothing}" != "$calldrop_out" ]; then
+  echo "ok    calldrop  a return list around a function that returns nothing is refused"
+else
+  echo "FAIL  calldrop  the mismatch was not refused by name (rc=$calldrop_rc)"; fail=1
+fi
+callmiss_rc=0
+callmiss_out=$("$WEFT" run kernels/callmiss.ptx --kernel callmiss --grid 1 --threads 1 --buffers 1,1 --cpu-only 2>&1) || callmiss_rc=$?
+if [ $callmiss_rc -ne 0 ] && [ "${callmiss_out#*no list to put it in}" != "$callmiss_out" ]; then
+  echo "ok    callmiss  a returned value the call ignores is refused, not dropped"
+else
+  echo "FAIL  callmiss  an ignored return value was not refused by name (rc=$callmiss_rc)"; fail=1
+fi
+
+# A predicated call to a function that waits: the call site records the predicate and
+# the re-entry after the park asks the record, so the call happens exactly once.
+python3 - "$TMP" <<'PYB'
+import struct, sys, os
+d = sys.argv[1]
+vals = [3, 11, 7, 0, 19, 5, 24, 2]
+n = len(vals)
+out = [(vals[i] + 1) + (vals[(i + 1) % n] + 1) for i in range(n)]
+open(os.path.join(d, 'callpredin.bin'), 'wb').write(struct.pack('<8I', *vals))
+open(os.path.join(d, 'callpredexp.bin'), 'wb').write(struct.pack('<8I', *out))
+PYB
+narrowref callpred  kernels/callpred.ptx callpred 8 8 8,8 1 callpredin.bin callpredexp.bin
+runf kernels/callpred.ptx callpred --grid 8 --threads 8 --buffers 8,8 --load 0="$TMP/callpredin.bin"
+runf kernels/surfq.ptx surfq --grid 1 --threads 1 --buffers 4 --textures 64x64
+runf kernels/more.ptx m4 --grid 8 --threads 8 --buffers 8,32 --load 0="$TMP/morein.bin"
+runf kernels/warpbits.ptx actm --grid 32 --threads 32 --buffers 32
+runf kernels/warpbits.ptx actm --grid 8 --threads 8 --buffers 8
+runf kernels/warpbits.ptx mvi --grid 32 --threads 32 --buffers 32,32 --load 0="$TMP/wbin.bin"
+runf kernels/f16x2_trans.ptx p16tx --grid 32 --threads 32 --buffers 32,32,32,32 --load 0="$TMP/p16in.bin"
+
+runf kernels/narrowtran.ptx narrowtran --grid 8 --threads 8 --buffers 8,48
+
+# The same arithmetic through the SPIR-V front end: `OpTypeFloat 16` is a
+# `_Float16` on the host and a `half` on the GPU, a 16-bit constant is decoded
+# from its bits, and a workgroup array of the same type is half in threadgroup
+# memory. The barrier between the write and the neighbouring read is what makes
+# the answer a rendezvous rather than a race.
+if [ -f kernels/spirv/halfmath.spv ]; then
+  "$WEFT" run kernels/spirv/halfmath.spv --kernel halfmath --grid 32 --threads 32 \
+      --buffers 32,32 --load 0="$TMP/hin32.bin" --cpu-only --dump 1="$TMP/halfmath.bin" >/dev/null
+  if cmp -s "$TMP/halfmath.bin" "$TMP/exp_spvh.bin"; then
+    echo "ok    spirv:halfmath  half arithmetic and a workgroup half array are exact"
+  else
+    echo "FAIL  spirv:halfmath  $(cmp "$TMP/halfmath.bin" "$TMP/exp_spvh.bin" 2>&1 | head -1)"; fail=1
+  fi
+else
+  echo "skip  spirv:halfmath  no kernels/spirv/halfmath.spv on this host"
+fi
+
+# Two `.shared` arrays at module scope. PTX makes those file scope, so the arena
+# holds both and they are laid out in declaration order: a layout that put the
+# second on the first answers 100 where `a` should be, and a module-scope tile
+# with no arena at all used to fail the GPU build instead of running.
+python3 -c 'import struct,sys; sys.stdout.buffer.write(b"".join(struct.pack("<I", (((i+1)%16)+1)*1000 + ((i+1)%16) + 100) for i in range(16)))' > "$TMP/exp_ms.bin"
+"$WEFT" run kernels/modshared.ptx --kernel modshared --grid 16 --threads 16 --buffers 16 \
+    --cpu-only --dump 0="$TMP/ms.bin" >/dev/null
+if cmp -s "$TMP/ms.bin" "$TMP/exp_ms.bin"; then
+  echo "ok    modshared  a module-scope .shared array is laid out and addressed"
+else
+  echo "FAIL  modshared  $(cmp "$TMP/ms.bin" "$TMP/exp_ms.bin" 2>&1 | head -1)"; fail=1
+fi
+# The same kernel on the GPU column, which is where the missing arena showed up.
+runf kernels/modshared.ptx modshared --grid 16 --threads 16 --buffers 16
+
 # The MX converts: fp4 (e2m1) and fp6 (e2m3, e3m2), which have no infinity and no
 # NaN, so `.satfinite` is the whole range rule, a NaN is the positive MAX_NORM and
 # an infinity is MAX_NORM with its sign kept. The ties sit on grids whose subnormal
@@ -469,8 +2146,8 @@ fi
 # The four-value forms: fp4 into a half-word and the f6 pair into a word, first
 # source in the high field. 0.25 as fp4 is a tie between 0 and 0.5, and 28 as e3m2
 # is MAX_NORM itself rather than a saturation.
-runf kernels/cvtmx.ptx cvtmx4 --grid 1 --threads 1 --buffers 3
-"$WEFT" run kernels/cvtmx.ptx --kernel cvtmx4 --grid 1 --threads 1 --buffers 3 \
+runf kernels/cvtmx4.ptx cvtmx4 --grid 1 --threads 1 --buffers 3
+"$WEFT" run kernels/cvtmx4.ptx --kernel cvtmx4 --grid 1 --threads 1 --buffers 3 \
     --cpu-only --dump 0="$TMP/cvtmx4.bin" >/dev/null
 if [ "$(head -c 12 "$TMP/cvtmx4.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "0000250f 0c00001f 1f040f1f " ]; then
@@ -567,8 +2244,8 @@ else
   echo "FAIL  cvtdown  read $(head -c 24 "$TMP/cvtdown.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
 fi
 
-runf kernels/cvtf8x2.ptx cvtup --grid 1 --threads 1 --buffers 6
-"$WEFT" run kernels/cvtf8x2.ptx --kernel cvtup --grid 1 --threads 1 --buffers 6 \
+runf kernels/cvtf8x2dn.ptx cvtup --grid 1 --threads 1 --buffers 6
+"$WEFT" run kernels/cvtf8x2dn.ptx --kernel cvtup --grid 1 --threads 1 --buffers 6 \
     --cpu-only --dump 0="$TMP/cvtup.bin" >/dev/null
 if [ "$(head -c 24 "$TMP/cvtup.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "00000042 00000002 00001f0c 00001f04 00003c38 00000000 " ]; then
@@ -581,8 +2258,8 @@ fi
 # decode, a wrong lane offset or a missing saturation shows in a byte of the word. The
 # last two are the operands that are not the obvious format: a ue8m0 scale and an fp4
 # tile padded one nibble a byte.
-runf kernels/cvtf8x2.ptx cvtsimd --grid 1 --threads 1 --buffers 7
-"$WEFT" run kernels/cvtf8x2.ptx --kernel cvtsimd --grid 1 --threads 1 --buffers 7 \
+runf kernels/cvtf8x2simd.ptx cvtsimd --grid 1 --threads 1 --buffers 7
+"$WEFT" run kernels/cvtf8x2simd.ptx --kernel cvtsimd --grid 1 --threads 1 --buffers 7 \
     --cpu-only --dump 0="$TMP/cvtsimd.bin" >/dev/null
 if [ "$(head -c 28 "$TMP/cvtsimd.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "44444444 38383838 41414141 4b4b4b4b 7e7e7e7e 44444444 44444444 " ]; then
@@ -622,8 +2299,8 @@ fi
 # The same instruction with a 128-byte swizzle, which is the layout a `wgmma` fragment
 # read expects: the second row of a 256-byte tile is XORed sixteen bytes along, so
 # element (1, 0) sits at 144 rather than at 128. Ignoring the swizzle reads 36 there.
-runf kernels/tensormap.ptx tensorswz --grid 1 --threads 1 --buffers 3,64,32
-"$WEFT" run kernels/tensormap.ptx --kernel tensorswz --grid 1 --threads 1 --buffers 3,64,32 \
+runf kernels/tensormap2.ptx tensorswz --grid 1 --threads 1 --buffers 3,64,32
+"$WEFT" run kernels/tensormap2.ptx --kernel tensorswz --grid 1 --threads 1 --buffers 3,64,32 \
     --cpu-only --dump 0="$TMP/tensorswz.bin" >/dev/null
 sw_got="$(od -An -tu4 -v "$TMP/tensorswz.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
 if [ "$sw_got" = "0 32 33" ]; then
@@ -637,8 +2314,8 @@ fi
 # the corner. Two channels by three pixels at the window's origin gives 0 to 5; the same
 # column one pixel to the right runs off the edge, so its third pixel is padded with zero
 # rather than read from the next row.
-runf kernels/tensormap.ptx tensorim2col --grid 1 --threads 1 --buffers 12,18,32
-"$WEFT" run kernels/tensormap.ptx --kernel tensorim2col --grid 1 --threads 1 --buffers 12,18,32 \
+runf kernels/tensormap3.ptx tensorim2col --grid 1 --threads 1 --buffers 12,18,32
+"$WEFT" run kernels/tensormap3.ptx --kernel tensorim2col --grid 1 --threads 1 --buffers 12,18,32 \
     --cpu-only --dump 0="$TMP/tensorim2col.bin" >/dev/null
 im_got="$(od -An -tu4 -v "$TMP/tensorim2col.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
 if [ "$im_got" = "0 1 2 3 4 5 2 3 4 5 0 0" ]; then
@@ -651,8 +2328,8 @@ fi
 # 5; 201 to 206 one pixel to the right land on 2 to 5 and stop at the edge, where a store
 # writes nothing. The tensor is read back afterwards, so what has to agree is both the
 # elements the scatters changed and the twelve they must have left alone.
-runf kernels/tensormap.ptx tensorim2st --grid 1 --threads 1 --buffers 18,18,32
-"$WEFT" run kernels/tensormap.ptx --kernel tensorim2st --grid 1 --threads 1 --buffers 18,18,32 \
+runf kernels/tensormap4.ptx tensorim2st --grid 1 --threads 1 --buffers 18,18,32
+"$WEFT" run kernels/tensormap4.ptx --kernel tensorim2st --grid 1 --threads 1 --buffers 18,18,32 \
     --cpu-only --dump 0="$TMP/tensorim2st.bin" >/dev/null
 is_got="$(od -An -tu4 -v "$TMP/tensorim2st.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
 is_want="101 102 201 202 203 204 6 7 8 9 10 11 12 13 14 15 16 17"
@@ -681,8 +2358,8 @@ fi
 # (l>>2) + 8*((s>>1)&1), and logical byte s is byte q of register r with
 # s = 2*r + (q&1) + 4*(q>>1). This pins the map; it cannot compare against hardware,
 # because these instructions are sm_100 and this host is not.
-runf kernels/ldmatrixb8.ptx ldmatrixb8 --grid 1 --threads 32 --buffers 64,64
-"$WEFT" run kernels/ldmatrixb8.ptx --kernel ldmatrixb8 --grid 1 --threads 32 --buffers 64,64 \
+runf kernels/ldmatrixb8.ptx ldmatrixb8 --grid 32 --threads 32 --buffers 64,64
+"$WEFT" run kernels/ldmatrixb8.ptx --kernel ldmatrixb8 --grid 32 --threads 32 --buffers 64,64 \
     --cpu-only --dump 0="$TMP/lb8.bin" --dump 1="$TMP/lb8b.bin" >/dev/null
 if od -An -tu4 -v "$TMP/lb8.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++;
       l = int(n / 2); r = n % 2; w = 0;
@@ -703,6 +2380,36 @@ if [ "$(od -An -tu1 -v "$TMP/lb8b.bin" | tr -s ' ' '\n' | sed '/^$/d' | sort -n 
   echo "ok    stmatrixb8  the two 16x8 stores cover the tile exactly once"
 else
   echo "FAIL  stmatrixb8  the store left a duplicate or a gap"; fail=1
+fi
+
+# The byte tile pinned by position rather than by coverage: every byte holds the
+# offset it belongs at, XORed with its matrix number, so a row taken for a column, a
+# matrix at the wrong stride, a dropped constant or another lane's address all land a
+# number the read-back does not expect. Three forms: four matrices at a symbol, one
+# matrix at symbol+256, and the lane-supplied addresses -- eight a matrix, from lanes
+# 8m to 8m+7, each the 16-byte block of two rows that the PTX ISA gives it.
+runf kernels/stmatrixb8map.ptx stmb8 --grid 32 --threads 32 --buffers 384
+env WEFT_WARP=1 "$WEFT" run kernels/stmatrixb8map.ptx --kernel stmb8 --grid 32 \
+    --threads 32 --buffers 384 --cpu-only --dump 0="$TMP/stmatrixb8map.bin" >/dev/null
+if python3 - "$TMP/stmatrixb8map.bin" <<'PY'
+import struct, sys
+w = struct.unpack('<384I', open(sys.argv[1], 'rb').read(1536))
+def byte(r, o):
+    if r == 1:                            # the single-matrix store, 256 bytes in
+        return (o - 256) if 256 <= o < 384 else 0
+    return (o % 128) ^ (64 * (o // 128))  # offset XOR matrix number
+bad = 0
+for n, x in enumerate(w):
+    e = sum(byte(n // 128, (n % 128) * 4 + k) << (8 * k) for k in range(4))
+    if x != e: bad += 1
+if bad:
+    print("  %d of 384 words differ" % bad)
+sys.exit(0 if bad == 0 else 1)
+PY
+then
+  echo "ok    stmatrixb8map  byte tiles, a constant offset, and lane-supplied addresses"
+else
+  echo "FAIL  stmatrixb8map  a byte landed where the map does not put it"; fail=1
 fi
 
 # The sub-byte shapes: sixteen 6-bit (or 4-bit) elements in a 16-byte container,
@@ -735,8 +2442,8 @@ else
   echo "FAIL  prmtmodes  a mode's bytes are not the ones the table names"; fail=1
 fi
 
-runf kernels/ldmatrixsub.ptx ldmsub --grid 1 --threads 32 --buffers 160
-"$WEFT" run kernels/ldmatrixsub.ptx --kernel ldmsub --grid 1 --threads 32 --buffers 160 \
+runf kernels/ldmatrixsub.ptx ldmsub --grid 32 --threads 32 --buffers 160
+"$WEFT" run kernels/ldmatrixsub.ptx --kernel ldmsub --grid 32 --threads 32 --buffers 160 \
     --cpu-only --dump 0="$TMP/lsub.bin" >/dev/null
 if od -An -tu4 -v "$TMP/lsub.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; w = 0;
       if (n < 128) { m = n % 64; l = int(m / 2); c0 = 8 * (m % 2); row = int(l / 4)
@@ -753,14 +2460,106 @@ else
   echo "FAIL  ldmatrixsub  a packed fragment is not the map the container describes"; fail=1
 fi
 
+# `.x4` is four tiles in one instruction, and the `.x1` fixture puts every tile at
+# offset zero, so it cannot see the stride between tiles or the peer lane that
+# supplies matrix k's rows. This one has matrix k at 128k with half h holding h, so
+# lane l holds row l>>2 at columns 2(l&3) and +1, word h0 | (h0+1) << 16, and the
+# transposed block the transpose, h0 | (h0+8) << 16 with h0 in column order. The
+# third block is the same four tiles through a per-lane address, lane a naming
+# matrix a>>3 at row a&7, which only matches if the peer lane is 8k + (l>>2).
+runf kernels/ldmatrixx4.ptx ldmx4 --grid 32 --threads 32 --buffers 384
+env WEFT_WARP=1 "$WEFT" run kernels/ldmatrixx4.ptx --kernel ldmx4 --grid 32 --threads 32 \
+    --buffers 384 --cpu-only --dump 0="$TMP/ldmx4.bin" >/dev/null
+if python3 - "$TMP/ldmx4.bin" <<'PY'
+import struct, sys
+w = struct.unpack('<384I', open(sys.argv[1], 'rb').read(1536))
+bad = 0
+for l in range(32):
+    r, c = l >> 2, l & 3
+    for k in range(4):
+        p = 64 * k + 8 * r + 2 * c
+        t = 64 * k + 8 * (2 * c) + r
+        if w[4 * l + k] != p | ((p + 1) << 16): bad += 1
+        if w[128 + 4 * l + k] != t | ((t + 8) << 16): bad += 1
+        if w[256 + 4 * l + k] != p | ((p + 1) << 16): bad += 1
+if bad:
+    print("  %d of 384 words differ" % bad)
+sys.exit(0 if bad == 0 else 1)
+PY
+then
+  echo "ok    ldmatrixx4  four tiles, named and per-lane, plain and transposed, match the map"
+else
+  echo "FAIL  ldmatrixx4  a tile at a non-zero offset is not the map"; fail=1
+fi
+
+# The multi-matrix forms of the wider shapes: `.x4` of the 6- and 4-bit containers,
+# and `.x2` of the 16x16 byte tile. `ldmatrixsub` and `ldmatrixb8` pin the first tile
+# at offset zero, so a stride of the wrong size passes them and fails here. The
+# container values make a wrong tile, row or column visible: (7c + 13col) & 63 and
+# (5c + 3col) & 15 are invertible along each axis in their own modulus, the
+# eight-container stride moves c by 8, and the second byte tile is the first ^ 0x5A.
+runf kernels/ldmatrixmulti.ptx ldmpack4 --grid 32 --threads 32 --buffers 384
+env WEFT_WARP=1 "$WEFT" run kernels/ldmatrixmulti.ptx --kernel ldmpack4 --grid 32 \
+    --threads 32 --buffers 384 --cpu-only --dump 0="$TMP/ldmpack4.bin" >/dev/null
+if python3 - "$TMP/ldmpack4.bin" <<'PY'
+import struct, sys
+w = struct.unpack('<384I', open(sys.argv[1], 'rb').read(1536))
+bad = 0
+for b, bits in ((0, 6), (1, 6), (2, 4)):
+    for l in range(32):
+        row, c0 = l >> 2, 4 * (l & 3)
+        for k in range(4):
+            n = 0
+            for q in range(4):
+                col = c0 + q
+                v = (7 * (8 * k + row) + 13 * col) if bits == 6 else (5 * (8 * k + row) + 3 * col)
+                n |= ((v & 63) if bits == 6 else (v & 15)) << (8 * q)
+            if w[128 * b + 4 * l + k] != n: bad += 1
+if bad:
+    print("  %d of 384 words differ" % bad)
+sys.exit(0 if bad == 0 else 1)
+PY
+then
+  echo "ok    ldmatrixmulti  four 6-bit containers, named and per-lane, and four 4-bit"
+else
+  echo "FAIL  ldmatrixmulti  a tile at a non-zero offset is not the container map"; fail=1
+fi
+
+runf kernels/ldmatrixmulti.ptx ldmb8x2 --grid 32 --threads 32 --buffers 128
+env WEFT_WARP=1 "$WEFT" run kernels/ldmatrixmulti.ptx --kernel ldmb8x2 --grid 32 \
+    --threads 32 --buffers 128 --cpu-only --dump 0="$TMP/ldmb8x2.bin" >/dev/null
+if python3 - "$TMP/ldmb8x2.bin" <<'PY'
+import struct, sys
+w = struct.unpack('<128I', open(sys.argv[1], 'rb').read(512))
+bad = 0
+for m in range(2):
+    for l in range(32):
+        for r in range(2):
+            n = 0
+            for q in range(4):
+                s = 2 * r + (q & 1) + 4 * (q >> 1)
+                row = 2 * (l & 3) + (s & 1) + 8 * (s >> 2)
+                col = (l >> 2) + 8 * ((s >> 1) & 1)
+                n |= ((16 * row + col) ^ (0x5A * m)) << (8 * q)
+            if w[64 * m + 2 * l + r] != n: bad += 1
+if bad:
+    print("  %d of 128 words differ" % bad)
+sys.exit(0 if bad == 0 else 1)
+PY
+then
+  echo "ok    ldmatrixmulti  the second byte tile is its own 16x16 map, 256 bytes on"
+else
+  echo "FAIL  ldmatrixmulti  the second byte tile is the first one's bytes"; fail=1
+fi
+
 # `stmatrix` is `ldmatrix` backwards. The tile is 0..63 in row-major halves, so the
 # word lane l's fragment holds is (2l) | (2l+1) << 16, and if the store lands it
 # back where the load found it, the tile read back is that word thirty-two times
 # over. The second half is the transposed store: a plain load of what it wrote has
 # to give the word a `.trans` load of the original gives, which is a different
 # closed form, so a store that ignored the transpose disagrees with both.
-runf kernels/stmatrix.ptx stmatrix --grid 1 --threads 32 --buffers 64
-"$WEFT" run kernels/stmatrix.ptx --kernel stmatrix --grid 1 --threads 32 --buffers 64 \
+runf kernels/stmatrix.ptx stmatrix --grid 32 --threads 32 --buffers 64
+"$WEFT" run kernels/stmatrix.ptx --kernel stmatrix --grid 32 --threads 32 --buffers 64 \
     --cpu-only --dump 0="$TMP/stmatrix.bin" >/dev/null
 if od -An -tu4 -v "$TMP/stmatrix.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; l = n % 32;
       if (n < 32) { want = 2 * l + (2 * l + 1) * 65536 }
@@ -772,12 +2571,68 @@ else
   echo "FAIL  stmatrix  the round trip is not the tile that was loaded"; fail=1
 fi
 
+# A store whose address moves from one round to the next. The warp backend batches a
+# store whose lanes walk consecutive addresses into one loop, which is only sound
+# when the address is the same expression every time the statement runs: it used to
+# fold a register's first value in, so a pointer walked in a loop put every round on
+# the first round's slot. Block 0 is four stores written out and block 1 the same
+# four from a loop, both answering h | (h + 1) << 16 with h = 8l + 2i, so the loop
+# can only match by not folding, and the written-out block stays right either way.
+runf kernels/ldstoreloop.ptx ldstoreloop --grid 32 --threads 32 --buffers 256
+env WEFT_WARP=1 "$WEFT" run kernels/ldstoreloop.ptx --kernel ldstoreloop --grid 32 \
+    --threads 32 --buffers 256 --cpu-only --dump 0="$TMP/ldstoreloop.bin" >/dev/null
+if python3 - "$TMP/ldstoreloop.bin" <<'PY'
+import struct, sys
+w = struct.unpack('<256I', open(sys.argv[1], 'rb').read(1024))
+bad = 0
+for n, x in enumerate(w):
+    l, i = (n % 128) // 4, n % 4
+    h = 8 * l + 2 * i
+    if x != (h | (h + 1) << 16): bad += 1
+if bad:
+    print("  %d of 256 words differ" % bad)
+sys.exit(0 if bad == 0 else 1)
+PY
+then
+  echo "ok    ldstoreloop  a walked store address is the same on every round"
+else
+  echo "FAIL  ldstoreloop  the loop wrote a round's word to a fixed slot"; fail=1
+fi
+
+# `stmatrix.x4` is four tiles at 128 bytes apiece, and `.trans` of four tiles at once.
+# The `.x1` row above pins the map at offset zero, so this one adds the stride and the
+# transpose together. `ldmatrix.x4` of the tile then `stmatrix.x4` has to give the tile
+# back, and the transposed store has to give the tile read down its columns, which as
+# a linear array of halves is  h -> (h & ~127) | 8 (h & 7) | ((h >> 3) & 7).
+runf kernels/stmatrixmulti.ptx stmatrixmulti --grid 32 --threads 32 --buffers 256
+env WEFT_WARP=1 "$WEFT" run kernels/stmatrixmulti.ptx --kernel stmatrixmulti --grid 32 \
+    --threads 32 --buffers 256 --cpu-only --dump 0="$TMP/stmatrixmulti.bin" >/dev/null
+if python3 - "$TMP/stmatrixmulti.bin" <<'PY'
+import struct, sys
+w = struct.unpack('<256I', open(sys.argv[1], 'rb').read(1024))
+def trans(h):                      # tile k's (r, c) holds what (c, r) held
+    return (h & ~63) | (8 * (h & 7)) | ((h >> 3) & 7)
+bad = 0
+for n, x in enumerate(w):
+    h = 2 * (n % 128)
+    e = (h | (h + 1) << 16) if n < 128 else (trans(h) | (trans(h + 1) << 16))
+    if x != e: bad += 1
+if bad:
+    print("  %d of 256 words differ" % bad)
+sys.exit(0 if bad == 0 else 1)
+PY
+then
+  echo "ok    stmatrixmulti  four tiles back in place, and the four-tile transpose"
+else
+  echo "FAIL  stmatrixmulti  a tile past the first is not the tile that was loaded"; fail=1
+fi
+
 # Triton's integer dot: `mma.m16n8k32` with `.s8` operands. The fragments are built so
 # the product is 80 (r + 1) (n + 1) at every one of the 128 outputs, a different
 # number for each, so a map that took a row for a column or widened a byte without a
 # sign lands on a different value.
-runf kernels/triton/dots8.ptx dots8_kernel --grid 1 --threads 32 --buffers 128
-"$WEFT" run kernels/triton/dots8.ptx --kernel dots8_kernel --grid 1 --threads 32 --buffers 128 \
+runf kernels/triton/dots8.ptx dots8_kernel --grid 32 --threads 32 --buffers 128
+"$WEFT" run kernels/triton/dots8.ptx --kernel dots8_kernel --grid 32 --threads 32 --buffers 128 \
     --cpu-only --dump 0="$TMP/dots8.bin" >/dev/null
 if od -An -tu4 -v "$TMP/dots8.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; r = int(n / 8); c = n % 8;
       if ($i != 80 * (r + 1) * (c + 1)) bad++ } } END { exit(bad ? 1 : 0) }'; then
@@ -847,7 +2702,7 @@ then
   else
     echo "FAIL  mma8        m16n8k64 s4 is not the product the fragments describe"; fail=1
   fi
-  "$WEFT" run kernels/mma8.ptx --kernel mmak32e2m1 --grid 32 --threads 32 --buffers 128,64,128 \
+  "$WEFT" run kernels/mma8fp4.ptx --kernel mmak32e2m1 --grid 32 --threads 32 --buffers 128,64,128 \
       --buffer-bytes 0=2,1=2 --load 0="$MT/f4a.bin" --load 1="$MT/f4bt.bin" \
       --cpu-only --dump 2="$MT/f4d.bin" >/dev/null
   if python3 tools/mma_ref.py k32e2m1 "$MT/f4a.bin" "$MT/f4bt.bin" "$MT/f4d.bin" >/dev/null; then
@@ -855,14 +2710,14 @@ then
   else
     echo "FAIL  mma8        m16n8k32 e2m1 is not the product the fragments describe"; fail=1
   fi
-  "$WEFT" run kernels/mma8.ptx --kernel mmak32e3m2 --grid 32 --threads 32 --buffers 128,64,128 \
+  "$WEFT" run kernels/mma8fp4.ptx --kernel mmak32e3m2 --grid 32 --threads 32 --buffers 128,64,128 \
       --load 0="$MT/f6a.bin" --load 1="$MT/f6bt.bin" --cpu-only --dump 2="$MT/f6d.bin" >/dev/null
   if python3 tools/mma_ref.py k32e3m2 "$MT/f6a.bin" "$MT/f6bt.bin" "$MT/f6d.bin" >/dev/null; then
     echo "ok    mma8        m16n8k32 e3m2: four fp6 codes a register, f32 accumulate"
   else
     echo "FAIL  mma8        m16n8k32 e3m2 is not the product the fragments describe"; fail=1
   fi
-  "$WEFT" run kernels/mma8.ptx --kernel mmak64e2m1 --grid 32 --threads 32 --buffers 128,64,128 \
+  "$WEFT" run kernels/mma8fp4k64.ptx --kernel mmak64e2m1 --grid 32 --threads 32 --buffers 128,64,128 \
       --load 0="$MT/f4ka.bin" --load 1="$MT/f4kbt.bin" --cpu-only --dump 2="$MT/f4kd.bin" >/dev/null
   if python3 tools/mma_ref.py k64e2m1 "$MT/f4ka.bin" "$MT/f4kbt.bin" "$MT/f4kd.bin" >/dev/null; then
     echo "ok    mma8        m16n8k64 e2m1: eight fp4 codes a register, k of 64"
@@ -1206,7 +3061,8 @@ gpucol kernels/ptxsrf.ptx             64 4096 --textures 64x64
 # filter cannot read through one, so the module declares a second, sampled view of
 # the same texture and the launcher binds one handle to both. `t0` is the lane's own
 # texel, so a sample that read stale storage answers with the image's old contents.
-gpucol kernels/ptxsrftmix.ptx         64 4096 --textures 64x64 --samplers nearest/clamp
+gpucol kernels/ptxsrftmix.ptx         64 4096 --buffers 4096,4096 --textures 64x64,64x64 \
+  --samplers nearest/clamp,nearest/clamp
 # 64-bit floating point, which this GPU has no instruction for: the GPU column runs
 # the software double over the bits and the CPU column runs the host's own, so the
 # two are the same arithmetic and the comparison is byte for byte. The input is
@@ -1493,6 +3349,10 @@ spvgpu() {
     fail=1
   fi
 }
+# 16-bit floats: the emitted metal against the C++ module, on arithmetic and a
+# workgroup half array. The reference comparison above is what catches a wrong
+# reading; this says the shader builds and agrees.
+spvgpu halfmath      halfmath  --grid 32 --threads 32 --buffers 32,32
 spvgpu saxpy        saxpy     --grid 1048576 --buffers 1048576,1048576,1048576
 spvgpu warpscan     warpscan  --grid 1048576 --threads 256 --buffers 1048576,1048576
 spvgpu block_reduce blockreduce --grid 1048576 --threads 256 --buffers 1048576,4096
@@ -1761,7 +3621,7 @@ triton reduce reduce_kernel 1 --grid 1024 --buffers 1024,8192
 # fragment-layout or conversion bug, never a rounding one.
 if python3 kernels/triton/fp8_ref.py gen 512 256 "$TMP/f8a.bin" "$TMP/f8b.bin" 2>"$TMP/f8.log" \
    && "$WEFT" run kernels/triton/dotfp8.ptx --kernel dotfp8_kernel --cpu-only \
-        --grid 1 --threads 32 --buffers 512,256,128 --buffer-bytes 0=1,1=1 \
+        --grid 32 --threads 32 --buffers 512,256,128 --buffer-bytes 0=1,1=1 \
         --load 0="$TMP/f8a.bin" --load 1="$TMP/f8b.bin" --dump 2="$TMP/f8d.bin" >>"$TMP/f8.log" 2>&1 \
    && python3 kernels/triton/fp8_ref.py matmul "$TMP/f8a.bin" "$TMP/f8b.bin" "$TMP/f8d.bin" >>"$TMP/f8.log" 2>&1; then
   echo "ok    triton:dotfp8  m16n8k32 e4m3 matches the e4m3 reference exactly"
@@ -2043,15 +3903,15 @@ for i8 in s8 u8; do
   fi
 done
 
-# A short immediate list. `1, 1` is scale-d then scale-a: accumulate, and negate A.
-# The form was refused as unreadable and is legal PTX; a translator that read it but
-# took every flag as zero returns the product instead of its negative.
+# A negative operand scale. scale-a is a multiplier, so -1 negates A: a translator
+# that read the field but applied only the positive value would return the product
+# instead of its negative.
 if python3 kernels/triton/wgmma_ref.py gen "$TMP/wia.bin" "$TMP/wib.bin" f16neg 2>"$TMP/wi.log" \
    && "$WEFT" run kernels/triton/wgmma_shortimm.ptx --kernel wgmma_shortimm_kernel --cpu-only \
         --grid 128 --threads 128 --buffers 1024,128,512 --buffer-bytes 0=2,1=2 \
         --load 0="$TMP/wia.bin" --load 1="$TMP/wib.bin" --dump 2="$TMP/wid.bin" >>"$TMP/wi.log" 2>&1 \
    && python3 kernels/triton/wgmma_ref.py check "$TMP/wia.bin" "$TMP/wib.bin" "$TMP/wid.bin" f16neg >>"$TMP/wi.log" 2>&1; then
-  echo "ok    triton:wgmma_shortimm  two immediates negate A, exactly"
+  echo "ok    triton:wgmma_shortimm  a negative scale negates A, exactly"
 else
   echo "FAIL  triton:wgmma_shortimm"; sed 's/^/      /' "$TMP/wi.log"; fail=1
 fi
@@ -2074,7 +3934,7 @@ fi
 # decode, so this catches a decoder wired to the wrong format.
 if python3 kernels/triton/fp8_ref.py gen 512 256 "$TMP/e5a.bin" "$TMP/e5b.bin" e5m2 2>"$TMP/e5.log" \
    && "$WEFT" run kernels/triton/dote5m2.ptx --kernel dote5m2_kernel --cpu-only \
-        --grid 1 --threads 32 --buffers 512,256,128 --buffer-bytes 0=1,1=1 \
+        --grid 32 --threads 32 --buffers 512,256,128 --buffer-bytes 0=1,1=1 \
         --load 0="$TMP/e5a.bin" --load 1="$TMP/e5b.bin" --dump 2="$TMP/e5d.bin" >>"$TMP/e5.log" 2>&1 \
    && python3 kernels/triton/fp8_ref.py matmul "$TMP/e5a.bin" "$TMP/e5b.bin" "$TMP/e5d.bin" e5m2 >>"$TMP/e5.log" 2>&1; then
   echo "ok    triton:dote5m2  m16n8k32 e5m2 matches the e5m2 reference exactly"
@@ -2155,7 +4015,7 @@ fi
 "$WEFT" run kernels/logic.ptx --kernel logic --cpu-only --grid 1048576 \
     --buffers 1048576,1048576 --dump 1="$TMP/logic_ptx.bin" >/dev/null
 if cmp -s "$TMP/logic_msl.bin" "$TMP/logic_ptx.bin"; then
-  echo "ok    ptx:logic     lop3 tables and all eight testp classes agree"
+  echo "ok    ptx:logic     lop3 tables, every class and the two zeros agree"
 else
   echo "FAIL  ptx:logic     differs from the metal kernel"; fail=1
 fi
@@ -2243,6 +4103,635 @@ for backend in lanes warp; do
 done
 unset WEFT_WARP
 
+# min/max.xorsign.abs: the magnitude of the comparison with the exclusive or of the two
+# signs on top, which is a different number from the plain comparison. The form is the
+# float's -- a double takes no modifier at all -- and a two-input `.abs` without `.xorsign`
+# is not a form the isa has, so both are refused by name rather than answered plainly.
+"$WEFT" run kernels/fxorabs.ptx --kernel fxorabs --grid 1 --threads 1 --buffers 136 \
+    --cpu-only --dump 0="$TMP/fxorabs.bin" >/dev/null
+if python3 - "$TMP/fxorabs.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+
+def xorabs(op, ab, bb):
+    ma, mb = ab & 0x7FFFFFFF, bb & 0x7FFFFFFF
+    mag = (ma if ma < mb else mb) if op == 'min' else (ma if ma > mb else mb)
+    # the magnitude's nan is caught before the sign goes on, and answers the float's
+    # canonical nan, the all-ones word
+    if (mag & 0x7F800000) == 0x7F800000 and (mag & 0x007FFFFF) != 0:
+        return 0x7FFFFFFF
+    return mag | ((ab ^ bb) & 0x80000000)
+
+NEG_ONE, ONE, TWO, NEG_TWO, NEG_THREE, THREE = 0xBF800000, 0x3F800000, 0x40000000, 0xC0000000, 0xC0400000, 0x40400000
+FOUR, NEG_FOUR, NAN, PZERO, NZERO, INF = 0x40800000, 0xC0800000, 0x7FC00000, 0, 0x80000000, 0x7F800000
+want32 = [
+    xorabs('min', NEG_ONE, TWO), xorabs('min', ONE, NEG_TWO),
+    xorabs('min', NEG_THREE, NEG_TWO), xorabs('max', NEG_THREE, TWO),
+    xorabs('max', ONE, NEG_FOUR), xorabs('min', NAN, TWO), xorabs('min', TWO, NAN),
+    xorabs('min', NZERO, PZERO), xorabs('max', PZERO, NZERO), xorabs('min', INF, ONE),
+]
+got32 = list(struct.unpack('<10I', data[:40]))
+# A double's plain min/max is minNum/maxNum with -0.0 below +0.0, and two NaNs answer the
+# canonical NaN of that format, which is 0x7ff8... -- the positive default, not all ones.
+# The last two are a zero immediate through a double register: an `int` literal under a
+# 64-bit destination is the width the bitcast used to read past.
+# The last five are the double's sign operations: copysign takes the sign and keeps the
+# payload, abs clears the sign bit and keeps the payload.
+want64 = [0x3FF0000000000000, 0x3FF0000000000000, 0x7FF8000000000000, 0,
+          0x8000000000000000, 0, 0,
+          0xBFF0000000000000, 0xFFF8000000000001, 0, 0x8000000000000000,
+          0x7FF8000000000001]
+got64 = list(struct.unpack('<12Q', data[40:136]))
+bad = 0
+for i, (g, x) in enumerate(zip(got32, want32)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+for i, (g, x) in enumerate(zip(got64, want64)):
+    if g != x:
+        print('  double %d got 0x%016X want 0x%016X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    fxorabs     .xorsign.abs on a float, and the plain min/max of a double"
+else
+  echo "FAIL  fxorabs     a sign, a magnitude or a NaN answered the wrong way"; fail=1
+fi
+runf kernels/fxorabs.ptx fxorabs --grid 1 --threads 1 --buffers 136 --exact
+cat > "$TMP/xorabsbad.ptx" <<'PTX'
+.version 7.0
+.target sm_86
+.address_size 64
+.visible .entry bad(.param .u64 p0)
+{
+    .reg .b64 %rd<3>;
+    .reg .f64 %fd<3>;
+    ld.param.u64 %rd1, [p0];
+    mov.b64 %fd1, 0x7FF8000000000000;
+    mov.b64 %fd2, 0x3FF0000000000000;
+    min.NaN.f64 %fd3, %fd1, %fd2;
+    mov.b64 %rd2, %fd3;
+    st.u64 [%rd1+0], %rd2;
+    ret;
+}
+PTX
+"$WEFT" run "$TMP/xorabsbad.ptx" --kernel bad --grid 1 --threads 1 --buffers 8 --cpu-only \
+    > "$TMP/xorabsbad.out" 2>&1 || true
+if grep -q "takes no modifier" "$TMP/xorabsbad.out"
+then
+  echo "ok    fxorabs64   a modifier the double form does not have is refused by name"
+else
+  echo "FAIL  fxorabs64   min.NaN.f64 was not refused by name"; fail=1
+fi
+# copysign, the min/max NaN rules and the shift clamp. Each row is the isa's reading:
+# copysign copies the sign and nothing else, plain min/max is minNum/maxNum (a NaN hands
+# back the other operand) with -0.0 below +0.0, .NaN answers the canonical NaN, and a
+# shift count at or past the word is clamped to it, which fills with zero for an
+# unsigned right shift and with the sign for a signed one.
+"$WEFT" run kernels/fedge.ptx --kernel fedge --grid 1 --threads 1 --buffers 84 \
+    --cpu-only --dump 0="$TMP/fedge.bin" >/dev/null
+if python3 - "$TMP/fedge.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+
+def f(b):
+    return struct.unpack('<f', struct.pack('<I', b))[0]
+
+def b32(x):
+    return struct.unpack('<I', struct.pack('<f', x))[0]
+
+def is_nan(b):
+    return (b & 0x7F800000) == 0x7F800000 and (b & 0x007FFFFF) != 0
+
+def minmax(op, ab, bb):
+    if is_nan(ab) and is_nan(bb):
+        return 0x7FFFFFFF
+    if is_nan(ab):
+        return bb
+    if is_nan(bb):
+        return ab
+    if (ab & 0x7FFFFFFF) == 0 and (bb & 0x7FFFFFFF) == 0:
+        # -0.0 < +0.0 to the isa; a C comparison calls them equal
+        if op == 'min':
+            return ab if (ab >> 31) else bb
+        return ab if (bb >> 31) else bb
+    a, b = f(ab), f(bb)
+    if op == 'min':
+        return ab if a < b else bb
+    return ab if a > b else bb
+
+def copysign(ab, bb):
+    return (ab & 0x7FFFFFFF) | (bb & 0x80000000)
+
+ONE, NEG_ONE, NAN, NANP, PZERO, NZERO = 0x3F800000, 0xBF800000, 0x7FC00000, 0x7FC00001, 0, 0x80000000
+want = [
+    copysign(ONE, NZERO), copysign(NANP, NZERO), copysign(NEG_ONE, PZERO),
+    minmax('min', NAN, ONE), minmax('min', ONE, NAN),
+    minmax('max', NAN, ONE), minmax('max', ONE, NAN),
+    minmax('min', NZERO, PZERO), minmax('max', NZERO, PZERO),
+    0x7FFFFFFF, minmax('min', ONE, 0x40000000), minmax('max', 0x40000000, ONE),
+    0, 0, 0xFFFFFFFF, 0, 0x00FFFFFF, 0, 0, 0x80000000,
+    # two NaNs answer the canonical NaN, the all-ones word for a float
+    minmax('min', NAN, 0x7FF80001),
+]
+got = list(struct.unpack('<21I', data[:84]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    fedge       copysign, minNum/maxNum with the zeros, and the shift clamp"
+else
+  echo "FAIL  fedge       a sign, a NaN or a clamped count answered the wrong way"; fail=1
+fi
+runf kernels/fedge.ptx fedge --grid 1 --threads 1 --buffers 84 --exact
+# A float read as an integer saturates. `F2I` clamps a value past the destination's
+# range to its end and answers zero for a NaN (the `.NTZ` bit), and the clamp comes
+# after the rounding the mode asks for: .rpi of 2.5 is 3, .rzi of it is 2. A C++ cast
+# is undefined for every one of those rows and answered 0 for both infinities.
+"$WEFT" run kernels/cvtint.ptx --kernel cvtint --grid 1 --threads 1 --buffers 56 \
+    --cpu-only --dump 0="$TMP/cvtint.bin" >/dev/null
+if python3 - "$TMP/cvtint.bin" <<'PY'
+import math, struct, sys
+data = open(sys.argv[1], 'rb').read()
+
+def val(b):
+    return struct.unpack('<f', struct.pack('<I', b))[0]
+
+def bits(x):
+    return struct.unpack('<I', struct.pack('<f', x))[0]
+
+def f2i(x, signed):
+    # the isa's rule, written as arithmetic rather than as a cast
+    if x != x:
+        return 0
+    if signed:
+        if x >= 2147483648.0:
+            return 0x7FFFFFFF
+        if x <= -2147483649.0:
+            return 0x80000000
+        return int(x) & 0xFFFFFFFF
+    if x >= 4294967296.0:
+        return 0xFFFFFFFF
+    if x <= -1.0:
+        return 0
+    return int(x) & 0xFFFFFFFF
+
+NAN, INF, NINF = 0x7FC00000, 0x7F800000, 0xFF800000
+HALF5, NEG15, HALF35, NEG25, X21 = 0x40200000, 0xBFC00000, 0x40600000, 0xC0200000, 0x40066666
+ONE, NEG_ONE = 0x3F800000, 0xBF800000
+want = [
+    f2i(val(NAN), True), f2i(val(INF), True), f2i(val(NINF), True),
+    f2i(float(math.trunc(val(HALF5))), True),
+    f2i(float(math.trunc(val(NEG15))), False), f2i(float(math.trunc(val(NEG15))), True),
+    f2i(val(NAN), False),
+    # .rni is ties-to-even, so 2.5 answers 2 and 3.5 answers 4
+    f2i(float(round(val(HALF5))), True), f2i(float(round(val(HALF35))), True),
+    f2i(float(math.floor(val(NEG25))), True), f2i(float(math.ceil(val(X21))), True),
+    # `.sat` on a float destination is the [0, 1] clamp, with a NaN flushed to +0
+    bits(1.0), bits(0.0), bits(0.0),
+]
+got = list(struct.unpack('<14I', data[:56]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    cvtint      float to int clamps at the ends of the range and zero for a NaN"
+else
+  echo "FAIL  cvtint      an out-of-range value or a NaN was not answered the isa's way"; fail=1
+fi
+runf kernels/cvtint.ptx cvtint --grid 1 --threads 1 --buffers 56 --exact
+# The same rule in the SPIR-V front end. `OpConvertFToS`/`OpConvertFToU` leave a value
+# the destination cannot hold undefined; the device answers the end of the range, and a
+# bare cast answered 0 for both infinities.
+python3 - "$TMP/spvcvtint_in.bin" <<'PY'
+import struct, sys
+vals = [float('nan'), float('inf'), float('-inf'), -1.5, -1.5, float('inf'), 2.5, float('nan')]
+open(sys.argv[1], 'wb').write(struct.pack('<8f', *vals))
+PY
+"$WEFT" run kernels/spirv/cvtint.spv --kernel cvtint --grid 1 --threads 1 --buffers 8,8 \
+    --buffer-bytes 0=4,1=4 --load 0="$TMP/spvcvtint_in.bin" --cpu-only \
+    --dump 1="$TMP/spvcvtint.bin" >/dev/null
+if python3 - "$TMP/spvcvtint.bin" <<'PY'
+import struct, sys
+
+def f2i(x):
+    if x != x:
+        return 0
+    if x >= 2147483648.0:
+        return 0x7FFFFFFF
+    if x <= -2147483649.0:
+        return 0x80000000
+    return int(x) & 0xFFFFFFFF
+
+def f2u(x):
+    if x != x:
+        return 0
+    if x >= 4294967296.0:
+        return 0xFFFFFFFF
+    if x <= -1.0:
+        return 0
+    return int(x) & 0xFFFFFFFF
+
+nan, inf = float('nan'), float('inf')
+want = [f2i(nan), f2i(inf), f2i(-inf), f2i(-1.5), f2u(-1.5), f2u(inf), f2i(2.5), f2u(nan)]
+got = list(struct.unpack('<8I', open(sys.argv[1], 'rb').read(32)))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    spvcvtint   float to int clamps in the spir-v front end too"
+else
+  echo "FAIL  spvcvtint   an out-of-range conversion was not answered the isa's way"; fail=1
+fi
+runf kernels/spirv/cvtint.spv cvtint --grid 1 --threads 1 --buffers 8,8 --buffer-bytes 0=4,1=4 --load 0="$TMP/spvcvtint_in.bin" --exact
+# A double read as an integer on the software fp64 path, where the value is its bits and
+# the conversion is arithmetic rather than a cast. It saturates like `F2I`: the end of the
+# destination's range, zero for a NaN, and zero for a negative under an unsigned
+# destination. Three of those were wrong before this row: an unsigned destination returned
+# the two's complement of the magnitude, the 64-bit clamp began at 2^119 so 1e20 wrapped,
+# and a 32-bit destination narrowed the 64-bit answer instead of clamping.
+"$WEFT" run kernels/f64cvt.ptx --kernel f64cvt --grid 1 --threads 1 --buffers 100 \
+    --cpu-only --dump 0="$TMP/f64cvt.bin" >/dev/null
+if python3 - "$TMP/f64cvt.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+
+def s64(x):
+    if x != x:
+        return 0
+    if x >= 9223372036854775808.0:
+        return 0x7FFFFFFFFFFFFFFF
+    if x <= -9223372036854775808.0:
+        return 0x8000000000000000
+    return int(x) & 0xFFFFFFFFFFFFFFFF
+
+def u64(x):
+    if x != x:
+        return 0
+    if x >= 18446744073709551616.0:
+        return 0xFFFFFFFFFFFFFFFF
+    if x <= -1.0:
+        return 0
+    return int(x)
+
+def s32(x):
+    if x != x:
+        return 0
+    if x >= 2147483648.0:
+        return 0x7FFFFFFF
+    if x <= -2147483649.0:
+        return 0x80000000
+    return int(x) & 0xFFFFFFFF
+
+def u32(x):
+    if x != x:
+        return 0
+    if x >= 4294967296.0:
+        return 0xFFFFFFFF
+    if x <= -1.0:
+        return 0
+    return int(x)
+
+inf = float('inf')
+want = [s64(1e20), s64(18446744073709551616.0), s64(9223372036854775808.0),
+        s64(-9223372036854775808.0), s64(-1e20), s64(4611686018427387904.0),
+        u64(1e20), u64(-1.5), 0, s64(inf), u64(inf),
+        s32(1e20), s32(1099511627776.0), u32(-1.5)]
+got = list(struct.unpack('<11Q', data[:88])) + list(struct.unpack('<3I', data[88:100]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%016X want 0x%016X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    f64cvt      a double read as an integer clamps on the software path"
+else
+  echo "FAIL  f64cvt      an out-of-range double was not answered the isa's way"; fail=1
+fi
+runf kernels/f64cvt.ptx f64cvt --grid 1 --threads 1 --buffers 100 --exact
+cat > "$TMP/undeclared.ptx" <<'PTX'
+.version 7.0
+.target sm_86
+.address_size 64
+.visible .entry undeclared(.param .u64 p0)
+{
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [p0];
+    mov.b64 %fd1, 0x3FF0000000000000;
+    mov.b64 %rd2, %fd1;
+    st.u64 [%rd1+0], %rd2;
+    ret;
+}
+PTX
+# `%fd1` is used but the kernel never declares an `.f64` register, so there is no field
+# to name. It used to be emitted anyway -- `s->fd[1]` -- and the C++ compiler was the one
+# to object, about generated code rather than about the fixture.
+"$WEFT" run "$TMP/undeclared.ptx" --kernel undeclared --grid 1 --threads 1 --buffers 8 --cpu-only \
+    > "$TMP/undeclared.out" 2>&1 || true
+if grep -q "register %fd1 is used but never declared" "$TMP/undeclared.out"
+then
+  echo "ok    undeclared   a register that was never declared is refused by name"
+else
+  echo "FAIL  undeclared   %fd1 was not refused by name"; fail=1
+fi
+# A full warp of the rendezvous instructions, checked lane by lane against the rule
+# rather than against another run of itself. Lane i reads words i*8 + k, so a shuffle
+# that took the wrong neighbour, clamped at the wrong end of the warp, or a ballot that
+# folded the wrong bit shows up as one moved word on the lanes that disagree.
+"$WEFT" run kernels/warpops.ptx --kernel warpv --grid 32 --threads 32 --buffers 256 \
+    --cpu-only --dump 0="$TMP/warpops.bin" >/dev/null
+if python3 - "$TMP/warpops.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+got = list(struct.unpack('<256I', data[:1024]))
+rows = []
+for i in range(32):
+    w = got[i * 8:i * 8 + 8]
+    rows.append(w)
+bad = 0
+for i in range(32):
+    want = [0xFFFFFFFF, 0xAAAAAAAA, 30,
+            i if i == 0 else i - 1,
+            i if i == 31 else i + 1,
+            i ^ 2, 0, 1]
+    for k, (g, x) in enumerate(zip(rows[i], want)):
+        if g != x:
+            print('  lane %d row %d got 0x%08X want 0x%08X' % (i, k, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    warpops      every lane of activemask, ballot, vote and shfl answers the rule"
+else
+  echo "FAIL  warpops      a lane read the wrong neighbour or the wrong bit"; fail=1
+fi
+runf kernels/warpops.ptx warpv --grid 32 --threads 32 --buffers 256 --exact
+# The same instructions where the warp is neither full nor uniform: a 24-lane member
+# mask, a predicated activemask, a clamp that ends a segment rather than the warp, a
+# segment mask in the high half of `c`, and a distance held in a register. The oracle
+# is the spec's model, written out from the lane id, so a shuffle that took the wrong
+# peer under any of those four shows up as a moved word.
+"$WEFT" run kernels/warpseg.ptx --kernel warpseg --grid 32 --threads 32 --buffers 544 \
+    --cpu-only --dump 0="$TMP/warpseg.bin" >/dev/null
+if python3 - "$TMP/warpseg.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+got = struct.unpack('<544I', data[:2176])
+bad = 0
+for x in range(24):
+    dl = (x & 7) + 1
+    j = x ^ 8
+    want = [0x00FFFFFF, 0x00AAAAAA, 1, 0, 30, x ^ 2,
+            x - 1 if x >= 9 else x,
+            x + 1 if x + 1 <= 15 else x,
+            x + dl if x + dl <= 31 else x,
+            x - dl if x >= dl else x,
+            x ^ 5, 8,
+            j if j <= x else x,
+            x - 2 if x >= 2 else x,
+            x + 2 if x + 2 <= 31 else x,
+            0,
+            x & 15]
+    for k, w in enumerate(want):
+        g = got[x * 17 + k]
+        if g != w:
+            print('  lane %d row %d got 0x%08X want 0x%08X' % (x, k, g, w)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    warpseg      a partial warp, a segment clamp and a register distance all land"
+else
+  echo "FAIL  warpseg      a lane read outside its segment or an inactive lane was counted"; fail=1
+fi
+runf kernels/warpseg.ptx warpseg --grid 32 --threads 32 --buffers 544 --exact
+# The clamp held in a register, which is the form a `width` below 32 compiles to: every
+# lane carries the end of its own segment. The oracle is the per-segment rule, so a
+# translation that read the register as a whole-warp clamp crosses a segment boundary on
+# the lanes that end one and nowhere else.
+"$WEFT" run kernels/warpreg.ptx --kernel warpreg --grid 32 --threads 32 --buffers 128 \
+    --cpu-only --dump 0="$TMP/warpreg.bin" >/dev/null
+if python3 - "$TMP/warpreg.bin" <<'PY'
+import struct, sys
+got = struct.unpack('<128I', open(sys.argv[1], 'rb').read()[:512])
+bad = 0
+for x in range(32):
+    want = [x - 1 if x & 7 else x,
+            x + 1 if (x & 7) != 7 else x,
+            x ^ 4,
+            x ^ 2]
+    for k, w in enumerate(want):
+        g = got[x * 4 + k]
+        if g != w:
+            print('  lane %d row %d got %d want %d' % (x, k, g, w)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    warpreg      a per-lane segment end held in a register clamps where it should"
+else
+  echo "FAIL  warpreg      a shuffle crossed its segment with a register clamp"; fail=1
+fi
+runf kernels/warpreg.ptx warpreg --grid 32 --threads 32 --buffers 128 --exact
+# match.sync answers the lanes that hold the same value, with and without a member mask,
+# and elect.sync picks the lowest lane of the mask. The oracle is the lane rule, so an
+# `any` compared against the wrong lane, an `all` that ignored the mask, or an election
+# that picked anything but the lowest lane moves one row.
+"$WEFT" run kernels/warpmask.ptx --kernel warpmask --grid 32 --threads 32 --buffers 416 \
+    --cpu-only --dump 0="$TMP/warpmask.bin" >/dev/null
+if python3 - "$TMP/warpmask.bin" <<'PY'
+import struct, sys
+got = struct.unpack('<416I', open(sys.argv[1], 'rb').read()[:1664])
+bad = 0
+for x in range(32):
+    want = [(0x11111111 << (x & 3)) & 0xFFFFFFFF,
+            (1 << x) & 0xFFFFFFFF,
+            0xFFFFFFFF, 1,
+            0, 0,
+            (0x11111111 << (x & 3)) & 0x00FFFFFF,
+            0x00FFFFFF, 1,
+            0,
+            1 if x == 0 else 0,
+            2,
+            1 if x == 2 else 0]
+    for k, w in enumerate(want):
+        g = got[x * 13 + k]
+        if g != w:
+            print('  lane %d row %d got 0x%08X want 0x%08X' % (x, k, g, w)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    warpmask     match.any, match.all and elect answer the mask they should"
+else
+  echo "FAIL  warpmask     a match mask or an elected lane came back wrong"; fail=1
+fi
+runf kernels/warpmask.ptx warpmask --grid 32 --threads 32 --buffers 416 --exact
+# redux.sync folds across the lanes: six integer ops over the full warp, three more on a
+# signed value where min and max must rank negatives below zero, and two partial masks
+# where the lanes outside the mask contribute the fold's identity. Every lane answers
+# the same number, so a dropped lane or a wrong identity moves a whole column.
+"$WEFT" run kernels/redux.ptx --kernel reduxk --grid 32 --threads 32 --buffers 352 \
+    --cpu-only --dump 0="$TMP/redux.bin" >/dev/null
+if python3 - "$TMP/redux.bin" <<'PY'
+import struct, sys
+got = struct.unpack('<352I', open(sys.argv[1], 'rb').read()[:1408])
+want = [496, 0, 31, 0, 31, 0, 0xFFFFFFF0, 0xFFFFFFF0, 15, 120, 3]
+bad = 0
+for x in range(32):
+    for k, w in enumerate(want):
+        g = got[x * 11 + k]
+        if g != w:
+            print('  lane %d row %d got 0x%08X want 0x%08X' % (x, k, g, w)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    redux        every integer fold, signed and masked, answers the warp's value"
+else
+  echo "FAIL  redux       a fold dropped a lane or used the wrong identity"; fail=1
+fi
+runf kernels/redux.ptx reduxk --grid 32 --threads 32 --buffers 352 --exact
+# The boundaries of the bit instructions, each row the isa's own reading: a prmt nibble
+# whose top bit is set replicates the sign of the byte it names rather than copying it, a
+# funnel shift names its two words `a` then `b` (so a left shift by 0 is b and a right
+# shift by 0 is a), bfind.shiftamt is 31 minus the position, and prmt.b4e walks backwards
+# from the byte it is given and wraps. The testp rows pin the one place the isa counts
+# something unusual: +-0 is a normal number.
+"$WEFT" run kernels/isaedge.ptx --kernel isaedge --grid 1 --threads 1 --buffers 124 \
+    --cpu-only --dump 0="$TMP/isaedge.bin" >/dev/null
+if python3 - "$TMP/isaedge.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+A, B = 0x11223344, 0x55667788
+
+def prmt_generic(a, b, c):
+    tmp, d = (b << 32) | a, 0
+    for i in range(4):
+        v = (c >> (4 * i)) & 0xF
+        byte = (tmp >> (8 * (v & 7))) & 0xFF
+        if v & 8:
+            byte = 0xFF if byte & 0x80 else 0x00
+        d |= byte << (8 * i)
+    return d
+
+def prmt_f4e(a, b, c):
+    tmp, base, d = (b << 32) | a, c & 3, 0
+    for i in range(4):
+        d |= ((tmp >> (8 * (base + i))) & 0xFF) << (8 * i)
+    return d
+
+def prmt_b4e(a, b, c):
+    tmp, base, d = (b << 32) | a, c & 3, 0
+    for i in range(4):
+        d |= ((tmp >> (8 * ((base - i) % 8))) & 0xFF) << (8 * i)
+    return d
+
+def shf_l(a, b, c, clamp):
+    n = min(c, 32) if clamp else (c & 31)
+    if n == 0:
+        return b
+    if n == 32:
+        return a
+    return ((b << n) | (a >> (32 - n))) & 0xFFFFFFFF
+
+def shf_r(a, b, c, clamp):
+    n = min(c, 32) if clamp else (c & 31)
+    if n == 0:
+        return a
+    if n == 32:
+        return b
+    return ((a >> n) | (b << (32 - n))) & 0xFFFFFFFF
+
+def lop3(a, b, c, imm):
+    d = 0
+    for bit in range(32):
+        idx = ((a >> bit) & 1) | (((b >> bit) & 1) << 1) | (((c >> bit) & 1) << 2)
+        if (imm >> idx) & 1:
+            d |= 1 << bit
+    return d
+
+L1, L2, L3 = 0xF0F0F0F0, 0x00FF00FF, 0x0F0F0F0F
+want = [
+    prmt_generic(A, B, 0x3210), prmt_generic(A, B, 0x7654), prmt_generic(A, B, 0x4C80),
+    prmt_f4e(A, B, 0), prmt_f4e(A, B, 2), prmt_b4e(A, B, 0),
+    shf_l(0x80000001, 2, 1, False), shf_l(0x80000001, 2, 32, True),
+    shf_r(1, 0x80000000, 32, True), shf_r(1, 1, 33, False),
+    8, 23, 0, lop3(L1, L2, L3, 0x96), lop3(L1, L2, L3, 0xE8),
+    # finite on inf, nan, min-normal; normal on subnormal, min-normal, zero
+    0, 0, 1, 0, 1, 1,
+    # subnormal on subnormal, min-normal, zero
+    1, 0, 0,
+    # number on nan, inf
+    0, 1,
+    # infinite on inf, -inf, zero
+    1, 1, 0,
+    # notanumber on nan, min-normal
+    1, 0,
+]
+got = list(struct.unpack('<31I', data[:124]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    isaedge     prmt signs, funnel shift ends, bfind and every testp class"
+else
+  echo "FAIL  isaedge     an edge of a bit instruction read the wrong way"; fail=1
+fi
+# SPIR-V's extended integer operations answer a struct of two words, and a kernel takes
+# them apart one member at a time. Each row below is the operation's own definition: the
+# result cut back to the word, and the bit that left it -- a sum below an addend when it
+# wraps, Operand 1 below Operand 2 for a borrow, and the product above its low word.
+"$WEFT" run kernels/spirv/carry.spv --kernel spvcarry --grid 1 --threads 1 --buffers 48 \
+    --cpu-only --dump 0="$TMP/spvcarry.bin" >/dev/null
+if python3 - "$TMP/spvcarry.bin" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+M32, M64 = 0xFFFFFFFF, (1 << 64) - 1
+
+def add32(a, b):
+    s = a + b
+    return [s & M32, 1 if s > M32 else 0]
+
+def sub32(a, b):
+    return [(a - b) & M32, 1 if a < b else 0]
+
+def umul(a, b):
+    p = (a * b) & M64
+    return [p & M32, (p >> 32) & M32]
+
+def smul(a, b):
+    sa, sb = (a - (1 << 32) if a >> 31 else a), (b - (1 << 32) if b >> 31 else b)
+    p = (sa * sb) & M64
+    return [p & M32, (p >> 32) & M32]
+
+want = []
+want += add32(M32, 1)
+want += sub32(5, 7)
+want += [sub32(7, 5)[1]]
+want += umul(M32, M32)
+want += smul(M32, M32)
+want += umul(1 << 16, 1 << 16)
+want += [1]  # the 64-bit sum of all ones and one carries out
+got = list(struct.unpack('<12I', data[:48]))
+bad = 0
+for i, (g, x) in enumerate(zip(got, want)):
+    if g != x:
+        print('  word %d got 0x%08X want 0x%08X' % (i, g, x)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "ok    spvcarry    carry, borrow and the high word of a product, each its own word"
+else
+  echo "FAIL  spvcarry    an extended integer operation answered the wrong word"; fail=1
+fi
 # SPIR-V front end vs the Metal front end, byte for byte. The modules are
 # assembled from text by spirv-as and validated, so a mistake in the module
 # cannot be mistaken for a mistake in the translator.
@@ -2983,6 +5472,46 @@ if "$CXX" -std=c++20 -O1 -Iinclude -Iruntime tools/half_texel.cpp -o "$TMP/half_
   fi
 else
   echo "FAIL  texel:half  the probe did not compile: $(head -2 "$TMP/halftex.log")\n"; fail=1
+fi
+
+# `mov.b32 {lo, hi}, %r` splits a 32-bit source at 16 bits. The high half read as
+# zero while the shift came from the destination width instead of the source, so a
+# word whose halves differ is what pins it down.
+runf kernels/movhilo.ptx movhilo --grid 1 --threads 1 --buffers 2
+"$WEFT" run kernels/movhilo.ptx --kernel movhilo --grid 1 --threads 1 --buffers 2 \
+    --cpu-only --dump 0="$TMP/movhilo.bin" >/dev/null
+if [ "$(head -c 8 "$TMP/movhilo.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
+    "00005678 00001234 " ]; then
+  echo "ok    movhilo  the 32-bit word split at 16 bits, low half then high"
+else
+  echo "FAIL  movhilo  read $(head -c 8 "$TMP/movhilo.bin" | od -An -tx4 -v | tr -s ' ' ' ')"; fail=1
+fi
+
+# `.kind::f8f6f4` is the dense four-operand multiply on sm_120a, which the three
+# `mma8` rows above pin by their products. Its block-scaled relatives carry the
+# per-block scales after the accumulators, and reading one as the other would answer
+# for a product nobody asked for, so that refusal is asked for here by name.
+cat > "$TMP/bscale.ptx" <<'BSEOF'
+.version 8.8
+.target sm_120a
+.address_size 64
+.visible .entry bscale(.param .u64 p)
+{
+    .reg .b32 %r<8>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [p];
+    mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32.kind::block_scale {%f1,%f2,%f3,%f4}, {%r1,%r2,%r3,%r4}, {%r5,%r6}, {%f5,%f6,%f7,%f8}, {%r7};
+    ret;
+}
+BSEOF
+bscale_rc=0
+bscale_out=$("$WEFT" run "$TMP/bscale.ptx" --kernel bscale --grid 32 --threads 32 \
+    --buffers 8 --cpu-only 2>&1) || bscale_rc=$?
+if [ $bscale_rc -ne 0 ] && [ "${bscale_out#*block-scaled}" != "$bscale_out" ]; then
+  echo "ok    bscale    a block-scaled mma is still refused by name, not read as dense"
+else
+  echo "FAIL  bscale    a block-scaled mma was not refused by name (rc=$bscale_rc)"; fail=1
 fi
 
 # A `.ptx` or `.spv` sample that nothing diffs is a translation nobody checked, and

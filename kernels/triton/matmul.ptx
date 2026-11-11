@@ -15,13 +15,11 @@
 // The floats are rounded to integers before they become halves, so every product
 // is an exact integer and every sum of sixteen is exact in f32: the result is the
 // same bits however the additions are scheduled, which is what makes it a test of
-// the *layouts*, ldmatrix's address→register map and mma's fragment map, rather
+// the *layouts*, ldmatrix's address->register map and mma's fragment map, rather
 // than of floating point.
 .version 8.1
 .target sm_80
 .address_size 64
-
-.maxntid 32, 1, 1
 
 .visible .entry matmul_kernel(
 	.param .u64 matmul_kernel_param_0,
@@ -29,6 +27,8 @@
 	.param .u64 matmul_kernel_param_2,
 	.param .u64 matmul_kernel_param_3
 )
+.maxntid 32, 1, 1
+
 {
 	.reg .f32 	%f<32>;
 	.reg .b32 	%r<40>;

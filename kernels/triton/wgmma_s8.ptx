@@ -1,5 +1,8 @@
 //
-// wgmma with 8-bit integer operands: `wgmma.mma_async.sync.aligned.m64n8k32.f32.s8.s8`.
+// wgmma with 8-bit integer operands: `wgmma.mma_async.sync.aligned.m64n8k32.s32.s8.s8`.
+//
+// Integer operands accumulate into `.s32`, not into `.f32`: the same k32 geometry
+// with a different accumulator type is a different instruction.
 //
 // The geometry is the fp8 one to the byte. A one-byte element puts sixteen to a
 // core-matrix row, so K is 32, A is 64x32 (2048 bytes: two cores along K, eight
@@ -12,19 +15,20 @@
 // same bytes as different numbers, so a decode wired to the wrong signedness
 // disagrees with it.
 .version 8.1
-.target sm_90
+.target sm_90a
 .address_size 64
-
-.maxntid 128, 1, 1
 
 .visible .entry wgmma_s8_kernel(
 	.param .u64 wgmma_s8_kernel_param_0,
 	.param .u64 wgmma_s8_kernel_param_1,
 	.param .u64 wgmma_s8_kernel_param_2
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .b32 	%r<40>;
-	.reg .f32 	%f<12>;
+	.reg .s32	%sa<4>;
+	.reg .f32	%fa<4>;
 	.reg .b64 	%rd<16>;
 
 	.shared .align 128 .b8 weft_ab[2560];
@@ -89,12 +93,12 @@
 	mov.u64 	%rd10, 68720001024;
 	mov.u64 	%rd12, 34360262784;
 
-	mov.f32 	%f5, 0f00000000;
-	mov.f32 	%f6, 0f00000000;
-	mov.f32 	%f7, 0f00000000;
-	mov.f32 	%f8, 0f00000000;
+	mov.s32	%sa0, 0;
+	mov.s32	%sa1, 0;
+	mov.s32	%sa2, 0;
+	mov.s32	%sa3, 0;
 	wgmma.fence.sync.aligned;
-	wgmma.mma_async.sync.aligned.m64n8k32.f32.s8.s8 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.mma_async.sync.aligned.m64n8k32.s32.s8.s8 {%sa0, %sa1, %sa2, %sa3}, %rd10, %rd12, 1;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 
@@ -110,9 +114,16 @@
 	add.s32 	%r25, %r25, %r26;
 	cvt.u64.u32 	%rd13, %r25;
 	add.s64 	%rd13, %rd3, %rd13;
-	st.global.b32 	[%rd13], %f5;
-	st.global.b32 	[%rd13+4], %f6;
-	st.global.b32 	[%rd13+256], %f7;
-	st.global.b32 	[%rd13+260], %f8;
+	// The results are integers, and D is the same float buffer the other wgmma
+	// fixtures write: one convert per value, exact because the range here is
+	// thousands, nowhere near 2^24.
+	cvt.rn.f32.s32 	%fa0, %sa0;
+	cvt.rn.f32.s32 	%fa1, %sa1;
+	cvt.rn.f32.s32 	%fa2, %sa2;
+	cvt.rn.f32.s32 	%fa3, %sa3;
+	st.global.b32 	[%rd13], %fa0;
+	st.global.b32 	[%rd13+4], %fa1;
+	st.global.b32 	[%rd13+256], %fa2;
+	st.global.b32 	[%rd13+260], %fa3;
 	ret;
 }

@@ -16,7 +16,7 @@
 .target sm_70
 .address_size 64
 
-.tex .u32 cube, 1, 1, 1, 1;
+.global .texref cube;
 
 .visible .entry ptxgathercube(
     .param .u64 ptxgathercube_param_0
@@ -49,7 +49,10 @@
     mul.f32 %f3, %f1, 0f3B800000;       // s
     mul.f32 %f4, %f2, 0f3B800000;       // t
 
-    tld4.b.cube.v4.f32.f32 {%f8,%f9,%f10,%f11}, [cube, {%f3,%f4,%r7}];
+    // The face is a coordinate like the other two, and PTX wants a fourth: q = 1.
+    cvt.rn.f32.s32 %f5, %r7;
+    mov.f32 %f6, 0f3F800000;
+    tld4.b.cube.v4.f32.f32 {%f8,%f9,%f10,%f11}, [cube, {%f3,%f4,%f5,%f6}];
 
     mul.f32 %f12, %f9, 0f40000000;      // 2 g.y
     add.f32 %f13, %f8, %f12;

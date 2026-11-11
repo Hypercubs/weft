@@ -1,0 +1,67 @@
+// Comparing two narrow floats. The words of a half run in the same order as the values
+// only while it is positive, so a compare of the bit patterns orders -1 above 1 and
+// calls -0.5 greater than 0.25. Each of these widens first, which is exact, and the
+// answers are the masks `set` writes: every bit set for true, zero for false.
+//
+//   0  setp.lt  h, 1.0
+//   1  setp.ge  h, -0.5
+//   2  set.eq   h, h         always true, including for -0 and for a NaN
+//   3  set.ne   h, +0.0      false for either zero
+//   4  setp.nan h, h         false on every input here
+//   5  setp.num h, +0.0      the negation of the test above
+//   6  set.le   h, -0.0      true for both zeros and for the negatives
+//   7  setp.gt  h, -2.0
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry narrowcmp(
+    .param .u64 narrowcmp_param_0,  // in: one half a lane
+    .param .u64 narrowcmp_param_1   // out: eight 32-bit answers a lane
+)
+{
+    .reg .b16 %hs<6>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [narrowcmp_param_0];
+    ld.param.u64 %rd2, [narrowcmp_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mul.wide.u32 %rd3, %r1, 2;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b16 %hs1, [%rd4];
+
+    mul.wide.u32 %rd5, %r1, 32;
+    add.u64 %rd6, %rd2, %rd5;
+
+    mov.b16 %hs2, 0x3C00;     // 1.0
+    mov.b16 %hs3, 0xB800;     // -0.5
+    mov.b16 %hs4, 0x0000;     // +0
+    mov.b16 %hs5, 0x8000;     // -0
+
+    setp.lt.f16 %p1, %hs1, %hs2;
+    selp.b32 %r2, 1, 0, %p1;
+    st.global.b32 [%rd6], %r2;
+    setp.ge.f16 %p2, %hs1, %hs3;
+    selp.b32 %r2, 1, 0, %p2;
+    st.global.b32 [%rd6+4], %r2;
+    set.eq.u32.f16 %r3, %hs1, %hs1;
+    st.global.b32 [%rd6+8], %r3;
+    set.ne.u32.f16 %r3, %hs1, %hs4;
+    st.global.b32 [%rd6+12], %r3;
+    setp.nan.f16 %p3, %hs1, %hs1;
+    selp.b32 %r2, 1, 0, %p3;
+    st.global.b32 [%rd6+16], %r2;
+    setp.num.f16 %p4, %hs1, %hs4;
+    selp.b32 %r2, 1, 0, %p4;
+    st.global.b32 [%rd6+20], %r2;
+    set.le.u32.f16 %r3, %hs1, %hs5;
+    st.global.b32 [%rd6+24], %r3;
+    mov.b16 %hs2, 0xC000;     // -2.0
+    setp.gt.f16 %p5, %hs1, %hs2;
+    selp.b32 %r2, 1, 0, %p5;
+    st.global.b32 [%rd6+28], %r2;
+    ret;
+}

@@ -1,0 +1,130 @@
+// Video instructions: packed lanes that do not carry into their neighbour.
+//
+// Each lane of `a` and `b` is widened at the signedness its own suffix names, the
+// operation runs in 32 bits, and the answer is cut back to the lane width. The
+// fourth operand belongs to the merge form and is not read by these.
+//
+//   vadd2u   vadd2.u32.u32.u32      16-bit lanes, unsigned, sum wraps per lane
+//   vadd2s   vadd2.s32.s32.s32      the same with signed lanes and signed bytes...
+//   vmin4s   vmin4.s32.s32.s32      8-bit lanes, signed, minimum
+//   vabs4u   vabsdiff4.u32.u32.u32  8-bit lanes, unsigned, absolute difference
+//   vadd4u   vadd4.u32.u32.u32      8-bit lanes, unsigned, sum wraps inside the byte
+//   vavg4s   vavrg4.s32.s32.s32     8-bit lanes, signed, rounded average, which rounds
+//                                   a negative sum down and a non-negative one up
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry vadd2u(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<6>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  add.u64 %rd4, %rd4, 32;
+  ld.global.u32 %r3, [%rd4];
+  mov.u32 %r4, 0;
+  vadd2.u32.u32.u32 %r5, %r2, %r3, %r4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r5;
+  ret;
+}
+
+.visible .entry vadd2s(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<6>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  add.u64 %rd4, %rd4, 32;
+  ld.global.u32 %r3, [%rd4];
+  mov.u32 %r4, 0;
+  vadd2.s32.s32.s32 %r5, %r2, %r3, %r4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r5;
+  ret;
+}
+
+.visible .entry vmin4s(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<6>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  add.u64 %rd4, %rd4, 32;
+  ld.global.u32 %r3, [%rd4];
+  mov.u32 %r4, 0;
+  vmin4.s32.s32.s32 %r5, %r2, %r3, %r4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r5;
+  ret;
+}
+
+.visible .entry vabs4u(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<6>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  add.u64 %rd4, %rd4, 32;
+  ld.global.u32 %r3, [%rd4];
+  mov.u32 %r4, 0;
+  vabsdiff4.u32.u32.u32 %r5, %r2, %r3, %r4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r5;
+  ret;
+}
+
+.visible .entry vadd4u(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<6>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  add.u64 %rd4, %rd4, 32;
+  ld.global.u32 %r3, [%rd4];
+  mov.u32 %r4, 0;
+  vadd4.u32.u32.u32 %r5, %r2, %r3, %r4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r5;
+  ret;
+}
+
+.visible .entry vavg4s(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<6>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  add.u64 %rd4, %rd4, 32;
+  ld.global.u32 %r3, [%rd4];
+  mov.u32 %r4, 0;
+  vavrg4.s32.s32.s32 %r5, %r2, %r3, %r4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r5;
+  ret;
+}

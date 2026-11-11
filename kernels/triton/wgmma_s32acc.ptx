@@ -9,16 +9,16 @@
 // width and the store type: the accumulator is written back as 32 bits, and an
 // accumulator declared `.s32` must not be read as a float to be added to.
 .version 8.1
-.target sm_90
+.target sm_90a
 .address_size 64
-
-.maxntid 128, 1, 1
 
 .visible .entry wgmma_s32acc_kernel(
 	.param .u64 wgmma_s32acc_kernel_param_0,
 	.param .u64 wgmma_s32acc_kernel_param_1,
 	.param .u64 wgmma_s32acc_kernel_param_2
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .b32 	%r<40>;
 	.reg .s32 	%s<8>;

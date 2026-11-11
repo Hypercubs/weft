@@ -1,0 +1,40 @@
+// The packed form: two halfs in one 32-bit register, low half first, and one
+// instruction for each pair. `0x3C003800` is 1.0 above 0.5.
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry halfops2(
+    .param .u64 halfops2_param_0,   // in: one half2 a lane
+    .param .u64 halfops2_param_1    // out: six half2s a lane
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [halfops2_param_0];
+    ld.param.u64 %rd2, [halfops2_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b32 %r2, [%rd4];
+
+    mul.wide.u32 %rd5, %r1, 24;
+    add.u64 %rd6, %rd2, %rd5;
+
+    mov.b32 %r3, 0x3C003800;          // hi 1.0, lo 0.5
+    add.rn.f16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6], %r4;
+    sub.rn.f16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+4], %r4;
+    mul.rn.f16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+8], %r4;
+    fma.rn.f16x2 %r4, %r3, %r2, %r3;
+    st.global.b32 [%rd6+12], %r4;
+    min.f16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+16], %r4;
+    max.f16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+20], %r4;
+    ret;
+}

@@ -8,13 +8,13 @@
 // Every operation on a double is exact IEEE-754 binary64 on both columns: the CPU
 // runs the host's own doubles, and the GPU runs the software one in `weft_fp64`
 // over the bits, so the comparison is of the same arithmetic rather than of an
-// approximation of it. The literals are `0d…` forms, which is what used to have no
+// approximation of it. The literals are `0d...` forms, which is what used to have no
 // GPU spelling at all, a double here is the `uint64_t` its bits live in, so the
 // constant is handed over as bits and the register holding it is that same word.
 //
 // The last line crosses back to binary32 so the result is one four-byte value per
 // lane: a rounding that disagreed would show up as a different float, and the two
-// conversions in the middle (`cvt.rn.s32.f64` and `cvt.f64.s32`) check the integer
+// conversions in the middle (`cvt.rni.s32.f64` and `cvt.f64.s32`) check the integer
 // bridge in both directions.
 .version 7.0
 .target sm_70
@@ -48,7 +48,7 @@
 
     add.f64 %fd2, %fd1, 0d3FF0000000000000;    // x + 1
     mul.f64 %fd3, %fd2, 0d4008000000000000;    // * 3
-    div.f64 %fd4, %fd3, 0d4000000000000000;    // / 2
+    div.rn.f64 %fd4, %fd3, 0d4000000000000000;    // / 2
     sub.f64 %fd5, %fd4, 0d3FE0000000000000;    // y = that - 0.5
     neg.f64 %fd6, %fd5;
     abs.f64 %fd7, %fd6;
@@ -60,8 +60,8 @@
     selp.b32 %r5, 1, 0, %p1;
 
     // The integer bridge in both directions, then back to binary32.
-    cvt.rn.s32.f64 %r6, %fd7;
-    cvt.f64.s32 %fd10, %r6;
+    cvt.rni.s32.f64 %r6, %fd7;
+    cvt.rn.f64.s32 %fd10, %r6;
     cvt.rn.f32.f64 %f1, %fd9;
     cvt.f64.f32 %fd11, %f1;
     add.f64 %fd12, %fd11, %fd10;

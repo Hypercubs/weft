@@ -1,0 +1,56 @@
+; 16-bit integer atomics. The hardware's atomics are 32 bits and two halves can share
+; one of those words, so the half addressed has to move on its own. Every buffer here
+; holds the operand half low and a 0xABCD sentinel high, so a translation that wrote
+; the whole word would show up as a wrong top half rather than as a zero nobody notices.
+;
+;   a16add  every thread adds 1 to a u16 counter: the answer is the thread count
+;   a16mix  one thread runs and, or, xor, a signed min of -2, an unsigned min of
+;           0x0100, an exchange to 0x1234, then a compare-exchange that matches it
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int16
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "a16add" %gid
+               OpEntryPoint Kernel %main2 "a16mix" %gid
+               OpName %main "a16add"
+               OpName %main2 "a16mix"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %u16 = OpTypeInt 16 0
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+      %pu16 = OpTypePointer CrossWorkgroup %u16
+   %v3u64 = OpTypeVector %u64 3
+      %pin = OpTypePointer Input %v3u64
+      %fnty = OpTypeFunction %void %pu16
+      %scp = OpConstant %u32 1
+      %sem = OpConstant %u32 0
+      %gid = OpVariable %pin Input
+       %c1 = OpConstant %u16 1
+     %andm = OpConstant %u16 255
+      %orm = OpConstant %u16 12288
+     %xorm = OpConstant %u16 1
+    %sminm = OpConstant %u16 65534
+    %uminm = OpConstant %u16 256
+    %exchm = OpConstant %u16 4660
+     %casm = OpConstant %u16 4660
+     %newm = OpConstant %u16 48879
+      %main = OpFunction %void None %fnty
+         %a = OpFunctionParameter %pu16
+     %entry = OpLabel
+      %old = OpAtomicIAdd %u16 %a %scp %sem %c1
+                OpReturn
+                OpFunctionEnd
+     %main2 = OpFunction %void None %fnty
+         %b = OpFunctionParameter %pu16
+    %entry2 = OpLabel
+        %m1 = OpAtomicAnd %u16 %b %scp %sem %andm
+        %m2 = OpAtomicOr %u16 %b %scp %sem %orm
+        %m3 = OpAtomicXor %u16 %b %scp %sem %xorm
+        %m4 = OpAtomicSMin %u16 %b %scp %sem %sminm
+        %m5 = OpAtomicUMin %u16 %b %scp %sem %uminm
+        %m6 = OpAtomicExchange %u16 %b %scp %sem %exchm
+        %m7 = OpAtomicCompareExchange %u16 %b %scp %sem %sem %newm %casm
+                OpReturn
+                OpFunctionEnd

@@ -1,0 +1,61 @@
+; A signed switch. The Kernel capability forbids a signed OpTypeInt, so this one is
+; written in the shader dialect, which is where a signed selector can exist at all.
+;
+;   sel = (int)gid - 3, so lanes 0 to 3 select with -3, -2, -1 and 0
+;   cases -1 and -2, and a default for the rest
+;   out[gid] = 5, 6 or 9
+;
+; The literal for -1 is 0xFFFFFFFF, one word. A comparison that sign-extends the
+; selector to 64 bits before comparing turns -1 into 0xFFFFFFFFFFFFFFFF, misses its
+; own case and answers the default: lane 2 writes 9 where the module asked for 5, and
+; lane 1 writes 9 instead of 6. Masking both sides to the selector's width is what
+; makes them the same number, and this is the fixture that says so.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "sws" %gid
+               OpExecutionMode %main LocalSize 4 1 1
+               OpName %main "sws"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %blk Block
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %outbuf DescriptorSet 0
+               OpDecorate %outbuf Binding 0
+      %void = OpTypeVoid
+       %i32 = OpTypeInt 32 1
+       %u32 = OpTypeInt 32 0
+       %v3u = OpTypeVector %u32 3
+     %rtarr = OpTypeRuntimeArray %i32
+       %blk = OpTypeStruct %rtarr
+   %ptr_sb = OpTypePointer StorageBuffer %i32
+  %ptr_blk = OpTypePointer StorageBuffer %blk
+       %pin = OpTypePointer Input %v3u
+      %fnty = OpTypeFunction %void
+        %gid = OpVariable %pin Input
+    %outbuf = OpVariable %ptr_blk StorageBuffer
+      %zerou = OpConstant %u32 0
+      %three = OpConstant %i32 3
+    %negone = OpConstant %i32 -1
+     %negtwo = OpConstant %i32 -2
+        %c5 = OpConstant %i32 5
+        %c6 = OpConstant %i32 6
+        %c9 = OpConstant %i32 9
+       %main = OpFunction %void None %fnty
+      %entry = OpLabel
+          %g = OpLoad %v3u %gid
+         %gi = OpCompositeExtract %u32 %g 0
+         %si = OpBitcast %i32 %gi
+        %sel = OpISub %i32 %si %three
+               OpSelectionMerge %merge None
+               OpSwitch %sel %dflt -1 %n1 -2 %n2
+        %n1 = OpLabel
+               OpBranch %merge
+        %n2 = OpLabel
+               OpBranch %merge
+      %dflt = OpLabel
+               OpBranch %merge
+     %merge = OpLabel
+         %r = OpPhi %i32 %c5 %n1 %c6 %n2 %c9 %dflt
+         %po = OpAccessChain %ptr_sb %outbuf %zerou %gi
+               OpStore %po %r
+               OpReturn
+               OpFunctionEnd

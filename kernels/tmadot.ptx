@@ -18,14 +18,14 @@
 .target sm_90
 .address_size 64
 
-.maxntid 32, 1, 1
-
 .visible .entry tmadot(
     .param .u64 tmadot_param_0,     // out: 16x8 floats
     .param .u64 tmadot_param_1,     // A: 16x16 halves
     .param .u64 tmadot_param_2,     // B: 16x8 halves
     .param .u64 tmadot_param_3      // the two maps, 128 bytes each
 )
+.maxntid 32, 1, 1
+
 {
     .shared .align 16 .b8 tileA[512];
     .shared .align 16 .b8 tileB[256];

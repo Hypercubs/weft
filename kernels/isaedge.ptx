@@ -1,0 +1,181 @@
+.version 7.0
+.target sm_70
+.address_size 64
+// The edge cases of the instructions whose plain form is easy and whose boundaries are
+// not: prmt's sign-replicate nibbles, the funnel shift at counts 0, 32 and past, bfind's
+// shiftamt, lop3's truth table, and every testp class on one bit pattern each. The last
+// one is the isa's special case -- +-0 is a normal number -- and it is here because the
+// first version of this translator answered 0 for it.
+.visible .entry isaedge(.param .u64 p0)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd1, [p0];
+    // prmt 3210
+    mov.b32 %r1, 0x11223344;
+    mov.b32 %r2, 0x55667788;
+    mov.b32 %r4, 0x3210;
+    prmt.b32 %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+0], %r3;
+    // prmt 7654
+    mov.b32 %r1, 0x11223344;
+    mov.b32 %r2, 0x55667788;
+    mov.b32 %r4, 0x7654;
+    prmt.b32 %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+4], %r3;
+    // prmt 4c80
+    mov.b32 %r1, 0x11223344;
+    mov.b32 %r2, 0x55667788;
+    mov.b32 %r4, 0x4c80;
+    prmt.b32 %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+8], %r3;
+    // prmt f4e
+    mov.b32 %r1, 0x11223344;
+    mov.b32 %r2, 0x55667788;
+    mov.b32 %r4, 0x0000;
+    prmt.b32.f4e %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+12], %r3;
+    // prmt f4e@2
+    mov.b32 %r1, 0x11223344;
+    mov.b32 %r2, 0x55667788;
+    mov.b32 %r4, 0x0002;
+    prmt.b32.f4e %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+16], %r3;
+    // prmt b4e
+    mov.b32 %r1, 0x11223344;
+    mov.b32 %r2, 0x55667788;
+    mov.b32 %r4, 0x0000;
+    prmt.b32.b4e %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+20], %r3;
+    // shf.l.wrap c1
+    mov.b32 %r1, 0x80000001;
+    mov.b32 %r2, 0x00000002;
+    mov.b32 %r4, 1;
+    shf.l.wrap.b32 %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+24], %r3;
+    // shf.l.clamp c32
+    mov.b32 %r1, 0x80000001;
+    mov.b32 %r2, 0x00000002;
+    mov.b32 %r4, 32;
+    shf.l.clamp.b32 %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+28], %r3;
+    // shf.r.clamp c32
+    mov.b32 %r1, 0x00000001;
+    mov.b32 %r2, 0x80000000;
+    mov.b32 %r4, 32;
+    shf.r.clamp.b32 %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+32], %r3;
+    // shf.r.wrap c33
+    mov.b32 %r1, 0x00000001;
+    mov.b32 %r2, 0x00000001;
+    mov.b32 %r4, 33;
+    shf.r.wrap.b32 %r3, %r1, %r2, %r4;
+    st.u32 [%rd1+36], %r3;
+    // bfind 0x100
+    mov.b32 %r1, 0x00000100;
+    bfind.u32 %r3, %r1;
+    st.u32 [%rd1+40], %r3;
+    // bfind.shiftamt 0x100
+    mov.b32 %r1, 0x00000100;
+    bfind.u32.shiftamt %r3, %r1;
+    st.u32 [%rd1+44], %r3;
+    // bfind.shiftamt msb
+    mov.b32 %r1, 0x80000000;
+    bfind.u32.shiftamt %r3, %r1;
+    st.u32 [%rd1+48], %r3;
+    // lop3 0x96
+    mov.b32 %r1, 0xF0F0F0F0;
+    mov.b32 %r2, 0x00FF00FF;
+    mov.b32 %r4, 0x0F0F0F0F;
+    lop3.b32 %r3, %r1, %r2, %r4, 0x96;
+    st.u32 [%rd1+52], %r3;
+    // lop3 0xe8
+    mov.b32 %r1, 0xF0F0F0F0;
+    mov.b32 %r2, 0x00FF00FF;
+    mov.b32 %r4, 0x0F0F0F0F;
+    lop3.b32 %r3, %r1, %r2, %r4, 0xe8;
+    st.u32 [%rd1+56], %r3;
+    // testp.finite inf
+    mov.b32 %f1, 0x7F800000;
+    testp.finite.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+60], %r3;
+    // testp.finite nan
+    mov.b32 %f1, 0x7FC00000;
+    testp.finite.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+64], %r3;
+    // testp.finite minnorm
+    mov.b32 %f1, 0x00800000;
+    testp.finite.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+68], %r3;
+    // testp.normal sub
+    mov.b32 %f1, 0x00000001;
+    testp.normal.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+72], %r3;
+    // testp.normal minnorm
+    mov.b32 %f1, 0x00800000;
+    testp.normal.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+76], %r3;
+    // testp.normal zero
+    mov.b32 %f1, 0x00000000;
+    testp.normal.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+80], %r3;
+    // testp.subnormal sub
+    mov.b32 %f1, 0x00000001;
+    testp.subnormal.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+84], %r3;
+    // testp.subnormal minnorm
+    mov.b32 %f1, 0x00800000;
+    testp.subnormal.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+88], %r3;
+    // testp.subnormal zero
+    mov.b32 %f1, 0x00000000;
+    testp.subnormal.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+92], %r3;
+    // testp.number nan
+    mov.b32 %f1, 0x7FC00000;
+    testp.number.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+96], %r3;
+    // testp.number inf
+    mov.b32 %f1, 0x7F800000;
+    testp.number.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+100], %r3;
+    // testp.infinite inf
+    mov.b32 %f1, 0x7F800000;
+    testp.infinite.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+104], %r3;
+    // testp.infinite ninf
+    mov.b32 %f1, 0xFF800000;
+    testp.infinite.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+108], %r3;
+    // testp.infinite zero
+    mov.b32 %f1, 0x00000000;
+    testp.infinite.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+112], %r3;
+    // testp.notanumber nan
+    mov.b32 %f1, 0x7FC00000;
+    testp.notanumber.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+116], %r3;
+    // testp.notanumber minnorm
+    mov.b32 %f1, 0x00800000;
+    testp.notanumber.f32 %p1, %f1;
+    selp.u32 %r3, 1, 0, %p1;
+    st.u32 [%rd1+120], %r3;
+    ret;
+}

@@ -1,0 +1,122 @@
+.version 7.0
+.target sm_80
+.address_size 64
+// The floating-point signs, the min/max NaN rules and the shift clamp, at the values
+// where a plausible implementation is wrong: `std::min` hands back its first operand
+// when a comparison is false, which is what a NaN makes it do, and `-0.0 < +0.0` is
+// true to the isa and false to every C comparison. The shift rows are the count at and
+// past the word, which the isa defines by clamping and C leaves undefined.
+.visible .entry fedge(.param .u64 p0)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd1, [p0];
+    // copysign takes the sign and nothing else, payload included
+    mov.b32 %f1, 0x3F800000;
+    mov.b32 %f2, 0x80000000;
+    copysign.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+0], %r3;
+    mov.b32 %f1, 0x7FC00001;
+    mov.b32 %f2, 0x80000000;
+    copysign.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+4], %r3;
+    mov.b32 %f1, 0xBF800000;
+    mov.b32 %f2, 0x00000000;
+    copysign.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+8], %r3;
+    // a NaN operand hands back the other one, whichever side it is on
+    mov.b32 %f1, 0x7FC00000;
+    mov.b32 %f2, 0x3F800000;
+    min.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+12], %r3;
+    mov.b32 %f1, 0x3F800000;
+    mov.b32 %f2, 0x7FC00000;
+    min.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+16], %r3;
+    mov.b32 %f1, 0x7FC00000;
+    mov.b32 %f2, 0x3F800000;
+    max.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+20], %r3;
+    mov.b32 %f1, 0x3F800000;
+    mov.b32 %f2, 0x7FC00000;
+    max.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+24], %r3;
+    // -0.0 is below +0.0, so the two zeros are not a tie
+    mov.b32 %f1, 0x80000000;
+    mov.b32 %f2, 0x00000000;
+    min.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+28], %r3;
+    mov.b32 %f1, 0x80000000;
+    mov.b32 %f2, 0x00000000;
+    max.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+32], %r3;
+    // .NaN answers the canonical NaN, and a plain row is still the plain answer
+    mov.b32 %f1, 0x7FC00000;
+    mov.b32 %f2, 0x3F800000;
+    min.NaN.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+36], %r3;
+    mov.b32 %f1, 0x3F800000;
+    mov.b32 %f2, 0x40000000;
+    min.NaN.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+40], %r3;
+    mov.b32 %f1, 0x40000000;
+    mov.b32 %f2, 0x3F800000;
+    max.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+44], %r3;
+    // a count at or past the word is clamped to the word
+    mov.b32 %r1, 0xFFFFFFFF;
+    mov.b32 %r2, 32;
+    shr.u32 %r3, %r1, %r2;
+    st.u32 [%rd1+48], %r3;
+    mov.b32 %r1, 0xFFFFFFFF;
+    mov.b32 %r2, 40;
+    shr.u32 %r3, %r1, %r2;
+    st.u32 [%rd1+52], %r3;
+    mov.b32 %r1, 0x80000000;
+    mov.b32 %r2, 32;
+    shr.s32 %r3, %r1, %r2;
+    st.u32 [%rd1+56], %r3;
+    mov.b32 %r1, 0x7FFFFFFF;
+    mov.b32 %r2, 40;
+    shr.s32 %r3, %r1, %r2;
+    st.u32 [%rd1+60], %r3;
+    mov.b32 %r1, 0xFFFFFFFF;
+    mov.b32 %r2, 8;
+    shr.u32 %r3, %r1, %r2;
+    st.u32 [%rd1+64], %r3;
+    mov.b32 %r1, 1;
+    mov.b32 %r2, 32;
+    shl.b32 %r3, %r1, %r2;
+    st.u32 [%rd1+68], %r3;
+    mov.b32 %f1, 0x80000000;
+    abs.f32 %f2, %f1;
+    mov.b32 %r3, %f2;
+    st.u32 [%rd1+72], %r3;
+    mov.b32 %f1, 0x00000000;
+    neg.f32 %f2, %f1;
+    mov.b32 %r3, %f2;
+    st.u32 [%rd1+76], %r3;
+    // Two NaNs answer the format's canonical word: the device's min/max emits the
+    // all-ones NaN when neither operand is a number, where a C library folds the
+    // payload it was handed.
+    mov.b32 %f1, 0x7FC00000;
+    mov.b32 %f2, 0x7FF80001;
+    min.f32 %f3, %f1, %f2;
+    mov.b32 %r3, %f3;
+    st.u32 [%rd1+80], %r3;
+    ret;
+}

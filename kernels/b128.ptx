@@ -1,0 +1,27 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// One 16-byte value moved per thread, read and written as one access. Four threads
+// cover the eight words of the input, so every lane's sixteen bytes have to arrive
+// for the dump to match: a move that only reached the first lane would leave three
+// quarters of the output as whatever the buffer held.
+.visible .entry b128mv(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b128 %q<2>;
+    .reg .b64 %rd<6>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 16;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd5, %rd2, %rd3;
+    ld.global.b128 %q1, [%rd4];
+    st.global.b128 [%rd5], %q1;
+    ret;
+}

@@ -1,0 +1,26 @@
+.version 7.0
+.target sm_70
+.address_size 64
+.visible .entry subnorm(.param .u64 p0, .param .u64 p1, .param .u64 p2)
+{
+    .reg .b32 %r<8>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd1, [p0];
+    ld.param.u64 %rd2, [p1];
+    ld.param.u64 %rd3, [p2];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd5, %rd1, %rd4;
+    add.u64 %rd6, %rd2, %rd4;
+    add.u64 %rd7, %rd3, %rd4;
+    ld.f32 %f1, [%rd5];
+    ld.f32 %f2, [%rd6];
+    mul.f32 %f3, %f1, %f2;
+    div.rn.f32 %f4, %f1, %f2;
+    setp.lt.u32 %p1, %r1, 4;
+    selp.f32 %f5, %f3, %f4, %p1;
+    st.f32 [%rd7], %f5;
+    ret;
+}

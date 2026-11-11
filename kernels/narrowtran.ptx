@@ -1,0 +1,59 @@
+// The `.approx` forms of a half: `ex2`, `lg2`, `rsqrt`, `sin`, `cos` and `tanh`. The
+// hardware's own polynomial is not reproduced here any more than it is for f32, so each
+// is the portable library rounded once to the half grid. Six answers a lane:
+//
+// PTX spells these for `.f32`, not for a single half, so each answer is the half widened,
+// the f32 form run, and the result rounded once back to the half grid.
+//
+//   0  ex2.approx   b
+//   1  lg2.approx   b
+//   2  rsqrt.approx b
+//   3  sin.approx   b
+//   4  cos.approx   b
+//   5  tanh.approx  b
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry narrowtran(
+    .param .u64 narrowtran_param_0, // in: one half a lane
+    .param .u64 narrowtran_param_1  // out: six halfs a lane
+)
+{
+    .reg .b16 %hs<8>;
+    .reg .b32 %r<4>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [narrowtran_param_0];
+    ld.param.u64 %rd2, [narrowtran_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mul.wide.u32 %rd3, %r1, 2;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b16 %hs1, [%rd4];
+
+    mul.wide.u32 %rd5, %r1, 12;
+    add.u64 %rd6, %rd2, %rd5;
+
+    cvt.f32.f16 %f1, %hs1;
+    ex2.approx.f32 %f2, %f1;
+    cvt.rn.f16.f32 %hs2, %f2;
+    st.global.b16 [%rd6], %hs2;
+    lg2.approx.f32 %f2, %f1;
+    cvt.rn.f16.f32 %hs2, %f2;
+    st.global.b16 [%rd6+2], %hs2;
+    rsqrt.approx.f32 %f2, %f1;
+    cvt.rn.f16.f32 %hs2, %f2;
+    st.global.b16 [%rd6+4], %hs2;
+    sin.approx.f32 %f2, %f1;
+    cvt.rn.f16.f32 %hs2, %f2;
+    st.global.b16 [%rd6+6], %hs2;
+    cos.approx.f32 %f2, %f1;
+    cvt.rn.f16.f32 %hs2, %f2;
+    st.global.b16 [%rd6+8], %hs2;
+    tanh.approx.f32 %f2, %f1;
+    cvt.rn.f16.f32 %hs2, %f2;
+    st.global.b16 [%rd6+10], %hs2;
+    ret;
+}

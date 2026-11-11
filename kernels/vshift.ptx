@@ -1,0 +1,47 @@
+.version 7.0
+.target sm_70
+.address_size 64
+// The scalar video shifts differ from the C shift in exactly two places: a count wider
+// than the word is clamped to 32 or wrapped to five bits depending on the mode, and a
+// count of 32 is a real answer rather than undefined. The rows below separate those two
+// modes, take a signed shift past the width, and set the sign bit without `.sat`. The
+// `vset` rows read the same bits as signed and as unsigned, where the two disagree.
+.visible .entry vshift(.param .u64 p0)
+{
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [p0];
+    mov.u32 %r1, 1;
+    mov.u32 %r2, 4;
+    mov.u32 %r3, 40;
+    mov.u32 %r4, 36;
+    mov.u32 %r5, 0x80000000;
+    mov.u32 %r6, 0x40000000;
+    vshl.u32.u32.u32.clamp %r10, %r1, %r2;
+    vshl.u32.u32.u32.wrap %r11, %r1, %r4;
+    vshl.u32.u32.u32.clamp %r12, %r1, %r3;
+    vshr.u32.u32.u32.clamp %r13, %r5, %r2;
+    vshr.s32.s32.u32.clamp %r14, %r5, %r2;
+    vshr.s32.s32.u32.clamp %r15, %r5, %r3;
+    vshl.s32.u32.u32.clamp %r16, %r6, %r1;
+    vshr.s32.u32.u32.wrap %r17, %r5, %r4;
+    st.u32 [%rd1], %r10;
+    st.u32 [%rd1+4], %r11;
+    st.u32 [%rd1+8], %r12;
+    st.u32 [%rd1+12], %r13;
+    st.u32 [%rd1+16], %r14;
+    st.u32 [%rd1+20], %r15;
+    st.u32 [%rd1+24], %r16;
+    st.u32 [%rd1+28], %r17;
+    mov.u32 %r20, 0xFFFFFFFF;
+    mov.u32 %r21, 1;
+    vset.s32.s32.lt %r22, %r20, %r21;
+    vset.u32.u32.lt %r23, %r20, %r21;
+    vset.s32.s32.ge %r24, %r20, %r20;
+    vset.u32.u32.ne %r25, %r20, %r21;
+    st.u32 [%rd1+32], %r22;
+    st.u32 [%rd1+36], %r23;
+    st.u32 [%rd1+40], %r24;
+    st.u32 [%rd1+44], %r25;
+    ret;
+}

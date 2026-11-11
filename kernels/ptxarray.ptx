@@ -16,13 +16,14 @@
 .target sm_70
 .address_size 64
 
-.tex .u32 tex, 1, 1, 1, 1;
+.global .texref tex;
 
 .visible .entry ptxarray(
     .param .u64 ptxarray_param_0
 )
 {
     .reg .b32 %r<16>;
+    .reg .u32 %ru<2>;
     .reg .f32 %f<24>;
     .reg .b64 %rd<8>;
 
@@ -49,7 +50,11 @@
     mul.f32 %f6, %f4, 0f3B800000;       // (y + 0.5) / 64
     cvt.rn.f32.s32 %f7, %r9;            // the layer, as a coordinate
 
-    tex.a2d.v4.f32.f32 {%f8,%f9,%f10,%f11}, [tex, {%f5,%f6,%f7}];
+    // PTX wants four coordinates here and the slice index comes first, as a `.u32`
+    // register rather than a float, then x, y, and q = 1, the projective identity.
+    mov.u32 %ru1, %r9;
+    mov.f32 %f17, 0f3F800000;
+    tex.a2d.v4.f32.f32 {%f8,%f9,%f10,%f11}, [tex, {%ru1,%f5,%f6,%f17}];
 
     mul.f32 %f12, %f8, 0f40000000;      // t * 2
     cvt.rn.f32.u32 %f13, %r5;           // the slice count, from txq.depth

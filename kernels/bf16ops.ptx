@@ -1,0 +1,137 @@
+// Bfloat16 arithmetic. A bf16 is the top half of a float: eight significand bits and
+// the float exponent range, so its bits are a shift away from a float and add, sub and
+// mul are exact in a float before one rounding back. The fused form is the same exact
+// integer routine the half uses, at bf16's widths, and is one rounding of the whole
+// expression. Sixteen results a lane, each on a grid point chosen so a wrong reading
+// is visible:
+//
+//   0  add 1.0 + b
+//   1  sub 1.0 - b
+//   2  mul 0.5 * b
+//   3  fma 2.0 * b + 1.0        one rounding of the product and the sum
+//   4  min 1.0, b               NaN hands back the other operand
+//   5  max 1.0, b
+//   6  neg b                    the sign bit, exact on a NaN
+//   7  abs b
+//   8  add 0.75, b, clamped      the [0, 1] clamp, not the destination's range
+//   9  mul 1.0, b, clamped
+//  10  fma 1.0, 1.0, 2^-9       exactly halfway between 1 and 1+2^-8: ties to even
+//  11  fma 1+2^-8, 1.0, 2^-9    halfway again, one ulp up, and even is two ulp
+//  12  add 3.3895314e38, 1.0    inside the range, so still the largest finite
+//  13  mul 0.5, largest finite   exactly half of it
+//  14  add 2^-133, 2^-133       the subnormal grid: 2^-132
+//  15  sub 2^-133, 2^-133       +0, not -0
+.version 7.8
+.target sm_90
+.address_size 64
+
+.visible .entry bf16ops(
+    .param .u64 bf16ops_param_0,    // in: one bf16 a lane
+    .param .u64 bf16ops_param_1     // out: sixteen bf16s a lane
+)
+{
+    .reg .b16 %hs<12>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [bf16ops_param_0];
+    ld.param.u64 %rd2, [bf16ops_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mul.wide.u32 %rd3, %r1, 2;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b16 %hs1, [%rd4];
+
+    mul.wide.u32 %rd5, %r1, 32;
+    add.u64 %rd6, %rd2, %rd5;
+
+    mov.b16 %hs2, 0x3F80;     // 1.0
+    mov.b16 %hs3, 0x3F00;     // 0.5
+    mov.b16 %hs4, 0x4000;     // 2.0
+
+    add.rn.bf16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6], %hs5;
+    sub.rn.bf16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6+2], %hs5;
+    mul.rn.bf16 %hs5, %hs3, %hs1;
+    st.global.b16 [%rd6+4], %hs5;
+    fma.rn.bf16 %hs5, %hs4, %hs1, %hs2;
+    st.global.b16 [%rd6+6], %hs5;
+    min.bf16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6+8], %hs5;
+    max.bf16 %hs5, %hs2, %hs1;
+    st.global.b16 [%rd6+10], %hs5;
+    neg.bf16 %hs5, %hs1;
+    st.global.b16 [%rd6+12], %hs5;
+    abs.bf16 %hs5, %hs1;
+    st.global.b16 [%rd6+14], %hs5;
+
+    mov.b16 %hs6, 0x3F40;     // 0.75
+    mov.b16 %hs11, 0x0000;    // 0, the floor of the clamp
+    add.rn.bf16 %hs5, %hs6, %hs1;
+    max.bf16 %hs5, %hs5, %hs11;   // `.sat` is not a bf16 modifier, so the [0, 1]
+    min.bf16 %hs5, %hs5, %hs2;    // clamp is the two instructions it stands for
+    st.global.b16 [%rd6+16], %hs5;
+    mul.rn.bf16 %hs5, %hs2, %hs1;
+    max.bf16 %hs5, %hs5, %hs11;
+    min.bf16 %hs5, %hs5, %hs2;
+    st.global.b16 [%rd6+18], %hs5;
+
+    mov.b16 %hs7, 0x3B00;     // 2^-9
+    fma.rn.bf16 %hs5, %hs2, %hs2, %hs7;
+    st.global.b16 [%rd6+20], %hs5;
+    mov.b16 %hs8, 0x3F81;     // 1 + 2^-8
+    fma.rn.bf16 %hs5, %hs8, %hs2, %hs7;
+    st.global.b16 [%rd6+22], %hs5;
+
+    mov.b16 %hs9, 0x7F7F;     // the largest finite bf16
+    add.rn.bf16 %hs5, %hs9, %hs2;
+    st.global.b16 [%rd6+24], %hs5;
+    mul.rn.bf16 %hs5, %hs3, %hs9;
+    st.global.b16 [%rd6+26], %hs5;
+    mov.b16 %hs10, 0x0001;    // the smallest subnormal, 2^-133
+    add.rn.bf16 %hs5, %hs10, %hs10;
+    st.global.b16 [%rd6+28], %hs5;
+    sub.rn.bf16 %hs5, %hs10, %hs10;
+    st.global.b16 [%rd6+30], %hs5;
+    ret;
+}
+
+// The packed form: two bf16s in one 32-bit register, low half first, and one
+// instruction for each pair. `0x3F803F00` is 1.0 above 0.5. One module, one
+// version and target: the packed entry is a second `.entry` here, not a file.
+
+.visible .entry bf16ops2(
+    .param .u64 bf16ops2_param_0,   // in: one bf16x2 a lane
+    .param .u64 bf16ops2_param_1    // out: six bf16x2s a lane
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [bf16ops2_param_0];
+    ld.param.u64 %rd2, [bf16ops2_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b32 %r2, [%rd4];
+
+    mul.wide.u32 %rd5, %r1, 24;
+    add.u64 %rd6, %rd2, %rd5;
+
+    mov.b32 %r3, 0x3F803F00;          // hi 1.0, lo 0.5
+    add.rn.bf16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6], %r4;
+    sub.rn.bf16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+4], %r4;
+    mul.rn.bf16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+8], %r4;
+    fma.rn.bf16x2 %r4, %r3, %r2, %r3;
+    st.global.b32 [%rd6+12], %r4;
+    min.bf16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+16], %r4;
+    max.bf16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6+20], %r4;
+    ret;
+}

@@ -1,0 +1,86 @@
+// brx.idx: an indirect branch through a jump table.
+//
+//   ts: .branchtargets L0, L1, L2;
+//   brx.idx %r1, ts;
+//
+// The table is a directive at a label, and the instruction names that label
+// second; the index comes first. The list is a list of destinations, not
+// storage, so nothing is loaded and nothing is declared.
+//
+//   brxidx   out[gid] = 10, 11, 12 for an index of 0, 1, 2, and 99 for anything
+//            else, which is the instruction after the table
+//   brxpred  the same table in the compact form `M<3>` (M0, M1, M2), behind a
+//            `@%p` guard: an index of 3 or more fails the guard and answers 99,
+//            an index of 2 answers 22 -- so a table that ignored the guard or
+//            mis-expanded the range answers a number the reference does not.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry brxidx(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  cvt.u64.u32 %rd3, %r1;
+  shl.b64 %rd3, %rd3, 2;
+  add.s64 %rd3, %rd1, %rd3;
+  ld.global.u32 %r1, [%rd3];
+  ts: .branchtargets L0, L1, L2;
+  brx.idx %r1, ts;
+  mov.u32 %r2, 99;
+  bra.uni Ldone;
+L0:
+  mov.u32 %r2, 10;
+  bra.uni Ldone;
+L1:
+  mov.u32 %r2, 11;
+  bra.uni Ldone;
+L2:
+  mov.u32 %r2, 12;
+  bra.uni Ldone;
+Ldone:
+  mov.u32 %r3, %tid.x;
+  cvt.u64.u32 %rd4, %r3;
+  shl.b64 %rd4, %rd4, 2;
+  add.s64 %rd4, %rd2, %rd4;
+  st.global.u32 [%rd4], %r2;
+  ret;
+}
+
+.visible .entry brxpred(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<4>;
+  .reg .pred %p<2>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  cvt.u64.u32 %rd3, %r1;
+  shl.b64 %rd3, %rd3, 2;
+  add.s64 %rd3, %rd1, %rd3;
+  ld.global.u32 %r1, [%rd3];
+  mov.u32 %r2, 99;
+  setp.lt.u32 %p1, %r1, 3;
+  ms: .branchtargets M<3>;
+  @%p1 brx.idx %r1, ms;
+  bra.uni Ldone2;
+M0:
+  mov.u32 %r2, 20;
+  bra.uni Ldone2;
+M1:
+  mov.u32 %r2, 21;
+  bra.uni Ldone2;
+M2:
+  mov.u32 %r2, 22;
+  bra.uni Ldone2;
+Ldone2:
+  mov.u32 %r3, %tid.x;
+  cvt.u64.u32 %rd4, %r3;
+  shl.b64 %rd4, %rd4, 2;
+  add.s64 %rd4, %rd2, %rd4;
+  st.global.u32 [%rd4], %r2;
+  ret;
+}

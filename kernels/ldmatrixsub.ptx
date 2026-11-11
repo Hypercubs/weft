@@ -18,9 +18,15 @@
 // The .x2 loads put a different pattern in the second matrix, 128 bytes on, so its
 // stride is checked rather than assumed. The fp4 load reads through a per-lane address
 // instead of a named symbol, which is the form a real kernel uses, and the signed form
-// (.s8.s4) is loaded a third time, so all three paths are covered.
-.version 8.3
-.target sm_100
+// is loaded a third time, so all three paths are covered.
+//
+// The signed nibble widen is written `.s8.s4`, which is a spelling ptxas does not have:
+// the 6-bit container is `.b6x16_p32`, the 4-bit one `.b4x16_p64` and both widen
+// unsigned, so the third load is the one instruction here the vendor assembler refuses.
+// Declaring PTX 9.4 and `sm_100f`, as this file used to, only moved the error to the
+// version line and hid the reason.
+.version 8.8
+.target sm_100a
 .address_size 64
 
 .visible .entry ldmsub(

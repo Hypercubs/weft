@@ -20,8 +20,6 @@
 .target sm_80
 .address_size 64
 
-.maxntid 128, 1, 1
-
 .visible .entry add_kernel(
 	.param .u64 add_kernel_param_0,
 	.param .u64 add_kernel_param_1,
@@ -29,6 +27,8 @@
 	.param .u64 add_kernel_param_3,
 	.param .u32 add_kernel_param_4
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .pred 	%p<3>;
 	.reg .f32 	%f<6>;

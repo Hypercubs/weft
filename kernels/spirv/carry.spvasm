@@ -1,0 +1,90 @@
+; The extended integer operations answer a struct of two words each: the result and the
+; bit that came out of it, both at the operand's own type. Every row is the definition
+; read off the spec rather than a twin's copy of it, and the two words of a product are
+; separated by a factor of 2^32 so that swapping them cannot pass.
+;   buffer 0: twelve words, one per row
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %main "spvcarry" %gid
+               OpName %main "spvcarry"
+               OpDecorate %gid BuiltIn GlobalInvocationId
+      %void = OpTypeVoid
+       %u32 = OpTypeInt 32 0
+       %u64 = OpTypeInt 64 0
+     %v3u64 = OpTypeVector %u64 3
+       %pin = OpTypePointer Input %v3u64
+      %pu32 = OpTypePointer CrossWorkgroup %u32
+    %pair32 = OpTypeStruct %u32 %u32
+    %pair64 = OpTypeStruct %u64 %u64
+      %fnty = OpTypeFunction %void %pu32
+       %gid = OpVariable %pin Input
+        %i0 = OpConstant %u64 0
+        %i1 = OpConstant %u64 1
+        %i2 = OpConstant %u64 2
+        %i3 = OpConstant %u64 3
+        %i4 = OpConstant %u64 4
+        %i5 = OpConstant %u64 5
+        %i6 = OpConstant %u64 6
+        %i7 = OpConstant %u64 7
+        %i8 = OpConstant %u64 8
+        %i9 = OpConstant %u64 9
+       %i10 = OpConstant %u64 10
+       %i11 = OpConstant %u64 11
+        %c1 = OpConstant %u32 1
+        %c5 = OpConstant %u32 5
+        %c7 = OpConstant %u32 7
+     %cffff = OpConstant %u32 4294967295
+  %c10000 = OpConstant %u32 65536
+    %c1u64 = OpConstant %u64 1
+ %cffffu64 = OpConstant %u64 18446744073709551615
+      %main = OpFunction %void None %fnty
+       %out = OpFunctionParameter %pu32
+     %entry = OpLabel
+      %ac00 = OpPtrAccessChain %pu32 %out %i0
+      %ac01 = OpPtrAccessChain %pu32 %out %i1
+      %ac02 = OpPtrAccessChain %pu32 %out %i2
+      %ac03 = OpPtrAccessChain %pu32 %out %i3
+      %ac04 = OpPtrAccessChain %pu32 %out %i4
+      %ac05 = OpPtrAccessChain %pu32 %out %i5
+      %ac06 = OpPtrAccessChain %pu32 %out %i6
+      %ac07 = OpPtrAccessChain %pu32 %out %i7
+      %ac08 = OpPtrAccessChain %pu32 %out %i8
+      %ac09 = OpPtrAccessChain %pu32 %out %i9
+      %ac10 = OpPtrAccessChain %pu32 %out %i10
+      %ac11 = OpPtrAccessChain %pu32 %out %i11
+        %pa = OpIAddCarry %pair32 %cffff %c1
+      %pa_l = OpCompositeExtract %u32 %pa 0
+      %pa_c = OpCompositeExtract %u32 %pa 1
+               OpStore %ac00 %pa_l
+               OpStore %ac01 %pa_c
+        %sb = OpISubBorrow %pair32 %c5 %c7
+      %sb_l = OpCompositeExtract %u32 %sb 0
+      %sb_b = OpCompositeExtract %u32 %sb 1
+               OpStore %ac02 %sb_l
+               OpStore %ac03 %sb_b
+        %sb2 = OpISubBorrow %pair32 %c7 %c5
+      %sb2_b = OpCompositeExtract %u32 %sb2 1
+               OpStore %ac04 %sb2_b
+        %um = OpUMulExtended %pair32 %cffff %cffff
+      %um_l = OpCompositeExtract %u32 %um 0
+      %um_h = OpCompositeExtract %u32 %um 1
+               OpStore %ac05 %um_l
+               OpStore %ac06 %um_h
+        %sm = OpSMulExtended %pair32 %cffff %cffff
+      %sm_l = OpCompositeExtract %u32 %sm 0
+      %sm_h = OpCompositeExtract %u32 %sm 1
+               OpStore %ac07 %sm_l
+               OpStore %ac08 %sm_h
+        %um2 = OpUMulExtended %pair32 %c10000 %c10000
+      %um2_l = OpCompositeExtract %u32 %um2 0
+      %um2_h = OpCompositeExtract %u32 %um2 1
+               OpStore %ac09 %um2_l
+               OpStore %ac10 %um2_h
+        %pc = OpIAddCarry %pair64 %cffffu64 %c1u64
+      %pc_c = OpCompositeExtract %u64 %pc 1
+      %pc_cw = OpUConvert %u32 %pc_c
+               OpStore %ac11 %pc_cw
+               OpReturn
+               OpFunctionEnd

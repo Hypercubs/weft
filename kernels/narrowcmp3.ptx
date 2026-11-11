@@ -1,0 +1,42 @@
+// The packed forms: one instruction compares both halves. `set` answers a word with a
+// 0xFFFF per half that is true, and `setp` answers a pair of predicates written
+// `p|q`. `0x3C003800` is 1.0 above 0.5, so a lane equal to that pair answers all ones
+// and a lane below it answers 0xFFFF in the low half only.
+//
+//   0  set.eq  a, (1.0, 0.5)     the mask
+//   1  setp.lt a, (1.0, 0.5) p   low half below 0.5
+//   2  setp.lt a, (1.0, 0.5) q   high half below 1.0
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry narrowcmp2(
+    .param .u64 narrowcmp2_param_0,     // in: one half2 a lane
+    .param .u64 narrowcmp2_param_1      // out: three words a lane
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [narrowcmp2_param_0];
+    ld.param.u64 %rd2, [narrowcmp2_param_1];
+    mov.u32 %r1, %tid.x;
+
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.b32 %r2, [%rd4];
+
+    mul.wide.u32 %rd5, %r1, 12;
+    add.u64 %rd6, %rd2, %rd5;
+
+    mov.b32 %r3, 0x3C003800;  // hi 1.0, lo 0.5
+    set.eq.f16x2.f16x2 %r4, %r2, %r3;
+    st.global.b32 [%rd6], %r4;
+    setp.lt.f16x2 %p1|%p2, %r2, %r3;
+    selp.b32 %r5, 1, 0, %p1;
+    st.global.b32 [%rd6+4], %r5;
+    selp.b32 %r6, 1, 0, %p2;
+    st.global.b32 [%rd6+8], %r6;
+    ret;
+}

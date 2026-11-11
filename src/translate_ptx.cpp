@@ -107,6 +107,7 @@ std::string cpp_type(const std::string& ptx) {
   if (ptx == ".b32" || ptx == ".u32") return "uint32_t";
   if (ptx == ".s32") return "int32_t";
   if (ptx == ".b64" || ptx == ".u64") return "uint64_t";
+  if (ptx == ".b128") return "weft_u128";
   if (ptx == ".s64") return "int64_t";
   if (ptx == ".b16" || ptx == ".u16") return "uint16_t";
   if (ptx == ".s16") return "int16_t";
@@ -127,6 +128,19 @@ struct Reg {
 Reg parse_reg(const std::string& tok) {
   Reg r;
   if (tok.empty() || tok[0] != '%') return r;
+  // The special registers that carry no dot. PTX reserves these names, so a register a
+  // module declares cannot shadow one, and the whole token is compared rather than the
+  // word before a dot: `lanemask_eq` has an underscore, which the name scanner does not
+  // read, and the index stripping below would otherwise turn it into a plain register.
+  static const char* const kNoDot[] = {"laneid",  "warpid",      "nwarpid",
+                                       "lanemask_eq", "lanemask_lt", "lanemask_le",
+                                       "lanemask_gt", "lanemask_ge"};
+  for (const char* name : kNoDot)
+    if (tok.compare(1, std::string::npos, name) == 0) {
+      r.special = name;
+      r.ok = true;
+      return r;
+    }
   size_t i = 1, s = 1;
   while (i < tok.size() && is_word(tok[i])) i++;
   std::string head = tok.substr(s, i - s);
@@ -152,6 +166,7 @@ std::string sanitize(const std::string& s) {
 int cpp_size(const std::string& t) {
   if (t == "float" || t == "uint32_t" || t == "int32_t") return 4;
   if (t == "double" || t == "uint64_t" || t == "int64_t") return 8;
+  if (t == "weft_u128") return 16;
   if (t == "uint16_t" || t == "int16_t") return 2;
   if (t == "uint8_t" || t == "int8_t" || t == "bool") return 1;
   return 0;
@@ -210,8 +225,30 @@ struct Emitter {
   bool vec_control = false;  // emitted text is control flow: do not wrap it
   bool vec_side = false;     // emitted text already contains its lane loop
   bool vec_select = true;    // store() masks by lane; off inside a lane loop
+  // The condition code: PTX's one flag that outlives the instruction that set it.
+  // `add.cc` and `sub.cc` write it, `addc` and `subc` read it and may write it
+  // again, and that chain is how a 64-bit or a 128-bit integer add is spelled. It is
+  // a member of the per-thread state for the same reason a register is, because the
+  // instruction that reads it is a different one. The vector back end keeps a
+  // register per lane and has no place for a flag that is not one of them, so a
+  // kernel holding a chain stays on the per-lane back end, where a thread has one.
+  std::vector<std::string> cc_members;
+  std::string cc_name;
+  int cc_next = 0;
+  // The member is declared here and reached the way a register is, through `s`, so the
+  // statement that writes it and the one that reads it name the same slot.
+  std::string cc_member() {
+    if (cc_name.empty()) {
+      cc_name = "weft_cc" + std::to_string(cc_next++);
+      cc_members.push_back("uint32_t " + cc_name + ";");
+    }
+    return "s->" + cc_name;
+  }
   int label_count = 1;                 // 0 is the entry
   std::map<std::string, int> label_ids;
+  // `ts: .branchtargets L1, L2, L3;` names a jump table a `brx.idx` indexes, and
+  // the label at the start of that line is what the instruction names.
+  std::map<std::string, std::vector<std::string>> brxtab;
 
   int label_id(const std::string& name) {
     auto it = label_ids.find(name);
@@ -232,6 +269,72 @@ struct Emitter {
     long stride = 0;   // coefficient of the lane index
   };
   std::map<std::string, VecVal> vec_vals;
+  // How many times the body writes each register. The model folds a register's
+  // value into the text a memory instruction carries, so a register written twice
+  // would be folded in with the number it held at the first write: a loop counter
+  // then reads as a constant and every iteration stores to the first iteration's
+  // address. Only a register with a single definition anywhere in the body is
+  // followed, which is what a real kernel's address chain looks like.
+  std::map<std::string, int> reg_defs;
+
+  void scan_defs(const std::string& body) {
+    size_t q = 0;
+    while (q < body.size()) {
+      size_t semi = body.find(';', q);
+      if (semi == std::string::npos) semi = body.size();
+      std::string s = trim(body.substr(q, semi - q));
+      q = semi + 1;
+      const size_t colon = s.find(':');
+      if (colon != std::string::npos && colon > 0 &&
+          s.substr(0, colon).find_first_of(" \t.") == std::string::npos)
+        s = trim(s.substr(colon + 1));
+      if (s.empty() || s[0] == '.') continue;
+      if (s[0] == '@') {
+        size_t i = 1;
+        while (i < s.size() && !std::isspace((unsigned char)s[i])) i++;
+        s = trim(s.substr(i));
+      }
+      const size_t sp = s.find_first_of(" \t");
+      if (sp == std::string::npos) continue;
+      std::string dst = trim(s.substr(sp + 1));
+      const size_t comma = dst.find(',');
+      if (comma != std::string::npos) dst = trim(dst.substr(0, comma));
+      std::string list;
+      if (dst.find('{') != std::string::npos) {
+        list = dst.substr(dst.find('{') + 1);
+        if (list.find('}') != std::string::npos) list = list.substr(0, list.find('}'));
+      }
+      for (const auto& t : split_top(list.empty() ? dst : list, ',')) {
+        Reg r = parse_reg(trim(t));
+        if (!r.ok || !r.special.empty()) continue;
+        reg_defs[reg_key(r)]++;
+      }
+    }
+  }
+
+  // A `call.uni` names a `.func` in this module, and PTX gives a function its own
+  // register file: the callee's `%rd1` is not the caller's. So the callee is
+  // translated into a function of its own, with a state struct of its own, and the
+  // call site passes the arguments by value. `callees` is the module's table of
+  // functions that translated, `callee_errs` the reason for the ones that did not,
+  // and `callee_args` maps a callee's parameter names to its own arguments, which
+  // is what `ld.param` inside it reads.
+  std::map<std::string, std::vector<std::string>> callees;
+  std::map<std::string, std::string> callee_errs;
+  std::map<std::string, std::string> callee_args;
+  std::vector<std::pair<std::string, std::string>> callee_members;
+  // A callee's answer is a field of its state struct rather than the generated
+  // function's return type: the body is a switch over a program counter, so the `ret`
+  // that ends it is a `return` from the middle of that switch, and a value has to be
+  // somewhere a jump cannot drop. `callee_rets` is what the module knows about each
+  // function it translated (empty for one that returns nothing), `callee_ret` is this
+  // function's own parameter name for the slot it writes.
+  std::map<std::string, std::string> callee_rets;
+  std::string callee_ret;
+  // A function that can give the worker back in the middle -- a rendezvous inside it,
+  // or a call to one -- makes its call site a resume point, so the caller has to know
+  // that before it writes the call.
+  std::map<std::string, bool> callee_suspends;
 
   static std::string reg_key(const Reg& r) { return r.base + "#" + std::to_string(r.index); }
 
@@ -263,7 +366,10 @@ struct Emitter {
       return v;
     }
     auto it = vec_vals.find(reg_key(r));
-    return it == vec_vals.end() ? VecVal{} : it->second;
+    if (it == vec_vals.end()) return VecVal{};
+    auto d = reg_defs.find(reg_key(r));
+    if (d != reg_defs.end() && d->second > 1) return VecVal{};
+    return it->second;
   }
 
   VecVal vec_add(const VecVal& a, const VecVal& b, bool negate) {
@@ -304,6 +410,14 @@ struct Emitter {
     }
     Reg d = parse_reg(args[0]);
     if (!d.ok || !d.special.empty()) return;
+    // A predicated write leaves the register alone in the lanes that fail the
+    // predicate, so what it holds afterwards is conditional. Folding that into an
+    // address would be the same mistake as folding a loop counter: the value is
+    // right for the lanes that ran and stale for the ones that did not.
+    if (!vec_pred.empty()) {
+      vec_vals[reg_key(d)] = VecVal{};
+      return;
+    }
 
     const std::string op = opcode.substr(0, opcode.find('.'));
     VecVal a = args.size() > 1 ? vec_sym(args[1]) : VecVal{};
@@ -477,6 +591,14 @@ struct Emitter {
       }
     }
     if (!vec || !vec_select) return dst + " = " + core + ";";
+    // A 128-bit value is a struct, so the per-lane bitwise select that stands in for a
+    // predicate has no operands to work on: assign on the lanes that ran and leave the
+    // others alone, which is what the predicate asks for.
+    if (r.ok) {
+      auto wide = reg_types.find(r.base);
+      if (wide != reg_types.end() && cpp_size(wide->second) > 8)
+        return "if (am[l]) " + dst + " = " + core + ";";
+    }
     // Inactive lanes keep what they had: they are on a different path. This is a
     // bitwise select rather than a ternary because a ternary over a per-lane
     // mask is the one shape the vectoriser refuses: as a ternary these loops
@@ -534,11 +656,38 @@ struct Emitter {
       if (r.special == "ctaid.y" || r.special == "ctaid.z") return "0u";
       if (r.special == "nctaid.x") return "((ctx.grid + ctx.tg_size - 1) / ctx.tg_size)";
       if (r.special == "laneid") return vec ? "l" : "(ctx.lid & 31u)";
+      // The lane masks are the warp's own bit patterns and nothing more: each is a shift
+      // of one or two ones, which is what a warp intrinsic asks for when it wants the
+      // lanes below or above it. They are written as complements of a shift rather than
+      // shifts of the complement, so the lane at 31 never shifts by 32, which is not a
+      // shift this language defines. `full` and `activemask` are not these: they depend on
+      // which lanes are actually running, so they are still refused rather than guessed.
+      {
+        const std::string lane = vec ? "l" : std::string("(ctx.lid & 31u)");
+        if (r.special == "lanemask_eq") return "(1u << " + lane + ")";
+        if (r.special == "lanemask_lt") return "((1u << " + lane + ") - 1u)";
+        if (r.special == "lanemask_le") return "((2u << " + lane + ") - 1u)";
+        if (r.special == "lanemask_gt") return "~((2u << " + lane + ") - 1u)";
+        if (r.special == "lanemask_ge") return "~((1u << " + lane + ") - 1u)";
+      }
+      // Which warp of the block this lane is in, and how many the block has: both are the
+      // block's geometry, not the hardware's, so a 64-lane block has two and lanes 0..31
+      // are in the first.
+      if (r.special == "warpid") return vec ? "0u" : "(ctx.lid / 32u)";
+      if (r.special == "nwarpid") return "((ctx.tg_size + 31u) / 32u)";
       err = "unsupported special register %" + r.special;
       return "0";
     }
     auto rc = reg_counts.find(r.base);
-    if (rc != reg_counts.end() && (long)r.index >= rc->second) {
+    // A register that is *never* declared used to be emitted as a field of the state
+    // struct that does not exist -- `%fd1` became `s->fd[1]` -- so the module failed in
+    // the C++ compiler rather than here, with an error that names generated code. The
+    // name is what is wrong, so the name is what the report carries.
+    if (rc == reg_counts.end()) {
+      err = "register %" + r.base + std::to_string(r.index) + " is used but never declared";
+      return "0";
+    }
+    if ((long)r.index >= rc->second) {
       err = "register %" + r.base + std::to_string(r.index) + " is outside the declared %" +
             r.base + "<" + std::to_string(rc->second) + ">";
       return "0";
@@ -891,7 +1040,10 @@ std::string Emitter::emit(const std::string& raw) {
   for (const auto& p : parts) {
     std::string t = cpp_type("." + p);  // split on '.' drops the dot
     if (!t.empty()) ty = t;
-    if (p == "shared") shared = true;
+    // `.shared`, `.shared::cta` and `.shared::cluster` are the same space to a launch
+    // that is one CTA wide: the sub-qualifier picks which CTA's window the address is
+    // taken in, and there is only one window here.
+    if (p.rfind("shared", 0) == 0) shared = true;
     if (p == "param") param = true;
     if (p == "global") global = true;
     if (p == "const") is_const = true;
@@ -910,6 +1062,22 @@ std::string Emitter::emit(const std::string& raw) {
 
   if (op == "ld" || op == "st") {
     if (!need(2)) return "";
+    // A 128-bit move is the one value wider than the arithmetic types: `weft_u128` is
+    // a pair of 64-bit halves, and the load and the store each read or write the whole
+    // sixteen bytes in one access, which is what the isa promises. Nothing computes
+    // with it, so it never meets the scalar paths. The register it names has to be
+    // declared to hold sixteen bytes: a `.b64` name in that position is not a narrower
+    // load, it is a module ptxas would reject, so it is refused by name here too.
+    if (has_part(parts, "b128")) {
+      const std::string& tok = (op == "ld") ? args[0] : args[1];
+      Reg br = parse_reg(trim(tok));
+      auto bt = br.ok ? reg_types.find(br.base) : reg_types.end();
+      if (bt == reg_types.end() || cpp_size(bt->second) != 16) {
+        err = "'" + opcode + "' moves sixteen bytes, which needs a .b128 register, not '" +
+              trim(tok) + "'";
+        return "";
+      }
+    }
     if (ty.empty()) ty = "uint32_t";
     if (shared && !shared_size) {
       err = "shared memory used without a .shared declaration";
@@ -941,6 +1109,10 @@ std::string Emitter::emit(const std::string& raw) {
       if (!param) note_width(name, base, ty);
       auto load_at = [&](const std::string& a) -> std::string {
         if (param) {
+          // A callee's own parameter is an argument the call site passed, not a
+          // binding: `ld.param` inside a `.func` reads the value, not the buffer.
+          auto ca = callee_args.find(name);
+          if (ca != callee_args.end()) return "(" + ty + ")" + ca->second;
           auto b = params.find(name);
           auto sc = scalars.find(name);
           // `[buf + 8]` is a field inside what the binding points at, so the offset
@@ -990,6 +1162,18 @@ std::string Emitter::emit(const std::string& raw) {
     std::string addr, name, base;
     if (!mem_operand(args[0], addr, name, &base)) return "";
     if (!param) note_width(name, base, ty);
+    if (param) {
+      // `st.param.b32 [rv], %r;` is how a called function hands a value back: the
+      // parameter is the return slot, and here that is a field of the state the caller
+      // reads after the call. A store to any other parameter is not a move this side
+      // has, and is refused by name rather than aimed at address zero.
+      if (!callee_ret.empty() && name == callee_ret) {
+        const std::string vty = (msl && ty == "double") ? "uint64_t" : ty;
+        return guard + "s->weft_ret = " + operand_as(args[1], vty) + ";";
+      }
+      err = "a store to the parameter '" + name + "', which is not the function's return slot";
+      return "";
+    }
     auto store_at = [&](const std::string& a, const std::string& v) -> std::string {
       if (shared)
         return "*((" + addr_space("threadgroup", false) + ty_mem + "*)(sh + " + a + ")) = " + v +
@@ -1030,8 +1214,13 @@ std::string Emitter::emit(const std::string& raw) {
       list = list.substr(0, list.find('}'));
       auto parts2 = split_top(list, ',');
       if (parts2.size() != 2) { err = "mov with a brace list needs two registers"; return ""; }
-      return guard + store(parts2[0], "(uint32_t)(" + reg_expr(args[1]) + " & 0xFFFFFFFFu)", "uint32_t") +
-             " " + store(parts2[1], "(uint32_t)((" + reg_expr(args[1]) + ") >> 32)", "uint32_t");
+      // The halves are split at the source's own width: a `.b64` gives 32 bits a
+      // half, a `.b32` (the f16x2 and packed-narrow words) 16.
+      const bool wide = reg_type_of(args[1]) == "uint64_t";
+      const std::string mask = wide ? "0xFFFFFFFFu" : "0xFFFFu";
+      const std::string sh = wide ? "32" : "16";
+      return guard + store(parts2[0], "(uint32_t)(" + reg_expr(args[1]) + " & " + mask + ")", "uint32_t") +
+             " " + store(parts2[1], "(uint32_t)((" + reg_expr(args[1]) + ") >> " + sh + ")", "uint32_t");
     }
     if (braced(args[1])) {
       std::string list = trim(args[1]);
@@ -1360,6 +1549,50 @@ std::string Emitter::emit(const std::string& raw) {
     // A 16-bit float read as a *source*: its bits sit in a b16 register, so the
     // conversion starts by widening them back to a float, the exact inverse of what
     // the encode does on the way down, and the form `__half2float` compiles to.
+    // cvt.pack.sat.<narrow>.<wide>.b32 d, a, b, c;
+    //
+    // A different instruction that shares the opcode, so it is answered before the
+    // conversion modifiers are read. Both sources are saturated to the narrow type
+    // and packed into d; the eight- and sixteen-bit forms differ in how much of c
+    // survives, because two narrow values fill the low half and leave the high half
+    // of d alone.
+    if (opcode.find("pack") != std::string::npos) {
+      if (!need(4)) return "";
+      std::string narrow, wide;
+      for (const auto& t : parts) {
+        if (t == "u8" || t == "s8" || t == "u16" || t == "s16") narrow = t;
+        else if (t == "s32" || t == "u32") wide = t;
+      }
+      if (narrow.empty() || wide.empty()) {
+        err = "'" + opcode + "' does not name the narrow type it packs into";
+        return "";
+      }
+      if (opcode.find(".sat") == std::string::npos) {
+        err = "'" + opcode + "' without .sat is a different instruction, and the only "
+              "form here is the saturating pack";
+        return "";
+      }
+      auto pclamp = [&](const std::string& v, const std::string& lo, const std::string& hi) {
+        return math("min", math("max", "(int32_t)(" + v + "), " + lo) + ", " + hi);
+      };
+      const std::string a = operand_as(args[1], "uint32_t");
+      const std::string b = operand_as(args[2], "uint32_t");
+      const std::string c = operand_as(args[3], "uint32_t");
+      const bool low = narrow[0] == 'u';
+      const bool small = narrow == "u8" || narrow == "s8";
+      const std::string lo_v = low ? "0" : (small ? "-128" : "-32768");
+      const std::string hi_v = low ? (small ? "255" : "65535") : (small ? "127" : "32767");
+      std::string e;
+      if (small) {
+        e = "((" + c + ") & 0xFFFF0000u) | ((uint32_t)(" + pclamp(a, lo_v, hi_v) +
+            ") & 0xFFu) | (((uint32_t)(" + pclamp(b, lo_v, hi_v) + ") & 0xFFu) << 8)";
+      } else {
+        e = "((uint32_t)(" + pclamp(a, lo_v, hi_v) + ") & 0xFFFFu) | (((uint32_t)(" +
+            pclamp(b, lo_v, hi_v) + ") & 0xFFFFu) << 16)";
+      }
+      return guard + store(args[0], e, "uint32_t");
+    }
+
     std::string src_half;
     for (size_t i = 1; i < parts.size(); i++) {
       const std::string t = cpp_type("." + parts[i]);
@@ -1428,9 +1661,14 @@ std::string Emitter::emit(const std::string& raw) {
       const bool to_zero = mode == "rz";
       const bool satf = has_part(parts, "satfinite");
       const bool relu = has_part(parts, "relu");
-      std::string v = src_half.empty()
-                          ? operand_as(args[1], "float")
-                          : (src_half + operand_as(args[1], "uint16_t") + ", 0)");
+      // A double source is bits on the GPU target and a number on the CPU one, so it is
+      // read rather than cast: `(float)` of a `uint64_t` would convert the pattern.
+      std::string v;
+      if (!src_half.empty()) v = src_half + operand_as(args[1], "uint16_t") + ", 0)";
+      else if (has_part(parts, "f64"))
+        v = msl ? "weft_bitcast<float>(weft_fp64::to_f32(" + operand_as(args[1], "uint64_t") + "))"
+                : "(float)" + operand_as(args[1], "double");
+      else v = operand_as(args[1], "float");
       if (relu) v = "((" + v + " < 0.0f) ? 0.0f : (" + v + "))";
       // `.sat` is the [0, 1] clamp with a NaN flushed to +0; `.satfinite` is the
       // destination's largest finite value. Two modifiers, two answers.
@@ -1507,7 +1745,11 @@ std::string Emitter::emit(const std::string& raw) {
         v = std::string("weft_fp64::") +
             (mode == "rn" ? "rne_bits(" : mode == "rm" ? "floor_bits(" : "ceil_bits(") + v + ")";
       const bool sgn = dstty == "int32_t" || dstty == "int64_t";
-      const std::string c = std::string("weft_fp64::to_") + (sgn ? "i64(" : "u64(") + v + ")";
+      // A 32-bit destination clamps to its own range: the 64-bit answer narrowed to 32
+      // bits wraps, and 1e20 came back as 0x63100000 instead of INT32_MAX.
+      const bool narrow = dstty == "int32_t" || dstty == "uint32_t";
+      const std::string c = std::string("weft_fp64::to_") + (sgn ? "i" : "u") +
+                            (narrow ? "32(" : "64(") + v + ")";
       return guard + store(args[0], "(" + dstty + ")" + c, dstty);
     }
     // The source is coerced to the *instruction's* type, not the register's:
@@ -1517,6 +1759,15 @@ std::string Emitter::emit(const std::string& raw) {
     if (!src_half.empty()) src = src_half + src + ", 0)";
     const bool dst_f = dstty == "float" || dstty == "double";
     const bool src_f = ty == "float" || ty == "double" || !src_half.empty();
+    // A conversion to an integer clamps: the destination's ends for a value past
+    // them, zero for a NaN. Anything else keeps the cast it had.
+    auto f2i = [&](const std::string& v) -> std::string {
+      if (dstty == "int32_t") return "weft_f2i32(" + v + ")";
+      if (dstty == "uint32_t") return "weft_f2u32(" + v + ")";
+      if (dstty == "int64_t") return "weft_f2i64(" + v + ")";
+      if (dstty == "uint64_t") return "weft_f2u64(" + v + ")";
+      return "(" + dstty + ")(" + v + ")";
+    };
     // Rounding only exists between floats, and between a float and an integer.
     // Everything else is a truncation and a cast.
     std::string e;
@@ -1543,14 +1794,19 @@ std::string Emitter::emit(const std::string& raw) {
         e = "(" + dstty + ")(" + rounded_math(fn, src) + ")";
       }
     } else if (!mode.empty() && src_f) {
-      // Float to integer: the cast truncates, so .rz needs nothing and the
-      // other three round first. Rounding a float in double keeps .rn exact for
-      // every f32 input, halves included.
-      if (mode == "rz") e = "(" + dstty + ")(" + src + ")";
+      // Float to integer: the device clamps an out-of-range value to the
+      // destination's ends and answers zero for a NaN (the `.NTZ` bit every `F2I`
+      // carries), so the conversion is a helper rather than a cast. `(int)` of an
+      // infinity is undefined in C++ and answered 0, where the device answers
+      // INT_MAX. `.rz` truncates and the other three round before the clamp, so
+      // rounding first and clamping once is the same order the hardware uses.
+      if (mode == "rz") e = f2i(src);
       else {
         const char* fn = mode == "rn" ? "nearbyint" : (mode == "rm" ? "floor" : "ceil");
-        e = "(" + dstty + ")(" + rounded_math(fn, src) + ")";
+        e = f2i(rounded_math(fn, src));
       }
+    } else if (src_f) {
+      e = f2i(src);
     } else {
       e = "(" + dstty + ")(" + src + ")";
     }
@@ -1578,6 +1834,63 @@ std::string Emitter::emit(const std::string& raw) {
     else if (cmp == "ls") sym = "<=";
     else if (cmp == "hi") sym = ">";
     else if (cmp == "hs") sym = ">=";
+    // A narrow float's word order is not its value order: the bits of -1 sit above
+    // the bits of 1, so the word compare this block would otherwise make calls -0.5
+    // greater than 0.25. Widening to float is exact, so compare the widened pair.
+    if (has_part(parts, "f16x2") || has_part(parts, "bf16x2")) {
+      // `setp.lt.f16x2 p|q, a, b` answers one predicate per half, and the pair is
+      // written as two destinations joined by a bar.
+      if (!sym || args.size() < 3) {
+        err = "'" + opcode + "' is not a packed comparison of two halves";
+        return "";
+      }
+      const std::string dsts = trim(args[0]);
+      const size_t bar = dsts.find('|');
+      if (bar == std::string::npos) {
+        err = "'" + opcode + "' compares two packed halves and answers two predicates, "
+              "which have to be named as p|q";
+        return "";
+      }
+      const std::string dl = dsts.substr(0, bar);
+      const std::string dh = dsts.substr(bar + 1);
+      const std::string pre = has_part(parts, "bf16x2") ? "weft_bf16_" : "weft_f16_";
+      const std::string A = operand_as(args[1], "uint32_t");
+      const std::string B = operand_as(args[2], "uint32_t");
+      const std::string la = "(float)" + pre + "val((uint16_t)" + A + ")";
+      const std::string lb = "(float)" + pre + "val((uint16_t)" + B + ")";
+      const std::string ha = "(float)" + pre + "val((uint16_t)(" + A + " >> 16))";
+      const std::string hb = "(float)" + pre + "val((uint16_t)(" + B + " >> 16))";
+      return guard + store(dl, "(" + la + " " + sym + " " + lb + ")", "bool") + " " +
+             store(dh, "(" + ha + " " + sym + " " + hb + ")", "bool");
+    }
+    if (has_part(parts, "f16") || has_part(parts, "bf16")) {
+      if (!need(3)) return "";
+      const std::string pre = has_part(parts, "bf16") ? "weft_bf16_" : "weft_f16_";
+      const std::string va = "((float)" + pre + "val(" + operand_as(args[1], "uint16_t") + "))";
+      const std::string vb = "((float)" + pre + "val(" + operand_as(args[2], "uint16_t") + "))";
+      if (cmp == "nan" || cmp == "num") {
+        const std::string any = "(" + va + " != " + va + " || " + vb + " != " + vb + ")";
+        return guard + store(args[0], cmp == "nan" ? any : ("(!" + any + ")"), "bool");
+      }
+      if (!sym) {
+        err = "'" + opcode + "' is not a comparison of two halves: ." + cmp +
+              " orders unsigned integers";
+        return "";
+      }
+      std::string both = "(" + va + " " + sym + " " + vb + ")";
+      // `setp.lt.and p|q, a, b, c` folds in a second predicate; the fold is the same
+      // operator whichever type the comparison was on.
+      for (const auto& p : parts) {
+        if (p != "and" && p != "or" && p != "xor") continue;
+        if (args.size() < 4) {
+          err = "'" + opcode + "' names ." + p + " without the predicate it combines with";
+          return "";
+        }
+        const char* bs = p == "and" ? " && " : (p == "or" ? " || " : " ^ ");
+        both = both + bs + operand_as(args[3], "bool");
+      }
+      return guard + store(args[0], both, "bool");
+    }
     // NaN tests are not comparisons: .nan is true when *either* operand is a
     // NaN, .num when neither is, and every other predicate is ordered.
     if (msl && ty == "double" && (cmp == "nan" || cmp == "num")) {
@@ -1616,6 +1929,163 @@ std::string Emitter::emit(const std::string& raw) {
       cond = cond + bs + operand_as(args[3], "bool");
     }
     return guard + store(args[0], cond, "bool");
+  }
+
+  // `set` is the mask answer to the same comparison `setp` turns into a predicate:
+  // every bit of the destination set for true, and 1.0 for a float one.
+  if (op == "set") {
+    if (!need(3)) return "";
+    const std::string cmp = parts.size() > 1 ? parts[1] : "";
+    const char* sym = cmp == "eq"   ? "=="
+                      : cmp == "ne" ? "!="
+                      : cmp == "lt" ? "<"
+                      : cmp == "le" ? "<="
+                      : cmp == "gt" ? ">"
+                      : cmp == "ge" ? ">="
+                      : cmp == "lo" ? "<"
+                      : cmp == "ls" ? "<="
+                      : cmp == "hi" ? ">"
+                      : cmp == "hs" ? ">="
+                                    : nullptr;
+    std::string dty = reg_type_of(args[0]);
+    if (dty.empty()) dty = "uint32_t";
+    const std::string on = dty == "float"    ? "1.0f"
+                           : dty == "double" ? "1.0"
+                           : cpp_size(dty) == 8 ? "0xFFFFFFFFFFFFFFFFull"
+                           : cpp_size(dty) == 2 ? "(uint16_t)0xFFFFu"
+                                                : "0xFFFFFFFFu";
+    std::string cond;
+    if (has_part(parts, "f16x2") || has_part(parts, "bf16x2")) {
+      // A packed comparison answers a mask per half in one word, which is the same
+      // widened compare run twice: the low answer in the low half of the result.
+      if (!sym) {
+        err = "'" + opcode + "' is not a packed comparison of two halves: ." + cmp +
+              " orders unsigned integers";
+        return "";
+      }
+      const std::string pre2 = has_part(parts, "bf16x2") ? "weft_bf16_" : "weft_f16_";
+      const std::string A = operand_as(args[1], "uint32_t");
+      const std::string B = operand_as(args[2], "uint32_t");
+      const std::string la = "(float)" + pre2 + "val((uint16_t)" + A + ")";
+      const std::string lb = "(float)" + pre2 + "val((uint16_t)" + B + ")";
+      const std::string ha = "(float)" + pre2 + "val((uint16_t)(" + A + " >> 16))";
+      const std::string hb = "(float)" + pre2 + "val((uint16_t)(" + B + " >> 16))";
+      const std::string m = "((" + la + " " + sym + " " + lb + ") ? 0xFFFFu : 0u) | ((" + ha +
+                            " " + sym + " " + hb + ") ? 0xFFFF0000u : 0u)";
+      return guard + store(args[0], m, dty);
+    }
+    if (has_part(parts, "f16") || has_part(parts, "bf16")) {
+      // The same widening `setp` does: a narrow float's words are not ordered like
+      // its values.
+      const std::string pre = has_part(parts, "bf16") ? "weft_bf16_" : "weft_f16_";
+      const std::string va = "((float)" + pre + "val(" + operand_as(args[1], "uint16_t") + "))";
+      const std::string vb = "((float)" + pre + "val(" + operand_as(args[2], "uint16_t") + "))";
+      if (cmp == "nan" || cmp == "num") {
+        const std::string any = "(" + va + " != " + va + " || " + vb + " != " + vb + ")";
+        cond = cmp == "nan" ? any : ("(!" + any + ")");
+      } else if (sym) {
+        cond = "(" + va + " " + sym + " " + vb + ")";
+      }
+    } else if (cmp == "nan" || cmp == "num") {
+      if (ty != "float" && ty != "double") {
+        err = "'" + opcode + "' tests for a NaN, which an integer is not";
+        return "";
+      }
+      if (msl && ty == "double") {
+        const std::string a = operand_as(args[1], "uint64_t"), b = operand_as(args[2], "uint64_t");
+        const std::string any =
+            "(weft_fp64::is_nan(" + a + ") || weft_fp64::is_nan(" + b + "))";
+        cond = cmp == "nan" ? any : ("(!" + any + ")");
+      } else {
+        const std::string a = operand_as(args[1], ty), b = operand_as(args[2], ty);
+        const std::string any = "(" + a + " != " + a + " || " + b + " != " + b + ")";
+        cond = cmp == "nan" ? any : ("(!" + any + ")");
+      }
+    } else if (sym) {
+      if (msl && ty == "double") {
+        const std::string a = operand_as(args[1], "uint64_t"), b = operand_as(args[2], "uint64_t");
+        cond = cmp == "eq"   ? "weft_fp64::eq(" + a + ", " + b + ")"
+               : cmp == "ne" ? "(!weft_fp64::eq(" + a + ", " + b + "))"
+               : cmp == "lt" ? "weft_fp64::lt(" + a + ", " + b + ")"
+               : cmp == "le" ? "weft_fp64::le(" + a + ", " + b + ")"
+               : cmp == "gt" ? "weft_fp64::gt(" + a + ", " + b + ")"
+                             : "weft_fp64::ge(" + a + ", " + b + ")";
+      } else {
+        cond = "(" + operand_as(args[1], ty) + " " + sym + " " + operand_as(args[2], ty) + ")";
+      }
+    }
+    if (cond.empty()) {
+      err = "unsupported comparison '" + opcode + "'";
+      return "";
+    }
+    return guard + store(args[0], "(" + cond + " ? " + on + " : 0)", dty);
+  }
+
+  // `slct.dtype.s32 d, a, b, c` is a select on the sign of c: a when c is not
+  // negative, b when it is. The comparison is in c's own width, which is why the
+  // `.f32` spelling compares against zero as a float. A NaN c is not negative, so
+  // it takes b, which is what `>= 0` answers.
+  if (op == "slct") {
+    if (!need(4)) return "";
+    // The sign of c is the whole test, and the register holding it is a `.b32`,
+    // which carries no sign: read as unsigned, -5 is larger than zero and the
+    // select picks the wrong argument. So the type suffix names how c is compared.
+    const bool isf = has_part(parts, "f32") || has_part(parts, "f64");
+    const std::string cty = isf ? (has_part(parts, "f64") ? "double" : "float")
+                                : (has_part(parts, "u32") ? "uint32_t" : "int32_t");
+    return guard + store(args[0],
+                         "((" + operand_as(args[3], cty) + ") >= " + (isf ? "0.0" : "0") +
+                             " ? " + operand_as(args[1], ty) + " : " +
+                             operand_as(args[2], ty) + ")",
+                         ty);
+  }
+
+  // `brx.idx a, tlist`: branch to the entry the index picks out of the table the
+  // named `.branchtargets` directive lists. The index comes first and the table
+  // second (llc writes `brx.idx %r1, $L_brx_0`), and the table is a label rather
+  // than a value, so it is looked up among the lists parsed beside the labels.
+  // An index past the end is undefined in the isa and every producer guards it
+  // itself, llc with a `setp`/`bra` pair before the instruction; the next
+  // instruction is what a jump table leaves there, so that is where it goes.
+  if (op == "brx") {
+    if (parts.size() < 2 || parts[1] != "idx") {
+      err = "unsupported branch '" + opcode + "'";
+      return "";
+    }
+    if (args.size() < 2) { err = "brx.idx with no table operand"; return ""; }
+    auto tb = brxtab.find(trim(args[1]));
+    if (tb == brxtab.end()) {
+      err = "brx.idx names '" + trim(args[1]) +
+            "', which no .branchtargets directive declares";
+      return "";
+    }
+    vec_control = true;
+    const std::string ix = "(uint32_t)(" + operand_as(args[0], "uint32_t") + ")";
+    if (!vec) {
+      std::string out = guard + "{ const uint32_t weft_ix = " + ix + "; ";
+      for (size_t k = 0; k < tb->second.size(); k++)
+        out += std::string(k ? "else if" : "if") + " (weft_ix == " + std::to_string(k) +
+               "u) " +
+               (msl ? "{ s->pc = " + std::to_string(label_id(tb->second[k])) + "u; continue; }"
+                    : "goto " + sanitize(tb->second[k]) + ";") +
+               " ";
+      return out + "}";
+    }
+    // The warp target keeps a program counter per lane, so the table is a choice
+    // per lane: the index is read inside the lane loop, and a lane whose index
+    // picks nothing moves to the instruction after the table.
+    const int fall = label_count++;
+    const std::string fallu = std::to_string(fall) + "u";
+    std::string pick = fallu;
+    for (size_t k = tb->second.size(); k-- > 0;)
+      pick = "weft_ix == " + std::to_string(k) + "u ? " +
+             std::to_string(label_id(tb->second[k])) + "u : " + pick;
+    std::string out = "{ for (uint32_t l = 0; l < 32u; l++) { if (!(am[l])) continue;\n";
+    out += "    const uint32_t weft_ix = " + ix + ";\n";
+    out += "    s->pc[l] = " +
+           (vec_pred.empty() ? pick : "((" + vec_pred + ") ? " + pick + " : " + fallu + ")") +
+           ";\n  }\n  goto dispatch; }\n  L" + std::to_string(fall) + ":;";
+    return out;
   }
 
   if (op == "bra") {
@@ -1937,6 +2407,71 @@ std::string Emitter::emit(const std::string& raw) {
     if (mode.empty()) { err = "unsupported shuffle mode in '" + opcode + "'"; return ""; }
 
     uses_shfl = true;
+    // A lane's registers are a member of the state struct, so a pointer into one has to
+    // name the address space on the Metal target; the host's C++ has no such qualifier.
+    const std::string addr_q = msl ? "thread " : "";
+    // `c` packs two fields: a clamp value in bits 4:0 and a sub-segment mask in bits
+    // 12:8. The spec's model is that a lane may only read inside its segment, the
+    // source index is clamped at the segment's end, and a lane whose source falls
+    // outside that clamp keeps its own value. Read as a single number in 0..31 -- the
+    // only form this used to accept -- every segment is the whole warp, which is the
+    // common case but not the general one.
+    uint32_t cval = (mode == "up") ? 0u : 31u, segmask = 0u;
+    bool c_lit = true;
+    std::string cexpr;
+    if (args.size() >= 4) {
+      const std::string t = trim(args[3]);
+      char* end = nullptr;
+      const long v = std::strtol(t.c_str(), &end, 0);
+      if (end && *end == '\0' && v >= 0 && v <= 0x1fff) {
+        cval = (uint32_t)v & 31u;
+        segmask = ((uint32_t)v >> 8) & 31u;
+      } else if (!t.empty() &&
+                 (t[0] == '%' || t[0] == '(' || t[0] == '_' ||
+                  std::isalnum((unsigned char)t[0]))) {
+        // A clamp in a register is how a front end writes a segment end that differs
+        // per lane -- a `width` below 32 -- so its two fields are taken from the value
+        // at run time rather than refused.
+        cexpr = operand_as(t, "uint32_t");
+        if (cexpr.empty() || !err.empty()) return "";
+        c_lit = false;
+      } else {
+        err = "unsupported shuffle clamp '" + t + "' in '" + opcode + "'";
+        return "";
+      }
+    }
+    const std::string cval_e = c_lit ? std::to_string(cval) : "((uint32_t)(" + cexpr + ") & 31u)";
+    const std::string seg_e =
+        c_lit ? std::to_string(segmask) : "((((uint32_t)(" + cexpr + ") >> 8) & 31u))";
+    auto max_lane = [&](const std::string& lane) -> std::string {
+      if (c_lit && segmask == 0) return cval_e;
+      return "((" + lane + " & " + seg_e + ") | (" + cval_e + " & ~" + seg_e + "))";
+    };
+    auto peer_of = [&](const std::string& lane, const std::string& b) -> std::string {
+      const std::string hi = max_lane(lane);
+      if (mode == "idx") {
+        const std::string j =
+            (c_lit && segmask == 0)
+                ? b
+                : "((" + lane + " & " + seg_e + ") | (" + b + " & ~" + seg_e + "))";
+        if (c_lit && segmask == 0 && cval == 31) return j;
+        return "(" + j + " <= " + hi + " ? " + j + " : " + lane + ")";
+      }
+      if (mode == "bfly") {
+        const std::string j = "(" + lane + " ^ " + b + ")";
+        if (c_lit && segmask == 0 && cval == 31) return j;
+        return "(" + j + " <= " + hi + " ? " + j + " : " + lane + ")";
+      }
+      if (mode == "up")
+        return "((int32_t)" + lane + " - (int32_t)(" + b + ") >= (int32_t)" + hi + " ? " +
+               lane + " - " + b + " : " + lane + ")";
+      return "(" + lane + " + " + b + " <= " + hi + " ? " + lane + " + " + b + " : " + lane + ")";
+    };
+    // The shifted-vector form below is exact only for the full-warp clamp: a segment
+    // edge moves where the shift stops, and `.idx` reads one lane from everywhere.
+    const bool full_clamp =
+        c_lit && segmask == 0 &&
+        ((mode == "up" && cval == 0) || ((mode == "down" || mode == "idx") && cval == 31));
 
     if (vec) {
       // 32 lanes are one vector here, so a shuffle is a gather inside the
@@ -1947,28 +2482,9 @@ std::string Emitter::emit(const std::string& raw) {
         err = "shuffle of a value that is not a register";
         return "";
       }
-      const std::string c = std::to_string([&] {
-        uint32_t cl = (mode == "up") ? 0u : 31u;
-        if (args.size() >= 4) {
-          const std::string t = trim(args[3]);
-          char* end = nullptr;
-          const long v = std::strtol(t.c_str(), &end, 0);
-          if (end && *end == '\0' && v >= 0 && v <= 31) cl = (uint32_t)v;
-          else vec_ok = false;
-        }
-        return cl;
-      }());
       const std::string lane = "l";
       const std::string b = operand_as(args[2], "uint32_t");
-      std::string peer;
-      if (mode == "idx")
-        peer = "(" + lane + " & ~" + c + "u) | (" + b + " & " + c + "u)";
-      else if (mode == "bfly")
-        peer = "(" + lane + " & ~" + c + "u) | ((" + lane + " ^ " + b + ") & " + c + "u)";
-      else if (mode == "up")
-        peer = "(" + lane + " >= " + b + " + " + c + "u ? " + lane + " - " + b + " : " + lane + ")";
-      else
-        peer = "(" + lane + " + " + b + " <= " + c + "u ? " + lane + " + " + b + " : " + lane + ")";
+      const std::string peer = peer_of(lane, b);
       const std::string arr = "s->" + rs.base + "[" + std::to_string(rs.index) + "]";
       const std::string src = arr + "[" + peer + "]";
       const std::string masked = store(args[0], src, "uint32_t");
@@ -1981,7 +2497,8 @@ std::string Emitter::emit(const std::string& raw) {
       // and this becomes the most expensive instruction in the kernel.
       const VecVal dv = vec_sym(args[2]);
       const bool uniform_delta = dv.ok && dv.stride == 0;
-      if (uniform_delta && vec_pred.empty() && (mode == "down" || mode == "up" || mode == "idx")) {
+      if (uniform_delta && full_clamp && vec_pred.empty() &&
+          (mode == "down" || mode == "up" || mode == "idx")) {
         std::string dtext;
         Reg dr = parse_reg(trim(args[2]));
         if (dr.ok && dr.special.empty()) {
@@ -2000,18 +2517,19 @@ std::string Emitter::emit(const std::string& raw) {
         vec_select = sel;
         std::string shift;
         if (mode == "idx") {
-          shift = "const uint32_t weft_s = (" + dtext + ") & " + c +
-                  "u; const uint32_t* weft_v = " + arr +
+          shift = "const uint32_t weft_s = (" + dtext + ") & " + cval_e +
+                  "; const " + addr_q + "uint32_t* weft_v = " + arr +
                   "; const uint32_t weft_sv = weft_v[weft_s];" +
                   " for (uint32_t l = 0; l < 32u; l++) { " + move_one + " }";
         } else if (mode == "down") {
-          shift = "const uint32_t weft_d = " + dtext + "; const uint32_t* weft_v = " + arr +
+          shift = "const uint32_t weft_d = " + dtext + "; const " + addr_q +
+                  "uint32_t* weft_v = " + arr +
                   "; for (uint32_t l = 0; l + weft_d < 32u; l++) { " + move1 +
                   " } for (uint32_t l = (weft_d < 32u ? 32u - weft_d : 0u); l < 32u; l++) { " +
                   move_self + " }";
         } else {
           shift = "const uint32_t weft_d = (" + dtext + " < 32u ? " + dtext +
-                  " : 32u); const uint32_t* weft_v = " + arr +
+                  " : 32u); const " + addr_q + "uint32_t* weft_v = " + arr +
                   "; for (uint32_t l = 0; l < 32u; l++) { " + move_self +
                   " } for (uint32_t l = weft_d; l < 32u; l++) { " + move0 + " }";
         }
@@ -2027,36 +2545,10 @@ std::string Emitter::emit(const std::string& raw) {
     resume_cases += "    case " + std::to_string(id) + ": goto R" + std::to_string(id) + ";\n";
     const std::string label = "R" + std::to_string(id) + ":;";
 
-    // `c` is the clamp: the far edge of the segment a lane may read from, in the
-    // direction of travel. CUDA passes 0x1f for .down/.idx/.bfly and 0 for .up,
-    // and a lane whose source falls outside keeps its own value, that is what
-    // the hardware does, so it is what this does.
-    uint32_t clamp = (mode == "up") ? 0u : 31u;
-    if (args.size() >= 4) {
-      const std::string t = trim(args[3]);
-      char* end = nullptr;
-      const long v = std::strtol(t.c_str(), &end, 0);
-      if (!end || *end != '\0' || v < 0 || v > 31) {
-        err = "unsupported shuffle clamp '" + t + "' in '" + opcode + "'";
-        return "";
-      }
-      clamp = (uint32_t)v;
-    }
-    const std::string c = std::to_string(clamp);
     const std::string lane = "(ctx.lid & 31u)";
     const std::string base = "(ctx.lid & ~31u)";
     const std::string b = operand_as(args[2], "uint32_t");
-    std::string src;
-    if (mode == "idx")
-      src = "(" + lane + " & ~" + c + "u) | (" + b + " & " + c + "u)";
-    else if (mode == "bfly")
-      src = "(" + lane + " & ~" + c + "u) | ((" + lane + " ^ " + b + ") & " + c + "u)";
-    else if (mode == "up")
-      src = "(" + lane + " >= " + b + " + " + c + "u ? " + lane + " - " + b + " : " + lane +
-            ")";
-    else
-      src = "(" + lane + " + " + b + " <= " + c + "u ? " + lane + " + " + b + " : " + lane +
-            ")";
+    const std::string src = peer_of(lane, b);
 
     if (msl) {
       // The hardware moves the value between lanes, so a shuffle is one
@@ -2154,6 +2646,158 @@ std::string Emitter::emit(const std::string& raw) {
         store(args[0], value, mode == "ballot" ? "uint32_t" : "bool");
     if (!guard.empty())
       return guard + "{ " + publish + "}\n  " + label + "\n  " + guard + "{ " + refine + " }";
+    return "{ " + publish + "}\n  " + label + "\n  " + refine;
+  }
+
+  // `elect.sync d|p, membermask` elects one lane out of the mask: every lane learns
+  // which lane it is and only that lane's predicate is true. The choice every engine
+  // here makes is the lowest lane of the mask, which is the one a hardware leader
+  // election is allowed to make, and the answer is the same on both columns.
+  if (op == "elect") {
+    if (args.empty()) { err = "elect.sync with no destination"; return ""; }
+    std::vector<std::string> two = split_top(args[0], '|');
+    if (two.size() != 2) { err = "elect.sync needs the 'd|p' destination form"; return ""; }
+    const std::string d_dst = trim(two[0]), p_dst = trim(two[1]);
+    const bool want_d = !d_dst.empty() && d_dst != "_";
+    const bool want_p = !p_dst.empty() && p_dst != "_";
+    std::string member = "0xFFFFFFFFu";
+    if (args.size() >= 2) {
+      const std::string t = trim(args[1]);
+      char* end = nullptr;
+      const long v = std::strtol(t.c_str(), &end, 0);
+      if (!end || *end != '\0') { err = "unsupported member mask '" + t + "'"; return ""; }
+      member = std::to_string((uint32_t)v) + "u";
+    }
+    uses_shfl = true;
+    const std::string pick =
+        "const uint32_t weft_e = weft_m ? (uint32_t)__builtin_ctz(weft_m) : 0xFFFFFFFFu; ";
+    if (vec) {
+      // All 32 lanes are one thread's registers, so the mask is the lane mask and
+      // the election is a count of trailing zeros, no rendezvous at all.
+      vec_side = true;
+      std::string out = "{ uint32_t weft_m = 0; for (uint32_t l = 0; l < 32u; l++) "
+                        "if (am[l]) weft_m |= 1u << l; weft_m &= " + member + "; " + pick;
+      if (want_d || want_p) {
+        out += "for (uint32_t l = 0; l < 32u; l++) { ";
+        if (want_d) out += store(d_dst, "weft_e", "uint32_t") + " ";
+        if (want_p) out += store(p_dst, "(uint32_t)l == weft_e", "bool") + " ";
+        out += "} ";
+      }
+      return out + "}";
+    }
+    if (msl) {
+      std::string body = guard + "{ const uint32_t weft_m = (uint32_t)(simd_vote::vote_t)" +
+                          std::string("simd_ballot(true) & ") + member + "; " + pick;
+      if (want_d) body += store(d_dst, "weft_e", "uint32_t") + " ";
+      if (want_p) body += store(p_dst, "((ctx.lid & 31u) == weft_e)", "bool") + " ";
+      return body + "}";
+    }
+    // The host has no warp, so the active lanes have to agree first: publish, give
+    // the worker back, and fold the published bits once every lane has arrived.
+    const int id = next_resume++;
+    resume_cases += "    case " + std::to_string(id) + ": goto R" + std::to_string(id) + ";\n";
+    const std::string label = "R" + std::to_string(id) + ":;";
+    const std::string publish =
+        "((uint32_t*)weft::shfl_pub_buf(ctx))[ctx.lid] = 1u; s->pc = " + std::to_string(id) +
+        "u; return;\n  ";
+    std::string refine = "{ const uint32_t weft_m = weft::vote_ballot(ctx) & " + member + "; " + pick;
+    if (want_d) refine += store(d_dst, "weft_e", "uint32_t") + " ";
+    if (want_p) refine += store(p_dst, "((ctx.lid & 31u) == weft_e)", "bool") + " ";
+    refine += "}";
+    if (!guard.empty()) return guard + "{ " + publish + "}\n  " + label + "\n  " + guard + refine;
+    return "{ " + publish + "}\n  " + label + "\n  " + refine;
+  }
+
+  // `match.any.sync d, a, membermask` answers the mask of lanes whose value equals
+  // this lane's, and `match.all.sync d|p, a, membermask` answers all ones (and a
+  // true predicate) only if every live lane of the mask holds the same value. Only
+  // live lanes count, so a short warp's absent lanes are not compared: on the host
+  // that is the thread count, and on the GPU it is the ballot of the lanes that ran.
+  if (op == "match") {
+    bool any = false, all = false;
+    for (const auto& p : parts) {
+      if (p == "any") any = true;
+      else if (p == "all") all = true;
+    }
+    if (!any && !all) { err = "unsupported match mode in '" + opcode + "'"; return ""; }
+    if (args.size() < 2) { err = "match with no value"; return ""; }
+    std::string d_dst = trim(args[0]), p_dst;
+    if (all) {
+      std::vector<std::string> two = split_top(args[0], '|');
+      if (two.size() != 2) { err = "match.all.sync needs the 'd|p' destination form"; return ""; }
+      d_dst = trim(two[0]);
+      p_dst = trim(two[1]);
+    }
+    const bool want_d = !d_dst.empty() && d_dst != "_";
+    const bool want_p = !p_dst.empty() && p_dst != "_";
+    std::string member = "0xFFFFFFFFu";
+    if (args.size() >= 3) {
+      const std::string t = trim(args[2]);
+      char* end = nullptr;
+      const long v = std::strtol(t.c_str(), &end, 0);
+      if (!end || *end != '\0') { err = "unsupported member mask '" + t + "'"; return ""; }
+      member = std::to_string((uint32_t)v) + "u";
+    }
+    uses_shfl = true;
+    const std::string value = operand_as(args[1], "uint32_t");
+    // What each column adds after the same-value mask is known.
+    auto emit_from = [&](const std::string& scope) {
+      std::string out = scope;
+      if (all) {
+        out += "const bool weft_all = (weft_same == weft_am); ";
+        if (want_d) out += store(d_dst, "(weft_all ? " + member + " : 0u)", "uint32_t") + " ";
+        if (want_p) out += store(p_dst, "weft_all", "bool") + " ";
+      } else if (want_d) {
+        out += store(d_dst, "weft_same", "uint32_t") + " ";
+      }
+      return out;
+    };
+    if (vec) {
+      Reg rs = parse_reg(trim(args[1]));
+      if (!rs.ok || !rs.special.empty()) {
+        err = "match of a value that is not a register";
+        return "";
+      }
+      vec_side = true;
+      const std::string arr = "s->" + rs.base + "[" + std::to_string(rs.index) + "]";
+      std::string out = "{ uint32_t weft_am = 0; for (uint32_t k = 0; k < 32u; k++) "
+                        "if (am[k]) weft_am |= 1u << k; weft_am &= " + member +
+                        "; for (uint32_t l = 0; l < 32u; l++) { if (!am[l]) continue; "
+                        "uint32_t weft_same = 0; for (uint32_t k = 0; k < 32u; k++) "
+                        "if (am[k] && " + arr + "[k] == " + arr + "[l]) weft_same |= 1u << k; ";
+      out += emit_from(std::string());
+      return out + "} }";
+    }
+    if (msl) {
+      // One shuffle per lane position: the warp's values compared against this
+      // lane's, which is the same comparison the host folds out of its slot array.
+      std::string out = guard + "{ const uint32_t weft_v = " + value +
+                        "; const uint32_t weft_am = (uint32_t)(simd_vote::vote_t)" +
+                        "simd_ballot(true) & " + member + "; uint32_t weft_same = 0; "
+                        "for (uint32_t k = 0; k < 32u; k++) "
+                        "if (simd_shuffle(weft_v, (ushort)k) == weft_v) weft_same |= 1u << k; "
+                        "weft_same &= weft_am; ";
+      out += emit_from(std::string());
+      return out + "}";
+    }
+    const int id = next_resume++;
+    resume_cases += "    case " + std::to_string(id) + ": goto R" + std::to_string(id) + ";\n";
+    const std::string label = "R" + std::to_string(id) + ":;";
+    const std::string publish = "((uint32_t*)weft::shfl_pub_buf(ctx))[ctx.lid] = " + value +
+                                "; s->pc = " + std::to_string(id) + "u; return;\n  ";
+    const std::string scope = "{ const uint32_t weft_wb = ctx.lid & ~31u; "
+                              "const uint32_t weft_lv = weft::live_threads(ctx.tgid, ctx.tg_size, ctx.grid); "
+                              "const uint32_t weft_wl = (weft_lv > weft_wb) ? "
+                              "((weft_lv - weft_wb) > 32u ? 32u : (weft_lv - weft_wb)) : 0u; "
+                              "const uint32_t weft_am = ((weft_wl >= 32u ? 0xFFFFFFFFu : "
+                              "((1u << weft_wl) - 1u)) & " + member + "); "
+                              "const uint32_t weft_v = " + value + "; "
+                              "const uint32_t* weft_pv = weft::shfl_read_buf(ctx) + weft_wb; "
+                              "uint32_t weft_same = 0; for (uint32_t k = 0; k < 32u; k++) "
+                              "if (((weft_am >> k) & 1u) && weft_pv[k] == weft_v) weft_same |= 1u << k; ";
+    std::string refine = emit_from(scope);
+    refine += "}";
+    if (!guard.empty()) return guard + "{ " + publish + "}\n  " + label + "\n  " + guard + refine;
     return "{ " + publish + "}\n  " + label + "\n  " + refine;
   }
 
@@ -2260,7 +2904,13 @@ std::string Emitter::emit(const std::string& raw) {
     if (cls == "finite") e = math("isfinite", v);
     else if (cls == "infinite") e = math("isinf", v);
     else if (cls == "number") e = "!" + math("isnan", v);
-    else if (cls == "normal") e = math("isnormal", v);
+    else if (cls == "normal")
+      // The isa counts positive and negative zero as normal numbers, and `isnormal` does
+      // not: it is true for a value that is neither zero nor subnormal. The isa's reading
+      // is "finite and not subnormal, or zero", which is what this says. Measured: zero
+      // answered 0 before this line and 1 after it.
+      e = msl ? ("(((" + v + ") == 0.0f) || (isfinite(" + v + ") && fabs(" + v + ") >= 0x1p-126f))")
+              : ("(std::fpclassify(" + v + ") == FP_NORMAL || (" + v + ") == 0)");
     else if (cls == "subnormal")
       // Metal has no fpclassify, and a subnormal is exactly "not zero and below
       // the smallest normal", so the test is the two comparisons.
@@ -2299,6 +2949,118 @@ std::string Emitter::emit(const std::string& raw) {
                          "uint32_t");
   }
 
+  // add/sub/mul/fma/min/max/neg/abs of a narrow float: `.f16` is a half's 5-bit
+  // exponent over a 10-bit significand, `.bf16` a float's 8-bit exponent over 7,
+  // and the `b16` register holds the bits of either. The generic integer path added
+  // the patterns instead (0x3C00 + 0x4000 answered 0x7C00, an infinity, where
+  // 1.0 + 2.0 is 3.0), so the type suffix is what says to read them as a float at
+  // all. Both widths are answered from one exact routine, so neither form has to be
+  // refused for want of a single rounding.
+  if ((op == "add" || op == "sub" || op == "mul" || op == "fma" || op == "mad" ||
+       op == "min" || op == "max" || op == "neg" || op == "abs" || op == "div" ||
+       op == "rcp" || op == "sqrt" || op == "ex2" || op == "lg2" || op == "rsqrt" ||
+       op == "sin" || op == "cos" || op == "tanh") &&
+      (has_part(parts, "f16") || has_part(parts, "f16x2") || has_part(parts, "bf16") ||
+       has_part(parts, "bf16x2"))) {
+    // Everything the operation does not name is refused rather than dropped: `.rz`
+    // is a second rounding rule, `.ftz` flushes subnormals, and an unknown qualifier
+    // would be a different answer that looks like this one. `min`/`max` also carry
+    // `.NaN` and the `min.xorsign.abs` pair, each with its own helper.
+    for (const auto& p : parts) {
+      if (p == op || p == "f16" || p == "f16x2" || p == "bf16" || p == "bf16x2") continue;
+      if (p == "rn") continue;
+      if (p == "sat" && (op == "add" || op == "sub" || op == "mul")) continue;
+      // `.approx` asks only that the answer be close, and the portable library
+      // rounded once to the narrow grid is closer than "close": it is the exact
+      // answer, which every approximation is allowed to be.
+      if (p == "approx" && (op == "ex2" || op == "lg2" || op == "rsqrt" || op == "sin" ||
+                            op == "cos" || op == "tanh" || op == "rcp" || op == "sqrt"))
+        continue;
+      if ((op == "min" || op == "max") && (p == "NaN" || p == "xorsign" || p == "abs"))
+        continue;
+      err = "'" + opcode + "' carries a qualifier the 16-bit path does not know: ." + p;
+      return "";
+    }
+    if ((op == "min" || op == "max") && has_part(parts, "abs") &&
+        !has_part(parts, "xorsign")) {
+      err = "'" + opcode + "' names .abs without .xorsign, which is the only form the isa has";
+      return "";
+    }
+    if (op == "mad") {
+      err = "'" + opcode + "' is not a 16-bit float instruction: the fused form the isa "
+            "names is `fma`";
+      return "";
+    }
+    const bool packed = has_part(parts, "f16x2") || has_part(parts, "bf16x2");
+    const bool bf = has_part(parts, "bf16") || has_part(parts, "bf16x2");
+    const std::string wt = packed ? "uint32_t" : "uint16_t";
+    // The type and the packing only pick which family answers: `weft_bf16x2_fma` is
+    // the packed bf16 fused form, and every one of them names the same operation.
+    const std::string pre = packed ? (bf ? "weft_bf16x2_" : "weft_f16x2_")
+                                   : (bf ? "weft_bf16_" : "weft_f16_");
+    if (op == "neg" || op == "abs") {
+      if (!need(2)) return "";
+      return guard + store(args[0], pre + op + "(" + operand_as(args[1], wt) + ")", wt);
+    }
+    if (op == "min" || op == "max") {
+      if (!need(3)) return "";
+      // Three answers: the plain form hands a NaN operand back as the other one,
+      // `.NaN` answers a canonical NaN instead, and `.xorsign.abs` compares the
+      // magnitudes and keeps the exclusive or of the two signs.
+      const std::string fn =
+          pre + op +
+          (has_part(parts, "xorsign") ? "_xorabs" : (has_part(parts, "NaN") ? "_nan" : ""));
+      return guard + store(args[0],
+                           fn + "(" + operand_as(args[1], wt) + ", " +
+                               operand_as(args[2], wt) + ")",
+                           wt);
+    }
+    // The approximate transcendentals answer the portable library rounded once, the
+    // same bargain the f32 forms strike: no CPU reproduces the silicon's polynomial.
+    // The packed forms are that answer per half, so `weft_f16x2_tanh` is two independent
+    // roundings rather than one rounding of a wider expression.
+    if (op == "ex2" || op == "lg2" || op == "rsqrt" || op == "sin" || op == "cos" ||
+        op == "tanh") {
+      if (!need(2)) return "";
+      return guard + store(args[0], pre + op + "(" + operand_as(args[1], wt) + ")", wt);
+    }
+    // Division, reciprocal and square root end in the same one-rounding pack the
+    // fused form uses, so a narrow quotient or root is the nearest value on the
+    // grid rather than whatever a widening to float would have rounded twice.
+    if (op == "div") {
+      if (!need(3)) return "";
+      return guard + store(args[0],
+                           pre + "div(" + operand_as(args[1], wt) + ", " +
+                               operand_as(args[2], wt) + ")",
+                           wt);
+    }
+    if (op == "rcp") {
+      if (!need(2)) return "";
+      return guard + store(args[0], pre + "rcp(" + operand_as(args[1], wt) + ")", wt);
+    }
+    if (op == "sqrt") {
+
+      if (!need(2)) return "";
+      return guard + store(args[0], pre + "sqrt(" + operand_as(args[1], wt) + ")", wt);
+    }
+    if (op == "fma") {
+      if (!need(4)) return "";
+      std::string e = pre + "fma(" + operand_as(args[1], wt) + ", " +
+                      operand_as(args[2], wt) + ", " + operand_as(args[3], wt) + ")";
+      if (has_part(parts, "sat")) {
+        err = "'" + opcode + "' asks for .sat on a fused multiply-add, which the isa does "
+              "not name";
+        return "";
+      }
+      return guard + store(args[0], e, wt);
+    }
+    if (!need(3)) return "";
+    std::string e = pre + op + "(" + operand_as(args[1], wt) + ", " +
+                    operand_as(args[2], wt) + ")";
+    if (has_part(parts, "sat")) e = pre + "sat(" + e + ")";
+    return guard + store(args[0], e, wt);
+  }
+
   // A 64-bit float on the GPU target is bits in a `uint64_t`, so there is no
   // operator to apply: each of these is the software double's own function, over
   // the same text the SPIR-V front end calls. The CPU column keeps the host's
@@ -2315,6 +3077,81 @@ std::string Emitter::emit(const std::string& raw) {
                                operand_as(args[1], "uint64_t") + ", " +
                                operand_as(args[2], "uint64_t") + ")",
                            "uint64_t");
+  }
+
+  // The condition code, PTX's one flag that survives between instructions.
+  // `add.cc`, `sub.cc` and `mad.cc` write it, `addc`, `subc` and `madc` read it and
+  // write it again when they carry `.cc`, and that chain is how a 64-bit or a
+  // 128-bit integer add is spelled. The carry out is the one the sum leaves: a sum
+  // below its first addend wrapped, and a difference whose first source is below the
+  // second borrowed. With a carry-in the flag is the two events together, which is
+  // what makes the second word of a wide addition come out right.
+  {
+    const bool writes_cc = has_part(parts, "cc");
+    const bool has_hi = has_part(parts, "hi");
+    const bool is_carry_op = (op == "addc" || op == "subc" || op == "madc");
+    const bool mad_op = (op == "mad" || op == "madc");
+    const bool sub_op = (op == "sub" || op == "subc");
+    const bool reads_cc = is_carry_op;
+    // A product with a word picked out belongs here even without a flag: `.hi` is the
+    // high word, and the add that would otherwise take it answers with the low one,
+    // which is a wrong number rather than a refusal.
+    const bool word_pick = mad_op && has_hi;
+    if (is_carry_op || word_pick || (writes_cc && (op == "add" || op == "sub" || mad_op))) {
+      if (!need(mad_op ? 4u : 3u)) return "";
+      if (ty != "uint32_t" && ty != "int32_t" && ty != "uint64_t" && ty != "int64_t") {
+        err = "'" + opcode + "' is an integer instruction; the condition code is an integer flag";
+        return "";
+      }
+      if (has_part(parts, "wide")) {
+        err = "'" + opcode + "': a wide product is two words, and this lowers one";
+        return "";
+      }
+      // One flag per lane is the per-lane back end's; `r[reg][lane]` has nowhere to
+      // put one that is not a register. A word of a product needs no flag, so it is
+      // still a per-lane expression the vector back end can carry.
+      if (vec && (reads_cc || writes_cc)) vec_ok = false;
+      const std::string ut = cpp_size(ty) == 8 ? "uint64_t" : "uint32_t";
+      const bool sgn = (ty == "int32_t" || ty == "int64_t");
+      const std::string f = (reads_cc || writes_cc) ? cc_member() : std::string();
+      const std::string a = operand_as(args[1], ut);
+      const std::string b = operand_as(args[2], ut);
+      const std::string q = mad_op ? operand_as(args[3], ut) : b;
+      // The word of the product. `.lo` is the plain multiply, which wraps. `.hi` is
+      // the high word: exact for unsigned, sign-extended for signed, and the same two
+      // answers `mul.hi` already gives, so a magic-number multiply and an
+      // extended-precision one agree down both roads.
+      std::string prod = mad_op ? "(" + a + " * " + b + ")" : a;
+      if (has_hi) {
+        const std::string as = operand_as(args[1], ty), bs = operand_as(args[2], ty);
+        if (ut == "uint32_t")
+          prod = sgn ? "((uint32_t)(((int64_t)" + as + " * (int64_t)" + bs + ") >> 32))"
+                     : "((uint32_t)(((uint64_t)(uint32_t)" + a + " * (uint64_t)(uint32_t)" + b +
+                           ") >> 32))";
+        else
+          prod = sgn ? "((uint64_t)weft_mulhi_s64(" + as + ", " + bs + "))"
+                     : "weft_mulhi_u64(" + a + ", " + b + ")";
+      }
+      // `weft_` names throughout: the lane back end reaches its state through `s`,
+      // and a temporary called `s` would shadow the whole register file.
+      std::string line = "{ " + ut + " weft_p = " + prod + "; " + ut +
+                         " weft_q = " + q + "; " + ut + " weft_s = weft_p " +
+                         (sub_op ? "-" : "+") + " weft_q; ";
+      if (reads_cc)
+        line += ut + " weft_r = weft_s " + (sub_op ? "-" : "+") + " " + f + "; ";
+      if (writes_cc) {
+        std::string flag = sub_op ? "weft_p < weft_q" : "weft_s < weft_p";
+        if (reads_cc) flag += sub_op ? " || weft_s < " + f : " || weft_r < weft_s";
+        line += f + " = (" + flag + ") ? 1u : 0u; ";
+      }
+      line += store(args[0], reads_cc ? "weft_r" : "weft_s", ty) + " }";
+      return guard + line;
+    }
+    if (writes_cc) {
+      err = "'" + opcode +
+            "': only add, sub, mad, addc, subc and madc carry the condition code";
+      return "";
+    }
   }
 
   auto it = binop.find(op);
@@ -2334,14 +3171,16 @@ std::string Emitter::emit(const std::string& raw) {
       char* end = nullptr;
       const long n = std::strtol(lit.c_str(), &end, 0);
       const bool constant = !lit.empty() && end && *end == '\0';
-      if (constant && n >= bits) return guard + store(args[0], "0", ty);
+      // What the clamp leaves: nothing for a left shift or an unsigned right one, the
+      // sign for a signed right one. The unsigned case fills with zero, and reading the
+      // sign bit instead answered 1 for `shr.u32 0xFFFFFFFF, 32`.
+      const bool keeps_sign = (op == "shr" && ty[0] == 'i');
+      const std::string fill =
+          keeps_sign ? ("(" + a + " >> " + std::to_string(bits - 1) + ")") : "0";
+      if (constant && n >= bits) return guard + store(args[0], fill, ty);
       if (constant && n >= 0)
         return guard + store(args[0],
                              a + (op == "shl" ? " << " : " >> ") + std::to_string(n), ty);
-      // What the clamp leaves: nothing for a left shift or an unsigned right one,
-      // the sign for a signed right one.
-      const std::string fill =
-          op == "shl" ? "0" : "(" + a + " >> " + std::to_string(bits - 1) + ")";
       return guard + store(args[0],
                            "((uint64_t)(" + sh + ") >= " + std::to_string(bits) + "ull ? (" + ty +
                                ")(" + fill + ") : (" + a + (op == "shl" ? " << (" : " >> (") +
@@ -2394,17 +3233,112 @@ std::string Emitter::emit(const std::string& raw) {
     return guard + store(args[0], math("abs", operand_as(args[1], ty)), ty);
   }
 
+  if (op == "copysign") {
+    if (!need(3)) return "";
+    // The answer is the first operand's bits with the second's sign on top, so this is
+    // the bit operation rather than a library call: it keeps a NaN payload, which is
+    // what "copied without modification" means for the value that is not a number.
+    const std::string A = operand_as(args[1], ty), B = operand_as(args[2], ty);
+    if (msl && ty == "double")
+      return guard + store(args[0],
+                           "weft_fp64::copysign_bits(" + operand_as(args[1], "uint64_t") + ", " +
+                               operand_as(args[2], "uint64_t") + ")",
+                           "uint64_t");
+    if (ty == "double")
+      return guard + store(args[0],
+                           "weft_bitcast<double>((weft_bitcast<uint64_t>(" + A +
+                               ") & 0x7FFFFFFFFFFFFFFFull) | (weft_bitcast<uint64_t>(" + B +
+                               ") & 0x8000000000000000ull))",
+                           "double");
+    return guard + store(args[0],
+                         "weft_bitcast<float>((weft_bitcast<uint32_t>(" + A +
+                             ") & 0x7FFFFFFFu) | (weft_bitcast<uint32_t>(" + B +
+                             ") & 0x80000000u))",
+                         "float");
+  }
+
   if (op == "min" || op == "max") {
     if (!need(3)) return "";
-    // minNum/maxNum on the software double: a NaN operand means the other one.
+    // The three-input form (`{min,max}{.NaN}{.abs}.f32 d, a, b, c`, sm_100) asks for an
+    // answer over three magnitudes, which is not two answers folded: reading two of its
+    // operands and dropping the third is a different number that looks like this one.
+    if (args.size() > 3) {
+      err = "'" + opcode + "': the three-input min/max form is not translated";
+      return "";
+    }
+    const std::string A = operand_as(args[1], ty), B = operand_as(args[2], ty);
+    const bool flt = (ty == "float" || ty == "double");
+    if (!flt) {
+      if (has_part(parts, "NaN") || has_part(parts, "xorsign") || has_part(parts, "abs")) {
+        err = "'" + opcode + "' carries a floating-point modifier on an integer type";
+        return "";
+      }
+      return guard + store(args[0], math(op, A + ", " + B), ty);
+    }
+    // The isa spells the modifiers on the .f32 form -- `{min,max}{.NaN}{.xorsign.abs}.f32`,
+    // with `.abs` alone only in the sm_100 three-input form -- and `{min,max}.f64` takes
+    // none at all. Reading one on a double would be inventing an instruction.
+    if (ty == "double" && (has_part(parts, "NaN") || has_part(parts, "xorsign") ||
+                           has_part(parts, "abs"))) {
+      err = "'" + opcode + "': min/max of a double takes no modifier";
+      return "";
+    }
+    if (has_part(parts, "abs") && !has_part(parts, "xorsign")) {
+      err = "'" + opcode + "' names .abs without .xorsign, which the two-input form does"
+            " not have";
+      return "";
+    }
+    if (has_part(parts, "xorsign")) {
+      // Not this instruction with an extra: the magnitude is the comparison of the two
+      // magnitudes and the sign is the exclusive or of both, so `min.xorsign.abs(-1, 2)`
+      // is -1 where `min(-1, 2)` is -1 for another reason, and `max.xorsign.abs(1, -4)`
+      // is -4. The comparison runs on the magnitude's bit pattern, where a non-negative
+      // float's order is its integer order, and a NaN magnitude answers the canonical
+      // NaN, which is the all-ones word for a float.
+      const std::string ua = "weft_bitcast<uint32_t>(" + A + ")";
+      const std::string ub = "weft_bitcast<uint32_t>(" + B + ")";
+      const std::string ma = "(" + ua + " & 0x7FFFFFFFu)";
+      const std::string mb = "(" + ub + " & 0x7FFFFFFFu)";
+      const std::string mag =
+          "((" + ma + (op == "min" ? " < " : " > ") + mb + ") ? " + ma + " : " + mb + ")";
+      return guard + store(args[0],
+                           "(((" + mag + " & 0x7F800000u) == 0x7F800000u && (" + mag +
+                               " & 0x007FFFFFu) != 0u) ? weft_bitcast<float>(0x7FFFFFFFu) :"
+                               " weft_bitcast<float>(" + mag + " | ((" + ua + " ^ " + ub +
+                               ") & 0x80000000u)))",
+                           "float");
+    }
+    // The plain form is minNum/maxNum: a NaN operand hands back the other one, and a
+    // comparison with both NaNs answers a NaN. `std::min` is not that -- it returns its
+    // first operand whenever the comparison is false, so a NaN in the first operand came
+    // back out -- and it treats -0.0 and +0.0 as equal, where the isa puts -0.0 below.
+    // Both are said here rather than in a helper so the expression is the definition.
+    const std::string canon = ty == "double" ? "weft_bitcast<double>(0x7FF8000000000000ull)"
+                                             : "weft_bitcast<float>(0x7FFFFFFFu)";
+    const std::string isnanA = "(" + math("isnan", A) + ")", isnanB = "(" + math("isnan", B) + ")";
+    // Equal values are only a question when they are the two zeros: the isa puts -0.0
+    // below +0.0 and a C comparison calls them equal, so the sign bit breaks that tie.
+    // `min(-0.0, +0.0)` answered +0.0 with the comparison alone.
+    const std::string gt = (op == "min") ? " < " : " > ";
+    const std::string lt = (op == "min") ? " > " : " < ";
+    const std::string tie = "(" + math("signbit", A) + " ? " + (op == "min" ? A : B) + " : " +
+                            (op == "min" ? B : A) + ")";
+    const std::string pick =
+        (std::string("(") + isnanA + " ? (" + isnanB + " ? " + canon + " : " + B + ") : (" +
+         isnanB + " ? " + A + " : ((" + A + gt + B + ") ? " + A + " : ((" + B + lt + A + ") ? " + B +
+         " : " + tie + "))))");
+    // minNum/maxNum on the software double is already this rule, the zeros and the
+    // both-NaN answer included.
     if (msl && ty == "double")
       return guard + store(args[0],
                            std::string("weft_fp64::") + op + "_bits(" +
                                operand_as(args[1], "uint64_t") + ", " +
                                operand_as(args[2], "uint64_t") + ")",
                            "uint64_t");
-    return guard + store(
-        args[0], math(op, operand_as(args[1], ty) + ", " + operand_as(args[2], ty)), ty);
+    if (has_part(parts, "NaN"))
+      return guard + store(args[0], "(" + isnanA + " || " + isnanB + ") ? " + canon + " : " + pick,
+                           ty);
+    return guard + store(args[0], pick, ty);
   }
 
   if (op == "sqrt") {
@@ -2487,12 +3421,420 @@ std::string Emitter::emit(const std::string& raw) {
     return guard + store(args[0], "(" + sum + ")", ty.empty() ? "int32_t" : ty);
   }
 
+  // `dp2a.mode.atype.btype d, a, b, c` is the 16x8 sibling of `dp4a`: `a` holds two
+  // 16-bit lanes, `b` four bytes, and the mode picks which byte pair of `b` takes
+  // part -- `.lo` the low two bytes, `.hi` the high two. Both of `a`'s lanes always
+  // take part, one per byte of the pair, and each is folded in at its own
+  // signedness: atype names a's lanes, btype names b's bytes, and `c` is signed
+  // only when one of them is. Pure integer arithmetic again, so one expression is
+  // exact on both columns.
+  if (op == "dp2a" && args.size() >= 4) {
+    bool sgn_a = true, sgn_b = true, hi = false, seen_a = false, seen_b = false;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "lo") hi = false;
+      else if (p == "hi") hi = true;
+      else if (p == "u32" || p == "s32") {
+        if (!seen_a) { sgn_a = (p == "s32"); seen_a = true; }
+        else if (!seen_b) { sgn_b = (p == "s32"); seen_b = true; }
+      } else if (p == "satfinite") {
+        continue;  // unreachable at these widths, as for dp4a
+      } else {
+        err = "unsupported dp2a modifier '" + p + "'";
+        return "";
+      }
+    }
+    if (!seen_b) { err = "dp2a without both lane types in '" + opcode + "'"; return ""; }
+    auto lane16 = [](const std::string& w, int i, bool sgn) {
+      const std::string m = "(((uint32_t)(" + w + ") >> " + std::to_string(16 * i) +
+                            ") & 0xFFFFu)";
+      return sgn ? ("((int32_t)(int16_t)" + m + ")") : ("((int32_t)" + m + ")");
+    };
+    auto byte8 = [](const std::string& w, int i, bool sgn) {
+      const std::string m = "(((uint32_t)(" + w + ") >> " + std::to_string(8 * i) +
+                            ") & 0xFFu)";
+      return sgn ? ("((int32_t)(int8_t)" + m + ")") : ("((int32_t)" + m + ")");
+    };
+    const std::string a = operand_as(args[1], "uint32_t");
+    const std::string b = operand_as(args[2], "uint32_t");
+    const int base = hi ? 2 : 0;
+    // The sum is taken in 64 bits and cut to 32 at the end, so the wrap is the
+    // 32-bit wrap the destination has and not an overflow nobody defined.
+    std::string sum = "((int64_t)(" + operand_as(args[3], "uint32_t") + "))";
+    for (int i = 0; i < 2; i++)
+      sum += " + " + lane16(a, i, sgn_a) + " * " + byte8(b, base + i, sgn_b);
+    return guard + store(args[0], "(uint32_t)(" + sum + ")", ty.empty() ? "int32_t" : ty);
+  }
+
+  // The scalar video instructions are one operation on the whole word, with the two
+  // sources read at the types their suffixes name: `vmin.u32.u32.u32` on 0xFFFFFFFF
+  // takes the unsigned maximum, and `vmin.s32.s32.s32` on the same bits takes -1 and is
+  // therefore the minimum. The plain form is what a producer emits and its answer is the
+  // operation cut back to the destination's width, so the arithmetic runs in 64 bits
+  // where the sum of two words cannot overflow the language. `.sat` saturates instead of
+  // wrapping, the `.asel`/`.bsel` selectors name a part of an operand, and `.add` folds
+  // in a fourth operand; all three are refused by name rather than dropped.
+  if ((op == "vadd" || op == "vsub" || op == "vmin" || op == "vmax" || op == "vabsdiff" ||
+       op == "vmad") &&
+      args.size() >= 3) {
+    const bool mad_op = (op == "vmad");
+    bool seen_sat = false, seen_add = false;
+    std::string types[3];
+    int ntypes = 0;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "s32" || p == "u32") {
+        if (ntypes == 3) { err = "'" + opcode + "' names three types"; return ""; }
+        types[ntypes++] = p;
+      } else if (p == "sat") {
+        seen_sat = true;
+      } else if (p == "add") {
+        seen_add = true;
+      } else {
+        err = "'" + opcode + "' carries a qualifier the plain form does not lower: ." + p;
+        return "";
+      }
+    }
+    if (ntypes != 3) {
+      err = "'" + opcode + "' names a destination type and two source types";
+      return "";
+    }
+    if (seen_sat) { err = "'" + opcode + ".sat' saturates, which this does not"; return ""; }
+    if (seen_add || (!mad_op && args.size() > 3)) {
+      err = "'" + opcode + "': the fourth operand of the merge form is not translated";
+      return "";
+    }
+    const int nops = mad_op ? 4 : 3;
+    for (int i = 0; i < nops && (size_t)i < args.size(); i++) {
+      const std::string t = trim(args[(size_t)i]);
+      if (t.find('.') != std::string::npos || (!t.empty() && t[0] == '-')) {
+        err = "a part selector or a negated operand on '" + opcode + "' is not translated";
+        return "";
+      }
+    }
+    const bool dsgn = (types[0] == "s32");
+    const std::string dst = dsgn ? "int32_t" : "uint32_t";
+    // The low 32 bits of a 32x32 product plus a third word are the same whether the
+    // sources are signed or not, so one unsigned 64-bit expression is exact here.
+    if (mad_op) {
+      if (!need(4)) return "";
+      const std::string p = "((uint64_t)(uint32_t)" + operand_as(args[1], "uint32_t") +
+                            " * (uint64_t)(uint32_t)" + operand_as(args[2], "uint32_t") + ")";
+      const std::string sum =
+          "(" + p + " + (uint32_t)" + operand_as(args[3], "uint32_t") + ")";
+      return guard + store(args[0], std::string("(") + dst + ") (uint32_t)(" + sum + ")", dst);
+    }
+    auto wide_of = [&](const std::string& tok, bool sgn) {
+      return "((int64_t)" + std::string(sgn ? "(int32_t)" : "(uint32_t)") +
+             operand_as(tok, sgn ? "int32_t" : "uint32_t") + ")";
+    };
+    const std::string ta = wide_of(args[1], types[1] == "s32");
+    const std::string tb = wide_of(args[2], types[2] == "s32");
+    std::string val;
+    if (op == "vadd") val = "(" + ta + " + " + tb + ")";
+    else if (op == "vsub") val = "(" + ta + " - " + tb + ")";
+    else if (op == "vmin") val = "(" + ta + " < " + tb + " ? " + ta + " : " + tb + ")";
+    else if (op == "vmax") val = "(" + ta + " > " + tb + " ? " + ta + " : " + tb + ")";
+    else
+      val = "(" + ta + " > " + tb + " ? " + ta + " - " + tb + " : " + tb + " - " + ta + ")";
+    return guard + store(args[0], "(" + dst + ") (" + val + ")", dst);
+  }
+
+  // `vshl`/`vshr` are the scalar video shifts: one shift of the whole 32-bit word, and
+  // the mode says what a count wider than the register means. `.clamp` stops the count
+  // at 32 and `.wrap` takes its low five bits, which are two different answers for a
+  // count of 36. Both run in 64 bits, so the clamped count of 32 is a shift the language
+  // defines rather than one it does not, and the fill comes from the source type: signed
+  // shifts bring the sign down and unsigned ones bring zero. The `.sat` form, the merge
+  // and the `.asel`/`.bsel` selectors are refused by name rather than dropped, and a
+  // count with no mode is refused too, because the isa leaves it undefined.
+  if ((op == "vshl" || op == "vshr") && args.size() >= 3) {
+    bool clamp = false, wrap = false, sat = false, sgn_a = false;
+    std::string dtype;
+    int word_types = 0;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "clamp") clamp = true;
+      else if (p == "wrap") wrap = true;
+      else if (p == "sat") sat = true;
+      else if (p == "s32" || p == "u32") {
+        if (++word_types == 1) dtype = p;
+        else if (word_types == 2) sgn_a = (p == "s32");
+        else if (p != "u32") {
+          err = "'" + opcode + "': the shift amount is .u32";
+          return "";
+        }
+      } else {
+        err = "'" + opcode + "' carries a qualifier the scalar form does not lower: ." + p;
+        return "";
+      }
+    }
+    if (word_types < 3) {
+      err = "'" + opcode + "' names a destination type, a source type and an amount type";
+      return "";
+    }
+    if (!clamp && !wrap) {
+      err = "'" + opcode + "' needs .clamp or .wrap: without one a count past the width is undefined";
+      return "";
+    }
+    if (sat) { err = "'" + opcode + ".sat' saturates, which this does not"; return ""; }
+    for (int i = 0; i < 3; i++)
+      if (args[(size_t)i].find('.') != std::string::npos) {
+        err = "a part selector on '" + opcode + "' is not translated";
+        return "";
+      }
+    const std::string amt = "((uint32_t)" + operand_as(args[2], "uint32_t") + ")";
+    const std::string cnt =
+        wrap ? ("(" + amt + " & 31u)") : ("(" + amt + " > 32u ? 32u : " + amt + ")");
+    const std::string src = sgn_a
+                                ? ("((int64_t)(int32_t)" + operand_as(args[1], "int32_t") + ")")
+                                : ("((uint64_t)(uint32_t)" + operand_as(args[1], "uint32_t") + ")");
+    const std::string sh =
+        op == "vshl" ? (src + " << " + cnt) : (src + " >> " + cnt);
+    const bool dsgn = (dtype == "s32");
+    return guard + store(args[0], (dsgn ? "(int32_t)(" : "(uint32_t)(") + sh + ")",
+                         dsgn ? "int32_t" : "uint32_t");
+  }
+
+  // `vset.atype.btype.cmp d, a, b` compares two words at the types the suffixes name and
+  // answers 1 or 0, so a predicate lands in a register. The two types must agree: a
+  // signed word against an unsigned one has no comparison the isa defines, and a
+  // sign-extended word read as unsigned is a different answer rather than a rounding.
+  // The merge form and the part selectors are refused, as they are next door.
+  if (op == "vset" && args.size() >= 3) {
+    std::string at, bt, cmp;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "s32" || p == "u32") {
+        if (at.empty()) at = p;
+        else if (bt.empty()) bt = p;
+        else { err = "'" + opcode + "' names two types and a comparison"; return ""; }
+      } else if (p == "eq" || p == "ne" || p == "lt" || p == "le" || p == "gt" || p == "ge") {
+        cmp = p;
+      } else {
+        err = "'" + opcode + "' carries a qualifier this form does not lower: ." + p;
+        return "";
+      }
+    }
+    if (at.empty() || bt.empty() || cmp.empty()) {
+      err = "'" + opcode + "' names two source types and a comparison";
+      return "";
+    }
+    for (int i = 0; i < 2; i++)
+      if (args[(size_t)i].find('.') != std::string::npos) {
+        err = "a part selector on '" + opcode + "' is not translated";
+        return "";
+      }
+    // Both sides are widened to 64 bits and compared there. An unsigned word becomes a
+    // positive 64-bit value and a signed one keeps its sign, so a single comparison is
+    // right for both, and the two types are allowed to differ: that is a form the isa
+    // defines, and widening first is what makes `s32` against `u32` well defined.
+    auto wide_of = [&](const std::string& tok, bool sgn) {
+      return "((int64_t)" + std::string(sgn ? "(int32_t)" : "(uint32_t)") +
+             operand_as(tok, sgn ? "int32_t" : "uint32_t") + ")";
+    };
+    const std::string a = wide_of(args[1], at == "s32");
+    const std::string b = wide_of(args[2], bt == "s32");
+    const std::string sym = cmp == "eq" ? "==" : cmp == "ne" ? "!=" : cmp == "lt" ? "<"
+                            : cmp == "le" ? "<=" : cmp == "gt" ? ">" : ">=";
+    return guard + store(args[0], "((" + a + " " + sym + " " + b + ") ? 1u : 0u)", "uint32_t");
+  }
+
+  // `vset2`/`vset4` are the packed comparisons: each half (two lanes) or byte (four) of
+  // the two sources is compared at its own element type and the answer is 1 or 0 in that
+  // same field, which is not the all-ones mask a vector compare gives. A lane of a
+  // `.u32` source is an unsigned half or byte, so the same bits compared as `.s32` are a
+  // different answer, and one row of the fixture is there to say so. The destination mask,
+  // the part selectors and the `.add` form are the merge variants and are refused by
+  // name rather than dropped.
+  if ((op == "vset2" || op == "vset4") && args.size() >= 3) {
+    const int lanes = (op == "vset2") ? 2 : 4;
+    const int width = 32 / lanes;
+    std::string at, bt, cmp;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p == "s32" || p == "u32") {
+        if (at.empty()) at = p;
+        else if (bt.empty()) bt = p;
+        else { err = "'" + opcode + "' names two element types and a comparison"; return ""; }
+      } else if (p == "eq" || p == "ne" || p == "lt" || p == "le" || p == "gt" || p == "ge") {
+        cmp = p;
+      } else {
+        err = "'" + opcode + "' carries a qualifier this form does not lower: ." + p;
+        return "";
+      }
+    }
+    if (at.empty() || bt.empty() || cmp.empty()) {
+      err = "'" + opcode + "' names two element types and a comparison";
+      return "";
+    }
+    // The packed form names its merge operand `c` even when no mask selects it, and the
+    // mask that is absent means every lane, so `c` is not read here. A mask on the
+    // destination or a selector on any operand makes it matter, and those are refused.
+    if (args.size() > 4) {
+      err = "'" + opcode + "' has more operands than the packed form does";
+      return "";
+    }
+    for (size_t i = 0; i < args.size(); i++)
+      if (args[i].find('.') != std::string::npos) {
+        err = "a part selector on '" + opcode + "' is not translated";
+        return "";
+      }
+    const std::string field = lanes == 2 ? "0xFFFFu" : "0xFFu";
+    auto lane_val = [&](const std::string& tok, bool sgn, int i) {
+      const std::string m = "(((uint32_t)(" + operand_as(tok, "uint32_t") + ") >> " +
+                            std::to_string(width * i) + ") & " + field + ")";
+      return sgn ? ("((int32_t)(int" + std::to_string(width == 16 ? 16 : 8) + "_t)" + m + ")")
+                 : ("((int32_t)" + m + ")");
+    };
+    const std::string sym = cmp == "eq" ? "==" : cmp == "ne" ? "!=" : cmp == "lt" ? "<"
+                            : cmp == "le" ? "<=" : cmp == "gt" ? ">" : ">=";
+    std::string packed = "0u";
+    for (int i = 0; i < lanes; i++) {
+      const std::string x = lane_val(args[1], at == "s32", i);
+      const std::string y = lane_val(args[2], bt == "s32", i);
+      const std::string t = "((" + x + " " + sym + " " + y + ") ? 1u : 0u)";
+      packed = "(" + packed + " | (" + t + " << " + std::to_string(width * i) + "))";
+    }
+    return guard + store(args[0], packed, "uint32_t");
+  }
+
+  //
+  // The video instructions are packed arithmetic that does not carry between lanes.
+  // The plain form is what a producer emits -- no `.asel`/`.bsel`, no destination
+  // mask, no `.add` -- and there each lane of `a` and `b` is widened at the signedness
+  // its own suffix names, the operation runs in 32 bits, and the answer is cut back
+  // to the lane width. The fourth operand `c` belongs to the merge form and is not
+  // read here, which is why a `.add` or a selector is refused by name instead of
+  // being accepted and quietly dropped.
+  {
+    int lanes = 0;
+    std::string vop;
+    if (op == "vadd2") { lanes = 2; vop = "add"; }
+    else if (op == "vsub2") { lanes = 2; vop = "sub"; }
+    else if (op == "vmin2") { lanes = 2; vop = "min"; }
+    else if (op == "vmax2") { lanes = 2; vop = "max"; }
+    else if (op == "vavrg2") { lanes = 2; vop = "avrg"; }
+    else if (op == "vabsdiff2") { lanes = 2; vop = "absdiff"; }
+    else if (op == "vadd4") { lanes = 4; vop = "add"; }
+    else if (op == "vsub4") { lanes = 4; vop = "sub"; }
+    else if (op == "vmin4") { lanes = 4; vop = "min"; }
+    else if (op == "vmax4") { lanes = 4; vop = "max"; }
+    else if (op == "vavrg4") { lanes = 4; vop = "avrg"; }
+    else if (op == "vabsdiff4") { lanes = 4; vop = "absdiff"; }
+    if (lanes) {
+      if (!need(4)) return "";
+      if (args[0].find('.') != std::string::npos || args[1].find('.') != std::string::npos ||
+          args[2].find('.') != std::string::npos) {
+        err = "the merge form of '" + op +
+              "' (a destination mask or an .asel/.bsel selector) is not translated";
+        return "";
+      }
+      bool sgn_a = false, sgn_b = false;
+      int ti = 0;
+      for (size_t i = 1; i < parts.size(); i++) {
+        const std::string& p = parts[i];
+        if (p == "sat" || p == "add") {
+          err = "'" + op + "' with ." + p + " is the merge form and is not translated";
+          return "";
+        }
+        if (p != "u32" && p != "s32") {
+          err = "unsupported " + op + " operand type '." + p + "'";
+          return "";
+        }
+        if (ti == 1) sgn_a = (p == "s32");
+        if (ti == 2) sgn_b = (p == "s32");
+        ti++;
+      }
+      if (ti < 3) {
+        err = op + " needs three operand types: destination, a and b";
+        return "";
+      }
+      const int width = lanes == 2 ? 16 : 8;
+      const std::string lm = width == 16 ? "0xFFFFu" : "0xFFu";
+      auto ext = [&](const std::string& w, int i, bool sgn) {
+        const std::string m = "(((uint32_t)(" + w + ") >> " + std::to_string(width * i) +
+                              ") & " + lm + ")";
+        if (width == 16)
+          return sgn ? ("((int32_t)(int16_t)" + m + ")") : ("((int32_t)" + m + ")");
+        return sgn ? ("((int32_t)(int8_t)" + m + ")") : ("((int32_t)" + m + ")");
+      };
+      const std::string a = operand_as(args[1], "uint32_t");
+      const std::string b = operand_as(args[2], "uint32_t");
+      std::string packed = "0u";
+      for (int i = 0; i < lanes; i++) {
+        const std::string x = ext(a, i, sgn_a);
+        const std::string y = ext(b, i, sgn_b);
+        std::string t;
+        if (vop == "add") t = "(" + x + " + " + y + ")";
+        else if (vop == "sub") t = "(" + x + " - " + y + ")";
+        else if (vop == "min") t = "(" + x + " < " + y + " ? " + x + " : " + y + ")";
+        else if (vop == "max") t = "(" + x + " > " + y + " ? " + x + " : " + y + ")";
+        else if (vop == "absdiff")
+          t = "(" + x + " > " + y + " ? " + x + " - " + y + " : " + y + " - " + x + ")";
+        else
+          t = "(((" + x + " + " + y + ") >= 0) ? ((" + x + " + " + y +
+              " + 1) >> 1) : ((" + x + " + " + y + ") >> 1))";
+        const std::string cut = "(((uint32_t)" + t + ") & " + lm + ")";
+        packed = "(" + packed + " | (" + cut + " << " + std::to_string(width * i) + "))";
+      }
+      return guard + store(args[0], packed, ty.empty() ? "uint32_t" : ty);
+    }
+  }
+
   if (op == "clz" && args.size() >= 2)
     return guard + store(args[0], "(uint32_t)__builtin_clz(" + operand_as(args[1], ty) + ")", ty);
   if (op == "popc" && args.size() >= 2)
     return guard + store(args[0], "(uint32_t)__builtin_popcount(" + operand_as(args[1], ty) + ")", ty);
   if (op == "brev" && args.size() >= 2)
     return guard + store(args[0], "weft_bitrev32(" + operand_as(args[1], ty) + ")", ty);
+
+  // `bswap.b32 d, a` and `bswap.b64 d, a` reverse the bytes of the register, which is
+  // how a kernel turns a word read from memory into host order. It is not `brev`: the
+  // bits move eight at a time and stay inside their byte, so a value with one byte set
+  // comes back with that byte at the other end. The 64-bit form reverses the eight bytes
+  // as a whole, so its two 32-bit halves trade places too.
+  if (op == "bswap" && args.size() >= 2) {
+    const bool wide = (ty == "uint64_t" || ty == "int64_t");
+    return guard + store(args[0],
+                         std::string(wide ? "weft_bswap64(" : "weft_bswap32(") +
+                             operand_as(args[1], wide ? "uint64_t" : "uint32_t") + ")",
+                         ty.empty() ? (wide ? "uint64_t" : "uint32_t") : ty);
+  }
+
+  // `cnot.type d, a` is the C logical negation and not the bitwise one: the answer is 1
+  // when the register is zero and 0 when it is anything else, so a word of all ones
+  // answers 0 rather than `not`'s all zeros. The width only picks the register to read,
+  // which is why `.b16`, `.b32` and `.b64` all have the same answer.
+  if (op == "cnot" && args.size() >= 2)
+    return guard + store(args[0], "(" + operand_as(args[1], ty) + " == 0 ? 1 : 0)",
+                         ty.empty() ? "uint32_t" : ty);
+
+  // `bfind.u32 d, a` is the position of the highest set bit, counted from the least
+  // significant end, and 0xFFFFFFFF when there is no set bit. `.s32` searches for
+  // the highest bit that differs from the sign, so a negative value is searched
+  // inverted and both 0 and -1 have no such bit; `.shiftamt` answers the shift that
+  // moves that bit to the sign position, 31 - pos, and 0xFFFFFFFF for none. All
+  // three are one helper on both columns, so the answer cannot differ between them.
+  if (op == "bfind" && args.size() >= 2) {
+    const bool sgn = ty == "int32_t";
+    bool shiftamt = false;
+    for (const auto& p : parts)
+      if (p == "shiftamt") shiftamt = true;
+    const std::string call = std::string(sgn ? "weft_bfind_s32(" : "weft_bfind_u32(") +
+                             operand_as(args[1], sgn ? "int32_t" : "uint32_t") + ")";
+    const std::string body =
+        shiftamt ? "(" + call + " == 0xFFFFFFFFu ? 0xFFFFFFFFu : (31u - " + call + "))" : call;
+    return guard + store(args[0], body, ty.empty() ? "uint32_t" : ty);
+  }
+  // `fns.b32 d, mask, base, offset` is the position of the offset-th set bit of
+  // `mask`, counting upward from `base`, and 0xFFFFFFFF if it never meets one.
+  if (op == "fns" && args.size() >= 4)
+    return guard + store(args[0],
+                         "weft_fns_b32(" + operand_as(args[1], "uint32_t") + ", " +
+                             operand_as(args[2], "uint32_t") + ", " +
+                             operand_as(args[3], "uint32_t") + ")",
+                         ty.empty() ? "uint32_t" : ty);
 
   if ((op == "ex2" || op == "lg2" || op == "rcp" || op == "rsqrt" || op == "div" || op == "sqrt") &&
       args.size() >= 2) {
@@ -2520,7 +3862,7 @@ std::string Emitter::emit(const std::string& raw) {
     for (size_t i = 1; i < parts.size(); i++) {
       const std::string& p = parts[i];
       if (p == "rcp" || p == "rsqrt" || p == "sqrt" || p == "sin" || p == "cos" ||
-          p == "ex2" || p == "lg2" || p == "tanh")
+          p == "ex2" || p == "lg2" || p == "tanh" || p == "tan")
         f = p;
       else if (p == "approx" || p == "ftz" || p == "f32" || p == "rn")
         continue;
@@ -2548,6 +3890,8 @@ std::string Emitter::emit(const std::string& raw) {
     return guard + store(args[0], "weft_cos(" + operand_as(args[1], ty) + ")", ty);
   if (op == "tanh" && args.size() >= 2)
     return guard + store(args[0], "weft_tanh(" + operand_as(args[1], ty) + ")", ty);
+  if (op == "tan" && args.size() >= 2)
+    return guard + store(args[0], "weft_tan(" + operand_as(args[1], ty) + ")", ty);
 
   //
   // ldmatrix and mma are warp-wide: a fragment is distributed across the 32
@@ -2695,22 +4039,13 @@ std::string Emitter::emit(const std::string& raw) {
     // is a place inside the shared window that is known at translation time, so
     // nothing has to be read out of a peer's register, the rows are the 16-byte
     // ones the tile was declared with.
-    if (!sym.empty()) {
-      std::string nm = sym;
-      long long k = 0;
-      const size_t cut = sym.find_first_of("+/-");
-      if (cut != std::string::npos) {
-        nm = trim(sym.substr(0, cut));
-        k = std::strtoll(sym.c_str() + cut + 1, nullptr, 0);
-        if (sym[cut] == '-') k = -k;
-      }
-      nm = trim(nm);
-      auto so = shared_offsets.find(nm);
-      if (so == shared_offsets.end()) {
-        err = "'" + nm + "' is not a shared array: ldmatrix reads threadgroup memory";
-        return "";
-      }
-      addr = std::to_string((long long)so->second + k);
+    // `addr` already carries the array's offset in the shared window and any constant
+    // in the operand, so the symbol is only here to say whether the address is shared
+    // by the warp or a per-lane register. Re-deriving the base from the bare name threw
+    // the constant away: `[tile+256]` read `tile`.
+    if (!sym.empty() && shared_offsets.find(sym) == shared_offsets.end()) {
+      err = "'" + sym + "' is not a shared array: ldmatrix reads threadgroup memory";
+      return "";
     }
     // The address a lane supplies points at one row of 8 halves, and another
     // lane is the one that reads it: matrix k's row i is addressed by lane 8k+i,
@@ -2721,7 +4056,7 @@ std::string Emitter::emit(const std::string& raw) {
     // tile instead, so the row is an offset from its start, 16 bytes per row.
     const bool uniform = !sym.empty();
     auto row_addr = [&](const std::string& who) -> std::string {
-      if (uniform) return "(" + addr + "ull + 16u * (" + who + "))";
+      if (uniform) return "((uint64_t)(" + addr + ") + 16u * (" + who + "))";
       std::string s = addr;
       for (size_t p = 0; (p = s.find("[l]", p)) != std::string::npos;)
         s.replace(p, 3, "[" + who + "]");
@@ -2751,8 +4086,8 @@ std::string Emitter::emit(const std::string& raw) {
             const std::string col = "(" + idx + " & 15u)";
             std::string chunk;
             if (uniform) {
-              chunk = "(" + addr + "ull + " + std::to_string(16 * rows * m) + "u + 16u * " +
-                      row + ")";
+              chunk = "((uint64_t)(" + addr + ") + " + std::to_string(16 * rows * m) +
+                      "u + 16u * " + row + ")";
             } else {
               // Container `rows*m + row` is the one lane `rows*m + row` supplied, the
               // same pairing the byte shape uses.
@@ -2820,8 +4155,8 @@ std::string Emitter::emit(const std::string& raw) {
             const std::string col = "(l >> 2) + " + std::to_string(8 * bq) + "u";
             std::string at;
             if (uniform) {
-              at = "(" + addr + "ull + " + std::to_string(256 * m) + "u + 16u * (" + row +
-                   ") + (" + col + "))";
+              at = "((uint64_t)(" + addr + ") + " + std::to_string(256 * m) + "u + 16u * (" +
+                   row + ") + (" + col + "))";
             } else {
               // The address lane `16m + f(row)` supplied is the start of that row, so
               // the peer's slot plus the column is the byte. f is the inverse of the
@@ -2879,6 +4214,89 @@ std::string Emitter::emit(const std::string& raw) {
     return "for (uint32_t l = 0; l < 32u; l++) { " + out + " }";
   }
 
+  // activemask.b32 d;  -- one bit per lane of this warp that is executing.
+  //
+  // The warp body already carries that as the predicate it dispatches on, so the
+  // mask is a fold over it and the answer is the same number in every lane that ran:
+  // a converged kernel reports all of its live lanes, and one whose lanes are on
+  // different paths reports the block the scheduler ran, which is exactly what the
+  // instruction promises.
+  if (op == "activemask") {
+    if (!vec) {
+      warp_only = true;
+      err = "activemask answers which lanes of the warp are executing, which only the "
+            "warp body knows";
+      return "";
+    }
+    if (!need(1)) return "";
+    // A predicated instruction deactivates its lane just as a branch does, and the
+    // spec counts a predicated-off lane as a 0 in this mask. The predicate is a
+    // per-lane expression, so the fold runs over the lane index instead of being
+    // unrolled with a constant one.
+    const std::string p = vec_pred.empty() ? "1" : vec_pred;
+    vec_side = true;
+    return "{ uint32_t weft_m = 0; for (uint32_t l = 0; l < 32u; l++) if (am[l] && (" + p +
+           ")) weft_m |= 1u << l; for (uint32_t l = 0; l < 32u; l++) if (am[l] && (" + p +
+           ")) { " + store(args[0], "weft_m", "uint32_t") + " } }";
+  }
+
+  // `movmatrix` is the transpose of the fragment `ldmatrix` builds and `stmatrix`
+  // takes apart, laid out the same way: lane l holds row l>>2, at columns 2(l&3) and
+  // 2(l&3)+1. Transposed, this lane holds columns l>>2 of the matrix at rows 2(l&3)
+  // and 2(l&3)+1, that is original elements (2(l&3), l>>2) and (2(l&3)+1, l>>2).
+  // Element (c, r) of the original lives in lane 4c+(r>>1), in the half that r&1
+  // names, so the two halves this lane needs come from peers four lanes apart -- and
+  // because the map is the one the two matrix instructions already agree on, a lane
+  // layout that drifted would break the round trip rather than go unnoticed.
+  if (op == "movmatrix") {
+    if (!vec) {
+      warp_only = true;
+      err = "movmatrix reads registers belonging to other lanes, so it needs the warp backend";
+      return "";
+    }
+    if (!need(2)) return "";
+    if (!has_part(parts, "m8n8") || !has_part(parts, "b16")) {
+      err = "unsupported movmatrix form: the 8x8 tile of 16-bit elements, transposed";
+      return "";
+    }
+    Reg src = parse_reg(args[1]);
+    Reg dst = parse_reg(args[0]);
+    if (!src.ok || !dst.ok) {
+      err = "movmatrix takes one destination and one source register";
+      return "";
+    }
+    const std::string sreg = "s->" + src.base + "[" + std::to_string(src.index) + "]";
+    const std::string dreg = "s->" + dst.base + "[" + std::to_string(dst.index) + "]";
+    auto rt = reg_types.find(src.base);
+    const bool fl = rt != reg_types.end() && rt->second == "float";
+    auto word = [&](const std::string& lane) {
+      return fl ? ("weft_bits(" + sreg + "[" + lane + "])")
+                : ("((uint32_t)" + sreg + "[" + lane + "])");
+    };
+    // Without `.trans` the source and destination are the same matrix in the same
+    // fragment layout, so the move is the identity: the lane keeps the pair it holds.
+    // This was refused for a while because it measured as a bus error at a full warp.
+    // The fault was in the fixture that fed it, which added the output address to an
+    // address that already held the input address, so the store landed at in+out+tid*4.
+    // With that fixed the identity runs at 1, 8 and 32 lanes and round-trips the warp.
+    if (!has_part(parts, "trans")) {
+      std::string id = "for (uint32_t l = 0; l < 32u; l++) { ";
+      id += "const uint32_t weft_w = " + word("l") + "; ";
+      id += "if (am[l]) " + dreg + "[l] = weft_w; }";
+      return id;
+    }
+    std::string out = "for (uint32_t l = 0; l < 32u; l++) { ";
+    out += "const uint32_t weft_r = (l >> 2) & 7u; const uint32_t weft_c = 2u * (l & 3u); ";
+    out += "const uint32_t weft_p = 4u * weft_c + (weft_r >> 1u); ";
+    out += "const uint32_t weft_w0 = " + word("weft_p") + "; ";
+    out += "const uint32_t weft_w1 = " + word("weft_p + 4u") + "; ";
+    out += "const uint32_t weft_sh = 16u * (weft_r & 1u); ";
+    out += "const uint32_t weft_lo = (weft_w0 >> weft_sh) & 0xFFFFu; ";
+    out += "const uint32_t weft_hi = (weft_w1 >> weft_sh) & 0xFFFFu; ";
+    out += "if (am[l]) " + dreg + "[l] = weft_lo | (weft_hi << 16); }";
+    return out;
+  }
+
   // `stmatrix` is `ldmatrix` backwards: the same fragment map, walked from the
   // registers into shared memory. Lane l holds row l>>2 and the two halves at
   // columns 2(l&3) and 2(l&3)+1, and the address it stores through is the one lane
@@ -2921,26 +4339,17 @@ std::string Emitter::emit(const std::string& raw) {
     }
     std::string addr, sym;
     if (!mem_operand(args[0], addr, sym)) return "";
-    if (!sym.empty()) {
-      std::string nm = sym;
-      long long k = 0;
-      const size_t cut = sym.find_first_of("+/-");
-      if (cut != std::string::npos) {
-        nm = trim(sym.substr(0, cut));
-        k = std::strtoll(sym.c_str() + cut + 1, nullptr, 0);
-        if (sym[cut] == '-') k = -k;
-      }
-      nm = trim(nm);
-      auto so = shared_offsets.find(nm);
-      if (so == shared_offsets.end()) {
-        err = "'" + nm + "' is not a shared array: stmatrix writes threadgroup memory";
-        return "";
-      }
-      addr = std::to_string((long long)so->second + k);
-    }
+    // `addr` already carries the array's offset inside the shared window *and* any
+    // constant written in the operand, so the symbol is only here to say whether the
+    // address is one the warp shares or a per-lane register. Re-deriving the base
+    // from the bare name threw the constant away: `[tile+256]` stored at `tile`.
     const bool uniform = !sym.empty();
+    if (uniform && shared_offsets.find(sym) == shared_offsets.end()) {
+      err = "'" + sym + "' is not a shared array: stmatrix writes threadgroup memory";
+      return "";
+    }
     auto row_addr = [&](const std::string& who) -> std::string {
-      if (uniform) return "(" + addr + "ull + 16u * (" + who + "))";
+      if (uniform) return "((uint64_t)(" + addr + ") + 16u * (" + who + "))";
       std::string s = addr;
       for (size_t p = 0; (p = s.find("[l]", p)) != std::string::npos;)
         s.replace(p, 3, "[" + who + "]");
@@ -2974,17 +4383,19 @@ std::string Emitter::emit(const std::string& raw) {
           const std::string row = "4u * (l & 3u) + " + std::to_string(2 * a + bq) + "u";
           std::string at;
           if (uniform) {
-            at = "(" + addr + "ull + " + std::to_string(128 * m) + "u + 8u * (" + row +
-                 ") + (l >> 2))";
+            at = "((uint64_t)(" + addr + ") + " + std::to_string(128 * m) + "u + 8u * (" +
+                 row + ") + (l >> 2))";
           } else {
             // The address operand names a 16-byte block of the tile, two rows at a
-            // time, supplied by lane `16m + block`.
-            const std::string peer = "(" + std::to_string(16 * m) + "u + 2u * (l & 3u) + " +
+            // time, supplied by lane `8m + block`: eight addresses a matrix, the
+            // groups of eight lanes the PTX ISA gives each matrix. The byte inside
+            // that block is the row parity times eight plus the column.
+            const std::string peer = "(" + std::to_string(8 * m) + "u + 2u * (l & 3u) + " +
                                      std::to_string(a) + "u)";
             std::string s2 = addr;
             for (size_t p = 0; (p = s2.find("[l]", p)) != std::string::npos;)
               s2.replace(p, 3, "[" + peer + "]");
-            at = "(" + s2 + " + (l >> 2))";
+            at = "(" + s2 + " + " + std::to_string(8 * bq) + "u + (l >> 2))";
           }
           out += "*(" + addr_space("threadgroup", false) + "uint8_t*)(sh + " + at +
                  ") = (uint8_t)((" + w + " >> " + std::to_string(8 * q) + ") & 0xFFu); ";
@@ -3104,10 +4515,9 @@ std::string Emitter::emit(const std::string& raw) {
     }
     if (args.size() < 4) { err = "bad " + opcode; return ""; }
     // After the operands the immediates run in a fixed order: scale-d, scale-a,
-    // scale-b, transpose-a, transpose-b. PTX says the trailing ones may be left
-    // off, so a run of one to five is legal and whatever is missing is zero, a
-    // shorter list is not a different instruction, and refusing it refused
-    // assembly GCC and Triton both emit.
+    // scale-b, transpose-a, transpose-b. ptxas wants all five, but the dumps write
+    // shorter lists, so a missing one reads as the identity: zero for the flags,
+    // and for the two scales, where zero and an explicit 1 are the same answer.
     const size_t nargs = args.size();
     if (nargs > 8) {
       err = "wgmma '" + opcode + "' takes at most 5 immediates (scale-d, then "
@@ -3115,20 +4525,24 @@ std::string Emitter::emit(const std::string& raw) {
             std::to_string(nargs - 3);
       return "";
     }
-    bool flag[5] = {false, false, false, false, false};
+    int imm[5] = {0, 0, 0, 0, 0};
     static const char* const kImmName[5] = {"scale-d", "scale-a", "scale-b",
                                             "transpose-a", "transpose-b"};
     for (size_t i = 0; i < 5 && 3 + i < nargs; i++) {
       const std::string v = trim(args[3 + i]);
-      if (v != "0" && v != "1") {
+      if (v != "0" && v != "1" && v != "-1") {
         err = "wgmma '" + opcode + "': the " + kImmName[i] +
-              " immediate must be 0 or 1, got '" + v + "'";
+              " immediate must be 0, 1 or -1, got '" + v + "'";
         return "";
       }
-      flag[i] = (v == "1");
+      imm[i] = v == "-1" ? -1 : (v == "1" ? 1 : 0);
     }
-    const bool scale_d = flag[0], neg_a = flag[1], neg_b = flag[2];
-    const bool trans_a = flag[3], trans_b = flag[4];
+    // The operand scales are multipliers, not flags: -1 negates the operand and 1
+    // leaves it, which is why ptxas takes only those two there. The 0 an older dump
+    // writes means the same as 1. The rest are ordinary flags.
+    const bool scale_d = imm[0] != 0;
+    const bool neg_a = imm[1] == -1, neg_b = imm[2] == -1;
+    const bool trans_a = imm[3] != 0, trans_b = imm[4] != 0;
     std::string dlist = trim(args[0]);
     if (dlist.find('{') == std::string::npos) {
       err = "wgmma needs an accumulator register list";
@@ -3308,13 +4722,18 @@ std::string Emitter::emit(const std::string& raw) {
       err = "mma reads registers belonging to other lanes, so it needs the warp backend";
       return "";
     }
-    // `.kind::block_scale` (and `.kind::mxf4` / `f8f6f4`) names a *different*
-    // instruction: the scale operands that follow the accumulators multiply each
-    // block of the product, so the product alone is a different number rather than
-    // a coarser one. Those spellings would otherwise match a shape arm below, the
-    // tile and the type are the same, and the scales would be dropped in silence,
-    // which is the one thing a translator must not do.
+    // `.kind::block_scale` (and `.kind::mxf4`) names a *different* instruction: the
+    // scale operands that follow the accumulators multiply each block of the
+    // product, so the product alone is a different number rather than a coarser
+    // one. Those spellings would otherwise match a shape arm below, the tile and
+    // the type are the same, and the scales would be dropped in silence, which is
+    // the one thing a translator must not do.
+    //
+    // `.kind::f8f6f4` is the exception, and ptxas settles it: it is the plain
+    // fp4/fp6 multiply on `sm_120a`, four operands and no scales, so it is read as
+    // the form it is. The block-scaled spellings keep their rejection.
     for (const auto& p : parts) {
+      if (p == "kind::f8f6f4" && args.size() <= 4) continue;
       if (p.rfind("kind", 0) == 0 || p == "block_scale" || p.rfind("scale_vec", 0) == 0) {
         err = "mma '" + opcode + "': a block-scaled form carries the per-block scale "
               "operands after the accumulators, and the product without them is a "
@@ -3519,6 +4938,13 @@ std::string Emitter::emit(const std::string& raw) {
     // positions in the two spellings, and the *instruction as written* decides
     // where they are. Whether the result is kept is a separate question, below.
     const bool is_atom = (op == "atom");
+    // `atom.cas.b128` compares and writes sixteen bytes as one value. The widest
+    // atomic instruction here is 64 bits, so the sixteen bytes are read, compared and
+    // written under a lock: on the GPU the lock the 64-bit pair already takes, on the
+    // host the stripe table in src/soft_math.hpp. The shape is handled below, once the
+    // operation and the address are known, because a compare on a prefix is a different
+    // instruction with the same spelling and only a whole-value compare is this one.
+    const bool b128atom = has_part(parts, "b128");
     bool has_result = is_atom;
     // An atomic whose result nobody reads is a reduction, and ptxas emits the
     // reduction itself; this front end has to make the same rewrite because what
@@ -3544,13 +4970,256 @@ std::string Emitter::emit(const std::string& raw) {
     for (size_t i = 1; i < parts.size(); i++) {
       const std::string& p = parts[i];
       if (p == "add" || p == "sub" || p == "min" || p == "max" || p == "and" ||
-          p == "or" || p == "xor" || p == "exch" || p == "cas") {
+          p == "or" || p == "xor" || p == "exch" || p == "cas" || p == "inc" ||
+          p == "dec") {
         aop = p;
         break;
       }
     }
     if (aop.empty()) { err = "unsupported atomic '" + opcode + "'"; return ""; }
     std::string fn;
+    // An atomic in shared memory is refused by name. `.shared`, `.shared::cta` and
+    // `.shared::cluster` name a window the launch owns, and its address is an offset
+    // inside that window, not a pointer: the library's atomics in src/weft_msl.hpp are
+    // declared over device pointers, and on the GPU the address space is part of the
+    // pointer type, so one helper cannot serve both spaces. Handing the offset to the
+    // device form was a crash, an atomic on address zero, not an atomic on the window.
+    // Loads and stores in the same space are translated, the `.v2`/`.v4` cluster forms
+    // included; this is the atomic case alone.
+    // The address an atomic takes, in the space the instruction names. A shared address
+    // is an offset inside the threadgroup window, so it is added to `sh`; a device one
+    // is the value the register holds. `.shared`, `.shared::cta` and `.shared::cluster`
+    // are one window to a launch this wide, and on the GPU the window and the heap are
+    // different pointer types -- which is why src/weft_msl.hpp carries the atomic family
+    // twice and the narrow helpers in src/soft_math.hpp are templates over their pointer.
+    auto atom_ptr = [&](const std::string& t) -> std::string {
+      if (shared)
+        return "(" + addr_space("threadgroup", false) + t + "*)(sh + (" + addr + "))";
+      return "(" + addr_space("device", false) + t + "*)(uintptr_t)(" + addr + ")";
+    };
+    // The word that holds a 16-bit value or a packed pair: the address masked down to
+    // it. That arithmetic is the same in both spaces, so only the base and the cast
+    // differ. A shared atomic is not the device one with a cast: the window is not the
+    // heap, and casting an offset was an atomic on address zero.
+    auto atom_word = [&](const std::string& t, const std::string& a) -> std::string {
+      if (shared)
+        return "(" + addr_space("threadgroup", false) + t + "*)(sh + (" + a + " & ~3ull))";
+      return "(" + addr_space("device", false) + t + "*)(uintptr_t)(" + a + " & ~3ull)";
+    };
+    if (b128atom) {
+      if (aop != "cas") {
+        err = "'" + opcode + "' is a ." + aop + " atomic on .b128: the isa names only "
+              ".cas at that width";
+        return "";
+      }
+      if (shared) {
+        err = "'" + opcode + "' is a 128-bit atomic in shared memory: that width has no "
+              "atomic instruction in the window on this host's GPU, and the lock the "
+              "device form takes orders the heap rather than the window";
+        return "";
+      }
+      if (args.size() <= vi + 1) { err = "bad " + opcode; return ""; }
+      const std::string p = atom_ptr("weft_u128");
+      const std::string c = operand_as(args[vi], "weft_u128");
+      const std::string val = operand_as(args[vi + 1], "weft_u128");
+      if (msl) {
+        wide_atom = true;
+        // One thread runs all 32 lanes, so an address every lane shares takes the
+        // lock around the loop: a lane that waited for a peer in its own warp could
+        // never be resumed to release it.
+        if (vec && p.find("[l]") == std::string::npos) {
+          const bool sel = vec_select;
+          vec_select = false;
+          const std::string raw = "weft::rmw_cas_b128_raw(" + p + ", " + c + ", " + val + ")";
+          const std::string inner = has_result ? store(args[0], raw, "weft_u128")
+                                               : ("(void)" + raw + ";");
+          vec_select = sel;
+          vec_side = true;
+          return "{ device uint32_t* weft_lk = weft::lock_of(ctx.locks, (device const void*)" +
+                 p + ");\n"
+                 "  weft::lock_take(weft_lk);\n"
+                 "  for (uint32_t l = 0; l < 32u; l++) { if (" +
+                 lane_cond() + ") { " + inner + " } }\n"
+                 "  weft::lock_drop(weft_lk); }";
+        }
+        const std::string call =
+            "weft::rmw_cas_b128(ctx.locks, " + p + ", " + c + ", " + val + ")";
+        if (!has_result) return guard + "(void)" + call + ";";
+        return guard + store(args[0], call, "weft_u128");
+      }
+      const std::string call = "weft_atom_cas_b128(" + p + ", " + c + ", " + val + ")";
+      if (!has_result) return guard + "(void)" + call + ";";
+      return guard + store(args[0], call, "weft_u128");
+    }
+    // One width stays refused: a 64-bit atomic in the window. This host's GPU has no
+    // atomic at that width in threadgroup memory, and the lock the device form takes
+    // orders the heap, not the window, so answering with two 32-bit words would tear the
+    // value a reader is promised. Everything at 32 bits and below is translated.
+    if (shared && cpp_size(ty) == 8) {
+      err = "'" + opcode + "' is a 64-bit atomic in shared memory: that width has no "
+            "atomic instruction in the window on this host's GPU, and the lock the "
+            "device form takes orders the heap rather than the window";
+      return "";
+    }
+    // Vector atomics: `atom.global.v4.f16.max.noftz {%hd0,%hd1,%hd2,%hd3}, [gbl],
+    // {%h0,%h1,%h2,%h3}`. Table 41 keeps these in a table of their own, and it is not a
+    // wider copy of the scalar one: a half takes `.add`, `.min` and `.max` at `.v2`,
+    // `.v4` and `.v8`, a packed pair takes them at `.v2` and `.v4`, and no scalar half is
+    // spelled `.min` at all -- which is why this is its own case. The isa says the
+    // atomicity is per element and not for the group, so each element is one
+    // compare-exchange on the word that holds it and the element beside it keeps its
+    // value. `.noftz` is required by the isa on these and is what the library does
+    // anyway, so a form written without it lands on the same answer.
+    int vn = 0;
+    for (size_t i = 1; i < parts.size(); i++) {
+      const std::string& p = parts[i];
+      if (p.size() == 2 && p[0] == 'v' && p[1] >= '2' && p[1] <= '8') vn = p[1] - '0';
+    }
+    if (vn) {
+      const bool packv = has_part(parts, "f16x2") || has_part(parts, "bf16x2");
+      const bool halfv = has_part(parts, "f16") || has_part(parts, "bf16");
+      if (!halfv && !packv) {
+        err = "'" + opcode + "' is a vector atomic, and this front end carries the half "
+              "ones: a vector of floats or of integers is refused rather than written "
+              "as one step, since the isa makes each element its own atomic";
+        return "";
+      }
+      if (vn != 2 && vn != 4) {
+        if (vn != 8) {
+          err = "'" + opcode + "' is a vector atomic, and the isa names .v2, .v4 and "
+                ".v8 only";
+          return "";
+        }
+        if (packv) {
+          err = "'" + opcode + "' is a .v8 atomic of half pairs, which the isa does not "
+                "name: the packed vector forms are .v2 and .v4";
+          return "";
+        }
+      }
+      if (aop != "add" && aop != "min" && aop != "max") {
+        err = "'" + opcode + "' is a ." + aop + " vector atomic, and the isa names only "
+              ".add, .min and .max on a vector";
+        return "";
+      }
+      // The statement pre-pass strips a brace from each end of a line, because a block
+      // brace and an operand brace are the same character there, so a list that ends the
+      // instruction arrives without its closer. The elements are all still there.
+      auto elems = [&](const std::string& tok, std::vector<std::string>& out) {
+        std::string t = trim(tok);
+        if (t.size() < 2 || t.front() != '{') return false;
+        t = t.substr(1);
+        if (!t.empty() && t.back() == '}') t.pop_back();
+        out = split_top(t, ',');
+        return true;
+      };
+      // The bit bucket is how a reduction gives up its result, and the vector form
+      // writes it the same way the scalar one does.
+      const bool bucket = !args.empty() && trim(args[0]) == "_";
+      std::vector<std::string> dsts, srcs;
+      if (!elems(args[vi], srcs) || srcs.size() != (size_t)vn) {
+        err = "'" + opcode + "' names " + std::to_string(vn) +
+              " source halfs inside one pair of braces";
+        return "";
+      }
+      if (has_result && !bucket && (!elems(args[0], dsts) || dsts.size() != (size_t)vn)) {
+        err = "'" + opcode + "' names " + std::to_string(vn) +
+              " destination halfs inside one pair of braces";
+        return "";
+      }
+      const bool bf = has_part(parts, "bf16") || has_part(parts, "bf16x2");
+      const bool ismax = (aop == "max");
+      std::string code;
+      for (int k = 0; k < vn; k++) {
+        const std::string a =
+            "(" + addr + " + " + std::to_string(packv ? 4 * k : 2 * k) + "ull)";
+        std::string call;
+        if (packv) {
+          const std::string w = atom_word("uint32_t", a) + ", ";
+          call = aop == "add"
+                     ? "weft_atom_add_pack(" + w +
+                           operand_as(srcs[(size_t)k], "uint32_t") + ", " +
+                           (bf ? "1" : "0") + ")"
+                     : "weft_atom_minmax_pack(" + w +
+                           operand_as(srcs[(size_t)k], "uint32_t") + ", " +
+                           (bf ? "1" : "0") + ", " + (ismax ? "1" : "0") + ")";
+        } else {
+          const std::string w =
+              atom_word("uint32_t", a) + ", (uint32_t)(((" + a + ") & 2ull) * 8u), ";
+          call = aop == "add"
+                     ? "weft_atom_add_narrow(" + w +
+                           operand_as(srcs[(size_t)k], "uint16_t") + ", " +
+                           (bf ? "1" : "0") + ")"
+                     : "weft_atom_minmax_narrow(" + w +
+                           operand_as(srcs[(size_t)k], "uint16_t") + ", " +
+                           (bf ? "1" : "0") + ", " + (ismax ? "1" : "0") + ")";
+        }
+        if (!has_result || bucket) code += "(void)" + call + "; ";
+        else code += store(dsts[(size_t)k], call, packv ? "uint32_t" : "uint16_t") + " ";
+      }
+      // One instruction, one predicate, so the elements sit in one block.
+      return guard + "{ " + code + "}";
+    }
+    // 16-bit integer atomics. Table 41 of the isa gives the 16-bit width exactly one
+    // operation, .cas, and this host's atomics are 32 bits wide, so the half
+    // addressed is compared and written on its own: narrowing to a 32-bit atomic
+    // would overwrite the half beside it. Anything else at this width is refused by
+    // name rather than translated as something it is not (.exch, for one, the isa
+    // lists only at 32 bits and above).
+    if (ty == "uint16_t" || ty == "int16_t") {
+      if (aop != "cas" || args.size() <= vi + 1) {
+        err = "'" + opcode + "' is a ." + aop + " atomic on a 16-bit value: the isa "
+              "names only .cas at that width";
+        return "";
+      }
+      const std::string call =
+          "weft_atom_cas_b16(" + atom_word("uint32_t", addr) + ", (uint32_t)(((" + addr +
+          ") & 2ull) * 8u), " + operand_as(args[vi], "uint16_t") + ", " +
+          operand_as(args[vi + 1], "uint16_t") + ")";
+      if (!has_result) return guard + "(void)" + call + ";";
+      return guard + store(args[0], call, "uint16_t");
+    }
+    // A 16-bit float atomic. The isa names only `.add` at that width, and the
+    // hardware's atomics are 32 bits, so the add is a compare-exchange on the word
+    // that holds the half: the value beside it in the same word is left alone, and
+    // a packed pair is the whole word and needs no split.
+    if (has_part(parts, "f16") || has_part(parts, "bf16") || has_part(parts, "f16x2") ||
+        has_part(parts, "bf16x2")) {
+      const bool pack = has_part(parts, "f16x2") || has_part(parts, "bf16x2");
+      const bool bf = has_part(parts, "bf16") || has_part(parts, "bf16x2");
+      if (aop != "add") {
+        err = "'" + opcode + "' is a ." + aop + " atomic on a 16-bit float, which the isa "
+              "does not name: .add is the only 16-bit float atomic";
+        return "";
+      }
+      const std::string bfs = bf ? "1" : "0";
+      std::string call;
+      if (pack) {
+        call = "weft_atom_add_pack(" + atom_word("uint32_t", addr) + ", " +
+               operand_as(args[vi], "uint32_t") + ", " + bfs + ")";
+      } else {
+        call = "weft_atom_add_narrow(" + atom_word("uint32_t", addr) +
+               ", (uint32_t)(((" + addr + ") & 2ull) * 8u), " +
+               operand_as(args[vi], "uint16_t") + ", " + bfs + ")";
+      }
+      if (!has_result) return guard + "(void)" + call + ";";
+      return guard + store(args[0], call, pack ? "uint32_t" : "uint16_t");
+    }
+    // .inc and .dec: table 41 gives them the .u32 width and nothing else, and this
+    // host has no instruction for either, so the step round the cycle bounded by b
+    // is a compare-exchange loop. A counter that wraps at b is what a histogram
+    // bound or a segmented ballot does, and the answer after N lanes is the start
+    // advanced N steps whatever order they land in.
+    if (aop == "inc" || aop == "dec") {
+      if (ty != "uint32_t") {
+        err = "'" + opcode + "' is a ." + aop + " atomic on " + ty +
+              ": the isa names .inc and .dec only for .u32";
+        return "";
+      }
+      const std::string call = "weft_atom_" + aop + "_u32(" + atom_ptr("uint32_t") + ", " +
+                               operand_as(args[vi], "uint32_t") + ")";
+      if (!has_result) return guard + "(void)" + call + ";";
+      return guard + store(args[0], call, "uint32_t");
+    }
     if (ty == "float") {
       if (aop == "add") fn = "atom_add_f32";
       else if (aop == "min") fn = "atom_min_f32";
@@ -3602,39 +5271,74 @@ std::string Emitter::emit(const std::string& raw) {
       wide_atom = true;
       const std::string p =
           "((" + addr_space("device", false) + ty + "*)(uintptr_t)(" + addr + "))";
-      // In the warp back end one thread runs all 32 lanes, so an address that is
-      // the same for every lane is one word to lock rather than 32 trips to the
-      // coherent point: the lock goes around the loop instead of inside it. A
-      // lane-dependent address cannot be hoisted, each lane's word is its own , 
-      // and keeps the per-lane form below. Hoisting every address onto one global
-      // lock instead was tried and measured slower (19 ms against 10 ms at 4,096
-      // lanes, 660 ms against 150 ms at 262,144): serialising threads that were
-      // working on different words costs more than the lock trips saved.
-      if (vec && p.find("[l]") == std::string::npos) {
-        std::string raw = "weft::rmw_" + aop + "_raw(" + p + ", " + operand_as(args[vi], ty);
-        if (aop == "cas" && args.size() > vi + 1) raw += ", " + operand_as(args[vi + 1], ty);
-        raw += ")";
-        const bool sel = vec_select;
-        vec_select = false;  // the loop below masks by lane; the store must not
-        const std::string inner = has_result ? store(args[0], raw, ty) : ("(void)" + raw + ";");
+      // In the warp back end one thread runs all 32 lanes, so 32 trips to the
+      // coherent point for one word are 32 serialised trips for nothing: a counter, a
+      // reduction target or a head pointer is one word for the whole warp. When the
+      // emitted address says so -- no lane in it -- the lock goes around the loop. A
+      // lane-array register, `s->rd[1][l]`, never says so even when all 32 values
+      // agree, which is exactly the counter case, so the test is made at run time
+      // there: up to 31 pointer compares, and then one lock instead of 32.
+      // Hoisting every address onto one global lock instead was tried and measured
+      // slower (19 ms against 10 ms at 4,096 lanes, 660 ms against 150 ms at
+      // 262,144): serialising threads that were working on different words costs more
+      // than the lock trips saved.
+      const std::string val = operand_as(args[vi], ty);
+      // A no-result max/min whose value the word already holds needs no lock, and
+      // `satisfied_*` proves that without one (src/weft_msl.hpp). Only a value that is
+      // the same for every lane can be tested outside the lane loop.
+      const bool reducible = !has_result && (aop == "max" || aop == "min") &&
+                             val.find("[l]") == std::string::npos;
+      auto already = [&](const std::string& at) {
+        return "weft::satisfied_" + aop + (ty == "int64_t" ? "_s64(" : "_u64(") + "(device " + ty +
+               "*)(" + at + "), " + val + ")";
+      };
+      if (vec) {
+        std::string extra;
+        if (aop == "cas" && args.size() > vi + 1) extra = ", " + operand_as(args[vi + 1], ty);
+        const bool sel = vec_select;  // the loops below mask by lane; a store must not
+        vec_select = false;
+        const std::string raw_call = "weft::rmw_" + aop + "_raw(" + p + ", " + val + extra + ")";
+        const std::string lock_call =
+            "weft::rmw_" + aop + "(ctx.locks, " + p + ", " + val + extra + ")";
+        const std::string loop_raw =
+            "for (uint32_t l = 0; l < 32u; l++) { if (" + lane_cond() + ") { " +
+            (has_result ? store(args[0], raw_call, ty) : ("(void)" + raw_call + ";")) + " } }";
+        const std::string loop_lock =
+            "for (uint32_t l = 0; l < 32u; l++) { if (" + lane_cond() + ") { " +
+            (has_result ? store(args[0], lock_call, ty) : ("(void)" + lock_call + ";")) + " } }";
         vec_select = sel;
         vec_side = true;
-        return "{ device uint32_t* weft_lk = weft::lock_of(ctx.locks, (device const void*)" +
-               p + ");\n"
-               "  weft::lock_take(weft_lk);\n"
-               "  for (uint32_t l = 0; l < 32u; l++) { if (" +
-               lane_cond() + ") { " + inner + " } }\n"
-               "  weft::lock_drop(weft_lk); }";
+        std::string first = p;
+        for (size_t q = 0; (q = first.find("[l]", q)) != std::string::npos; q += 3)
+          first.replace(q, 3, "[0]");
+        auto locked = [&](const std::string& at) {
+          return "{ device uint32_t* weft_lk = weft::lock_of(ctx.locks, (device const void*)" + at +
+                 ");\n  weft::lock_take(weft_lk);\n  " + loop_raw +
+                 "\n  weft::lock_drop(weft_lk); }";
+        };
+        if (first == p)
+          return reducible ? "{ if (!" + already(first) + ") " + locked(first) + " }"
+                           : locked(first);
+        // The first *active* lane names the word, not lane 0: a divergent warp can
+        // have lane 0 parked on another path, and locking its address would leave the
+        // word the live lanes are updating unlocked.
+        return "{ device const void* weft_p0 = nullptr; bool weft_uni = true;\n"
+               "  for (uint32_t l = 0; l < 32u; l++) if (am[l]) { if (weft_p0 == nullptr) "
+               "weft_p0 = (device const void*)" + p + "; else if ((device const void*)" + p +
+               " != weft_p0) weft_uni = false; }\n"
+               "  if (weft_uni) " +
+               (reducible ? "{ if (!" + already("weft_p0") + ") " + locked("weft_p0") + " }"
+                          : locked("weft_p0")) +
+               " else { " + loop_lock + " } }";
       }
-      std::string call = "weft::rmw_" + aop + "(ctx.locks, " + p + ", " + operand_as(args[vi], ty);
+      std::string call = "weft::rmw_" + aop + "(ctx.locks, " + p + ", " + val;
       if (aop == "cas" && args.size() > vi + 1) call += ", " + operand_as(args[vi + 1], ty);
       call += ")";
       if (has_result) return guard + store(args[0], call, ty);
+      if (reducible) return guard + "{ if (!" + already(p) + ") (void)" + call + "; }";
       return guard + "(void)" + call + ";";
     }
-    std::string call = "weft::" + fn + "((" + addr_space("device", false) + ty +
-                       "*)(uintptr_t)(" + addr + "), " +
-                       operand_as(args[vi], ty);
+    std::string call = "weft::" + fn + "(" + atom_ptr(ty) + ", " + operand_as(args[vi], ty);
     if (aop == "cas" && args.size() > vi + 1) call += ", " + operand_as(args[vi + 1], ty);
     call += ")";
     if (has_result) return guard + store(args[0], call, ty);
@@ -3852,7 +5556,9 @@ std::string Emitter::emit(const std::string& raw) {
       // `.im2col` is the convolution form of the same instruction: the object describes
       // a column of the implicit GEMM, channels by pixels, and the copy names the
       // corner, so the filter window's position rides alongside it as a second list.
-      const bool column = has_part(parts, "im2col");
+      // PTX spells the qualifier `.tile::im2col`, so the token is not bare `im2col`;
+      // accept both and treat them as the one form.
+      const bool column = has_part(parts, "im2col") || has_part(parts, "tile::im2col");
       // One copy serves the whole threadgroup, so on the warp back end it is issued once,
       // by the thread that owns the whole warp, which is lane 0 of that warp. The loop
       // below runs a single lane for that reason: it binds `l` to 0, so a value the copy
@@ -4037,7 +5743,8 @@ std::string Emitter::emit(const std::string& raw) {
   // read and write a texel exactly, which is what a surface is for. The warp
   // backend has no form for any of them, a texture read is not register
   // arithmetic, so a kernel that uses one stays on the per-lane machine.
-  if (op == "tex" || op == "tld4" || op == "txq" || op == "suld" || op == "sust") {
+  if (op == "tex" || op == "tld4" || op == "txq" || op == "suq" || op == "suld" ||
+      op == "sust") {
     vec_ok = false;
     if (args.empty()) { err = "bad " + opcode; return ""; }
     // PTX's cube form is `(s, t, face)`, a face number and a position on it , 
@@ -4052,7 +5759,8 @@ std::string Emitter::emit(const std::string& raw) {
     // any filter and any address mode. So the lowering is exact rather than
     // approximate, and `txq` still answers with what was actually bound.
     const bool d1 = !cube && !d3 && opcode.find("1d") != std::string::npos;
-    if (op != "txq" && !cube && opcode.find("2d") == std::string::npos && !d3 && !d1) {
+    if (op != "txq" && op != "suq" && !cube && opcode.find("2d") == std::string::npos &&
+        !d3 && !d1) {
       err = "only a 1-D, 2-D or 3-D texture is bound here, and '" + opcode + "' is not one";
       return "";
     }
@@ -4153,6 +5861,40 @@ std::string Emitter::emit(const std::string& raw) {
                        : what == "1" ? std::string("1u")
                        : (msl ? ("(uint32_t)" + image_of(idx) + "." + msl_field)
                               : ("(uint32_t)weft::texture_ptr(" + i + ")->" + what));
+      return guard + store(args[0], expr, "uint32_t");
+    }
+
+    // suq.width/height/depth d, [surf];
+    //
+    // A surface's extent is the binding's own number, which is what makes the answer
+    // the launcher's rather than something the kernel assumes from its geometry.
+    // The format and channel-type queries are refused by name: this binding is texel
+    // storage laid out as the arena is, and it carries neither field, so inventing
+    // one would be an answer the hardware would not give.
+    if (op == "suq") {
+      if (args.size() < 2) { err = "bad " + opcode; return ""; }
+      std::vector<std::string> list;
+      const int idx = binding(args[1], list);
+      if (idx < 0) return "";
+      const bool arr = (size_t)idx < tex_array.size() && tex_array[idx];
+      const bool vol = (size_t)idx < tex_3d.size() && tex_3d[idx];
+      std::string field;
+      if (opcode.find("width") != std::string::npos) field = "width";
+      else if (opcode.find("height") != std::string::npos) field = "height";
+      else if (opcode.find("depth") != std::string::npos)
+        field = (arr || vol) ? "layers" : "one";
+      else {
+        err = "'" + opcode + "' asks a surface for its format or its channel type, and "
+              "this binding carries neither: a surface here is texel storage in the "
+              "one format the arena is laid out as";
+        return "";
+      }
+      const std::string expr =
+          field == "one"
+              ? std::string("1u")
+              : (msl ? ("(uint32_t)" + image_of(idx) + "." +
+                        (field == "layers" && vol ? "depth" : field))
+                     : ("(uint32_t)weft::texture_ptr(" + std::to_string(idx) + ")->" + field));
       return guard + store(args[0], expr, "uint32_t");
     }
 
@@ -4311,6 +6053,240 @@ std::string Emitter::emit(const std::string& raw) {
   // undefined, which keeping it satisfies, there is no cache here to invalidate.
   if (op == "prefetch" || op == "prefetchu" || op == "discard") return guard + ";";
 
+  // The remaining hints and the cluster operations a one-CTA launch cannot have:
+  // a cache priority applied to a line, a launch that may start, a performance
+  // counter event, a register-count request, a policy descriptor for a hint that
+  // is dropped. None of them produces a value a kernel can observe, so accepting
+  // them is exact rather than approximate: there is no cache here to hint and no
+  // scheduler to steer. `mapa` maps an address of another CTA's shared memory into
+  // this CTA's view, and a cluster is one CTA wide here, so it is the identity;
+  // `barrier.cluster` waits for CTAs that do not exist and is nothing.
+  if (op == "applypriority" || op == "griddepcontrol" || op == "pmevent" ||
+      op == "setmaxnreg")
+    return guard + ";";
+  if (op == "createpolicy") return guard + store(args[0], "0ull", ty.empty() ? "uint64_t" : ty);
+  if (op == "mapa" && args.size() >= 3)
+    return guard + store(args[0], operand_as(args[1], ty.empty() ? "uint32_t" : ty),
+                         ty.empty() ? "uint32_t" : ty);
+  if (op == "barrier" && !parts.empty() && parts.size() > 1 && parts[1] == "cluster")
+    return guard + ";";
+
+  // `multimem` names a multicast address: one address whose value every replica
+  // holds. This runtime has one replica, so a reduce over the replicas of a value is
+  // that value and a multicast store writes the one copy that exists -- the mapping
+  // cannot disagree with the hardware while there is a single device. `.red` is
+  // refused by name because the operation it carries would become a plain store.
+  if (op == "multimem") {
+    if (has_part(parts, "red")) {
+      err = "multimem.red is an atomic at a multicast address: refused rather than "
+            "turned into a plain store";
+      return "";
+    }
+    if (ty.empty()) {
+      err = "multimem needs the type of the value it moves";
+      return "";
+    }
+    const bool is_st = has_part(parts, "st");
+    if (!need(2)) return "";
+    const std::string ty_mem = (msl && ty == "double") ? "uint64_t" : ty;
+    std::string addr, name, base;
+    std::string code;
+    if (is_st) {
+      if (!mem_operand(args[0], addr, name, &base)) return "";
+      code = "*((" + addr_space("device", false) + ty_mem + "*)(uintptr_t)(" + addr +
+             ")) = " + operand_as(args[1], ty_mem) + ";";
+    } else {
+      if (!mem_operand(args[1], addr, name, &base)) return "";
+      const std::string rd =
+          "*(" + addr_space("device", true) + ty_mem + "*)(uintptr_t)(" + addr + ")";
+      code = store(args[0], rd, ty) + " ";
+    }
+    return vec ? lane_block(code) : guard + code;
+  }
+
+  // bmsk.b32 d, a, b;  -- the run of bits from a up to b and nothing else. The isa
+  // clamps instead of wrapping: a width of zero or less sets no bit at all, and a width
+  // the type cannot hold sets every bit, so `bmsk d, 0, 32` on a .b32 is all ones and
+  // not a shift by 32. The width is b - a in 64 bits, because a difference that does not
+  // fit the register is still the answer's width, and the low bit is a masked to the
+  // type's width, which is the only place the shift can be named without asking a
+  // compiler for a shift it would fold away or trap on.
+  if (op == "bmsk") {
+    if (!need(3)) return "";
+    const bool w64 = opcode.find(".b64") != std::string::npos;
+    const std::string ty = w64 ? "uint64_t" : "uint32_t";
+    const std::string one = w64 ? "1ull" : "1u";
+    const std::string bits = w64 ? "64" : "32";
+    const std::string rng = w64 ? "63u" : "31u";
+    const std::string a = operand_as(args[1], ty);
+    const std::string b = operand_as(args[2], ty);
+    const std::string wh = "(int64_t)((uint64_t)(" + b + ") - (uint64_t)(" + a + "))";
+    const std::string e = "(" + wh + " <= 0 ? (" + ty + ")0 : " + wh + " >= " + bits +
+                          " ? ~(" + ty + ")0 : ((" + one + " << (unsigned)" + wh + ") - 1) << ((" +
+                          a + ") & " + rng + "))";
+    return guard + store(args[0], e, ty);
+  }
+
+  // sad.u32 d, a, b, c;  -- the sum of the absolute differences of the four byte
+  // lanes, added to c. `.u32` reads the lanes unsigned and `.s32` signed, which is
+  // the only thing the suffix changes.
+  if (op == "sad") {
+    if (!need(4)) return "";
+    const bool sgn = opcode.find(".s32") != std::string::npos;
+    const std::string a = operand_as(args[1], "uint32_t");
+    const std::string b = operand_as(args[2], "uint32_t");
+    std::string sum = "(int32_t)(" + operand_as(args[3], "uint32_t") + ")";
+    for (int k = 0; k < 4; k++) {
+      const std::string sh = std::to_string(8 * k);
+      const std::string ea = sgn ? ("(int32_t)(int8_t)(((" + a + ") >> " + sh + ") & 0xFFu)")
+                                 : ("(int32_t)(((" + a + ") >> " + sh + ") & 0xFFu)");
+      const std::string eb = sgn ? ("(int32_t)(int8_t)(((" + b + ") >> " + sh + ") & 0xFFu)")
+                                 : ("(int32_t)(((" + b + ") >> " + sh + ") & 0xFFu)");
+      sum += " + " + math("abs", ea + " - " + eb);
+    }
+    return guard + store(args[0], "(uint32_t)(" + sum + ")", "uint32_t");
+  }
+
+  // mul24/mad24: both operands are the low 24 bits, widened at the suffix's
+  // signedness, so the product is 48 bits and `.lo`/`.hi` pick a half of it.
+  if (op == "mul24" || op == "mad24") {
+    const bool mad = op == "mad24";
+    if (!need(mad ? 4 : 3)) return "";
+    const bool sgn = opcode.find(".s32") != std::string::npos;
+    const bool hi = opcode.find(".hi") != std::string::npos;
+    auto w24 = [&](const std::string& tok) -> std::string {
+      const std::string v = operand_as(tok, "uint32_t");
+      return sgn ? ("(int64_t)(((int32_t)((" + v + ") << 8)) >> 8)")
+                 : ("(int64_t)(((" + v + ") & 0xFFFFFFu))");
+    };
+    std::string p = "(" + w24(args[1]) + " * " + w24(args[2]) + ")";
+    if (mad) {
+      const std::string c = operand_as(args[3], "uint32_t");
+      p = "(" + p + " + (int64_t)" + (sgn ? "(int32_t)" : "(uint32_t)") + "(" + c + "))";
+    }
+    const std::string e = hi ? ("(uint32_t)((uint64_t)(" + p + ") >> 32)")
+                             : ("(uint32_t)(uint64_t)(" + p + ")");
+    return guard + store(args[0], e, "uint32_t");
+  }
+
+  // A sleep is a scheduling hint, not an operation: nothing it does can reach a
+  // register or a buffer, so the answer is the same with it and without it.
+  if (op == "nanosleep") return guard + "(void)0;";
+
+  // call{.uni} target, (a, b);  and  call{.uni} (retvals), target, (a, b);
+  //
+  // The callee is a function in this module, translated once with a register file
+  // of its own (see the module pass), and the call is a C++ call to it. A value it
+  // hands back rides in its state struct: the generated function is a switch over a
+  // program counter, so the `ret` that ends it is a `return` from the middle of that
+  // switch. What is refused is refused by name: a call to a function whose body is
+  // not in this module has nothing to inline, and a return list with more than one
+  // slot has no field here to land in.
+  if (op == "call") {
+    if (args.size() < 2) { err = "malformed '" + opcode + "'"; return ""; }
+    // `call.uni (%r1), f, (a);` names where the answer goes, then the function, then
+    // the arguments.
+    size_t next = 0;
+    std::string tgt = trim(args[next++]);
+    std::string ret_dst;
+    if (!tgt.empty() && tgt[0] == '(') {
+      const std::string inner = trim(tgt.substr(1, tgt.size() - 2));
+      const std::vector<std::string> slots =
+          inner.empty() ? std::vector<std::string>() : split_top(inner, ',');
+      if (slots.size() != 1) {
+        err = "'" + opcode + "' returns " + std::to_string(slots.size()) +
+              " values through a parenthesised list, and a call here carries one";
+        return "";
+      }
+      ret_dst = trim(slots[0]);
+      if (next >= args.size()) { err = "malformed '" + opcode + "'"; return ""; }
+      tgt = trim(args[next++]);
+    }
+    auto f = callees.find(tgt);
+    if (f == callees.end()) {
+      auto bad = callee_errs.find(tgt);
+      if (bad != callee_errs.end())
+        err = "'" + opcode + " " + tgt + "': the callee did not translate: " + bad->second;
+      else
+        err = "'" + opcode + "' names '" + tgt + "', which has no body in this module: "
+              "a call to a function defined elsewhere has nothing to inline here";
+      return "";
+    }
+    std::string list = (next < args.size()) ? trim(args[next]) : std::string();
+    if (!list.empty() && list.front() == '(' && list.back() == ')')
+      list = list.substr(1, list.size() - 2);
+    const std::vector<std::string> avals =
+        trim(list).empty() ? std::vector<std::string>() : split_top(list, ',');
+    if (avals.size() != f->second.size()) {
+      err = "'" + opcode + " " + tgt + "' passes " + std::to_string(avals.size()) +
+            " arguments and the function declares " + std::to_string(f->second.size());
+      return "";
+    }
+    // The answer the call has to place, or the function's answer the call has nowhere
+    // to put: both are said rather than dropped.
+    auto rt = callee_rets.find(tgt);
+    const std::string rty = (rt == callee_rets.end()) ? std::string() : rt->second;
+    if (ret_dst.empty() && !rty.empty()) {
+      err = "'" + opcode + " " + tgt + "' returns a value and the call has no list to put it in";
+      return "";
+    }
+    if (!ret_dst.empty() && rty.empty()) {
+      err = "'" + opcode + " " + tgt + "' is in a return list, and that function returns nothing";
+      return "";
+    }
+    const std::string mem = "wcf_" + tgt;
+    bool have = false;
+    for (const auto& m : callee_members)
+      if (m.second == mem) have = true;
+    if (!have) callee_members.emplace_back("weft_cf_" + tgt, mem);
+    // A callee is per-thread scalar work: it has no lane dimension, so a kernel
+    // that calls one is emitted for the per-lane body rather than the warp one.
+    vec_ok = false;
+    std::string call = "weft_f_" + tgt + "(ctx, &s->" + mem;
+    for (size_t i = 0; i < avals.size(); i++)
+      call += ", (" + f->second[i] + ")(" + operand_as(avals[i], f->second[i]) + ")";
+    call += ");";
+    // A callee that can give the worker back in the middle makes the call site a
+    // resume point too: the fresh call starts the callee at its top, and a re-entry
+    // jumps straight back to the call rather than walking to it again. The callee's
+    // counter says where it stopped, and until that is the finished sentinel the caller
+    // stops here as well -- one level up per call, until the kernel's own counter is
+    // what parks.
+    auto sp = callee_suspends.find(tgt);
+    const bool suspends = (sp != callee_suspends.end() && sp->second);
+    if (!suspends) {
+      if (!ret_dst.empty()) call += " " + store(ret_dst, "s->" + mem + ".weft_ret", rty);
+      return guard + call;
+    }
+    const int rid = next_resume++;
+    const std::string rids = std::to_string(rid);
+    resume_cases += "    case " + rids + ": goto R" + rids + ";\n";
+    if (!guard.empty()) {
+      // A predicated call to a callee that stops: `if (cond) ` in front of the call
+      // would be gone by the time the lane came back, because a resume jumps straight
+      // to the label after it. So the decision is recorded in a bit of this call site's
+      // own state, the label goes after the fresh-call reset, and the re-entry asks the
+      // record rather than a register that may have been rewritten since.
+      const std::string cond = guard.substr(4, guard.size() - 6);
+      const std::string cg = "cg" + rids;
+      callee_members.emplace_back("uint32_t", cg);
+      std::string out = "s->" + cg + " = (" + cond + ") ? 1u : 0u;\n  if (s->" + cg +
+                        ") s->" + mem + ".pc = 0u;\n  R" + rids + ":;\n  if (s->" + cg +
+                        ") {\n  " + call;
+      out += "\n  if (s->" + mem + ".pc != 0xFFFFFFFFu) { s->pc = " + rids +
+             "u; return; }";
+      if (!ret_dst.empty())
+        out += "\n  " + store(ret_dst, "s->" + mem + ".weft_ret", rty);
+      out += "\n  }";
+      return out;
+    }
+    std::string out = "s->" + mem + ".pc = 0u;\n  R" + rids + ":;\n  " + call;
+    out += "\n  if (s->" + mem + ".pc != 0xFFFFFFFFu) { s->pc = " + std::to_string(rid) +
+           "u; return; }";
+    if (!ret_dst.empty()) out += " " + store(ret_dst, "s->" + mem + ".weft_ret", rty);
+    return out;
+  }
+
   err = "unsupported PTX instruction '" + opcode + "'";
   return "";
 }
@@ -4322,6 +6298,14 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
                                           bool gpu) {
   TranslateResult r;
   std::string src = strip_comments(raw);
+  // The module prologue: everything before the first `.entry`. A `.shared` array
+  // declared here is file scope in PTX, one instance per threadgroup, and every
+  // kernel that names it addresses that same arena; a declaration inside an entry
+  // is that kernel's own. Both have to be laid out, or a module-scope tile is
+  // addressed at offset 0 of an arena the GPU never declares.
+  const size_t first_entry = src.find(".entry");
+  const std::string module_head =
+      src.substr(0, first_entry == std::string::npos ? src.size() : first_entry);
 
   //
   // `.tex .u32 name, 1, 1, 1, 1;` declares a sampled texture and `.surf .u64
@@ -4332,8 +6316,7 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
   std::vector<std::string> tex_names;  // index -> the declared name
   int ntex = 0;
   {
-    const size_t first = src.find(".entry");
-    const std::string head = src.substr(0, first == std::string::npos ? src.size() : first);
+    const std::string& head = module_head;
     // One declaration per line: the module prologue is not semicolon-terminated
     // throughout (`.version 7.0` has no `;`), so splitting on `;` would swallow
     // the first declaration into the version line.
@@ -4345,13 +6328,23 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       at = nl + 1;
       if (!s.empty() && s.back() == ';') s.pop_back();
       s = trim(s);
-      if (s.rfind(".tex", 0) != 0 && s.rfind(".surf", 0) != 0) continue;
-      // `.texref t` carries no type token; `.tex .u32 t` does.
-      std::string rest = trim(s.substr(s.find_first_of(" \t")));
-      std::string nm = rest;
-      const size_t sp = rest.find_first_of(" \t");
-      if (sp != std::string::npos) nm = rest.substr(sp + 1);
-      nm = trim(nm.substr(0, nm.find(',')));
+      // Three spellings name a binding: `.global .texref t` and `.global .surfref t`,
+      // which is the form PTX accepts today, plus the older `.tex .u32 t, ...` and
+      // `.texref t` the dumps use. The name is the token after the directive.
+      std::string nm;
+      if (s.rfind(".global .texref", 0) == 0 || s.rfind(".global .surfref", 0) == 0) {
+        nm = trim(s.substr(s.find_last_of(" \t") + 1));
+      } else if (s.rfind(".texref", 0) == 0 || s.rfind(".surfref", 0) == 0) {
+        nm = trim(s.substr(s.find_first_of(" \t") + 1));
+      } else if (s.rfind(".tex", 0) == 0 || s.rfind(".surf", 0) == 0) {
+        std::string rest = trim(s.substr(s.find_first_of(" \t")));
+        nm = rest;
+        const size_t sp = rest.find_first_of(" \t");
+        if (sp != std::string::npos) nm = rest.substr(sp + 1);
+        nm = trim(nm.substr(0, nm.find(',')));
+      } else {
+        continue;
+      }
       if (nm.empty() || tex_index.count(nm)) continue;
       tex_index[nm] = ntex++;
       tex_names.push_back(nm);
@@ -4360,6 +6353,379 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
 
   std::string body_out;
   std::vector<TranslatedKernel> kernels;
+
+  //
+  // The module's `.func` bodies, translated once each and emitted ahead of the
+  // kernels that call them. A callee is a function of its own rather than its
+  // statements pasted into the caller, because PTX gives it its own register file:
+  // its `%rd1` is not the caller's, and pasting would make the two one slot.
+  // Only a function a `call` names is translated: a module can carry device
+  // functions no kernel reaches, and failing the module over one of those would be
+  // a refusal for code nothing runs.
+  std::map<std::string, std::vector<std::string>> callee_types;
+  std::map<std::string, std::string> callee_rets;
+  std::map<std::string, bool> callee_suspends;
+  std::map<std::string, std::string> callee_errs;
+  {
+    //
+    // The module's `.func` bodies are collected before any of them is translated,
+    // because a callee can call one written further down the file: what a `call`
+    // inside a body names is only known once every body has been read.
+    struct FuncDef {
+      std::string name;
+      std::vector<std::string> pnames, ptypes;
+      std::string ret_name, ret_type;  // the return slot, if the list names one
+      std::vector<std::string> deps;
+      std::string body;  // the text between the braces
+      bool called = false;
+    };
+    std::vector<FuncDef> defs;
+    std::map<std::string, size_t> def_at;
+
+    // The functions a body calls: the token after the `.uni`, or the one after the
+    // return list when the call carries one.
+    auto call_targets = [](const std::string& body, std::vector<std::string>& out) {
+      size_t q = 0;
+      while ((q = body.find("call", q)) != std::string::npos) {
+        if (q > 0 && (is_word(body[q - 1]) || body[q - 1] == '.' || body[q - 1] == '%')) {
+          q += 4;
+          continue;
+        }
+        size_t p = q + 4;
+        while (p < body.size() &&
+               (is_word(body[p]) || body[p] == '.' || body[p] == ':')) p++;
+        for (;;) {
+          while (p < body.size() && std::isspace((unsigned char)body[p])) p++;
+          if (p < body.size() && body[p] == '(') {
+            const size_t rc = find_matching(body, p, '(', ')');
+            if (rc == std::string::npos) { p = body.size(); break; }
+            p = rc + 1;
+            continue;
+          }
+          if (p < body.size() && body[p] == ',') { p++; continue; }
+          break;
+        }
+        const size_t ns = p;
+        while (p < body.size() && (is_word(body[p]) || body[p] == '$' || body[p] == '.')) p++;
+        if (p > ns) out.push_back(body.substr(ns, p - ns));
+        q = p > q + 4 ? p : q + 4;
+      }
+    };
+
+    size_t at = 0;
+    while ((at = src.find(".func", at)) != std::string::npos) {
+      at += 5;
+      size_t p = at;
+      while (p < src.size() && std::isspace((unsigned char)src[p])) p++;
+      // `.func (.param .b32 rv) name(...)` puts the return list before the name.
+      // The name is taken whichever side of it the list is on.
+      std::string ret_decl;
+      if (p < src.size() && src[p] == '(') {
+        const size_t rc = find_matching(src, p, '(', ')');
+        if (rc == std::string::npos) break;
+        ret_decl = src.substr(p + 1, rc - p - 1);
+        p = rc + 1;
+        while (p < src.size() && std::isspace((unsigned char)src[p])) p++;
+      }
+      const size_t ns = p;
+      while (p < src.size() && is_word(src[p])) p++;
+      const std::string fname = src.substr(ns, p - ns);
+      if (fname.empty()) continue;
+      const size_t lp = src.find('(', p);
+      if (lp == std::string::npos) continue;
+      const size_t rp = find_matching(src, lp, '(', ')');
+      if (rp == std::string::npos) continue;
+      // A declaration ends at its `;`. It names a function for a call written above
+      // the body, and the body that follows belongs to the next `.func`: reading on
+      // for a `{` here would give this name someone else's calls.
+      size_t after = rp + 1;
+      while (after < src.size() && std::isspace((unsigned char)src[after])) after++;
+      if (after < src.size() && src[after] == ';') {
+        at = after + 1;
+        continue;
+      }
+      const size_t lb = src.find('{', rp);
+      if (lb == std::string::npos) continue;
+      const size_t rb = find_matching(src, lb, '{', '}');
+      if (rb == std::string::npos) continue;
+
+      FuncDef d;
+      d.name = fname;
+      d.body = src.substr(lb + 1, rb - lb - 1);
+      // A call that names the function is what makes it worth translating: a
+      // module can carry device functions no kernel reaches, and failing the
+      // module over one of those would be a refusal for code nothing runs.
+      for (size_t q = 0; (q = src.find(fname, q)) != std::string::npos; q += fname.size()) {
+        const size_t back = q > 24 ? q - 24 : 0;
+        const size_t c = src.find("call", back);
+        if (c != std::string::npos && c < q) { d.called = true; break; }
+      }
+      bool bad = false;
+      for (const std::string& pt : split_top(src.substr(lp + 1, rp - lp - 1), ',')) {
+        if (trim(pt).empty()) continue;
+        const std::vector<std::string> toks = split_top(trim(pt), ' ');
+        std::string nm = toks.empty() ? std::string() : toks.back();
+        if (!nm.empty() && nm[0] == '%') nm = nm.substr(1);
+        std::string ty;
+        for (const auto& t : toks) {
+          if (t.empty() || t[0] != '.') continue;
+          const std::string ct = cpp_type(t);
+          if (!ct.empty() && cpp_size(ct)) { ty = ct; break; }
+        }
+        if (nm.empty()) { bad = true; break; }
+        d.pnames.push_back(nm);
+        d.ptypes.push_back(ty.empty() ? "uint64_t" : ty);
+      }
+      if (bad) {
+        callee_errs[fname] = "a parameter of the function is not a name";
+        continue;
+      }
+      // The return list is one slot: PTX allows several, and the state struct has one
+      // field to put an answer in, so a longer list is refused by name rather than
+      // folded into something the caller would have to unpack.
+      if (!trim(ret_decl).empty()) {
+        const std::vector<std::string> slots = split_top(trim(ret_decl), ',');
+        if (slots.size() != 1) {
+          callee_errs[fname] = "it returns " + std::to_string(slots.size()) +
+                               " values through its parenthesised list, and a call here "
+                               "carries one";
+          continue;
+        }
+        const std::vector<std::string> toks = split_top(trim(slots[0]), ' ');
+        std::string nm = toks.empty() ? std::string() : toks.back();
+        if (!nm.empty() && nm[0] == '%') nm = nm.substr(1);
+        std::string ty;
+        for (const auto& t : toks) {
+          if (t.empty() || t[0] != '.') continue;
+          const std::string ct = cpp_type(t);
+          if (!ct.empty() && cpp_size(ct)) { ty = ct; break; }
+        }
+        if (nm.empty()) {
+          callee_errs[fname] = "the return slot of the function is not a name";
+          continue;
+        }
+        d.ret_name = nm;
+        d.ret_type = ty.empty() ? "uint32_t" : ty;
+      }
+      call_targets(d.body, d.deps);
+      if (def_at.count(fname)) continue;  // one definition per name
+      def_at[fname] = defs.size();
+      defs.push_back(d);
+    }
+
+    // What has to be translated: the functions a `call` names, plus everything they
+    // call, because a call carries the callee's state as a member of its own and
+    // that member has to have a body.
+    std::map<std::string, bool> needed;
+    {
+      std::vector<std::string> work;
+      for (const FuncDef& d : defs)
+        if (d.called) { needed[d.name] = true; work.push_back(d.name); }
+      while (!work.empty()) {
+        const std::string nm = work.back();
+        work.pop_back();
+        auto it = def_at.find(nm);
+        if (it == def_at.end()) continue;
+        for (const std::string& dep : defs[it->second].deps)
+          if (def_at.count(dep) && !needed.count(dep)) {
+            needed[dep] = true;
+            work.push_back(dep);
+          }
+      }
+    }
+
+    std::map<std::string, int> state;  // 1 translated, 2 refused: both are answers
+    std::string callee_out;
+
+    auto translate = [&](size_t i) -> bool {
+      const std::string& fname = defs[i].name;
+      Emitter ef;
+      ef.msl = gpu;
+      ef.callees = callee_types;
+      ef.callee_errs = callee_errs;
+      ef.callee_rets = callee_rets;
+      ef.callee_suspends = callee_suspends;
+      ef.callee_ret = defs[i].ret_name;
+      ef.reg_defs.clear();
+      ef.scan_defs(defs[i].body);
+      for (size_t k = 0; k < defs[i].pnames.size(); k++)
+        ef.callee_args[defs[i].pnames[k]] = "weft_a" + std::to_string(k);
+      std::string decls, code;
+      bool ok = true;
+      size_t q = 0;
+      while (q < defs[i].body.size()) {
+        // One statement, up to its semicolon: `emit` takes a statement, and a `;`
+        // left on the end is not part of the operand list (`[src];` is not a memory
+        // operand).
+        size_t semi = defs[i].body.find(';', q);
+        if (semi == std::string::npos) semi = defs[i].body.size();
+        const std::string line = trim(defs[i].body.substr(q, semi - q));
+        q = semi + 1;
+        if (line.empty()) continue;
+        if (line.rfind(".reg", 0) == 0) {
+          // PTX separates tokens by any run of whitespace, and generators indent
+          // with tabs, so the declaration is split on tabs as well as spaces.
+          std::string decl = line;
+          for (char& c : decl) if (c == '\t') c = ' ';
+          std::vector<std::string> toks = split_top(decl, ' ');
+          std::string ty, reg;
+          for (const auto& t : toks) {
+            if (!t.empty() && t[0] == '.') {
+              const std::string ct = cpp_type(t);
+              if (!ct.empty()) ty = ct;
+            } else {
+              reg = t;
+            }
+          }
+          if ((gpu || ef.msl) && ty == "double") ty = "uint64_t";
+          Reg rr = parse_reg(reg);
+          if (ty.empty() || !rr.ok) {
+            ef.err = "bad register declaration '" + line + "'";
+            ok = false;
+            break;
+          }
+          int count = 1;
+          const size_t lt = reg.find('<');
+          if (lt != std::string::npos) count = std::atoi(reg.c_str() + lt + 1);
+          ef.reg_types[rr.base] = ty;
+          ef.reg_counts[rr.base] = count;
+          decls += "  " + ty + " " + rr.base + "[" + std::to_string(count) + "];\n";
+          continue;
+        }
+        // A label inside a function. The body becomes the same switch a kernel body
+        // is -- a branch is a write to `pc` and a restart of the case table -- because
+        // Metal has no goto (tools/msl_probe.mm); on the host column a label and a
+        // `goto` are the language's own, and the function is a plain function.
+        std::string stmt = line;
+        const size_t colon = stmt.find(':');
+        if (colon != std::string::npos && colon > 0 &&
+            stmt.substr(0, colon).find_first_of(" \t.:") == std::string::npos) {
+          const std::string lab = trim(stmt.substr(0, colon));
+          if (ef.msl)
+            code += "    case " + std::to_string(ef.label_id(lab)) + "u:;\n";
+          else
+            code += "  " + sanitize(lab) + ":;\n";
+          stmt = trim(stmt.substr(colon + 1));
+          if (stmt.empty()) continue;
+        }
+        if (!stmt.empty() && stmt[0] == '.') {
+          ef.err = "statement '" + stmt +
+                   "' inside the function is a directive the call does not carry";
+          ok = false;
+          break;
+        }
+        const std::string st = ef.emit(stmt);
+        if (!ef.err.empty()) { ok = false; break; }
+        code += "  " + st + "\n";
+      }
+      if (!ok) {
+        callee_errs[fname] = ef.err.empty() ? "the body translated to nothing" : ef.err;
+        state[fname] = 2;
+        return false;
+      }
+      // A callee's state holds the state of every function it calls, by value: those
+      // structs were emitted first, so this one is complete here. Two functions that
+      // call each other have no such shape, and never reach this.
+      // The value the function hands back is a field of its own state, next to the
+      // register file and the states of the functions it calls. Its zeroing is the
+      // entry to the body, so a path that writes no answer does not report the last
+      // call's.
+      const std::string rty =
+          (gpu && defs[i].ret_type == "double") ? std::string("uint64_t") : defs[i].ret_type;
+      // A body that can give the worker back in the middle -- a rendezvous, or a call to
+      // something that has one -- stops at a counter the caller resumes, and every one of
+      // those stops leaves a resume case behind. A branch writes the counter too, but as
+      // `continue` within its own switch, so what is left in `resume_cases` is exactly
+      // the set of ways out of the middle of this body.
+      const bool suspends = !ef.resume_cases.empty();
+      std::string members = decls;
+      for (const auto& m : ef.callee_members)
+        members += "  " + m.first + " " + m.second + ";\n";
+      if (!defs[i].ret_name.empty()) members += "  " + rty + " weft_ret;\n";
+      std::string sig;
+      for (size_t k = 0; k < defs[i].pnames.size(); k++)
+        sig += ", " + defs[i].ptypes[k] + " weft_a" + std::to_string(k);
+      callee_out += "struct weft_cf_" + fname + " {\n  uint32_t pc;\n" + members + "};\n";
+      // A body with labels is a switch over the program counter, so the `case` a branch
+      // writes is the case it lands on. A body that never stops is entered at its top;
+      // one that can stop is entered at the counter the caller left, which is why the
+      // reset only happens on a fresh call and the resume cases are part of the switch.
+      std::string fbody = "  (void)ctx; (void)s;\n";
+      if (!defs[i].ret_name.empty())
+        fbody += std::string("  ") + (suspends ? "if (s->pc == 0u) " : "") + "s->weft_ret = " +
+                 rty + "();\n";
+      if (gpu) {
+        if (!suspends) fbody += "  s->pc = 0u;\n";
+        fbody += "  for (;;) {\n    switch (s->pc) {\n";
+        fbody += ef.resume_cases;
+        fbody += "      case 0u:;\n";
+        fbody += code;
+        fbody += "      default: return;\n    }\n  }\n";
+      } else {
+        // The host body is a plain function, so its resume cases are a switch at the
+        // top rather than the switch the GPU body already is.
+        if (suspends)
+          fbody += "  if (s->pc != 0u) {\n    switch (s->pc) {\n" + ef.resume_cases +
+                   "      default: break;\n    }\n  }\n";
+        fbody += code;
+      }
+      callee_out += "static void weft_f_" + fname + "(" +
+                    std::string(gpu ? "thread weft::Ctx& ctx" : "weft::Ctx& ctx") + ", " +
+                    (gpu ? "thread " : "") + "weft_cf_" + fname + "* s" + sig +
+                    ") {\n" + fbody + "}\n";
+      callee_types[fname] = defs[i].ptypes;
+      callee_rets[fname] = rty;
+      callee_suspends[fname] = suspends;
+      state[fname] = 1;
+      return true;
+    };
+
+    // A callee is translated only after the functions it calls. A pass that
+    // translates nothing is the point at which one is waiting on one that waits on
+    // it, which is the shape a struct cannot hold.
+    for (bool progress = true; progress;) {
+      progress = false;
+      for (size_t i = 0; i < defs.size(); i++) {
+        const std::string& nm = defs[i].name;
+        if (!needed.count(nm) || state.count(nm)) continue;
+        bool waiting = false;
+        std::string that;
+        for (const std::string& dep : defs[i].deps) {
+          if (dep == nm) {
+            that = "'" + nm + "' calls itself, and the state a call carries is a struct "
+                   "that would have to contain itself: refused by name rather than given "
+                   "a depth limit";
+            break;
+          }
+          if (!needed.count(dep)) continue;
+          auto st = state.find(dep);
+          if (st == state.end()) { waiting = true; continue; }
+          if (st->second == 2) {
+            that = "the function it calls, '" + dep + "', did not translate: " + callee_errs[dep];
+            break;
+          }
+        }
+        if (!that.empty()) {
+          callee_errs[nm] = that;
+          state[nm] = 2;
+          progress = true;
+        } else if (!waiting) {
+          translate(i);
+          progress = true;
+        }
+      }
+    }
+    // Whatever is left is a chain that comes back to itself, one name at a time.
+    for (size_t i = 0; i < defs.size(); i++) {
+      const std::string& nm = defs[i].name;
+      if (!needed.count(nm) || state.count(nm)) continue;
+      callee_errs[nm] = "it calls a function that calls it back, and the state a call "
+                        "carries is a struct that would have to contain itself: refused "
+                        "by name rather than given a depth limit";
+      state[nm] = 2;
+    }
+    body_out += callee_out;
+  }
 
   size_t pos = 0;
   while (true) {
@@ -4381,14 +6747,17 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     size_t end = find_matching(src, brace, '{', '}');
     if (end == std::string::npos) { r.error = "unbalanced body in " + name; return r; }
 
-    // `.maxntid` sits immediately before the entry it applies to: the launch size
-    // the module was compiled for. Triton writes it from `num_warps`, and it is
-    // the only record of the geometry a kernel was indexed against.
+    // `.maxntid` describes the entry it belongs to: the launch size the module was
+    // compiled for. Triton writes it from `num_warps`, and it is the only record of
+    // the geometry a kernel was indexed against. The legal place is between the
+    // parameter list and the body; the dumps that put it above the `.entry` line are
+    // not legal PTX, and both spellings mean the same thing here.
     uint32_t tg_hint = 0;
     {
-      const size_t m = src.rfind(".maxntid", e);
-      const size_t semi = m == std::string::npos ? std::string::npos : src.find(';', m);
-      if (m != std::string::npos && m >= pos) {
+      size_t m = src.rfind(".maxntid", e);
+      if (m == std::string::npos || m < pos) m = src.find(".maxntid", close);
+      if (m != std::string::npos && m < brace) {
+        const size_t semi = src.find(';', m);
         const size_t v = src.find_first_of("0123456789", m);
         if (v != std::string::npos && semi != std::string::npos && v < semi)
           tg_hint = (uint32_t)std::strtoul(src.c_str() + v, nullptr, 10);
@@ -4396,6 +6765,10 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     }
 
     Emitter em;
+    em.callees = callee_types;
+    em.callee_errs = callee_errs;
+    em.callee_rets = callee_rets;
+    em.callee_suspends = callee_suspends;
     em.tex_index = tex_index;
     em.ntex = ntex;
     em.tex_write.assign((size_t)ntex, false);
@@ -4549,19 +6922,25 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       uint64_t off = 0;
       bool any = false;
       std::vector<std::pair<std::string, bool>> externs;
-      for (size_t p = 0; (p = body.find(".shared", p)) != std::string::npos; p += 7) {
+      // The prologue and the body in one scan, the prologue first: a module-scope
+      // array has to sit in the arena the launch hands the kernel, and before the
+      // kernel's own arrays so an offset in the body can never land inside it. The
+      // newline between them keeps a declaration that opens the body from being
+      // glued onto the prologue's last line.
+      const std::string scan = module_head + "\n" + body;
+      for (size_t p = 0; (p = scan.find(".shared", p)) != std::string::npos; p += 7) {
         // Declarations only: `.shared` is also the space qualifier of
         // `st.shared.f32`, which follows an opcode rather than a statement start.
         size_t q = p;
-        while (q > 0 && (body[q - 1] == ' ' || body[q - 1] == '\t')) q--;
-        bool decl_start = (q == 0 || body[q - 1] == '\n' || body[q - 1] == ';' || body[q - 1] == '{');
+        while (q > 0 && (scan[q - 1] == ' ' || scan[q - 1] == '\t')) q--;
+        bool decl_start = (q == 0 || scan[q - 1] == '\n' || scan[q - 1] == ';' || scan[q - 1] == '{');
         // `.extern .shared` is a declaration too: the token before `.shared` is
         // the `extern` qualifier, not the start of a statement.
-        if (!decl_start && q >= 6 && body.compare(q - 6, 6, "extern") == 0) decl_start = true;
+        if (!decl_start && q >= 6 && scan.compare(q - 6, 6, "extern") == 0) decl_start = true;
         if (!decl_start) continue;
-        const size_t semi = body.find(';', p);
+        const size_t semi = scan.find(';', p);
         if (semi == std::string::npos) break;
-        const std::string d = trim(body.substr(p + 7, semi - p - 7));
+        const std::string d = trim(scan.substr(p + 7, semi - p - 7));
         const size_t lb = d.find('[');
         std::string name_field = lb == std::string::npos ? d : trim(d.substr(0, lb));
         const size_t sp = name_field.find_last_of(" \t");
@@ -4609,6 +6988,10 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     // builders are shared; only the framing differs, one lane at a time, or the
     // 32 lanes of a warp as one vector.
     auto walk = [&](Emitter& e, std::string& out, std::string& struct_decls) -> bool {
+      // Counted before the body is emitted, because a memory instruction's text
+      // depends on how many times the register it reads is written.
+      e.reg_defs.clear();
+      e.scan_defs(body);
       std::string stmt, lane_batch;
       // Can this statement be fused into a lane loop with its neighbours? Only if
       // every element it touches is indexed by the lane number itself. A gather
@@ -4650,10 +7033,11 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
         // reads as a label called `cp.async.bulk.shared` followed by an instruction
         // beginning `:cluster`.
         size_t colon = s.find(':');
+        std::string lab;
         if (colon != std::string::npos && colon > 0 &&
             s.substr(0, colon).find_first_of(" \t.:") == std::string::npos) {
           flush_lanes();
-          const std::string lab = trim(s.substr(0, colon));
+          lab = trim(s.substr(0, colon));
           if (e.vec)
             out += "  L" + std::to_string(e.label_id(lab)) + ":;\n";
           else if (e.msl)
@@ -4664,12 +7048,50 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
           if (s.empty()) continue;
         }
 
+        // `ts: .branchtargets L1, L2, L3;` is a directive at a label, and the list
+        // is the table a `brx.idx` indexes. It is recorded under that label rather
+        // than emitted: a jump table is a choice of destinations, not storage. The
+        // compact form `N<3>` names N0, N1, N2, which the isa allows here.
+        if (s.rfind(".branchtargets", 0) == 0) {
+          if (lab.empty()) {
+            e.err = "a .branchtargets list with no label to name it";
+            return false;
+          }
+          std::vector<std::string> tgts;
+          for (const auto& tok : split_top(trim(s.substr(14)), ',')) {
+            std::string nm = trim(tok);
+            if (nm.empty()) continue;
+            const size_t lt = nm.find('<');
+            if (lt != std::string::npos && nm.back() == '>') {
+              const int n = std::atoi(nm.c_str() + lt + 1);
+              const std::string pre = nm.substr(0, lt);
+              for (int k = 0; k < n; k++) tgts.push_back(pre + std::to_string(k));
+            } else {
+              tgts.push_back(nm);
+            }
+          }
+          if (tgts.empty()) { e.err = "an empty .branchtargets list"; return false; }
+          e.brxtab[lab] = tgts;
+          continue;
+        }
+
         if (s.rfind(".reg", 0) == 0) {
-          std::vector<std::string> toks = split_top(s, ' ');
+          std::string decl = s;
+          for (char& c : decl) if (c == '\t') c = ' ';
+          std::vector<std::string> toks = split_top(decl, ' ');
           std::string ty, reg;
           for (const auto& t : toks) {
-            if (!t.empty() && t[0] == '.') { if (!cpp_type(t).empty()) ty = cpp_type(t); }
-            else reg = t;
+            if (!t.empty() && t[0] == '.') {
+              std::string ct = cpp_type(t);
+              // A `.f16` register holds the 16 bits of a half, which is the same
+              // storage `.b16` names; every half instruction here works on those
+              // bits, so the register is declared the same way. Triton and ptxas
+              // both write `.reg .f16`, and the declaration was refused by name.
+              if (ct.empty() && t == ".f16") ct = "uint16_t";
+              if (!ct.empty()) ty = ct;
+            } else {
+              reg = t;
+            }
           }
           Reg rr = parse_reg(reg);
           if (ty.empty() || !rr.ok) {
@@ -4725,6 +7147,13 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
         }
       }
       flush_lanes();
+      // A callee's register file is a member of the caller's state, because the two
+      // are one thread: the struct carries it, the function addresses it.
+      for (const auto& m : e.callee_members)
+        struct_decls += "  " + m.first + " " + m.second + ";\n";
+      // The condition code a carry chain keeps between instructions, declared with
+      // the registers because it lives exactly as long as they do.
+      for (const auto& m : e.cc_members) struct_decls += "  " + m + "\n";
       return true;
     };
 
@@ -4736,6 +7165,10 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
     // leaves the kernel on the per-lane state machine instead of failing.
     Emitter emv;
     emv.vec = true;
+    emv.callees = callee_types;
+    emv.callee_errs = callee_errs;
+    emv.callee_rets = callee_rets;
+    emv.callee_suspends = callee_suspends;
     // The warp body becomes Metal source on this back end, so its math and its
     // helper names have to be the GPU's spellings, not `std::`.
     emv.msl = gpu;
@@ -4840,7 +7273,6 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       body_out += "      if (p == 0xFFFFFFFFu) continue;\n";
       body_out += "      if (p < best) { best = p; m = 1u << l; }\n";
       body_out += "      else if (p == best) m |= 1u << l; }\n";
-      body_out += "    if (best == 0xFFFFFFFFu) return weft::kWarpDone;\n";
       body_out += "    weft_full = (m == 0xFFFFFFFFu) ? 1u : 0u;\n";
       body_out += "    for (uint32_t l = 0; l < weft::kWarpLanes; l++) {\n";
       body_out += "      am[l] = ((m >> l) & 1u) ? 0xFFFFFFFFu : 0u;\n";
@@ -4881,6 +7313,16 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       body_out += "  ctx.tgid = weft_tgid.x;\n";
       body_out += "  ctx.tg_size = (uint32_t)weft_geom[1];\n";
       body_out += "  ctx.grid = (uint32_t)weft_geom[0];\n";
+      // A lane past the end of the launch does not exist, and a zeroed program
+      // counter says "about to start", so the last warp of a short launch would run
+      // lanes the program does not have and store past its buffer. This is the same
+      // rule from the same geometry as the CPU driver's, so both engines run the same
+      // lanes and a warp-only kernel answers the same on each.
+      body_out += "  for (uint32_t l = 0; l < weft::kWarpLanes; l++)\n";
+      body_out += "    s->pc[l] = ((ctx.lid0 + l) < "
+                  "weft::live_threads(ctx.tgid, ctx.tg_size, ctx.grid)) ? 0u : "
+                  "0xFFFFFFFFu;\n";
+
       for (int i = 0; i < wnbufs; i++)
         body_out += "  ctx.b[" + std::to_string(i) + "] = weft_b" + std::to_string(i) + ";\n";
       body_out += "  ctx.params = weft_params;\n";
@@ -5290,9 +7732,44 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       "using std::sqrt;\n"
       "static inline float weft_f32(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }\n"
       "static inline double weft_f64(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }\n"
+      // `F2I` saturates: a float past the destination's range clamps to its end and
+      // a NaN answers zero, which is the `.NTZ` bit. A C++ cast is undefined for
+      // all of those and answered 0 for both infinities, where the device answers
+      // the ends. The comparisons are on the double form, so one helper serves an
+      // f32 and an f64 source and the bounds stay exact.
+      "static inline int32_t weft_f2i32(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 2147483648.0) return 2147483647;\n"
+      "  if (x <= -2147483649.0) return (-2147483647 - 1);\n"
+      "  return (int32_t)x;\n"
+      "}\n"
+      "static inline uint32_t weft_f2u32(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 4294967296.0) return 4294967295u;\n"
+      "  if (x <= -1.0) return 0u;\n"
+      "  return (uint32_t)x;\n"
+      "}\n"
+      "static inline int64_t weft_f2i64(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 9223372036854775808.0) return (int64_t)9223372036854775807ll;\n"
+      "  if (x <= -9223372036854775808.0) return (int64_t)(-9223372036854775807ll - 1);\n"
+      "  return (int64_t)x;\n"
+      "}\n"
+      "static inline uint64_t weft_f2u64(double x) {\n"
+      "  if (x != x) return 0;\n"
+      "  if (x >= 18446744073709551616.0) return 18446744073709551615ull;\n"
+      "  if (x <= -1.0) return 0u;\n"
+      "  return (uint64_t)x;\n"
+      "}\n"
 
       "template <class T, class U>\n"
-      "static inline T weft_bitcast(U u) { T t; std::memcpy(&t, &u, sizeof(T)); return t; }\n"
+      "// A narrow source -- an integer literal under a 64-bit destination -- fills the low\n"
+      "// bytes of a zeroed destination instead of reading past itself.\n"
+      "static inline T weft_bitcast(U u) {\n"
+      "  T t{};\n"
+      "  std::memcpy(&t, &u, sizeof(U) < sizeof(T) ? sizeof(U) : sizeof(T));\n"
+      "  return t;\n"
+      "}\n"
       // A tensor-core fragment register holds two halves, low half first, which
       // is the order the hardware packs them in.
       // `weft_bits` comes from the portable library, which defines it for both
@@ -5306,6 +7783,17 @@ static TranslateResult translate_ptx_impl(const std::string& raw,
       "  v = ((v >> 4) & 0x0F0F0F0Fu) | ((v & 0x0F0F0F0Fu) << 4);\n"
       "  v = ((v >> 8) & 0x00FF00FFu) | ((v & 0x00FF00FFu) << 8);\n"
       "  return (v >> 16) | (v << 16);\n"
+      "}\n"
+      // `bswap` is the byte order, not the bit order: each byte keeps its bits and the
+      // four (or eight) bytes trade places. Written as masks rather than
+      // `__builtin_bswap32` so the same text is the GPU's as well.
+      "static inline uint32_t weft_bswap32(uint32_t v) {\n"
+      "  return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |\n"
+      "         ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);\n"
+      "}\n"
+      "static inline uint64_t weft_bswap64(uint64_t v) {\n"
+      "  return ((uint64_t)weft_bswap32((uint32_t)v) << 32) |\n"
+      "         (uint64_t)weft_bswap32((uint32_t)(v >> 32));\n"
       "}\n"
       "static inline uint16_t weft_h16_bits(float x) {\n"
       "  const _Float16 h = (_Float16)x;\n"

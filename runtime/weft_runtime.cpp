@@ -243,6 +243,16 @@ void run_group_warp(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
     c.shared = shared;
     c.red = red;
     std::memset(states + (size_t)w * k.warp_size, 0, k.warp_size);
+    // A lane past the end of the launch does not exist, and a zeroed program counter
+    // means "about to start". Left alone, all 32 lanes of the last warp run, so the
+    // lanes the program does not have read and write the buffers: a store from one
+    // wrote 128 bytes into a 32-byte buffer, and `activemask` answered 0xFFFFFFFF for
+    // eight lanes. The state struct starts with one program counter per lane, so the
+    // lanes past the launch are marked finished before the body is called.
+    const uint32_t rem = live > w * 32u ? live - w * 32u : 0u;
+    const uint32_t live_w = rem > 32u ? 32u : rem;
+    uint32_t* pc = reinterpret_cast<uint32_t*>(states + (size_t)w * k.warp_size);
+    for (uint32_t l = live_w; l < 32u; l++) pc[l] = 0xFFFFFFFFu;
   }
 
   for (;;) {

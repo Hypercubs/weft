@@ -3,7 +3,7 @@
 // constant. On the GPU a double is the `uint64_t` its bits live in and the sum is
 // `weft_fp64::add`; on the CPU it is the host's own double. A reduce that added the
 // words as integers, or walked four elements instead of two, lands elsewhere.
-.version 7.0
+.version 8.0
 .target sm_90
 .address_size 64
 

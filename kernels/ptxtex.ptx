@@ -13,7 +13,7 @@
 .target sm_70
 .address_size 64
 
-.tex .u32 tex, 1, 1, 1, 1;
+.global .texref tex;
 
 .visible .entry ptxtex(
     .param .u64 ptxtex_param_0

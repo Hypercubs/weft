@@ -1,0 +1,32 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A function that calls itself: the same cycle one name short of mutual, and the
+// same refusal, because the state a call carries is a struct that would have to
+// contain itself either way.
+.visible .func spin(
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    call.uni spin, (%rd1, %rd2);
+    ret;
+}
+
+.visible .entry callself(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    call.uni spin, (%rd1, %rd2);
+    ret;
+}

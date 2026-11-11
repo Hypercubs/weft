@@ -1,0 +1,165 @@
+// The column going back the other way: `.im2col` in the store direction scatters
+// threadgroup memory into the window it describes. The same tensor and the same column
+// shape are used as above, and two columns are written in turn:
+//
+//   101..106 at the corner, which land on elements 0 to 5, the window's first three
+//           pixels, both channels of each;
+//   201..206 one pixel to the right, which land on elements 2 to 5 and then run past the
+//           edge on their third pixel, where a store has nothing to write and so writes
+//           nothing rather than spilling into the next row.
+//
+// The tensor is read back afterwards, so a scatter that moved the wrong element, walked
+// the column in the wrong order, or wrapped instead of stopping changes the eighteen
+// numbers. Elements 6 to 17 were never inside a window and have to be untouched, which
+// is the half of the answer a scatter that wrote past its box would spoil.
+.version 8.3
+.target sm_90
+.address_size 64
+
+.visible .entry tensorim2st(
+    .param .u64 tensorim2st_param_0,    // out: the tensor afterwards
+    .param .u64 tensorim2st_param_1,    // the tensor
+    .param .u64 tensorim2st_param_2     // the map
+)
+{
+    .shared .align 4 .b32 col[12];
+
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [tensorim2st_param_0];
+    ld.param.u64 %rd2, [tensorim2st_param_1];
+    ld.param.u64 %rd3, [tensorim2st_param_2];
+
+    // ---- the tensor: eighteen words ----
+    mov.u32 %r1, 0;
+FILL: setp.ge.u32 %p1, %r1, 18;
+    @%p1 bra FILLED;
+    mul.wide.s32 %rd4, %r1, 4;
+    add.s64 %rd5, %rd2, %rd4;
+    st.global.b32 [%rd5], %r1;
+    add.u32 %r1, %r1, 1;
+    bra FILL;
+FILLED:
+
+    // ---- two columns, twelve words, side by side in threadgroup memory ----
+    mov.u32 %r6, 101;
+    st.shared.b32 [col], %r6;
+    mov.u32 %r7, 102;
+    st.shared.b32 [col + 4], %r7;
+    mov.u32 %r8, 103;
+    st.shared.b32 [col + 8], %r8;
+    mov.u32 %r9, 104;
+    st.shared.b32 [col + 12], %r9;
+    mov.u32 %r10, 105;
+    st.shared.b32 [col + 16], %r10;
+    mov.u32 %r11, 106;
+    st.shared.b32 [col + 20], %r11;
+    mov.u32 %r6, 201;
+    st.shared.b32 [col + 24], %r6;
+    mov.u32 %r7, 202;
+    st.shared.b32 [col + 28], %r7;
+    mov.u32 %r8, 203;
+    st.shared.b32 [col + 32], %r8;
+    mov.u32 %r9, 204;
+    st.shared.b32 [col + 36], %r9;
+    mov.u32 %r10, 205;
+    st.shared.b32 [col + 40], %r10;
+    mov.u32 %r11, 206;
+    st.shared.b32 [col + 44], %r11;
+
+    // ---- the same map as the load kernel: two channels by three pixels ----
+    mov.b64 {%r2, %r3}, %rd2;
+    st.global.b32 [%rd3], %r2;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r3;
+    add.s64 %rd4, %rd3, 8;                 // rank 4, a column, no swizzle
+    mov.u32 %r4, 0x00000104;
+    st.global.b32 [%rd4], %r4;
+    add.s64 %rd4, %rd3, 12;                // element size
+    mov.u32 %r5, 4;
+    st.global.b32 [%rd4], %r5;
+    add.s64 %rd4, %rd3, 16;                // two channels
+    mov.u32 %r6, 2;
+    st.global.b32 [%rd4], %r6;
+    add.s64 %rd4, %rd3, 20;                // three across the width
+    mov.u32 %r7, 3;
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 24;                // three down the height
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 28;                // and one batch
+    mov.u32 %r8, 1;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 48;                // a step along the width is two channels
+    mov.u64 %rd9, 8;
+    st.global.b64 [%rd4], %rd9;
+    add.s64 %rd4, %rd3, 56;                // and down the height, three of those
+    mov.u64 %rd10, 24;
+    st.global.b64 [%rd4], %rd10;
+    add.s64 %rd4, %rd3, 64;                // a batch after the whole image
+    mov.u64 %rd11, 72;
+    st.global.b64 [%rd4], %rd11;
+    add.s64 %rd4, %rd3, 80;                // two channels in the column
+    st.global.b32 [%rd4], %r6;
+    add.s64 %rd4, %rd3, 84;                // three pixels
+    st.global.b32 [%rd4], %r7;
+    add.s64 %rd4, %rd3, 88;                // a pixel steps once along the width
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 92;                // and once down the height
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 96;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 100;               // the window starts at the corner
+    mov.u32 %r9, 0;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 104;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 108;
+    st.global.b32 [%rd4], %r9;
+    add.s64 %rd4, %rd3, 112;               // and a filter step is one element too
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 116;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 120;
+    st.global.b32 [%rd4], %r8;
+    add.s64 %rd4, %rd3, 124;
+    mov.u32 %r10, 0x41544657;
+    st.global.b32 [%rd4], %r10;
+
+    bar.sync 0;
+
+    // ---- threadgroup memory -> the tensor, twice ----
+    mov.u32 %r12, 0;
+    mov.u32 %r13, 0;
+    cp.async.bulk.tensor.4d.global.shared::cta.bulk_group.im2col
+        [%rd3, {0, 0, 0, 0}], {%r12, %r13}, [col];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+
+    mov.u32 %r14, 1;
+    mov.u32 %r15, 0;
+    cp.async.bulk.tensor.4d.global.shared::cta.bulk_group.im2col
+        [%rd3, {0, 0, 0, 0}], {%r14, %r15}, [col + 24];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+
+    // ---- the tensor as the two scatters left it ----
+    mov.u32 %r16, 0;
+BACK: setp.ge.u32 %p3, %r16, 18;
+    @%p3 bra BACKED;
+    mul.wide.s32 %rd7, %r16, 4;
+    add.s64 %rd8, %rd2, %rd7;
+    ld.global.b32 %r17, [%rd8];
+    add.s64 %rd6, %rd1, %rd7;
+    st.global.b32 [%rd6], %r17;
+    add.u32 %r16, %r16, 1;
+    bra BACK;
+BACKED:
+
+    mov.u32 %r17, 0;
+    st.global.b32 [%rd3], %r17;
+    add.s64 %rd4, %rd3, 4;
+    st.global.b32 [%rd4], %r17;
+    ret;
+}

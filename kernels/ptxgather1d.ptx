@@ -1,4 +1,6 @@
-// `tld4.1d`: a gather on a 1-D binding, which is a plane one row high.
+// A gather on a 1-D binding, which is a plane one row high. PTX has no 1-D `tld4`, so
+// the two texels the 2x2 footprint takes from the one row are two 1-D fetches and the
+// two from the row below are nothing -- the rule the gather follows at an edge.
 //
 //     u = (x + 0.5) / 64
 //     g = tld4(row, u)                   // (x,0), (x+1,0), then the row below
@@ -13,7 +15,7 @@
 .target sm_70
 .address_size 64
 
-.tex .u32 row, 1, 1, 1, 1;
+.global .texref row;
 
 .visible .entry ptxgather1d(
     .param .u64 ptxgather1d_param_0
@@ -21,6 +23,7 @@
 {
     .reg .b32 %r<16>;
     .reg .f32 %f<20>;
+    .reg .pred %ps<2>;
     .reg .b64 %rd<8>;
 
     ld.param.u64 %rd1, [ptxgather1d_param_0];
@@ -38,7 +41,13 @@
     add.f32 %f3, %f1, 0f3F000000;       // x + 0.5
     div.rn.f32 %f4, %f3, %f2;           // u
 
-    tld4.b.1d.v4.f32.f32 {%f7,%f8,%f9,%f10}, [row, %f4];
+    tex.1d.v4.f32.f32 {%f7,%f16,%f17,%f18}, [row, {%f4}];
+    add.f32 %f15, %f4, 0f3B800000;      // one texel along x, which is 1/64
+    setp.ge.s32 %ps1, %r6, 63;          // past the last column there is nothing
+    tex.1d.v4.f32.f32 {%f8,%f16,%f17,%f18}, [row, {%f15}];
+    selp.f32 %f8, 0f00000000, %f8, %ps1;
+    mov.f32 %f9, 0f00000000;
+    mov.f32 %f10, 0f00000000;
 
     mul.f32 %f11, %f8, 0f40000000;      // 2 g.y
     add.f32 %f12, %f7, %f11;

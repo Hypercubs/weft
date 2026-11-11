@@ -1,0 +1,61 @@
+// The packed half transcendentals: one word in, three words out, each the same input
+// answered by a different approximation.
+//
+//     out0 = ex2.approx.f16x2(in)
+//     out1 = lg2.approx.f16x2(in)
+//     out2 = tanh.approx.f16x2(in)
+//
+// `lg2` has no `.f16x2` spelling in ptxas, so that word answers each half in float and
+// packs the two rounded halves back together.
+//
+// Each half is widened, answered and rounded on its own, so the reference is the
+// double-precision library rounded once to the half grid -- an independent answer, not
+// this library run again. The input keeps every value in [0.0625, 4]: positive for lg2,
+// small enough that exp2 stays inside the half range and large enough that it does not
+// land on a subnormal, where a rounding difference would be invisible in the bits.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry p16tx(
+    .param .u64 in,
+    .param .u64 out0,
+    .param .u64 out1,
+    .param .u64 out2
+)
+{
+    .reg .b32 %r<6>;
+    .reg .b16 %hs<6>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<9>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out0];
+    ld.param.u64 %rd3, [out1];
+    ld.param.u64 %rd4, [out2];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd5, %r1, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.b32 %r2, [%rd6];
+    ex2.approx.f16x2 %r3, %r2;
+    ld.global.b16 %hs1, [%rd6];
+    ld.global.b16 %hs2, [%rd6+2];
+    cvt.f32.f16 %f1, %hs1;
+    cvt.f32.f16 %f2, %hs2;
+    lg2.approx.f32 %f1, %f1;
+    lg2.approx.f32 %f2, %f2;
+    cvt.rn.f16.f32 %hs3, %f1;
+    cvt.rn.f16.f32 %hs4, %f2;
+    cvt.u32.u16 %r4, %hs3;
+    cvt.u32.u16 %r5, %hs4;
+    shl.b32 %r5, %r5, 16;
+    or.b32 %r4, %r4, %r5;
+    tanh.approx.f16x2 %r5, %r2;
+    add.u64 %rd7, %rd2, %rd5;
+    st.global.b32 [%rd7], %r3;
+    add.u64 %rd7, %rd3, %rd5;
+    st.global.b32 [%rd7], %r4;
+    add.u64 %rd7, %rd4, %rd5;
+    st.global.b32 [%rd7], %r5;
+    ret;
+}

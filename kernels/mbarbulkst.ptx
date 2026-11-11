@@ -8,7 +8,7 @@
 // no descriptor and no transaction count: the size is written in the instruction. Four
 // different words, so a copy that moved the wrong address, or none of them, reads a
 // different set rather than the same one.
-.version 7.0
+.version 8.0
 .target sm_90
 .address_size 64
 

@@ -1,0 +1,52 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// Two functions that call each other. A call carries the callee's state as a member
+// of the caller's, so a cycle has no finite shape: the refusal names that rather than
+// inventing a depth limit. A function that calls only itself is the same case reached
+// without a second name.
+//
+// The forward name needs a prototype before the body that calls it, or ptxas answers
+// `Call to 'ping' requires call prototype`. The empty return list and the named
+// parameters make the prototype agree with the definition below.
+.visible .func () ping(.param .u64 src, .param .u64 dst);
+
+.visible .func pong(
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    call.uni ping, (%rd1, %rd2);
+    ret;
+}
+
+.visible .func ping(
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    call.uni pong, (%rd1, %rd2);
+    ret;
+}
+
+.visible .entry callrec(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    call.uni ping, (%rd1, %rd2);
+    ret;
+}

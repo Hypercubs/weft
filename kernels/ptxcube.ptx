@@ -15,7 +15,7 @@
 .target sm_70
 .address_size 64
 
-.tex .u32 cube, 1, 1, 1, 1;
+.global .texref cube;
 
 .visible .entry ptxcube(
     .param .u64 ptxcube_param_0
@@ -56,7 +56,10 @@
     add.f32 %f10, %f7, %f7;
     sub.f32 %f11, 0f3F800000, %f10;     // t = 1 - 2v
 
-    tex.cube.v4.f32.f32 {%f12,%f13,%f14,%f15}, [cube, {%f9,%f11,%r13}];
+    // The face is a coordinate like the other two, and PTX wants a fourth: q = 1.
+    cvt.rn.f32.s32 %f19, %r13;
+    mov.f32 %f20, 0f3F800000;
+    tex.cube.v4.f32.f32 {%f12,%f13,%f14,%f15}, [cube, {%f9,%f11,%f19,%f20}];
 
     mul.f32 %f16, %f12, 0f40000000;     // the texel, doubled
     cvt.rn.f32.u32 %f17, %r13;          // with the face folded in

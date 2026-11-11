@@ -17,16 +17,16 @@
 // the eight M groups. B is 16x16: LBO = 128 between K groups, SBO = 256 between N
 // groups, 512 bytes, since two K groups by two N groups of 128.
 .version 8.1
-.target sm_90
+.target sm_90a
 .address_size 64
-
-.maxntid 128, 1, 1
 
 .visible .entry wgmma_n16_kernel(
 	.param .u64 wgmma_n16_kernel_param_0,
 	.param .u64 wgmma_n16_kernel_param_1,
 	.param .u64 wgmma_n16_kernel_param_2
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .b32 	%r<48>;
 	.reg .f32 	%f<16>;
@@ -110,7 +110,7 @@
 	mov.f32 	%f11, 0f00000000;
 	mov.f32 	%f12, 0f00000000;
 	wgmma.fence.sync.aligned;
-	wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {%f5, %f6, %f7, %f8, %f9, %f10, %f11, %f12}, %rd10, %rd12, 1;
+	wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {%f5, %f6, %f7, %f8, %f9, %f10, %f11, %f12}, %rd10, %rd12, 1, 1, 1, 0, 0;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 

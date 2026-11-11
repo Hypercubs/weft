@@ -1,0 +1,41 @@
+.version 7.0
+.target sm_70
+.address_size 64
+// The packed comparisons answer 1 or 0 in each field, not all ones, so the packing is the
+// whole answer. Two rows compare the same bits as signed halves and as unsigned ones,
+// where they disagree, and the byte rows repeat it four lanes wide. The packed form names
+// its merge operand even with no mask, and ptxas takes no three-operand spelling of
+// `vset4`, so every row carries one.
+.visible .entry vsetpack(.param .u64 p0)
+{
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [p0];
+    mov.u32 %r1, 0x00010002;
+    mov.u32 %r2, 0x00010003;
+    mov.u32 %r3, 0xFFFF0001;
+    mov.u32 %r4, 0x00000002;
+    mov.u32 %r5, 0;
+    mov.u32 %r6, 0x0000FFFF;
+    mov.u32 %r7, 0x01020304;
+    mov.u32 %r8, 0x01020305;
+    mov.u32 %r9, 0x0A0B0C0D;
+    mov.u32 %r19, 0;
+    vset2.u32.u32.eq %r10, %r1, %r2, %r19;
+    vset2.s32.s32.lt %r11, %r3, %r4, %r19;
+    vset2.u32.u32.lt %r12, %r3, %r4, %r19;
+    vset2.u32.u32.ne %r13, %r5, %r6, %r19;
+    vset4.u32.u32.eq %r14, %r7, %r8, %r19;
+    vset4.u32.u32.lt %r15, %r9, %r2, %r19;
+    mov.u32 %r17, 0x80FF7F01;
+    mov.u32 %r18, 0;
+    vset4.s32.s32.gt %r16, %r17, %r18, %r19;
+    st.u32 [%rd1], %r10;
+    st.u32 [%rd1+4], %r11;
+    st.u32 [%rd1+8], %r12;
+    st.u32 [%rd1+12], %r13;
+    st.u32 [%rd1+16], %r14;
+    st.u32 [%rd1+20], %r15;
+    st.u32 [%rd1+24], %r16;
+    ret;
+}

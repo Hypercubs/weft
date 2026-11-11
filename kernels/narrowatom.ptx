@@ -1,0 +1,33 @@
+// A 16-bit float atomic add. The hardware's atomics are 32 bits wide and two halves
+// can share one of those words, so the add is a compare-exchange on the word with only
+// the half being added replaced. That is what this fixture is built to catch: the two
+// halves of one word are contended by different values at once, and the neighbour has
+// to keep its own total.
+//
+//   narrowatom  64 lanes, each adding 1.0 to the low half and 0.5 to the high one
+//               of the same word: 64.0 and 32.0, both exact whatever order they land
+//   redatom     64 lanes, each adding the pair (1.0, 0.5) with `red`, no result:
+//               64.0 above 32.0
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry narrowatom(
+    .param .u64 narrowatom_param_0  // out: two halfs, contended by 64 lanes
+)
+{
+    .reg .b16 %hs<4>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [narrowatom_param_0];
+    mov.u32 %r1, %tid.x;
+    and.b32 %r1, %r1, 63;
+
+    mov.b16 %hs1, 0x3C00;     // 1.0
+    mov.b16 %hs2, 0x3800;     // 0.5
+
+    atom.global.noftz.add.f16 %hs3, [%rd1], %hs1;
+    atom.global.noftz.add.f16 %hs3, [%rd1+2], %hs2;
+    ret;
+}

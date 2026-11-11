@@ -1,0 +1,189 @@
+// The multi-matrix forms of the two wider tile shapes. `ldmatrixsub` covers `.x2`
+// of the 6- and 4-bit containers and `ldmatrixb8` covers `.x1` of the byte shape,
+// so what is left is the second and later tile at a non-zero offset: a stride that
+// is off by one container passes the `.x1` rows and fails here.
+//
+// ldmpack4: `ldmatrix.m8n16.x4.b8x16.b6x16_p32` and its fp4 twin, four matrices of
+// eight 16-byte containers. Matrix m owns containers 8m..8m+7, and container c is
+// sixteen elements: 6-bit at bits 6*col, 4-bit at bits 4*col, the rest padding.
+// The values are chosen so a wrong matrix, row or column always shows:
+//     v6(c, col) = (7c + 13col) & 63      v4(c, col) = (5c + 3col) & 15
+// and 7, 13 are invertible modulo 64 and 5, 3 modulo 16, while the eight-container
+// stride moves c by 8, which changes both sums. The destination is CUTLASS's
+// `SM100_SU6_DU8x16_x1_LDSM_N` map: lane l holds row l>>2 at columns 4*(l&3)..+3 of
+// container 8m + (l>>2), widened to a byte. The same four tiles are loaded once
+// more through a per-lane address, lane a naming container a, which is the peer
+// lane 8m + row the register form asks for.
+//
+// ldmb8x2: `ldmatrix.m16n16.x2.trans.b8`, two 16x16 tiles. Byte k of tile m holds
+// k ^ (0x5A m), so the second tile's bytes all differ from the first's and a stride
+// of zero cannot pass. The map is the one `ldmatrixb8` states for one tile, applied
+// to each tile in turn.
+.version 8.8
+.target sm_100a
+.address_size 64
+
+.visible .entry ldmpack4(
+    .param .u64 ldmpack4_param_0        // out: three blocks of 128 words
+)
+{
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<8>;
+
+    .shared .align 16 .b8 sub4[512];
+
+    ld.param.u64 %rd1, [ldmpack4_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd2, sub4;
+
+    // ---- thirty-two containers of six-bit elements: four words a lane, one container ----
+    mov.u32 %r20, 0;                        // word of this lane's container
+F6: setp.ge.u32 %p1, %r20, 4;
+    @%p1 bra F6D;
+    mov.u32 %r24, 0;
+    mov.u32 %r25, 0;                        // element
+E6: setp.ge.u32 %p2, %r25, 16;
+    @%p2 bra E6D;
+    mul.lo.u32 %r26, %r1, 7;
+    mul.lo.u32 %r27, %r25, 13;
+    add.u32 %r26, %r26, %r27;
+    and.b32 %r26, %r26, 63;
+    // A six-bit field straddles a word boundary: it lands in this word when it
+    // starts in it, and in the next when it does not.
+    mul.lo.s32 %r27, %r25, 6;
+    shl.b32 %r31, %r20, 5;
+    sub.s32 %r27, %r27, %r31;               // 6e - 32w
+    setp.gt.s32 %p3, %r27, 31;
+    @%p3 bra E6N;
+    setp.ge.s32 %p4, %r27, 0;
+    @%p4 bra S6P;
+    setp.le.s32 %p4, %r27, -6;
+    @%p4 bra E6N;
+    neg.s32 %r27, %r27;
+    shr.u32 %r26, %r26, %r27;
+    or.b32 %r24, %r24, %r26;
+    bra E6N;
+S6P: shl.b32 %r26, %r26, %r27;
+    or.b32 %r24, %r24, %r26;
+E6N: add.u32 %r25, %r25, 1;
+    bra E6;
+E6D:
+    shl.b32 %r32, %r1, 4;
+    shl.b32 %r33, %r20, 2;
+    add.u32 %r32, %r32, %r33;
+    cvt.u64.u32 %rd3, %r32;
+    add.s64 %rd3, %rd2, %rd3;
+    st.shared.u32 [%rd3], %r24;
+    add.u32 %r20, %r20, 1;
+    bra F6;
+F6D:
+    bar.sync 0;
+
+    ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b6x16_p32 {%r10, %r11, %r12, %r13}, [sub4];
+
+    // ---- the same four tiles through a per-lane address: lane a names container a ----
+    shl.b32 %r34, %r1, 4;
+    cvt.u64.u32 %rd4, %r34;
+    add.s64 %rd5, %rd2, %rd4;
+    ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b6x16_p32 {%r14, %r15, %r16, %r17}, [%rd5];
+
+    mul.wide.s32 %rd6, %r1, 16;
+    add.s64 %rd7, %rd1, %rd6;
+    st.global.b32 [%rd7], %r10;
+    st.global.b32 [%rd7+4], %r11;
+    st.global.b32 [%rd7+8], %r12;
+    st.global.b32 [%rd7+12], %r13;
+    add.s64 %rd8, %rd7, 512;
+    st.global.b32 [%rd8], %r14;
+    st.global.b32 [%rd8+4], %r15;
+    st.global.b32 [%rd8+8], %r16;
+    st.global.b32 [%rd8+12], %r17;
+
+    // ---- the same containers as four-bit elements: two words of payload, two of padding ----
+    bar.sync 0;
+    mov.u32 %r20, 0;
+F4: setp.ge.u32 %p1, %r20, 4;
+    @%p1 bra F4D;
+    mov.u32 %r24, 0;
+    setp.ge.u32 %p5, %r20, 2;
+    @%p5 bra F4S;
+    mov.u32 %r25, 0;
+E4: setp.ge.u32 %p2, %r25, 8;
+    @%p2 bra F4S;
+    shl.b32 %r30, %r20, 3;
+    add.u32 %r30, %r30, %r25;               // col = 8w + e
+    mul.lo.u32 %r26, %r1, 5;
+    mul.lo.u32 %r27, %r30, 3;
+    add.u32 %r26, %r26, %r27;
+    and.b32 %r26, %r26, 15;
+    shl.b32 %r27, %r25, 2;
+    shl.b32 %r26, %r26, %r27;
+    or.b32 %r24, %r24, %r26;
+    add.u32 %r25, %r25, 1;
+    bra E4;
+F4S:
+    shl.b32 %r32, %r1, 4;
+    shl.b32 %r33, %r20, 2;
+    add.u32 %r32, %r32, %r33;
+    cvt.u64.u32 %rd3, %r32;
+    add.s64 %rd3, %rd2, %rd3;
+    st.shared.u32 [%rd3], %r24;
+    add.u32 %r20, %r20, 1;
+    bra F4;
+F4D:
+    bar.sync 0;
+
+    ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%r18, %r19, %r20, %r21}, [sub4];
+
+    add.s64 %rd9, %rd7, 1024;
+    st.global.b32 [%rd9], %r18;
+    st.global.b32 [%rd9+4], %r19;
+    st.global.b32 [%rd9+8], %r20;
+    st.global.b32 [%rd9+12], %r21;
+    ret;
+}
+
+.visible .entry ldmb8x2(
+    .param .u64 ldmb8x2_param_0         // out: two blocks of 64 words
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<10>;
+    .reg .pred %p<4>;
+
+    .shared .align 16 .b8 tile8[512];
+
+    ld.param.u64 %rd1, [ldmb8x2_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd4, tile8;
+
+    // ---- byte k of tile m holds k ^ (0x5A m) ----
+    shl.b32 %r2, %r1, 4;
+    mov.u32 %r5, 0;
+FB: setp.ge.u32 %p1, %r5, 16;
+    @%p1 bra FBD;
+    add.u32 %r3, %r2, %r5;
+    shr.u32 %r6, %r3, 8;
+    mul.lo.u32 %r6, %r6, 0x5A;
+    and.b32 %r7, %r3, 255;
+    xor.b32 %r6, %r7, %r6;
+    cvt.u64.u32 %rd5, %r3;
+    add.s64 %rd5, %rd4, %rd5;
+    st.shared.u8 [%rd5], %r6;
+    add.u32 %r5, %r5, 1;
+    bra FB;
+FBD:
+    bar.sync 0;
+
+    ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%r10, %r11, %r12, %r13}, [tile8];
+
+    mul.wide.s32 %rd6, %r1, 8;
+    add.s64 %rd7, %rd1, %rd6;
+    st.global.b32 [%rd7], %r10;
+    st.global.b32 [%rd7+4], %r11;
+    add.s64 %rd8, %rd7, 256;
+    st.global.b32 [%rd8], %r12;
+    st.global.b32 [%rd8+4], %r13;
+    ret;
+}

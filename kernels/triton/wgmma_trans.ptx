@@ -2,7 +2,7 @@
 // wgmma with MN-major operands: both descriptors point at tiles whose contiguous
 // direction is M for A and N for B, and the last two immediates say so.
 //
-//     wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {d}, a, b, 1, 0, 0, 1, 1;
+//     wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {d}, a, b, 1, 1, 1, 1, 1;
 //
 // What changes is the walk, not the element count. A core matrix is still 8 by 16
 // bytes, but a 16-byte chunk now holds eight values along M instead of eight along
@@ -18,16 +18,16 @@
 // The tiles are the same logical matrices as `wgmma.ptx`, staged the other way up,
 // so the reference that multiplies the input tiles directly still applies.
 .version 8.1
-.target sm_90
+.target sm_90a
 .address_size 64
-
-.maxntid 128, 1, 1
 
 .visible .entry wgmma_trans_kernel(
 	.param .u64 wgmma_trans_kernel_param_0,
 	.param .u64 wgmma_trans_kernel_param_1,
 	.param .u64 wgmma_trans_kernel_param_2
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .b32 	%r<48>;
 	.reg .f32 	%f<16>;
@@ -115,7 +115,7 @@
 	mov.f32 	%f7, 0f00000000;
 	mov.f32 	%f8, 0f00000000;
 	wgmma.fence.sync.aligned;
-	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 0, 0, 1, 1;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 1, 1, 1, 1;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 

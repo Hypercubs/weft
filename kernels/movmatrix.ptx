@@ -1,0 +1,48 @@
+// movmatrix: the transpose of the matrix `ldmatrix` distributes across a warp.
+//
+// Lane l holds row l>>2 of the 8x8 tile, at columns 2(l&3) and 2(l&3)+1, one half
+// each in its 32-bit register. The transposed tile is laid out by the same rule, so
+// lane l ends up with original elements (2(l&3), l>>2) in its low half and
+// (2(l&3)+1, l>>2) in its high half.
+//
+//   movmtx   one transpose:  out = frag(transpose(M))
+//   movmtx2  two transposes: out = frag(M), which is the input again
+//
+// The second kernel is the one that catches a transpose that moved the right
+// elements to the wrong halves: it is still a permutation, but it is not the inverse.
+.version 7.8
+.target sm_75
+.address_size 64
+
+.visible .entry movmtx(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  movmatrix.sync.aligned.m8n8.trans.b16 %r3, %r2;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r3;
+  ret;
+}
+
+.visible .entry movmtx2(.param .u64 p_in, .param .u64 p_out)
+{
+  .reg .b32 %r<5>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p_in];
+  ld.param.u64 %rd2, [p_out];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd1, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  movmatrix.sync.aligned.m8n8.trans.b16 %r3, %r2;
+  movmatrix.sync.aligned.m8n8.trans.b16 %r4, %r3;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r4;
+  ret;
+}

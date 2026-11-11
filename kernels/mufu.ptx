@@ -1,4 +1,6 @@
-// mufu: the multifunction unit's seven approximations, all in one lane.
+// The multifunction unit's seven approximations, all in one lane. PTX names each
+// operation itself -- `rcp.approx`, `rsqrt.approx`, `sqrt.approx`, `ex2`, `lg2`,
+// `sin`, `cos`, `tanh` -- where a SASS dump would say `mufu.<op>`.
 //
 //     a  = |in[gid]| + 1.5                 positive and bounded
 //     b  = 1 / (1 + a)                     in (0, 0.4]
@@ -18,8 +20,10 @@
 // which is why this kernel can be compared byte for byte instead of by a
 // tolerance. Every term is a different weight, so one operation mapped to another
 // lands on a different number.
+// `tanh.approx.f32` is the one operation here that needs something newer than the
+// fixture's original baseline, so the target is one that has it.
 .version 7.0
-.target sm_70
+.target sm_75
 .address_size 64
 
 .visible .entry mufu(
@@ -44,15 +48,15 @@
     add.f32 %f4, %f3, 0f3F800000;      // 1 + a
     rcp.approx.f32 %f5, %f4;           // b
 
-    mufu.rcp.approx.f32 %f6, %f3;
-    mufu.rsqrt.approx.f32 %f7, %f3;
-    mufu.sqrt.approx.f32 %f8, %f3;
+    rcp.approx.f32 %f6, %f3;
+    rsqrt.approx.f32 %f7, %f3;
+    sqrt.approx.f32 %f8, %f3;
     add.f32 %f9, %f5, 0fBF800000;      // b - 1
-    mufu.ex2.approx.f32 %f10, %f9;
-    mufu.lg2.approx.f32 %f11, %f3;
-    mufu.sin.approx.f32 %f12, %f3;
-    mufu.cos.approx.f32 %f13, %f3;
-    mufu.tanh.approx.f32 %f14, %f3;
+    ex2.approx.f32 %f10, %f9;
+    lg2.approx.f32 %f11, %f3;
+    sin.approx.f32 %f12, %f3;
+    cos.approx.f32 %f13, %f3;
+    tanh.approx.f32 %f14, %f3;
 
     add.f32 %f15, %f6, %f7;            // r + q
     add.f32 %f15, %f15, %f7;           // + q   (2q)

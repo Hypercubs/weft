@@ -1,0 +1,59 @@
+// The warp's own instructions, one word per lane each, on a full warp.
+//
+// A shuffle is a rendezvous, not a local operation: the answer for lane i is a value
+// lane j computed, so the only way to check one is to look at every lane at once. Row
+// k of the buffer is word k of lane i, for i in 0..31.
+//
+//     row 0  activemask      FFFFFFFF   every lane of the warp is executing
+//     row 1  ballot(t & 1)   AAAAAAAA   the odd lanes
+//     row 2  shfl.idx  t*10 from lane 3   30 for every lane: the source lane's value
+//     row 3  shfl.up   1     lane 0 keeps its own 0, lane i gets i-1
+//     row 4  shfl.down 1     lane 31 keeps its own 31, lane i gets i+1
+//     row 5  shfl.bfly 2     i xor 2
+//     row 6  vote.all  t<20  0: lanes 20..31 are false
+//     row 7  vote.any  t==7  1: exactly one lane is
+//
+// A `down` that read the wrong neighbour, an `up` that clamped at the wrong end, or a
+// ballot that folded the wrong bit would move one of these words and nothing else.
+// One word per lane per warp op, so the whole lane-by-lane answer is visible.
+.version 8.6
+.target sm_100
+.address_size 64
+
+.visible .entry warpv(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p<6>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 32;
+    add.u64 %rd2, %rd1, %rd2;
+
+    activemask.b32 %r2;
+    and.b32 %r3, %r1, 1;
+    setp.ne.u32 %p1, %r3, 0;
+    vote.sync.ballot.b32 %r4, %p1, 0xFFFFFFFF;
+    mul.lo.u32 %r5, %r1, 10;
+    shfl.sync.idx.b32 %r6, %r5, 3, 31, -1;
+    shfl.sync.up.b32 %r7, %r1, 1, 0, -1;
+    shfl.sync.down.b32 %r8, %r1, 1, 31, -1;
+    shfl.sync.bfly.b32 %r9, %r1, 2, 31, -1;
+    setp.lt.u32 %p2, %r1, 20;
+    vote.sync.all.pred %p3, %p2, -1;
+    selp.u32 %r10, 1, 0, %p3;
+    setp.eq.u32 %p4, %r1, 7;
+    vote.sync.any.pred %p5, %p4, -1;
+    selp.u32 %r11, 1, 0, %p5;
+
+    st.global.b32 [%rd2+0], %r2;
+    st.global.b32 [%rd2+4], %r4;
+    st.global.b32 [%rd2+8], %r6;
+    st.global.b32 [%rd2+12], %r7;
+    st.global.b32 [%rd2+16], %r8;
+    st.global.b32 [%rd2+20], %r9;
+    st.global.b32 [%rd2+24], %r10;
+    st.global.b32 [%rd2+28], %r11;
+    ret;
+}

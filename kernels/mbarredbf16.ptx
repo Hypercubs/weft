@@ -7,7 +7,7 @@
 // practice, and the reduction walks eight elements of two bytes rather than four
 // of four: a reduce that kept the 32-bit width would add (1,2) to (0.5,1) as one
 // number and land nowhere near these.
-.version 7.0
+.version 8.0
 .target sm_90
 .address_size 64
 

@@ -3,8 +3,8 @@
 //     a = round(in[gid])            a 32-bit value the input decides
 //     b = a ^ 0x01020304            the same bytes with different magnitudes
 //     c = gid
-//     u = dp4a.u8.u8 a, b, c        four unsigned byte products
-//     s = dp4a.s8.s8 a, b, c        four signed byte products
+//     u = dp4a.u32.u32 a, b, c      four unsigned byte products
+//     s = dp4a.s32.s32 a, b, c      four signed byte products
 //     out[gid] = u + s
 //
 // The two sign combinations read the same bytes differently, so a translator that
@@ -37,8 +37,8 @@
     xor.b32 %r6, %r5, 0x01020304;       // b
     add.s32 %r7, %r4, 1;                // c
 
-    dp4a.u8.u8 %r8, %r5, %r6, %r7;
-    dp4a.s8.s8 %r9, %r5, %r6, %r7;
+    dp4a.u32.u32 %r8, %r5, %r6, %r7;
+    dp4a.s32.s32 %r9, %r5, %r6, %r7;
 
     add.s32 %r10, %r8, %r9;
     cvt.rn.f32.s32 %f2, %r10;

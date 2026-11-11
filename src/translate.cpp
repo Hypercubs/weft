@@ -5852,7 +5852,13 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   code += carried.text;
   // as_type<T> becomes this: a bit-for-bit reinterpretation.
   code += "template <class T, class U>\n"
-      "static inline T weft_bitcast(U u) { T t; std::memcpy(&t, &u, sizeof(T)); return t; }\n";
+      "// A narrow source -- an integer literal under a 64-bit destination -- fills the low\n"
+      "// bytes of a zeroed destination instead of reading past itself.\n"
+      "static inline T weft_bitcast(U u) {\n"
+      "  T t{};\n"
+      "  std::memcpy(&t, &u, sizeof(U) < sizeof(T) ? sizeof(U) : sizeof(T));\n"
+      "  return t;\n"
+      "}\n";
   code += "using std::min;\n"
       "using std::max;\n"
       "using std::abs;\n"

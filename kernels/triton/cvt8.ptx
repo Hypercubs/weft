@@ -12,6 +12,7 @@
 	.param .u64 cvt8_kernel_param_1
 )
 {
+	.reg .b16 	%hs<4>;
 	.reg .b32 	%r<12>;
 	.reg .f32 	%f<8>;
 	.reg .b64 	%rd<8>;
@@ -23,8 +24,10 @@
 	cvt.u64.u32 	%rd3, %r2;
 	add.s64 	%rd3, %rd1, %rd3;
 	ld.global.v4.b32 	{%f1, %f2, %f3, %f4}, [%rd3];
-	cvt.rn.satfinite.e4m3x2.f32 %r3, %f2, %f1;
-	cvt.rn.satfinite.e4m3x2.f32 %r4, %f4, %f3;
+	cvt.rn.satfinite.e4m3x2.f32 %hs1, %f2, %f1;
+	cvt.rn.satfinite.e4m3x2.f32 %hs2, %f4, %f3;
+	cvt.u32.u16 %r3, %hs1;
+	cvt.u32.u16 %r4, %hs2;
 	prmt.b32 	%r5, %r3, %r4, 0x5410;
 	shl.b32 	%r6, %r1, 2;
 	cvt.u64.u32 	%rd4, %r6;

@@ -6,7 +6,7 @@
 // leaves them, so this kernel is the fragment layout and nothing else: A is a
 // 16x32 tile of bytes, B a 32x8 tile of bytes in row-major order, and D comes out
 // as the 16x8 tile of f32 the instruction accumulates into.
-.version 8.1
+.version 8.4
 .target sm_89
 .address_size 64
 

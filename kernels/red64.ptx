@@ -1,4 +1,4 @@
-// 64-bit reductions: `red.global.{add,or,sub,xor}.u64`.
+// 64-bit reductions: `red.global.{add,or,xor}.u64`.
 //
 // A `red` has no result, which is what lets these run on the GPU at all: the
 // answer does not need the pair read as one value, only to end up holding the
@@ -47,15 +47,17 @@
     and.b32 %r7, %r4, 63;
     mov.u64 %rd5, 1;
     shl.b64 %rd6, %rd5, %r7;
-    red.global.or.u64 [%rd2], %rd6;
+    red.global.or.b64 [%rd2], %rd6;
 
     // the same count downwards, so a borrow has to land in the high half
-    red.global.sub.u64 [%rd3], 1;
+    // `red` has no `.sub`, and subtracting one is the same wrap as adding its
+    // two's complement, which is the immediate a `red.add` can carry.
+    red.global.add.u64 [%rd3], -1;
 
     // and an xor of the thread's index, where the bit has to cancel exactly once
     cvt.u64.u32 %rd7, %r4;
     add.s64 %rd8, %rd7, 1;
-    red.global.xor.u64 [%rd4], %rd8;
+    red.global.xor.b64 [%rd4], %rd8;
 
 DONE:
     ret;

@@ -9,16 +9,16 @@
 // The tiles are the unswizzled core-matrix layout, which is what a K loop
 // stepping by one 16-wide slice uses.
 .version 8.1
-.target sm_90
+.target sm_90a
 .address_size 64
-
-.maxntid 128, 1, 1
 
 .visible .entry wgmma_chain_kernel(
 	.param .u64 wgmma_chain_kernel_param_0,
 	.param .u64 wgmma_chain_kernel_param_1,
 	.param .u64 wgmma_chain_kernel_param_2
 )
+.maxntid 128, 1, 1
+
 {
 	.reg .b32 	%r<40>;
 	.reg .f32 	%f<12>;
@@ -89,13 +89,13 @@
 	mov.f32 	%f7, 0f00000000;
 	mov.f32 	%f8, 0f00000000;
 	wgmma.fence.sync.aligned;
-	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 1, 1, 0, 0;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
-	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 1, 1, 0, 0;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
-	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1;
+	wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f5, %f6, %f7, %f8}, %rd10, %rd12, 1, 1, 1, 0, 0;
 	wgmma.commit_group.sync.aligned;
 	wgmma.wait_group.sync.aligned 0;
 

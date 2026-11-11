@@ -12,14 +12,14 @@
 .target sm_90
 .address_size 64
 
-.maxntid 32, 1, 1
-
 .visible .entry dotbf16_kernel(
 	.param .u64 dotbf16_kernel_param_0,
 	.param .u64 dotbf16_kernel_param_1,
 	.param .u64 dotbf16_kernel_param_2,
 	.param .u64 dotbf16_kernel_param_3
 )
+.maxntid 32, 1, 1
+
 {
 	.reg .f32 	%f<24>;
 	.reg .b32 	%r<40>;

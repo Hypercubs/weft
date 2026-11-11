@@ -1,0 +1,33 @@
+// The tangent, as the quotient of the two approximations the instruction set does have.
+// PTX spells `sin.approx` and `cos.approx` but no `tan.approx`, so this is `sin/cos`
+// rounded once, and the row checks it against a double's tangent inside an ulp.
+//
+//     a = in[gid]
+//     out[gid] = tan.approx.f32 a
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry ftan(
+    .param .u64 ftan_param_0
+)
+{
+    .reg .b32 %r<6>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [ftan_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+
+    ld.f32 %f1, [%rd4];
+    sin.approx.f32 %f2, %f1;
+    cos.approx.f32 %f3, %f1;
+    div.rn.f32 %f2, %f2, %f3;
+    st.f32 [%rd4], %f2;
+    ret;
+}

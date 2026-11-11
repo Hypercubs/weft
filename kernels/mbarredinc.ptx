@@ -9,7 +9,7 @@
 // A plain `+1` would answer 4 for the third counter and 4 for the fourth, and an
 // unbounded decrement would wrap 0 to 0xFFFFFFFF, so both forms are distinguished
 // by these eight numbers.
-.version 7.0
+.version 8.0
 .target sm_90
 .address_size 64
 

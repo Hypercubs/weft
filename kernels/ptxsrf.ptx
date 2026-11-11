@@ -13,7 +13,7 @@
 .target sm_70
 .address_size 64
 
-.surf .u64 srf, 1, 1, 1, 1;
+.global .surfref srf;
 
 .visible .entry ptxsrf(
     .param .u64 ptxsrf_param_0,
@@ -40,12 +40,12 @@
     shr.u32 %r6, %r4, 6;
     and.b32 %r6, %r6, 63;               // y
 
-    sust.b.2d.b32 [srf, {%r5,%r6}], {%f1};
+    sust.b.2d.clamp.b32 [srf, {%r5,%r6}], {%f1};
 
     bar.sync 0;
 
     xor.b32 %r7, %r5, 1;                // the neighbour inside this group
-    suld.b.2d.b32 %r8, [srf, {%r7,%r6}];
+    suld.b.2d.clamp.b32 %r8, [srf, {%r7,%r6}];
 
     add.s64 %rd5, %rd2, %rd3;
     st.global.b32 [%rd5], %r8;          // the texel's bits, as they were stored

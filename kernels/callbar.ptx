@@ -1,0 +1,56 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A rendezvous inside a called function. Lane i publishes v[i]+1, waits, then reads
+// the lane after it: the answer is v[i] + v[next] + 2, which is only that if the
+// barrier held the read until every lane had published. A callee that did not carry
+// its counter across the call would resume at its top, publish twice, and the answer
+// would come out v[i] + v[next] + 4.
+.visible .func stalladd(
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<6>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    mov.u32 %r2, %tid.x;
+    mul.wide.u32 %rd3, %r2, 4;
+    add.u64 %rd1, %rd1, %rd3;
+    add.u64 %rd2, %rd2, %rd3;
+
+    ld.global.u32 %r3, [%rd1];
+    add.u32 %r4, %r3, 1;
+    st.global.u32 [%rd1], %r4;
+    bar.sync 0;
+
+    // The lane after this one, wrapping at the group size: element 0 for the last lane.
+    mov.u32 %r1, %ntid.x;
+    add.u32 %r5, %r2, 1;
+    setp.eq.u32 %p1, %r5, %r1;
+    @%p1 mov.u32 %r5, 0;
+    mul.wide.u32 %rd3, %r5, 4;
+    ld.param.u64 %rd1, [src];
+    add.u64 %rd1, %rd1, %rd3;
+    ld.global.u32 %r5, [%rd1];
+    add.u32 %r4, %r4, %r5;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+
+.visible .entry callbar(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    call.uni stalladd, (%rd1, %rd2);
+    ret;
+}
