@@ -2258,8 +2258,8 @@ fi
 # decode, a wrong lane offset or a missing saturation shows in a byte of the word. The
 # last two are the operands that are not the obvious format: a ue8m0 scale and an fp4
 # tile padded one nibble a byte.
-runf tests/absent/cvtf8x2simd.ptx cvtsimd --grid 1 --threads 1 --buffers 7
-"$WEFT" run tests/absent/cvtf8x2simd.ptx --kernel cvtsimd --grid 1 --threads 1 --buffers 7 \
+runf kernels/cvtf8x2simd.ptx cvtsimd --grid 1 --threads 1 --buffers 7
+"$WEFT" run kernels/cvtf8x2simd.ptx --kernel cvtsimd --grid 1 --threads 1 --buffers 7 \
     --cpu-only --dump 0="$TMP/cvtsimd.bin" >/dev/null
 if [ "$(head -c 28 "$TMP/cvtsimd.bin" | od -An -tx4 -v | tr -s ' ' '\n' | sed '/^$/d' | tr '\n' ' ')" = \
     "44444444 38383838 41414141 4b4b4b4b 7e7e7e7e 44444444 44444444 " ]; then

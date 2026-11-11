@@ -1,0 +1,216 @@
+// The four-lane narrow arithmetic, split out of `cvtf8x2dn.ptx`.
+//
+// No `add`, `sub`, `mul` or `fma` over packed fp8 or fp6 exists in this PTX: the
+// kernel's `add.rn.satfinite.e4m3x4.e4m3x4` answers `Illegal modifier '.satfinite'`
+// at PTX 8.8 and at PTX 9.1, with `.rn` alone or with no rounding modifier, and
+// `.e2m1p4x4` is an unknown modifier.
+//
+// So each case is written as what the instruction means: decode the lane's operand
+// byte through its own bit layout into binary32, do the one arithmetic operation in
+// binary32, and encode the answer back with the pair convert that does exist. Every
+// case is exact in the destination -- the operands and answers are all dyadic -- so a
+// wrong decode, a wrong bias or a wrong destination format shows up as a wrong byte,
+// and the seven words are the ones the packed instruction would have written. Each
+// case's four lanes carry the same byte, so one lane's decode speaks for the four.
+//
+//   1.5 + 1.5 as e4m3                     -> 44444444  3.0 in every lane
+//   1.5 - 1.0 as e4m3, into e5m2          -> 38383838  0.5 in every lane
+//   1.5 * 1.5 as e2m3, into e4m3          -> 41414141  2.25
+//   2.0 * 2.0 + 1.5 as e4m3               -> 4b4b4b4b  5.5
+//   448 + 448, satfinite                  -> 7e7e7e7e  896 clamps to MAX_NORM
+//   1.5 * 2^1, the scale from ue8m0 0x80  -> 44444444  3.0
+//   1.5 * 2.0, the fp4 operand a byte     -> 44444444  a nibble per byte
+.version 8.8
+.target sm_100a
+.address_size 64
+
+.visible .entry cvtsimd(
+    .param .u64 cvtsimd_param_0     // seven words
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<8>;
+    .reg .b16 %rb<6>;
+
+    ld.param.u64 %rd1, [cvtsimd_param_0];
+
+    // ---- 1.5 + 1.5: e4m3 in, e4m3 out ----
+    mov.u32 %r1, 0x3C3C3C3C;
+    and.b32 %r2, %r1, 0xFF;                 // the lane: e4m3 1.5
+    shr.u32 %r3, %r2, 3;                    // four exponent bits, bias 7
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;                    // three mantissa bits
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    and.b32 %r5, %r2, 0x80;                 // the sign, into bit 31
+    shl.b32 %r5, %r5, 24;
+    or.b32 %r3, %r3, %r5;
+    mov.b32 %f1, %r3;
+    add.f32 %f1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f1, %f1;
+    cvt.u32.u16 %r10, %rb1;
+    cvt.u32.u16 %r11, %rb2;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r6, %r10, %r11;
+    st.global.u32 [%rd1], %r6;
+
+    // ---- 1.5 - 1.0: e4m3 operands, e5m2 answer ----
+    mov.u32 %r1, 0x3C3C3C3C;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f1, %r3;                       // 1.5
+    mov.u32 %r1, 0x38383838;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f2, %r3;                       // 1.0
+    sub.f32 %f1, %f1, %f2;
+    cvt.rn.satfinite.e5m2x2.f32 %rb1, %f1, %f1;
+    cvt.rn.satfinite.e5m2x2.f32 %rb2, %f1, %f1;
+    cvt.u32.u16 %r10, %rb1;
+    cvt.u32.u16 %r11, %rb2;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r6, %r10, %r11;
+    st.global.u32 [%rd1+4], %r6;
+
+    // ---- 1.5 * 1.5: e2m3 operands, e4m3 answer ----
+    mov.u32 %r1, 0x0C0C0C0C;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;                    // two exponent bits, bias 1
+    and.b32 %r3, %r3, 0x03;
+    add.u32 %r3, %r3, 126;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f1, %r3;                       // 1.5
+    mul.f32 %f1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f1, %f1;
+    cvt.u32.u16 %r10, %rb1;
+    cvt.u32.u16 %r11, %rb2;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r6, %r10, %r11;
+    st.global.u32 [%rd1+8], %r6;
+
+    // ---- 2.0 * 2.0 + 1.5: e4m3 in and out ----
+    mov.u32 %r1, 0x40404040;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f1, %r3;                       // 2.0
+    mov.b32 %f3, %r3;
+    mov.u32 %r1, 0x3C3C3C3C;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f2, %r3;                       // 1.5
+    fma.rn.f32 %f1, %f1, %f3, %f2;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f1, %f1;
+    cvt.u32.u16 %r10, %rb1;
+    cvt.u32.u16 %r11, %rb2;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r6, %r10, %r11;
+    st.global.u32 [%rd1+12], %r6;
+
+    // ---- 448 + 448: the saturation, at the top of the e4m3 range ----
+    mov.u32 %r1, 0x7E7E7E7E;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f1, %r3;                       // 448
+    add.f32 %f1, %f1, %f1;                  // 896, which satfinite clamps
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f1, %f1;
+    cvt.u32.u16 %r10, %rb1;
+    cvt.u32.u16 %r11, %rb2;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r6, %r10, %r11;
+    st.global.u32 [%rd1+16], %r6;
+
+    // ---- 1.5 * 2^1: the ue8m0 scale is a power of two, so it is an exponent ----
+    mov.u32 %r1, 0x3C3C3C3C;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f1, %r3;                       // 1.5
+    mov.u32 %r7, 0x80808080;
+    and.b32 %r8, %r7, 0xFF;
+    shl.b32 %r8, %r8, 23;                   // 2^(0x80 - 127) = 2
+    mov.b32 %f2, %r8;
+    mul.f32 %f1, %f1, %f2;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f1, %f1;
+    cvt.u32.u16 %r10, %rb1;
+    cvt.u32.u16 %r11, %rb2;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r6, %r10, %r11;
+    st.global.u32 [%rd1+20], %r6;
+
+    // ---- 1.5 * 2.0: the fp4 operand, one nibble in a byte ----
+    mov.u32 %r1, 0x03030303;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 1;                    // two exponent bits, bias 1
+    and.b32 %r3, %r3, 0x03;
+    and.b32 %r4, %r2, 0x01;                 // one mantissa bit
+    add.u32 %r3, %r3, 126;
+    shl.b32 %r3, %r3, 23;
+    shl.b32 %r4, %r4, 22;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f1, %r3;                       // 1.5
+    mov.u32 %r1, 0x40404040;
+    and.b32 %r2, %r1, 0xFF;
+    shr.u32 %r3, %r2, 3;
+    and.b32 %r3, %r3, 0x0F;
+    add.u32 %r3, %r3, 120;
+    shl.b32 %r3, %r3, 23;
+    and.b32 %r4, %r2, 7;
+    shl.b32 %r4, %r4, 20;
+    or.b32 %r3, %r3, %r4;
+    mov.b32 %f2, %r3;                       // 2.0
+    mul.f32 %f1, %f1, %f2;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f1, %f1;
+    cvt.u32.u16 %r10, %rb1;
+    cvt.u32.u16 %r11, %rb2;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r6, %r10, %r11;
+    st.global.u32 [%rd1+24], %r6;
+    ret;
+}
