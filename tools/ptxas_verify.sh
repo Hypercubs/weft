@@ -49,7 +49,6 @@ for f in kernels/*.ptx kernels/*/*.ptx; do
     kernels/cvtf8x2simd.ptx)                   want="Illegal modifier" ;;
     kernels/cvtqual.ptx)                       want="Arguments mismatch for instruction" ;;
     kernels/ldmatrixsub.ptx)                   want="Unexpected instruction types" ;;
-    kernels/mma8fp4k64.ptx)                    want="Incorrect instruction type specified for mma with shape" ;;
     kernels/tensormap3.ptx)                    want="Arguments mismatch for instruction" ;;
     kernels/tensormap4.ptx)                    want="Illegal modifier" ;;
   esac

@@ -396,13 +396,12 @@ Fixtures compare bytes, not tolerances.
   and reports each rejection or the SASS it produced (`--disasm`), so a fixture's own
   declaration and the instruction it stands for are both checked by the vendor's
   assembler. It needs Docker and a couple of gigabytes for the CUDA image. It assembles
-  161 of the 169 fixtures. Eight still do not, and each names a form this PTX has no
+  162 of the 169 fixtures. Seven still do not, and each names a form this PTX has no
   spelling for: the four-lane fp8 arithmetic (`cvtf8x2simd`), the `.rz`, `.scaled` and
-  four-value `.rs` converts (`cvtqual`), signed 4-bit `ldmatrix` (`ldmatrixsub`), the
-  fp4 multiply at a k of 64 (`mma8fp4k64`), and `im2col` on `cp.async.bulk.tensor`
-  (`tensormap3`, `tensormap4`). `calldrop` and `callmiss` are the other two and are
+  four-value `.rs` converts (`cvtqual`), signed 4-bit `ldmatrix` (`ldmatrixsub`), and
+  `im2col` on `cp.async.bulk.tensor` (`tensormap3`, `tensormap4`). `calldrop` and `callmiss` are the other two and are
   negative tests: they call with the wrong arity on purpose, so no assembler should
-  take them. Each of the eight is an expectation in the script, matched against the
+  take them. Each of the seven is an expectation in the script, matched against the
   refusal it has to produce, so a rejection from one of them is the expected result and
   the run passes on it; one that starts assembling is reported as stale, and a new
   failure inside one is still a failure. Two more versions were swept before settling on
@@ -424,7 +423,8 @@ Fixtures compare bytes, not tolerances.
   `rcp` and `sqrt` widen to a double and round once, a half `.approx` answers in float,
   `tan` is `sin/cos`, `lg2.approx.f16x2` answers each half in float, and a 1-D or 3-D
   `tld4` is the four taps of its footprint, and an fp4 or fp6 `mma` is
-  `.kind::f8f6f4`, the same dense product with no block scales, a four-value MX convert
+  `.kind::f8f6f4`, the same dense product with no block scales and, at a k of 64,
+  two of them over the two halves of the reduction, a four-value MX convert
   is two pair converts and a shift, an `x2.f16x2` down-convert is the two halves
   unpacked and widened to floats, and `.pzo` is an added `+0.0`. A second `.version` and `.target` in the
   middle of a file is illegal however many entries it holds, so `bf16ops` and

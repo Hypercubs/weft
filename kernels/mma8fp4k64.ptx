@@ -1,22 +1,26 @@
 // The fp4 multiply at K of 64, split out of `mma8fp4.ptx`.
 //
-// `.kind::f8f6f4` is the spelling ptxas takes for four-bit operands, and it is the
-// same dense product the two k32 kernels hold -- but the wide shape is not there:
-// `mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.kind::f8f6f4` answers
-// `Incorrect instruction type specified for mma with shape '.m16n8k64'`, and so
-// does the same shape with e2m3, e3m2 or e4m3. Sixteen fp4 codes a lane, four to a
-// register, is a k of 64 this assembler has no instruction for.
+// `mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.kind::f8f6f4` is not a shape
+// this assembler has: it answers `Incorrect instruction type specified for mma with
+// shape '.m16n8k64'`, and so does the same shape with e2m3, e3m2 or e4m3. The product
+// is the sum over sixty-four codes, though, and a sum over sixty-four is the sum of
+// two sums over thirty-two, so it is written here as two `m16n8k32` multiplies with
+// the second accumulating into the first -- two legal instructions whose answer is
+// the one the wider shape would have given.
 //
-// weft reads it, its own suite checks the fragment map and the decode, so the
-// kernel stays here as a dump form rather than being dropped.
+// The code-to-lane map is the `k32` one, `col = 4*(lane%4) + (i&3)` with `col += 16`
+// for the second register pair, because that is the instruction actually issued. The
+// second half of K is the same map sixteen bytes along each row, which is why the
+// loads below are the first half's offsets plus sixteen. Everything is exact in
+// binary32 -- the codes are dyadic and their products are sums of powers of two -- so
+// the split can only be exact too.
+//
+// weft reads both shapes, and `tools/mma_ref.py k64e2m1` still checks this kernel's
+// output against a product over all sixty-four.
 .version 8.8
 .target sm_120a
 .address_size 64
 
-// The same fp4 code, at twice the K: `mma.m16n8k64` with `.e2m1` puts eight codes in a
-// register, which is the four-bit integer form's map, `col = 8*(lane%4) + (i&7)`,
-// `col += 32` for the last two registers. A lane's eight codes are four bytes, so the
-// load is one word.
 .visible .entry mmak64e2m1(
     .param .u64 mmak64e2m1_param_0,   // A: 16 x 64 fp4 codes, 32 bytes a row
     .param .u64 mmak64e2m1_param_1,   // Bt: 8 x 64 fp4 codes, 32 bytes a row
@@ -32,29 +36,39 @@
     ld.param.u64 %rd3, [mmak64e2m1_param_2];
 
     mov.u32 %r1, %tid.x;
-    shr.u32 %r2, %r1, 2;
-    and.b32 %r3, %r1, 3;
+    shr.u32 %r2, %r1, 2;                // g
+    and.b32 %r3, %r1, 3;                // t
 
-    mul.wide.u32 %rd4, %r2, 32;         // 64 codes are 32 bytes
-    mad.lo.s32 %r4, %r3, 4, 0;          // 4t bytes: eight nibbles
+    mul.wide.u32 %rd4, %r2, 32;         // 64 codes are 32 bytes a row
+    mad.lo.s32 %r4, %r3, 2, 0;          // four codes a lane: 2t bytes
     mul.wide.u32 %rd6, %r4, 1;
     add.s64 %rd5, %rd1, %rd4;
     add.s64 %rd7, %rd5, %rd6;
-    ld.global.b32 %r5, [%rd7];          // A[g][8t..8t+7]
-    ld.global.b32 %r6, [%rd7+256];      // A[g+8][..]
-    ld.global.b32 %r7, [%rd7+16];       // A[g][32+8t..]
-    ld.global.b32 %r8, [%rd7+272];      // A[g+8][32+8t..]
-
     add.s64 %rd8, %rd2, %rd4;
     add.s64 %rd9, %rd8, %rd6;
-    ld.global.b32 %r9, [%rd9];          // B[8t..8t+7][g]
-    ld.global.b32 %r10, [%rd9+16];      // B[32+8t..][g]
 
     mov.f32 %f1, 0f00000000;
     mov.f32 %f2, 0f00000000;
     mov.f32 %f3, 0f00000000;
     mov.f32 %f4, 0f00000000;
-    mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.kind::f8f6f4 {%f5,%f6,%f7,%f8}, {%r5,%r6,%r7,%r8}, {%r9,%r10}, {%f1,%f2,%f3,%f4};
+
+    // the first thirty-two codes: cols 4t and 16+4t of the k32 map
+    ld.global.b16 %r5, [%rd7];
+    ld.global.b16 %r6, [%rd7+256];
+    ld.global.b16 %r7, [%rd7+8];
+    ld.global.b16 %r8, [%rd7+264];
+    ld.global.b16 %r9, [%rd9];
+    ld.global.b16 %r10, [%rd9+8];
+    mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32.kind::f8f6f4 {%f5,%f6,%f7,%f8}, {%r5,%r6,%r7,%r8}, {%r9,%r10}, {%f1,%f2,%f3,%f4};
+
+    // the second thirty-two, sixteen bytes along each row, onto the same accumulators
+    ld.global.b16 %r5, [%rd7+16];
+    ld.global.b16 %r6, [%rd7+272];
+    ld.global.b16 %r7, [%rd7+24];
+    ld.global.b16 %r8, [%rd7+280];
+    ld.global.b16 %r9, [%rd9+16];
+    ld.global.b16 %r10, [%rd9+24];
+    mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32.kind::f8f6f4 {%f5,%f6,%f7,%f8}, {%r5,%r6,%r7,%r8}, {%r9,%r10}, {%f5,%f6,%f7,%f8};
 
     mad.lo.s32 %r11, %r3, 8, 0;
     mul.wide.u32 %rd10, %r2, 32;

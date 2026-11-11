@@ -2717,7 +2717,7 @@ then
   else
     echo "FAIL  mma8        m16n8k32 e3m2 is not the product the fragments describe"; fail=1
   fi
-  "$WEFT" run kernels/mma8fp4k64.ptx --kernel mmak64e2m1 --grid 32 --threads 32 --buffers 128,64,128 \
+  "$WEFT" run kernels/mma8fp4k64.ptx --kernel mmak64e2m1 --grid 32 --threads 32 --buffers 256,128,128 \
       --load 0="$MT/f4ka.bin" --load 1="$MT/f4kbt.bin" --cpu-only --dump 2="$MT/f4kd.bin" >/dev/null
   if python3 tools/mma_ref.py k64e2m1 "$MT/f4ka.bin" "$MT/f4kbt.bin" "$MT/f4kd.bin" >/dev/null; then
     echo "ok    mma8        m16n8k64 e2m1: eight fp4 codes a register, k of 64"
