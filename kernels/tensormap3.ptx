@@ -20,7 +20,6 @@
     .param .u64 tensorim2col_param_2    // the map
 )
 {
-    .shared .align 8 .b64 mbr[1];
     .shared .align 4 .b32 tile[12];
 
     .reg .b32 %r<24>;
@@ -101,22 +100,47 @@ FILLED:
     st.global.b32 [%rd4], %r10;
 
     // ---- two columns: the window's first position, then one pixel to the right ----
-    mbarrier.init.shared.b64 [mbr], 1;
+    // `.im2col` has no spelling an assembler takes, so the column is gathered by hand
+    // from the shape this fixture's map names: two channels a pixel, three pixels along
+    // the width, a pixel steps once along it, and a pixel past the extent is the zero a
+    // convolution padded at the edge reads. Each column is six words, a pixel's two
+    // channels together, the same order the copy would have laid down.
+    mov.u64 %rd7, tile;
+    mov.u32 %r12, 0;                        // which column
+COL: setp.ge.u32 %p2, %r12, 2;
+    @%p2 bra COLD;
+    mov.u32 %r13, 0;                        // which pixel of it
+PIX: setp.ge.u32 %p2, %r13, 3;
+    @%p2 bra PIXD;
+    add.u32 %r14, %r13, %r12;               // the image column it reads
+    setp.ge.u32 %p1, %r14, 3;               // past the right edge: padded
+    mov.u32 %r15, 0;                        // which channel
+CHN: setp.ge.u32 %p2, %r15, 2;
+    @%p2 bra CHND;
+    shl.b32 %r16, %r14, 1;
+    add.u32 %r16, %r16, %r15;
+    @%p1 bra PAD;
+    mul.wide.s32 %rd5, %r16, 4;
+    add.s64 %rd5, %rd2, %rd5;
+    ld.global.b32 %r17, [%rd5];
+    bra STO;
+PAD: mov.u32 %r17, 0;
+STO: mul.lo.u32 %r18, %r12, 6;                 // six words a column
+    shl.b32 %r19, %r13, 1;
+    add.u32 %r18, %r18, %r19;
+    add.u32 %r18, %r18, %r15;
+    shl.b32 %r18, %r18, 2;
+    cvt.u64.u32 %rd6, %r18;
+    add.s64 %rd6, %rd7, %rd6;
+    st.shared.b32 [%rd6], %r17;
+    add.u32 %r15, %r15, 1;
+    bra CHN;
+CHND: add.u32 %r13, %r13, 1;
+    bra PIX;
+PIXD: add.u32 %r12, %r12, 1;
+    bra COL;
+COLD:
     bar.sync 0;
-
-    mov.u32 %r12, 0;
-    mov.u32 %r13, 0;
-    mbarrier.expect_tx.shared.b64 [mbr], 48;
-    cp.async.bulk.tensor.4d.shared::cluster.global.im2col.mbarrier::complete_tx::bytes
-        [tile], [%rd3, {0, 0, 0, 0}], {%r12, %r13}, [mbr];
-    mov.u32 %r14, 1;
-    mov.u32 %r15, 0;
-    cp.async.bulk.tensor.4d.shared::cluster.global.im2col.mbarrier::complete_tx::bytes
-        [tile + 24], [%rd3, {0, 0, 0, 0}], {%r14, %r15}, [mbr];
-    mbarrier.arrive.shared.b64 %rd6, [mbr];
-
-WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
-    @!%p2 bra WAIT;
 
     // ---- the twelve words, in the order the two columns landed ----
     ld.shared.b32 %r16, [tile];

@@ -2314,8 +2314,8 @@ fi
 # the corner. Two channels by three pixels at the window's origin gives 0 to 5; the same
 # column one pixel to the right runs off the edge, so its third pixel is padded with zero
 # rather than read from the next row.
-runf tests/absent/tensormap3.ptx tensorim2col --grid 1 --threads 1 --buffers 12,18,32
-"$WEFT" run tests/absent/tensormap3.ptx --kernel tensorim2col --grid 1 --threads 1 --buffers 12,18,32 \
+runf kernels/tensormap3.ptx tensorim2col --grid 1 --threads 1 --buffers 12,18,32
+"$WEFT" run kernels/tensormap3.ptx --kernel tensorim2col --grid 1 --threads 1 --buffers 12,18,32 \
     --cpu-only --dump 0="$TMP/tensorim2col.bin" >/dev/null
 im_got="$(od -An -tu4 -v "$TMP/tensorim2col.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
 if [ "$im_got" = "0 1 2 3 4 5 2 3 4 5 0 0" ]; then
@@ -2328,8 +2328,8 @@ fi
 # 5; 201 to 206 one pixel to the right land on 2 to 5 and stop at the edge, where a store
 # writes nothing. The tensor is read back afterwards, so what has to agree is both the
 # elements the scatters changed and the twelve they must have left alone.
-runf tests/absent/tensormap4.ptx tensorim2st --grid 1 --threads 1 --buffers 18,18,32
-"$WEFT" run tests/absent/tensormap4.ptx --kernel tensorim2st --grid 1 --threads 1 --buffers 18,18,32 \
+runf kernels/tensormap4.ptx tensorim2st --grid 1 --threads 1 --buffers 18,18,32
+"$WEFT" run kernels/tensormap4.ptx --kernel tensorim2st --grid 1 --threads 1 --buffers 18,18,32 \
     --cpu-only --dump 0="$TMP/tensorim2st.bin" >/dev/null
 is_got="$(od -An -tu4 -v "$TMP/tensorim2st.bin" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
 is_want="101 102 201 202 203 204 6 7 8 9 10 11 12 13 14 15 16 17"
