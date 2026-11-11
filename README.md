@@ -396,12 +396,15 @@ Fixtures compare bytes, not tolerances.
   and reports each rejection or the SASS it produced (`--disasm`), so a fixture's own
   declaration and the instruction it stands for are both checked by the vendor's
   assembler. It needs Docker and a couple of gigabytes for the CUDA image. It assembles
-  162 of the 169 fixtures assemble, and they are every file in `kernels/`. The other
-  seven are not assembly candidates and live under `tests/`: five name a form this PTX
-  has no spelling for -- the four-lane fp8 arithmetic (`cvtf8x2simd`), the `.rz`,
-  `.scaled` and four-value `.rs` converts (`cvtqual`), signed 4-bit `ldmatrix`
-  (`ldmatrixsub`), and `im2col` on `cp.async.bulk.tensor` (`tensormap3`, `tensormap4`)
-  -- and two are the signature tests. `calldrop` and `callmiss` are the other two and are
+  166 of the 169 fixtures assemble, and they are every file in `kernels/`. Three are not
+  assembly candidates and live under `tests/`: `cvtqual`, whose `.rz`, `.scaled` and
+  four-value `.rs` qualifiers this PTX has no spelling for, and the two signature tests.
+  Five of the seven that used to sit outside are written out now, each as the same
+  arithmetic the instruction names: an fp4 multiply at a k of 64 is two k32 products
+  summed, a signed nibble widen is the unsigned one with bit 3 of every nibble copied
+  upward, an `im2col` column is the loop the map already describes, and the four-lane
+  narrow arithmetic is a decode to binary32, the one operation there, and the pair
+  convert back. `calldrop` and `callmiss` are the other two and are
   negative tests. A return list around a function that returns nothing, and a returned
   value with no list to put it in, are a signature mismatch on purpose, and `ptxas`
   counts return slots in that list: an assembler that took either would have stopped
