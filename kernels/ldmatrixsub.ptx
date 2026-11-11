@@ -20,11 +20,13 @@
 // instead of a named symbol, which is the form a real kernel uses, and the signed form
 // is loaded a third time, so all three paths are covered.
 //
-// The signed nibble widen is written `.s8.s4`, which is a spelling ptxas does not have:
-// the 6-bit container is `.b6x16_p32`, the 4-bit one `.b4x16_p64` and both widen
-// unsigned, so the third load is the one instruction here the vendor assembler refuses.
-// Declaring PTX 9.4 and `sm_100f`, as this file used to, only moved the error to the
-// version line and hid the reason.
+// The third load is the signed nibble widen, and `.s8.s4` is a spelling ptxas does not
+// have: the 6-bit container is `.b6x16_p32`, the 4-bit one `.b4x16_p64`, and both widen
+// unsigned. So it loads through the unsigned form -- same containers, same bytes, same
+// lane -- and signs each byte where it lands: a four-bit element n read as a signed byte
+// is `(n xor 8) - 8`, which is the sign extension the wider spelling asks for. Declaring
+// PTX 9.4 and `sm_100f`, as this file used to, only moved the error to the version line
+// and hid the reason.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -189,11 +191,43 @@ ESD:
     st.shared.u32 [%rd3], %r24;
     bar.sync 0;
 
-    ldmatrix.sync.aligned.m8n16.x1.shared.s8.s4 {%r14}, [sub];
+    ldmatrix.sync.aligned.m8n16.x1.shared.b8x16.b4x16_p64 {%r12}, [sub];
+
+    // The four bytes of the lane's slice, each signed the way the `.s8.s4` widen would
+    // have: `(n xor 8) - 8` takes a nibble 0..15 to the byte -8..7 it names, and the
+    // low nibble is at most fifteen, so nothing carries into the byte above it.
+    and.b32 %r40, %r12, 0x0F;
+    xor.b32 %r40, %r40, 8;
+    sub.s32 %r40, %r40, 8;
+    and.b32 %r40, %r40, 0xFF;
+
+    shr.u32 %r41, %r12, 8;
+    and.b32 %r41, %r41, 0x0F;
+    xor.b32 %r41, %r41, 8;
+    sub.s32 %r41, %r41, 8;
+    and.b32 %r41, %r41, 0xFF;
+    shl.b32 %r41, %r41, 8;
+    or.b32 %r40, %r40, %r41;
+
+    shr.u32 %r42, %r12, 16;
+    and.b32 %r42, %r42, 0x0F;
+    xor.b32 %r42, %r42, 8;
+    sub.s32 %r42, %r42, 8;
+    and.b32 %r42, %r42, 0xFF;
+    shl.b32 %r42, %r42, 16;
+    or.b32 %r40, %r40, %r42;
+
+    shr.u32 %r43, %r12, 24;
+    and.b32 %r43, %r43, 0x0F;
+    xor.b32 %r43, %r43, 8;
+    sub.s32 %r43, %r43, 8;
+    and.b32 %r43, %r43, 0xFF;
+    shl.b32 %r43, %r43, 24;
+    or.b32 %r40, %r40, %r43;
 
     add.s64 %rd9, %rd1, 512;
     cvt.u64.u32 %rd10, %r32;
     add.s64 %rd9, %rd9, %rd10;
-    st.global.b32 [%rd9], %r14;
+    st.global.b32 [%rd9], %r40;
     ret;
 }

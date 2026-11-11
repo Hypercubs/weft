@@ -2442,8 +2442,8 @@ else
   echo "FAIL  prmtmodes  a mode's bytes are not the ones the table names"; fail=1
 fi
 
-runf tests/absent/ldmatrixsub.ptx ldmsub --grid 32 --threads 32 --buffers 160
-"$WEFT" run tests/absent/ldmatrixsub.ptx --kernel ldmsub --grid 32 --threads 32 --buffers 160 \
+runf kernels/ldmatrixsub.ptx ldmsub --grid 32 --threads 32 --buffers 160
+"$WEFT" run kernels/ldmatrixsub.ptx --kernel ldmsub --grid 32 --threads 32 --buffers 160 \
     --cpu-only --dump 0="$TMP/lsub.bin" >/dev/null
 if od -An -tu4 -v "$TMP/lsub.bin" | awk '{ for (i = 1; i <= NF; i++) { n = n0++; w = 0;
       if (n < 128) { m = n % 64; l = int(m / 2); c0 = 8 * (m % 2); row = int(l / 4)
