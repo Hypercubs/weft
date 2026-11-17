@@ -1,9 +1,3 @@
-// A stand-in for libcuda.so.1: enough of the driver to run weft's CUDA column on
-// a host with no CUDA. Every call is recorded and nothing is executed, so the
-// binding, the uploads and the launch can be read back as calls. tools/cuda_calls.sh
-// builds it, points the loader at it and checks what it recorded. It is a test
-// double, not a driver: a launch returns success without running anything, and a
-// readback returns what was last written into the buffer.
 
 #include <cctype>
 #include <cstdarg>
@@ -90,40 +84,43 @@ P new_handle(const char* what) {
   return (P)(uintptr_t)g_next;
 }
 
-// A name is declared when the module has an entry of that name: the column is
-// checked against the module, not against what the launcher asked for.
 bool declares(const char* word, const char* name) {
   const std::string want = std::string(word) + " " + name;
   return g_ptx.find(want) != std::string::npos;
 }
 
-// The names a `.tex` line declares. The type comes first, then the name, then
-// the shape, so the name is the token after the type.
 void scan_textures() {
   g_tex.clear();
   size_t at = 0;
   while (at <= g_ptx.size()) {
     size_t eol = g_ptx.find('\n', at);
     std::string line = g_ptx.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+    if (eol == std::string::npos) at = g_ptx.size() + 1; else at = eol + 1;
     size_t k = 0;
-    while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) k++;
-    if (line.compare(k, 5, ".tex ") == 0) {
-      size_t i = k + 5;
-      if (i < line.size() && line[i] == '.') {
-        while (i < line.size() && !std::isspace((unsigned char)line[i])) i++;
+    while (k < line.size() && std::isspace((unsigned char)line[k])) k++;
+    if (line.compare(k, 2, "//") == 0) continue;
+    std::vector<std::string> tok;
+    std::string cur;
+    for (size_t i = k; i < line.size(); i++) {
+      const char c = line[i];
+      if (std::isspace((unsigned char)c) || c == ';' || c == ',') {
+        if (!cur.empty()) { tok.push_back(cur); cur.clear(); }
+      } else {
+        cur.push_back(c);
       }
-      while (i < line.size() && std::isspace((unsigned char)line[i])) i++;
-      size_t j = i;
-      while (j < line.size() && (std::isalnum((unsigned char)line[j]) || line[j] == '_')) j++;
-      if (j > i) g_tex.push_back(line.substr(i, j - i));
     }
-    if (eol == std::string::npos) break;
-    at = eol + 1;
+    if (!cur.empty()) tok.push_back(cur);
+    bool tex = false, surf = false;
+    for (const std::string& t : tok) {
+      if (t == ".texref" || t == ".tex") tex = true;
+      if (t == ".surfref" || t == ".surf") surf = true;
+    }
+    if (!tex || surf || tok.size() < 2) continue;
+    const std::string& nm = tok.back();
+    if (!nm.empty() && nm[0] != '.') g_tex.push_back(nm);
   }
 }
 
-// The parameter count of one entry, read from its own signature rather than the
-// whole module, so a file with several kernels is not miscounted.
 void count_params(const char* name) {
   g_params = 0;
   size_t at = g_ptx.find(std::string("entry ") + name);
@@ -209,8 +206,6 @@ I cuMemcpyDtoH_v2(void* dst, U64 at, size_t bytes) {
 }
 
 I cuModuleLoadData(P* m, const void* text) {
-  // A driver that loaded but will not take the module, which is the shape of an
-  // sm mismatch on a real card. The launcher turns this into a named refusal.
   if (std::getenv("WEFT_FAKE_REFUSE")) {
     lg("cuModuleLoadData REFUSED");
     return 1;

@@ -1,16 +1,4 @@
-// A cube texture from PTX, the twin of basic.metal's `texcube`:
-//
-//     x = gid & 63, y = (gid >> 6) & 63, face = (gid >> 12) % 6
-//     s = (x + .5) / 64 * 2 - 1, t = 1 - (y + .5) / 64 * 2
-//     out[gid] = texCube(cube, {s, t, face}) * 2 + face
-//
-// PTX's cube form names a face and a position on it rather than a direction, and
-// this is the one place the two spellings of the same thing are checked against
-// each other: `weft_cube_dir` rebuilds the direction, and the sampler picks the
-// face back out of it. A face that is off by one, an axis that is flipped, or a
-// t that runs the wrong way all answer on a different texel, and the face is
-// folded into the result, so picking the wrong one cannot hide behind a texel
-// that happens to hold the same number.
+// A cube texture from PTX: a fetch's coordinate vector is a direction, (s, t, r).
 .version 7.0
 .target sm_70
 .address_size 64
@@ -21,8 +9,9 @@
     .param .u64 ptxcube_param_0
 )
 {
+    .reg .pred %p<6>;
     .reg .b32 %r<20>;
-    .reg .f32 %f<24>;
+    .reg .f32 %f<32>;
     .reg .b64 %rd<8>;
 
     ld.param.u64 %rd1, [ptxcube_param_0];
@@ -38,34 +27,55 @@
     shr.u32 %r8, %r4, 6;
     and.b32 %r9, %r8, 63;               // y = (gid >> 6) & 63
     shr.u32 %r10, %r4, 12;
-    // face = (gid >> 12) % 6, without assuming a power of two.
     div.u32 %r11, %r10, 6;
     mul.lo.s32 %r12, %r11, 6;
-    sub.s32 %r13, %r10, %r12;           // the face index
+    sub.s32 %r13, %r10, %r12;           // face = (gid >> 12) % 6
 
-    cvt.rn.f32.u32 %f1, %r7;
-    cvt.rn.f32.u32 %f2, %r9;
-    add.f32 %f3, %f1, 0f3F000000;       // x + 0.5
-    add.f32 %f4, %f2, 0f3F000000;       // y + 0.5
-    cvt.rn.f32.u32 %f5, %r5;
-    div.rn.f32 %f6, %f3, %f5;           // (x + .5) / w, in (0, 1)
-    div.rn.f32 %f7, %f4, %f5;           // (y + .5) / h
-    // A cube coordinate runs from -1 to 1 across the face, with t pointing up.
-    add.f32 %f8, %f6, %f6;
-    add.f32 %f9, %f8, 0fBF800000;       // s = 2u - 1
-    add.f32 %f10, %f7, %f7;
-    sub.f32 %f11, 0f3F800000, %f10;     // t = 1 - 2v
+    // s and t across the face, each in [-1, 1).
+    shl.b32 %r14, %r7, 1;
+    sub.s32 %r14, %r14, 63;
+    shl.b32 %r15, %r9, 1;
+    sub.s32 %r15, %r15, 63;
+    cvt.rn.f32.s32 %f1, %r14;
+    cvt.rn.f32.s32 %f2, %r15;
+    mul.f32 %f1, %f1, 0f3B800000;       // s
+    mul.f32 %f2, %f2, 0f3B800000;       // t
+    neg.f32 %f3, %f1;                   // -s
+    neg.f32 %f4, %f2;                   // -t
 
-    // The face is a coordinate like the other two, and PTX wants a fourth: q = 1.
-    cvt.rn.f32.s32 %f19, %r13;
-    mov.f32 %f20, 0f3F800000;
-    tex.cube.v4.f32.f32 {%f12,%f13,%f14,%f15}, [cube, {%f9,%f11,%f19,%f20}];
+    // The direction a face and (s, t) stand for: the face's own axis at +-1, the two
+    // others the minor coordinates, as the CUDA programming guide's table has them.
+    setp.eq.s32 %p0, %r13, 0;
+    setp.eq.s32 %p1, %r13, 1;
+    setp.eq.s32 %p2, %r13, 2;
+    setp.eq.s32 %p3, %r13, 3;
+    setp.eq.s32 %p4, %r13, 4;
+    setp.eq.s32 %p5, %r13, 5;
 
-    mul.f32 %f16, %f12, 0f40000000;     // the texel, doubled
-    cvt.rn.f32.u32 %f17, %r13;          // with the face folded in
-    add.f32 %f18, %f16, %f17;
+    mov.f32 %f5, %f1;
+    selp.f32 %f5, %f3, %f5, %p5;
+    selp.f32 %f5, 0f3F800000, %f5, %p0;
+    selp.f32 %f5, 0fBF800000, %f5, %p1;
+
+    mov.f32 %f6, %f4;
+    selp.f32 %f6, 0f3F800000, %f6, %p2;
+    selp.f32 %f6, 0fBF800000, %f6, %p3;
+
+    mov.f32 %f7, %f2;
+    selp.f32 %f7, %f4, %f7, %p3;
+    selp.f32 %f7, %f3, %f7, %p0;
+    selp.f32 %f7, %f1, %f7, %p1;
+    selp.f32 %f7, 0f3F800000, %f7, %p4;
+    selp.f32 %f7, 0fBF800000, %f7, %p5;
+
+    mov.f32 %f8, 0f3F800000;            // the fourth element pads the tuple
+    tex.cube.v4.f32.f32 {%f16,%f17,%f18,%f19}, [cube, {%f5,%f6,%f7,%f8}];
+
+    mul.f32 %f20, %f16, 0f40000000;     // the texel, doubled
+    cvt.rn.f32.s32 %f21, %r13;          // with the face folded in
+    add.f32 %f22, %f20, %f21;
     mul.wide.s32 %rd3, %r4, 4;
     add.s64 %rd4, %rd1, %rd3;
-    st.global.f32 [%rd4], %f18;
+    st.global.f32 [%rd4], %f22;
     ret;
 }

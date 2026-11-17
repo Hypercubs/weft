@@ -1,20 +1,4 @@
 // `mbarrier`: an arrival-counted barrier with a phase, in threadgroup memory.
-//
-//     init  [mbr], 32       one arrival owed per lane of the group
-//     bar.sync 0            every lane sees the object before anyone arrives
-//     data[0] = 42; arrive  all 32 lanes, so the phase flips on the last one
-//     try_wait.parity [mbr], 0   until that flip
-//     out[gid] = data[0]
-//
-// Every lane arrives and every lane waits: that is the shape Triton emits, where the
-// count is the size of the group. A lane that arrives before the rest reaches the wait
-// with the phase still where it started, so the wait has to hold it until the last
-// arrival, and the value it reads afterwards was written by another lane.
-//
-// The brackets count elements, so `mbr[1]` is one `.b64`, the eight bytes the object
-// is, the owed count and the phase word, and `data[4]` is sixteen bytes after them.
-// Spelling it `.b32 mbr[8]` would reserve the same bytes but read them in the wrong
-// width, and the phase lives in the object's second word.
 .version 7.8
 .target sm_90
 .address_size 64

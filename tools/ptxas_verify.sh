@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-# Assemble every fixture under kernels/ with NVIDIA's ptxas, so the translator is
-# checked against an assembler and not only against our reading of the ISA.
-#
-#   tools/ptxas_verify.sh            # assemble everything, report rejections
-#   tools/ptxas_verify.sh --disasm   # also print the matrix SASS each fixture becomes
-#
-# `kernels/` holds only fixtures that have to assemble, so a rejection is a failure and
-# there is no list of accepted ones. The files ptxas cannot take are not candidates and
-# do not live here: `tests/refused/` holds the two signature tests, whose whole subject
-# is a call an assembler must reject, and `tests/absent/` holds the five whose
-# instruction this ISA has no spelling for. check.sh still runs all seven and names the
-# refusal each has to produce.
-#
-# Needs Docker (on macOS, colima). Set WEFT_PTXAS_IMAGE to pin the CUDA image and
-# DOCKER_CONTEXT to pick a context. Exits 2 if the image cannot be fetched, 1 if any
-# fixture is rejected, and 0 when every one assembles.
 set -uo pipefail
 
 image=${WEFT_PTXAS_IMAGE:-nvidia/cuda:12.9.1-devel-ubuntu22.04}

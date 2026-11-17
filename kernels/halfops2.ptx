@@ -1,5 +1,5 @@
 // The packed form: two halfs in one 32-bit register, low half first, and one
-// instruction for each pair. `0x3C003800` is 1.0 above 0.5.
+// instruction for each pair.
 .version 7.0
 .target sm_80
 .address_size 64

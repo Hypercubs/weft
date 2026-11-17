@@ -1,21 +1,4 @@
 // The warp's own instructions, one word per lane each, on a full warp.
-//
-// A shuffle is a rendezvous, not a local operation: the answer for lane i is a value
-// lane j computed, so the only way to check one is to look at every lane at once. Row
-// k of the buffer is word k of lane i, for i in 0..31.
-//
-//     row 0  activemask      FFFFFFFF   every lane of the warp is executing
-//     row 1  ballot(t & 1)   AAAAAAAA   the odd lanes
-//     row 2  shfl.idx  t*10 from lane 3   30 for every lane: the source lane's value
-//     row 3  shfl.up   1     lane 0 keeps its own 0, lane i gets i-1
-//     row 4  shfl.down 1     lane 31 keeps its own 31, lane i gets i+1
-//     row 5  shfl.bfly 2     i xor 2
-//     row 6  vote.all  t<20  0: lanes 20..31 are false
-//     row 7  vote.any  t==7  1: exactly one lane is
-//
-// A `down` that read the wrong neighbour, an `up` that clamped at the wrong end, or a
-// ballot that folded the wrong bit would move one of these words and nothing else.
-// One word per lane per warp op, so the whole lane-by-lane answer is visible.
 .version 8.6
 .target sm_100
 .address_size 64

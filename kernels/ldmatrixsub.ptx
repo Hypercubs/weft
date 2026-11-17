@@ -1,32 +1,6 @@
-// The sub-byte shapes: `ldmatrix.m8n16` with `.b6x16_p32` and `.b4x16_p64`, which
-// widen a 6- or 4-bit element to a byte while they load, what a Blackwell kernel
-// feeds an fp6 or fp4 tensor core with.
-//
-// The source side is the ISA's own definition: one 16-byte container holds sixteen
-// 6-bit elements in its first 96 bits (or sixteen 4-bit elements in its first 64) and
-// the rest of the container is padding, which is the same `x16` container the tensor
-// copy instructions use. The destination side is CUTLASS's: `SM100_SU6_DU8x16_x1_LDSM_N`
-// and its fp4 twin in `cute/atom/copy_traits_sm100.hpp` say the warp reads eight
-// containers, lane t supplies container t&7, and that a lane's slice is the 32 bits
-// at 32*t of a 1024-bit reference, four consecutive bytes in order.
-//
-// Composed, with a container being one row of sixteen elements: lane l holds row l>>2
-// at columns 4*(l&3)..+3, and a container sits 16 bytes on from the one before. That is
-// what this fixture writes out and what check.sh recomputes from the same rule, so the
-// two are a check rather than a copy of each other.
-//
-// The .x2 loads put a different pattern in the second matrix, 128 bytes on, so its
-// stride is checked rather than assumed. The fp4 load reads through a per-lane address
-// instead of a named symbol, which is the form a real kernel uses, and the signed form
-// is loaded a third time, so all three paths are covered.
-//
-// The third load is the signed nibble widen, and `.s8.s4` is a spelling ptxas does not
-// have: the 6-bit container is `.b6x16_p32`, the 4-bit one `.b4x16_p64`, and both widen
-// unsigned. So it loads through the unsigned form -- same containers, same bytes, same
-// lane -- and signs each byte where it lands: a four-bit element n read as a signed byte
-// is `(n xor 8) - 8`, which is the sign extension the wider spelling asks for. Declaring
-// PTX 9.4 and `sm_100f`, as this file used to, only moved the error to the version line
-// and hid the reason.
+// The sub-byte shapes: `ldmatrix.m8n16` with `.b6x16_p32` and `.b4x16_p64`, which widen
+// a 6- or 4-bit element to a byte while they load. `.s8.s4` is not a spelling ptxas
+// has, so the load is unsigned and each byte is signed where it lands.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -45,7 +19,7 @@
     mov.u32 %r1, %tid.x;
     mov.u64 %rd2, sub;
 
-    // ---- sixteen containers of six-bit elements: two words a lane ----
+    // sixteen containers of six-bit elements: two words a lane
     mov.u32 %r20, 0;
 F6: setp.ge.u32 %p1, %r20, 2;
     @%p1 bra F6D;
@@ -104,7 +78,7 @@ F6D:
     st.global.b32 [%rd5], %r10;
     st.global.b32 [%rd5+4], %r11;
 
-    // ---- the same sixteen containers as four-bit elements ----
+    // the same sixteen containers as four-bit elements
     bar.sync 0;
     mov.u32 %r20, 0;
 F4: setp.ge.u32 %p1, %r20, 2;
@@ -148,7 +122,7 @@ E4D:
 F4D:
     bar.sync 0;
 
-    // ---- the same load, addressed a lane at a time ----
+    // the same load, addressed a lane at a time
     and.b32 %r34, %r1, 15;
     shl.b32 %r35, %r34, 4;
     cvt.u64.u32 %rd6, %r35;
@@ -160,7 +134,7 @@ F4D:
     st.global.b32 [%rd8], %r12;
     st.global.b32 [%rd8+4], %r13;
 
-    // ---- eight containers of signed four-bit elements, one matrix ----
+    // eight containers of signed four-bit elements, one matrix
     bar.sync 0;
     shr.u32 %r22, %r1, 2;
     and.b32 %r23, %r1, 3;

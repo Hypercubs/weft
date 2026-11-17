@@ -1,17 +1,4 @@
 // Run one probe kernel and print what it wrote.
-//
-//     clang++ -fobjc-arc -std=c++17 -framework Metal -framework Foundation \
-//       tools/f64_probe.mm -o /tmp/f64probe
-//     /tmp/f64probe probe.metal in.bin
-//
-// The kernel is `probe(device uint64_t* in, device uint64_t* out, uint id)`: it runs
-// one thread per element of `in`, and every element of `out` is printed as sixteen
-// hex digits. That is the whole harness, the values live in a file, so the caller
-// can generate them, and the answer comes back as bits so a difference of one ulp
-// is visible rather than rounded away.
-//
-// `tools/f64_check.py` is the caller: it writes the cases, generates the kernel for
-// each operation and compares against this machine's own doubles.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -48,9 +35,6 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "no input words\n");
       return 2;
     }
-    // The file holds a pair of words per case and the kernel reads the pair, so one
-    // thread per case: dispatching per word would read past the end and shift every
-    // answer by one.
     const unsigned n = (unsigned)(in.size() / 2);
     if (n == 0) {
       std::fprintf(stderr, "the input needs a pair of words per case\n");

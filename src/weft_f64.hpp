@@ -5,19 +5,6 @@
 
 // The software 64-bit float, as one text that both columns compile.
 
-// A GPU with no fp64 cannot carry the type at all, Metal rejects it outright,
-// which is the language and not a missing lowering, so the value is carried as
-// the `uint64_t` its bits live in and every operation is exact IEEE-754 binary64
-// over the integers the hardware does have.
-
-// It lives in its own text because it is not the GPU's alone any more: the CPU
-// column runs the same functions for the calls the host's libm cannot be held to
-// (a double's `exp`, `log`, `pow` and trigonometry), so a module asking for one
-// gets the same number on both targets rather than the GPU's approximation
-// against the host's library.
-
-// The text is plain C++: two of Metal's address-space words are keywords there
-// and not here, and `weft_f64_cpp_text` below defines them for its length.
 static const char* kWWeftF64 = R"WEFFF64(
 namespace weft_fp64 {
 
@@ -25,20 +12,10 @@ constant uint64_t kSign = 0x8000000000000000ull;
 constant uint64_t kExpMask = 0x7FF0000000000000ull;
 constant uint64_t kFracMask = 0x000FFFFFFFFFFFFFull;
 constant uint64_t kHidden = 0x0010000000000000ull;
-// The leading bit of the working form. It is not `kHidden`: that is bit 52, the
-// significand's leading bit in the *encoding*, and the working form carries three
-// spare bits below it, so its leading bit sits at 55. Normalizing on the wrong one
-// is an infinite loop, because a value whose low bits are zero can never set bit 52
-// by shifting left.
 constant uint64_t kLead = 0x0080000000000000ull;
 constant uint64_t kInf = 0x7FF0000000000000ull;
 constant uint64_t kQNaN = 0x7FF8000000000000ull;
-// The leading-zero count of a 64-bit value, in 32-bit halves. `__builtin_clzll` is
-// what this host's compiler dies on, at pipeline creation, with
-// XPC_ERROR_CONNECTION_INTERRUPTED and nothing else, and the 32-bit builtin is
-// fine, so the wide one is spelled out of the narrow one. Measured with
-// tools/msl_bisect.py: the two helpers that used it were the only ones of sixteen
-// that failed to build.
+// The leading-zero count of a 64-bit value, in 32-bit halves.
 static inline uint32_t clz64(uint64_t v) {
   const uint32_t hi = (uint32_t)(v >> 32);
   if (hi != 0u) return (uint32_t)__builtin_clz(hi);
@@ -57,9 +34,7 @@ static inline bool is_zero(uint64_t b) { return (b & ~kSign) == 0ull; }
 static inline uint64_t neg(uint64_t b) { return b ^ kSign; }
 static inline uint64_t abs_bits(uint64_t b) { return b & ~kSign; }
 
-// The working form. A subnormal is normalized here, it has fewer than 53
-// significant bits, so shifting it up loses nothing and every operation below can
-// then be written once.
+// The working form.
 static inline void unpack(uint64_t b, thread int32_t& e, thread uint64_t& sig) {
   const int32_t be = (int32_t)((b >> 52) & 0x7FF);
   const uint64_t f = b & kFracMask;
@@ -74,9 +49,7 @@ static inline void unpack(uint64_t b, thread int32_t& e, thread uint64_t& sig) {
   }
 }
 
-// Round the working form into a pattern. A result below the normal range has a
-// quantum of 2^-1074, so the significand is shifted down before the same three-bit
-// rounding applies; that shift is the whole difference between the two cases.
+// Round the working form into a pattern.
 static inline uint64_t round_pack(uint32_t sign, int32_t e, uint64_t sig) {
   const uint64_t sgn = sign ? kSign : 0ull;
   if (sig == 0ull) return sgn;
@@ -96,7 +69,6 @@ static inline uint64_t round_pack(uint32_t sign, int32_t e, uint64_t sig) {
   sig >>= 3;
   if (g && (r || s || (sig & 1ull))) sig += 1ull;  // nearest, ties to even
   if (sub) return sgn | sig;  // fraction only; a carry out of bit 52 is the smallest
-                              // normal, which those same bits already spell
   int32_t be = e + 1023;
   if (sig == (1ull << 53)) { sig >>= 1; be += 1; }
   if (be >= 2047) return sgn | kInf;
@@ -125,7 +97,7 @@ static inline uint64_t add(uint64_t a, uint64_t b) {
   const int32_t d = a_bigger ? (ua - ub) : (ub - ua);
   if (d > 0) {
     if (d >= 64) {
-      small = 1u;  // nothing of it survives except the fact that it was not zero
+      small = 1u;  // nothing of it survives except that it was not zero
     } else {
       const uint64_t lost = small & ((1ull << d) - 1ull);
       small = (small >> d) | ((lost != 0ull) ? 1u : 0u);
@@ -168,7 +140,6 @@ static inline uint64_t mul(uint64_t a, uint64_t b) {
   uint64_t ma, mb;
   unpack(a, ua, ma);
   unpack(b, ub, mb);
-  // The product of two 56-bit significands needs 112 bits, so it is built from
   // 32-bit halves, and the top of it is shifted down with a sticky bit.
   const uint64_t p0 = (ma & 0xFFFFFFFFull) * (mb & 0xFFFFFFFFull);
   const uint64_t p1 = (ma >> 32) * (mb & 0xFFFFFFFFull);
@@ -182,8 +153,6 @@ static inline uint64_t mul(uint64_t a, uint64_t b) {
   uint64_t sig = (hi << (64 - sh)) | (lo >> sh);
   const uint64_t lost = lo & ((1ull << sh) - 1ull);
   sig |= (lost != 0ull) ? 1ull : 0ull;
-  // value(a) = m_a * 2^(ua-52) and P = (m_a<<3) * (m_b<<3), so
-  // value(a)*value(b) = P * 2^(ua+ub-110) = sig * 2^(sh+ua+ub-110), and the working
   // form is sig * 2^(e-55): e = sh + ua + ub - 55.
   return round_pack(sign, sh + ua + ub - 55, sig);
 }
@@ -201,7 +170,6 @@ static inline uint64_t div(uint64_t a, uint64_t b) {
   uint64_t ma, mb;
   unpack(a, ua, ma);
   unpack(b, ub, mb);
-  // Long division of the significands: 55 quotient bits, and whatever is left over
   // is below the last of them, which is exactly the sticky bit.
   uint64_t q = 0ull, r = ma;
   if (r >= mb) { r -= mb; q = 1ull; }  // the quotient is at least one
@@ -210,9 +178,6 @@ static inline uint64_t div(uint64_t a, uint64_t b) {
     r <<= 1;
     if (r >= mb) { r -= mb; q |= 1ull; }
   }
-  // The quotient is in [2^54, 2^55) when the dividend's significand is the larger
-  // and [2^53, 2^54) when it is not, so the leading bit belongs at 55, and the
-  // sticky bit goes in only after that shift, or it would move with it.
   uint64_t sig = q << 1;
   int32_t e = ua - ub;
   while ((sig & kLead) == 0ull) { sig <<= 1; e -= 1; }
@@ -237,10 +202,7 @@ static inline bool lt(uint64_t a, uint64_t b) {
 static inline bool le(uint64_t a, uint64_t b) { return lt(a, b) || eq(a, b); }
 static inline bool gt(uint64_t a, uint64_t b) { return lt(b, a); }
 static inline bool ge(uint64_t a, uint64_t b) { return le(b, a); }
-// `.sat` on a floating-point destination is the [0, 1] clamp with a NaN flushed to
-// positive zero, and it is not the destination's range. Written over the comparisons
-// above rather than over the sign bit, so -0.0 stays the zero it was, which is what
-// the CPU column's own `-0.0 < 0.0` test answers too.
+// to positive zero, and it is not the destination's range.
 static inline uint64_t sat_bits(uint64_t b) {
   if (is_nan(b)) return 0ull;
   if (lt(b, 0ull)) return 0ull;
@@ -248,11 +210,7 @@ static inline uint64_t sat_bits(uint64_t b) {
   return b;
 }
 
-//
-// `a * b + c`, rounded once. A product of two 53-bit significands needs 106 bits and
-// the addition can cancel almost all of that away, which is exactly why a multiply and
 // then an add is a different answer: no 56-bit working form can hold the intermediate.
-// The three values are placed at one scale in a 192-bit accumulator instead, and the
 // rounding happens once, at the end.
 struct decon {
   uint64_t sig;   // value = sig * 2^exp, with bit 52 set for a non-zero value
@@ -264,9 +222,6 @@ struct wide {
 
 static inline int32_t bitlen64(uint64_t v) { return v == 0ull ? 0 : 64 - (int32_t)clz64(v); }
 
-// A value as an integer significand with its leading bit at 52, so two of them fit a
-// product exactly. A subnormal is shifted up until its leading bit is there, which
-// loses nothing: it has fewer than 53 significant bits to begin with.
 static inline decon decompose(uint64_t b) {
   decon d;
   const uint32_t be = (uint32_t)((b >> 52) & 0x7FF);
@@ -315,8 +270,7 @@ static inline wide wide_sub(wide a, wide b) {  // a >= b
   return r;
 }
 
-// Shift right, folding every dropped bit into bit 0. A sticky bit only has to say
-// that something was there, which is all a rounding decision needs from it.
+// Shift right, folding every dropped bit into bit 0.
 static inline wide wide_shr(wide v, int32_t k) {
   if (k <= 0) return v;
   if (k >= 192) return wide{0ull, 0ull, ((v.h | v.m | v.l) != 0ull) ? 1ull : 0ull};
@@ -338,8 +292,7 @@ static inline wide wide_shr(wide v, int32_t k) {
   return r;
 }
 
-// Lay the 128-bit `hi:lo` at the accumulator's scale. A negative shift is a value
-// entirely below the window, where only its existence survives.
+// Lay the 128-bit `hi:lo` at the accumulator's scale.
 static inline wide place(uint64_t hi, uint64_t lo, int32_t sh) {
   if (sh < 0) {
     wide v;
@@ -393,8 +346,6 @@ static inline uint64_t fma(uint64_t a, uint64_t b, uint64_t c) {
   const uint64_t plo = (mid << 32) | (p0 & 0xFFFFFFFFull);
   const uint64_t phi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
   const int32_t pexp = da.exp + db.exp;
-  // One scale for both: the larger operand's top bit lands at bit 190, which leaves
-  // 84 bits below it, more than the 106-bit product spans, so nothing is lost before
   // the sum and the rounding happens once, at the end.
   const int32_t tbP = pexp + (phi != 0ull ? 64 + bitlen64(phi) : bitlen64(plo)) - 1;
   const int32_t tbC = dc.exp + bitlen64(dc.sig) - 1;
@@ -415,24 +366,11 @@ static inline uint64_t fma(uint64_t a, uint64_t b, uint64_t c) {
   }
   if (wide_zero(r)) return 0ull;
   const int32_t mpos = msb192(r);
-  // Into the form `round_pack` takes: the top bit at 55 with three bits of guard,
   // round and sticky under it, and the exponent of that top bit.
   const uint64_t sig = (mpos >= 55) ? wide_shr(r, mpos - 55).l : (r.l << (55 - mpos));
   return round_pack(sign, e0 + mpos, sig);
 }
 
-//
-// `sqrt` is the one function in the transcendental library that IEEE-754 pins
-// exactly: the result is the correctly rounded root, so a software one is not an
-// approximation of the host's, it is the same number, and the two can be compared
-// bit for bit. Everything else in that library rounds through whatever the vendor
-// chose and is therefore not carried here.
-//
-// The root is built from the significand as an integer: the input is written
-// `sig * 2^e` with `sig` in [2^52, 2^53) and `e` even, `sig << 54` is the radicand,
-// and `floor(sqrt(that))` is 54 bits of the answer. The restoring loop is the one
-// from pencil-and-paper long division, two radicand bits a step, its remainder is
-// below `2q + 1`, so everything after the first line fits in 64 bits.
 static inline uint64_t bit128(uint64_t hi, uint64_t lo, int b) {
   return b >= 64 ? ((hi >> (b - 64)) & 1ull) : ((lo >> b) & 1ull);
 }
@@ -460,7 +398,6 @@ static inline uint64_t sqrt_bits(uint64_t b) {
   if (is_zero(b) || is_inf(b)) return b;
   decon d = decompose(b);
   int32_t e = d.exp;
-  // An odd exponent moves one bit into the significand, which is exact and makes the
   // halving below a shift rather than a rounding.
   if ((e & 1) != 0) {
     d.sig <<= 1;
@@ -468,7 +405,6 @@ static inline uint64_t sqrt_bits(uint64_t b) {
   }
   bool exact = false;
   const uint64_t q = isqrt128(d.sig >> 10, (d.sig & 0x3FFull) << 54, exact);
-  // sqrt(value) = (q + frac) * 2^(e/2 - 27) with q in [2^53, 2^54), so the leading bit
   // of the significand is the exponent below and `q >> 1` is the 53 bits that follow.
   int32_t k = e / 2 + 26;
   uint64_t s = q >> 1;
@@ -479,7 +415,6 @@ static inline uint64_t sqrt_bits(uint64_t b) {
     k += 1;
   }
   const int32_t biased = k + 1023;
-  // No finite double roots below the smallest normal, sqrt(2^-1074) is 2^-537, so
   // the subnormal branch has nothing to carry.
   if (biased >= 2047) return kInf;
   if (biased <= 0) return kInf;
@@ -487,7 +422,6 @@ static inline uint64_t sqrt_bits(uint64_t b) {
 }
 
 // minNum and maxNum: a NaN operand means the other one, and two NaNs mean a NaN.
-// Of two zeros the negative one is the smaller, which is the order IEEE gives them.
 static inline uint64_t min_bits(uint64_t a, uint64_t b) {
   if (is_nan(a)) return is_nan(b) ? kQNaN : b;
   if (is_nan(b)) return a;
@@ -529,10 +463,6 @@ static inline uint64_t from_i64(int64_t x) {
   }
   return round_pack(sign, lead, sig);
 }
-// Toward zero, which is what a cast does. Out-of-range and NaN are undefined in
-// SPIR-V; this saturates rather than trapping, so two targets cannot disagree by
-// accident of the host's conversion. An unsigned destination takes zero for any
-// negative value, the way `F2I` does, rather than the two's complement of it.
 static inline uint64_t to_u64(uint64_t b) {
   if (is_nan(b)) return 0ull;
   const uint32_t sign = (uint32_t)(b >> 63);
@@ -544,8 +474,6 @@ static inline uint64_t to_u64(uint64_t b) {
   if (e < 0) return 0ull;
   uint64_t m;
   if (e >= 55) {
-    // 2^(e+1) already reaches past 2^64 at e = 63, so anything from e = 64 up is out
-    // of range and has to clamp before the shift: the shift itself is undefined past
     // 63, and the old guard at 119 let 1e20 wrap to 0x6BC75E2D63100000.
     if (e >= 64) return sign ? 0ull : ~0ull;
     m = sig << (e - 55);
@@ -562,8 +490,7 @@ static inline int64_t to_i64(uint64_t b) {
   if (m == 0x8000000000000000ull) return negative ? (-0x7FFFFFFFFFFFFFFF - 1) : 0x7FFFFFFFFFFFFFFF;
   return negative ? -(int64_t)m : (int64_t)m;
 }
-// A 32-bit destination saturates to its own range. Narrowing the 64-bit answer would
-// wrap it, and 1e20 came back as 0x63100000 instead of INT32_MAX.
+// A 32-bit destination saturates to its own range.
 static inline int32_t to_i32(uint64_t b) {
   const int64_t n = to_i64(b);
   if (n > 2147483647) return 2147483647;
@@ -590,7 +517,6 @@ static inline uint64_t from_f32(uint32_t fb) {
   return round_pack(sign, (int32_t)be - 127, ((uint64_t)(f | 0x800000u)) << 32);
 }
 
-// Round into binary32: same working form, twenty-nine fewer significand bits, and
 // binary32's own bias and subnormal floor.
 static inline uint32_t round_pack32(uint32_t sign, int32_t e, uint64_t sig) {
   const uint32_t sgn = sign << 31;
@@ -631,8 +557,7 @@ static inline uint32_t to_f32(uint64_t b) {
   return round_pack32(sign, e, sig);
 }
 
-// Toward zero: the fraction bits below the binary point go. Everything from a value
-// already integral to an infinity is its own answer.
+// Toward zero: the fraction bits below the binary point go.
 static inline uint64_t trunc_bits(uint64_t b) {
   if (is_nan(b) || is_inf(b)) return b;
   const uint32_t be = (uint32_t)((b >> 52) & 0x7FF);
@@ -651,11 +576,6 @@ static inline uint64_t ceil_bits(uint64_t b) {
   if (is_nan(b) || is_inf(b) || t == b) return t;
   return ((b >> 63) == 0ull) ? add(t, kOne) : t;
 }
-// fract: the part below the binary point, capped at the largest value under one, which
-// is what OpenCL.std defines it as. A NaN and an infinity have no fraction and both
-// answer the cap. Everything else subtracts its own floor, and that subtraction is
-// exact: above one the two values are the same, and below it the difference is a
-// representable neighbour of the smaller magnitude. -0.0 answers +0.0, because
 // -0.0 - (-0.0) is a positive zero in round-to-nearest.
 static inline uint64_t fract_bits(uint64_t b) {
   const uint64_t cap = 0x3fefffffffffffffull;  // 1 - 2^-53, the largest below 1
@@ -664,10 +584,7 @@ static inline uint64_t fract_bits(uint64_t b) {
   return gt(r, cap) ? cap : r;
 }
 
-// To the nearest integer, ties to even, what a conversion to an integer with
-// `.rn` means, and what a cast to an integer does on the CPU. `round_bits` below is
-// GLSL's Round, which breaks a tie away from zero, so the two are not
-// interchangeable: 2.5 is 2 here and 3 there.
+// `.rn` means, and what a cast to an integer does on the CPU.
 static inline uint64_t rne_bits(uint64_t b) {
   if (is_nan(b) || is_inf(b)) return b;
   const uint64_t t = trunc_bits(b);
@@ -688,11 +605,7 @@ static inline uint64_t round_bits(uint64_t b) {
   return t;
 }
 
-//
-// `hi` is the value and `lo` the part that did not fit, so a sum that cancels most
-// of `hi` still keeps its answer in `lo`. A little over a hundred bits, which is
-// what a reduced trigonometric argument needs, and what lets an exponent be
-// rounded once at the end instead of twice on the way through.
+// most of `hi` still keeps its answer in `lo`.
 struct dd {
   uint64_t hi, lo;
 };
@@ -706,15 +619,11 @@ static inline dd dd_make(uint64_t hi, uint64_t lo) {
 static inline dd dd_of(uint64_t b) { return dd_make(b, 0ull); }
 static inline uint64_t dd_bits(dd a) { return add(a.hi, a.lo); }
 static inline dd dd_neg(dd a) { return dd_make(neg(a.hi), neg(a.lo)); }
-// The sign of a double-double is the sign of its high part: `lo` rides within an ulp
-// of it and frequently has the opposite sign, so taking the magnitude of the two words
-// separately adds that fraction a second time instead of taking it away, a whole ulp
-// of error at the magnitude of `hi`. Negating both words is exact and is the magnitude.
+// The sign of a double-double is the sign of its high part.
 static inline dd dd_abs(dd a) { return (a.hi >> 63) != 0ull ? dd_neg(a) : a; }
 static inline bool dd_is_zero(dd a) { return is_zero(a.hi) && is_zero(a.lo); }
 static inline bool dd_is_nan(dd a) { return is_nan(a.hi) || is_nan(a.lo); }
 
-// Knuth's two-sum and its fast form, where the answer is exact whatever the
 // operands: `s` is the rounded sum and `lo` what the rounding dropped.
 static inline dd dd_two_sum(uint64_t a, uint64_t b) {
   const uint64_t s = add(a, b);
@@ -732,8 +641,6 @@ static inline dd dd_add(dd a, dd b) {
 static inline dd dd_sub(dd a, dd b) { return dd_add(a, dd_neg(b)); }
 static inline dd dd_mul(dd a, dd b) {
   const uint64_t p = mul(a.hi, b.hi);
-  // The product's dropped part is exact in `fma`, and the three cross terms are
-  // what a double-double adds to it.
   return dd_fast_sum(p, add(add(fma(a.hi, b.hi, neg(p)), mul(a.hi, b.lo)), mul(a.lo, b.hi)));
 }
 static inline dd dd_mul_d(dd a, uint64_t d) {
@@ -757,7 +664,6 @@ static inline dd dd_sqrt(dd a) {
   return dd_add(dd_of(s0), dd_div_d(e, add(s0, s0)));
 }
 
-// Multiply by a power of two by moving the exponent, which is exact in either
 // direction: a value below the normal range is shifted into it and rounded once.
 static inline uint64_t ldexp_bits(uint64_t b, int32_t n) {
   if (n == 0 || is_nan(b) || is_inf(b) || is_zero(b)) return b;
@@ -773,10 +679,7 @@ static inline dd dd_ldexp(dd a, int32_t n) {
   return dd_make(ldexp_bits(a.hi, n), ldexp_bits(a.lo, n));
 }
 
-//
-// A constant has to be as wide as the thing it multiplies, or the rounding it
-// carries is the error of the result: `ln2` as one double times an exponent of
-// 1,024 leaves an error of 2^-43, which is 300,000 ulps.
+// carries is the error of the result.
 static inline dd kLn2d() { return dd_make(0x3fe62e42fefa39efull, 0x3c7abc9e3b39803full); }
 static inline dd kInvLn2d() { return dd_make(0x3ff71547652b82feull, 0x3c7777d0ffda0d24ull); }
 static inline dd kLn10d() { return dd_make(0x40026bb1bbb55516ull, 0xbcaf48ad494ea3e9ull); }
@@ -792,10 +695,7 @@ static inline uint64_t kBighB() { return 0x4086300000000000ull; } // 710
 static inline uint64_t kPiOver4B() { return 0x3FE921FB54442D18ull; }
 static inline uint64_t kThreePiOver4B() { return 0x4002D97C7F3321D2ull; }
 
-//
-// e^r by a Taylor series on `r/16`, then four squarings. The reduced argument is
-// under 0.022, so sixteen terms reach 2^-132 and the squarings keep a hundred bits
-// of them; `n` is applied afterwards, exactly, as an exponent.
+// e^r by a Taylor series on `r/16`, then four squarings.
 static inline dd exp_scaled(dd r, int32_t n) {
   const dd t = dd_div_d(r, from_i64(16));
   dd s = dd_of(kOne);
@@ -812,8 +712,6 @@ static inline dd exp_of_dd(dd v) {
   if (dd_is_nan(v)) return dd_of(kQNaN);
   if (is_inf(v.hi)) return (v.hi >> 63) ? dd_of(0ull) : dd_make(kInf, 0ull);
   if (dd_is_zero(v)) return dd_of(kOne);
-  // The ends of the range are decided here, before the series: log(DBL_MAX) and
-  // log(DBL_TRUE_MIN), so an argument past either one never has to pass through a
   // reduced one that has underflowed or overflowed on its own.
   if (gt(v.hi, 0x40862E42FEFA39EFull)) return dd_make(kInf, 0ull);
   if (lt(v.hi, 0xC0874910D52D3051ull)) return dd_of(0ull);
@@ -847,9 +745,6 @@ static inline uint64_t exp10_bits(uint64_t x) {
   if (is_inf(x)) return (x >> 63) ? 0ull : kInf;
   return dd_bits(exp_of_dd(dd_mul(dd_of(x), kLn10d())));
 }
-// e^x - 1: the subtraction that would eat the answer for a small x is the series
-// instead, and for anything larger `exp`'s own rounding is below an ulp of the
-// difference.
 static inline uint64_t expm1_bits(uint64_t x) {
   if (is_nan(x) || is_inf(x)) return is_nan(x) ? kQNaN : x;
   const dd v = dd_of(x);
@@ -861,18 +756,12 @@ static inline uint64_t expm1_bits(uint64_t x) {
     }
     return dd_bits(sum);
   }
-  // Past the range of exp the answer is the limit itself: an infinity above, and
   // exactly -1 below, where e^x is under half an ulp of zero difference.
   if (gt(x, 0x40862E42FEFA39EFull)) return kInf;
   if (lt(x, 0xC0874910D52D3051ull)) return kNegOne;
   return dd_bits(dd_sub(exp_of_dd(v), dd_of(kOne)));
 }
 
-//
-// log(m) from atanh: s = (m-1)/(m+1) is under 0.172 once m is inside
-// [1/sqrt(2), sqrt(2)), and 2*(s + s^3/3 + s^5/5 + ...) is a series of thirty-one
-// terms to reach 2^-130. The exponent goes back on as `k * ln2`, in the same
-// double-double, so the sum is rounded once.
 static inline dd log_of_dd(dd v) {
   int32_t be = (int32_t)((v.hi >> 52) & 0x7FF);
   int32_t below = 0;
@@ -915,8 +804,6 @@ static inline uint64_t log10_bits(uint64_t x) {
   if (is_inf(x)) return kInf;
   return dd_bits(dd_div(log_of_dd(dd_of(x)), kLn10d()));
 }
-// log(1+x), with the addition done in the double-double so a small x keeps every
-// bit it started with.
 static inline uint64_t log1p_bits(uint64_t x) {
   if (is_nan(x) || lt(x, kNegOne)) return kQNaN;
   if (eq(x, kNegOne)) return kSign | kInf;
@@ -925,9 +812,6 @@ static inline uint64_t log1p_bits(uint64_t x) {
   return dd_bits(log_of_dd(dd_add(dd_of(kOne), dd_of(x))));
 }
 
-//
-// x^y = e^(y log x), with the product kept in the double-double: its absolute
-// error is 2^-96 of the exponent, which is far below the last bit of the answer
 // even when the answer is at the top of the range.
 static inline uint64_t pow_bits(uint64_t x, uint64_t y) {
   if (is_nan(x) || is_nan(y)) return kQNaN;
@@ -976,10 +860,7 @@ static inline uint64_t rootn_bits(uint64_t x, int32_t n) {
   if (lt(x, 0ull) && !odd) return kQNaN;
   const uint64_t a = abs_bits(x);
   if (is_inf(a)) return (n < 0) ? ((x >> 63) != 0ull ? (kSign | 0ull) : 0ull) : x;
-  // A negative index is not the reciprocal of a rounded root, that rounds twice and
-  // costs the last bit, which `rootn(0.5, -3)` showed. The signed index goes into the
-  // exponent, so exp(log(a)/n) is the answer in one rounding, and the square root of a
-  // positive index is the one case the hardware helper is exact for.
+  // and costs the last bit, which `rootn(0.5, -3)` showed.
   const uint64_t r = (nn == 2 && n > 0)
                          ? sqrt_bits(a)
                          : dd_bits(exp_of_dd(dd_div_d(log_of_dd(dd_of(a)), from_i64(n))));
@@ -1003,18 +884,7 @@ static inline uint64_t hypot_bits(uint64_t x, uint64_t y) {
   return dd_bits(dd_ldexp(dd_sqrt(s), e));
 }
 
-//
-// The argument is reduced against 2/pi as an integer: a double is a 53-bit
-// significand times a power of two, so `x * 2/pi` is a product of that integer with
-// the bits of 2/pi, and the bits of the answer that matter are the ones at weights
-// 2^1 down to 2^-200. Those are accumulated in a 320-bit window, which is exact:
-// every partial product is an integer, and the huge integer parts cancel by
-// construction rather than by luck. What comes out is the reduced value with more
-// than a hundred and fifty bits of it, which is what a near-multiple of pi/2 needs , 
 // a floating-point reduction loses exactly those bits, and the answer with them.
-//
-// 1,408 bits of 2/pi: a double's exponent reaches 1,023, and the reduced value is
-// wanted to 200 bits below its own leading bit.
 constant uint64_t kInvPi2Bits[22] = {
     0xa2f9836e4e441529ull, 0xfc2757d1f534ddc0ull, 0xdb6295993c439041ull, 0xfe5163abdebbc561ull,
     0xb7246e3a424dd2e0ull, 0x06492eea09d1921cull, 0xfe1deb1cb129a73eull, 0xe88235f52ebb4484ull,
@@ -1036,7 +906,6 @@ static inline void place_bits(thread uint64_t* sp, uint64_t v, int32_t at) {
   if (b != 0 && w + 1 >= 0 && w + 1 < 6) sp[w + 1] |= v >> (64 - b);
 }
 
-// Add (hi:lo) * 2^sh into the 320-bit window, keeping every bit that lands inside
 // it and a sticky bit for the ones that fall below.
 static inline void add_shifted(thread uint64_t* acc, uint64_t hi, uint64_t lo, int32_t sh) {
   uint64_t sp[6] = {0ull, 0ull, 0ull, 0ull, 0ull, 0ull};
@@ -1091,8 +960,7 @@ static inline red reduce_pi2(uint64_t xb) {
   out.y = dd_of(xb);
   if (k < -250) return out;  // x mod pi/2 is x, and sin(x) is x
   uint64_t acc[5] = {0ull, 0ull, 0ull, 0ull, 0ull};
-  // The limbs whose bits reach weights between 2^1 and 2^-200. The division
-  // truncates toward zero, which can start one limb early and never skips one.
+  // The limbs whose bits reach weights between 2^1 and 2^-200.
   int32_t first = (k - 384) / 64;
   if (first < 0) first = 0;
   int32_t last = (k + 200) / 64 + 1;
@@ -1114,8 +982,6 @@ static inline red reduce_pi2(uint64_t xb) {
   acc[4] &= (1ull << 62) - 1ull;
   bool negative = false;
   if (((acc[4] >> 61) & 1ull) != 0ull) {
-    // The fraction is at least a half, so the nearest multiple of pi/2 is one
-    // further on and the reduced value is what is left, one minus the fraction,
     // negated, which is the two's complement of the window.
     uint64_t carry = 1ull;
     for (int32_t t = 0; t < 5; t++) {
@@ -1149,9 +1015,6 @@ static inline red reduce_pi2(uint64_t xb) {
   return out;
 }
 
-// sin and cos of a reduced argument, |y| <= pi/4, to about a hundred and twenty
-// bits: sixteen terms of the series each, which is two terms past the last bit a
-// double can hold.
 static inline dd sin_dd(dd y) {
   const dd y2 = dd_mul(y, y);
   dd term = y, sum = y;
@@ -1208,9 +1071,6 @@ static inline uint64_t tan_bits(uint64_t x) {
   return v;
 }
 
-//
-// atan is halved five times through atan(t) = 2 atan(t / (1 + sqrt(1+t^2))) until
-// the argument is under 0.013, where the series is nine terms to reach 2^-125, and
 // the halvings are given back as a multiply by 32.
 static inline dd atan_small_dd(dd x) {
   dd t = x;
@@ -1245,10 +1105,7 @@ static inline uint64_t atan_bits(uint64_t x) {
   if (is_zero(x)) return x;
   return dd_bits(atan_of_dd(dd_of(x)));
 }
-// The inverse functions are each one double-double computation, and the bits are taken
-// from it once at the end. The pi-scaled forms divide by pi inside the same
-// double-double: dividing a rounded arctangent by pi rounds twice, which costs a whole
-// ulp at the least convenient places.
+// taken from it once at the end.
 static inline dd atan2_of_dd(uint64_t y, uint64_t x) {
   const bool ys = (y >> 63) != 0ull, xs = (x >> 63) != 0ull;
   const dd q = dd_div(dd_of(abs_bits(y)), dd_of(abs_bits(x)));
@@ -1279,9 +1136,6 @@ static inline uint64_t atan2_bits(uint64_t y, uint64_t x) {
 }
 
 static inline dd asin_of_dd(uint64_t x) {
-  // asin(x) = atan(x / sqrt(1 - x^2)), which holds its relative accuracy at both ends
-  // of the interval because nothing is subtracted near 0 and the root is the small
-  // quantity near 1.
   const bool neg_ = (x >> 63) != 0ull;
   const dd a = dd_abs(dd_of(x));
   const dd s = dd_sqrt(dd_sub(dd_of(kOne), dd_mul(a, a)));
@@ -1298,9 +1152,7 @@ static inline uint64_t asin_bits(uint64_t x) {
 }
 
 static inline dd acos_of_dd(uint64_t x) {
-  // acos(x) = 2 asin(sqrt((1-x)/2)): the subtraction that loses everything near 1 is
-  // halved first, which is why this is not pi/2 - asin(x). The negative half is pi
-  // minus the positive one, still in the double-double.
+  // 1 is halved first, which is why this is not pi/2 - asin(x).
   if ((x >> 63) != 0ull) return dd_sub(kPid(), acos_of_dd(abs_bits(x)));
   const dd h = dd_div_d(dd_sub(dd_of(kOne), dd_of(x)), from_i64(2));
   const dd r = dd_sqrt(h);
@@ -1315,7 +1167,6 @@ static inline uint64_t acos_bits(uint64_t x) {
   if (eq(a, kOne)) return (x >> 63) != 0ull ? kPiB() : 0ull;
   return dd_bits(acos_of_dd(x));
 }
-
 
 static inline uint64_t sinh_bits(uint64_t x) {
   if (is_nan(x) || is_inf(x)) return x;
@@ -1362,11 +1213,9 @@ static inline uint64_t tanh_bits(uint64_t x) {
   if (is_zero(x)) return x;
   if (is_inf(x)) return (x >> 63) != 0ull ? kNegOne : kOne;
   const bool neg_ = (x >> 63) != 0ull;
-  // Past 40 the exponential is under an ulp of one and the answer is exactly one.
   if (gt(abs_bits(x), 0x4044000000000000ull)) return neg_ ? kNegOne : kOne;
   uint64_t r;
   if (le(abs_bits(x), kHalf)) {
-    // sinh and cosh of a small argument, both from their series, divided: the
     // subtraction near zero cancels in neither of them.
     const dd v = dd_of(abs_bits(x));
     const dd v2 = dd_mul(v, v);
@@ -1382,7 +1231,6 @@ static inline uint64_t tanh_bits(uint64_t x) {
     }
     r = dd_bits(dd_div(sa, ca));
   } else {
-    // (1 - e^-2|x|) / (1 + e^-2|x|): for a large argument the exponential is the
     // small one, so nothing near equal is subtracted.
     const dd t = dd_div(dd_of(kOne), exp_of_dd(dd_mul_d(dd_of(abs_bits(x)), from_i64(2))));
     r = dd_bits(dd_div(dd_sub(dd_of(kOne), t), dd_add(dd_of(kOne), t)));
@@ -1393,17 +1241,13 @@ static inline uint64_t asinh_bits(uint64_t x) {
   if (is_nan(x) || is_inf(x) || is_zero(x)) return x;
   const bool neg_ = (x >> 63) != 0ull;
   const dd a = dd_of(abs_bits(x));
-  // Under 2^-27 the x^3/6 term is below half an ulp, and for a subnormal it is not
   // representable at all: the answer is the argument.
   if (lt(a.hi, kTinyB())) return x;
-  // Above 2^26 sqrt(x^2+1) is x to the last bit, so log(2x) is the answer and the
   // square that would overflow is never formed.
   if (gt(a.hi, kBigB())) {
     const uint64_t r = dd_bits(dd_add(log_of_dd(a), kLn2d()));
     return neg_ ? neg(r) : r;
   }
-  // log(x + sqrt(x^2+1)) written as log1p(x + x^2/(1+sqrt(x^2+1))), so a small x
-  // keeps its own bits.
   const dd s = dd_sqrt(dd_add(dd_mul(a, a), dd_of(kOne)));
   const dd t = dd_add(a, dd_div(dd_mul(a, a), dd_add(dd_of(kOne), s)));
   const uint64_t r = dd_bits(log_of_dd(dd_add(dd_of(kOne), t)));
@@ -1423,28 +1267,17 @@ static inline uint64_t atanh_bits(uint64_t x) {
   if (gt(a, kOne)) return kQNaN;
   if (eq(a, kOne)) return (x >> 63) != 0ull ? (kSign | kInf) : kInf;
   if (is_zero(x)) return x;
-  // 0.5 * log((1+x)/(1-x)), with both sides of the fraction formed in the
-  // double-double.
   const dd one = dd_of(kOne);
   const dd q = dd_div(dd_add(one, dd_of(x)), dd_sub(one, dd_of(x)));
   return dd_bits(dd_mul_d(log_of_dd(q), kHalf));
 }
 
-//
-// The two that no elementary expression reaches. `erf` is its Maclaurin series where
-// the argument is small and the continued fraction of the upper incomplete gamma
-// where it is not, since each of those is the one that converges on its own side;
-// `tgamma` is Stirling's asymptotic series, carried far enough up the recurrence that
-// the series is sharp, and the reflection formula on the other side of zero. All of
-// it is double-double over the exact primitives above, which is what holds the last
-// bit where a nearly-equal subtraction would otherwise spend it: `erfc(3)` is a
 // number 2.2e-5 in size formed from one very nearly itself.
 static inline dd kTwoOverSqrtPid() { return dd_make(0x3FF20DD750429B6Dull, 0x3C71AE3A914FED80ull); }
 static inline dd kHalfLn2Pid() { return dd_make(0x3FED67F1C864BEB5ull, 0xBC865B5A1B7FF5DFull); }
 static inline dd kHalfLnPid() { return dd_make(0x3FE250D048E7A1BDull, 0x3C57ABF2AD8D5088ull); }
 static inline uint64_t kSixteenB() { return 0x4030000000000000ull; }
 
-// sin(pi x) with the reduction done on the integer part, so a small fractional part
 // keeps its own significant bits instead of being lost on the way into sin(pi*x).
 static inline dd sinpi_dd(dd x) {
   const uint64_t n = rne_bits(dd_bits(x));
@@ -1456,10 +1289,6 @@ static inline dd sinpi_dd(dd x) {
   return s;
 }
 
-// erf on [-3, 3]: 2/sqrt(pi) * sum (-1)^n x^(2n+1) / (n! (2n+1)). The terms peak at
-// n = x^2, so the top of the range needs a hundred and fifty of them to reach 2^-100;
-// the largest of them is 3,200 times the answer, which costs twelve bits of the
-// hundred and six and no more.
 static inline dd erf_series(dd x) {
   const dd x2 = dd_mul(x, x);
   dd t = x, sum = x;
@@ -1470,9 +1299,7 @@ static inline dd erf_series(dd x) {
   return dd_mul(sum, kTwoOverSqrtPid());
 }
 
-// erfc on [3, inf): the continued fraction of Gamma(1/2, x^2), in the form that
-// converges without ever forming the reciprocal of something near zero. A fixed
-// hundred terms, so both engines take the same path and the same number of them.
+// converges without ever forming the reciprocal of something near zero.
 static inline dd erfc_cf(dd x) {
   const dd z = dd_mul(x, x);
   dd b = dd_add(z, dd_of(0x3FE0000000000000ull));  // z + 1/2
@@ -1521,9 +1348,7 @@ static inline uint64_t erfc_bits(uint64_t x) {
   return dd_bits(r);
 }
 
-// lgamma(z) for z >= 16: Stirling, with eight Bernoulli terms. The first omitted one
-// is under 4e-22 at z = 16, which is six orders below an ulp of any gamma this can
-// still return.
+// lgamma(z) for z >= 16.
 static inline dd lgamma_large_dd(dd z) {
   const dd iz = dd_div(dd_of(kOne), z);
   dd r = dd_sub(dd_mul(dd_sub(z, dd_of(0x3FE0000000000000ull)), log_of_dd(z)), z);
@@ -1548,8 +1373,6 @@ static inline dd lgamma_large_dd(dd z) {
   return r;
 }
 
-// Gamma of a positive argument: up the recurrence until the series is sharp, then the
-// logarithms of the steps back down, all in the double-double so the sum of sixteen
 // of them costs nothing that can be seen in the answer.
 static inline dd tgamma_pos_dd(dd v) {
   dd z = v;
@@ -1574,7 +1397,6 @@ static inline uint64_t tgamma_bits(uint64_t x) {
   if (!neg_) {
     r = tgamma_pos_dd(dd_of(x));
   } else {
-    // A negative integer is a pole, and the reflection formula would divide by a zero
     // sine: NaN, which is what the specification says.
     if (eq(trunc_bits(x), x)) return kQNaN;
     const dd s = sinpi_dd(dd_of(x));
@@ -1584,8 +1406,6 @@ static inline uint64_t tgamma_bits(uint64_t x) {
   return dd_bits(r);
 }
 
-// The pi-scaled inverse forms: one multiply by 1/pi, in the double-double, so the
-// answer is the same number the un-scaled form divided by pi would be.
 static inline uint64_t asinpi_bits(uint64_t x) {
   if (is_nan(x)) return kQNaN;
   const uint64_t a = abs_bits(x);
@@ -1613,7 +1433,6 @@ static inline uint64_t atanpi_bits(uint64_t x) {
 static inline uint64_t atan2pi_bits(uint64_t y, uint64_t x) {
   if (is_nan(x) || is_nan(y)) return kQNaN;
   const bool ys = (y >> 63) != 0ull, xs = (x >> 63) != 0ull;
-  // The quadrant boundaries are exact fractions of pi, so they are written as the
   // quarters they are rather than as an arctangent scaled afterwards.
   const uint64_t quart = mul(kHalf, kHalf);
   const uint64_t threeq = add(kHalf, quart);
@@ -1630,19 +1449,13 @@ static inline uint64_t atan2pi_bits(uint64_t y, uint64_t x) {
   return dd_bits(dd_mul(atan2_of_dd(y, x), kInvPid()));
 }
 
-// The pi-scaled sines reduce against the nearest *half* integer, not against the period:
-// r = x - k/2 is exact and |r| <= 1/4, so the sine is taken at an argument of at most
-// pi/4 and an integer multiple of pi lands on zero exactly. Reducing over the period
-// instead leaves sin(pi) as the sine of pi as a double-double, the residue of the
 // constant, which is the whole answer where the right one is zero.
 static inline dd pi_arg(uint64_t x) {
   const uint64_t k = rne_bits(mul(x, from_i64(2)));  // round(2x), exact
   return dd_mul(dd_sub(dd_of(x), dd_of(mul(k, kHalf))), kPid());  // pi * r, |r| <= 1/4
 }
 static inline int32_t pi_quad(uint64_t x) {
-  // The quadrant is k mod 4 for k = round(2x). Past 2^52 the step is a whole number of
-  // halves and every double is an integer, so only the parity of that multiple is left;
-  // past 2^53 the multiple is even and every one of these lands on a zero of the sine.
+  // The quadrant is k mod 4 for k = round(2x).
   const uint64_t k = rne_bits(mul(x, from_i64(2)));
   if (lt(abs_bits(k), 0x4330000000000000ull)) return (int32_t)(to_i64(k) & 3);
   if (lt(abs_bits(x), 0x4340000000000000ull)) return (int32_t)((to_i64(x) & 1) << 1);
@@ -1672,9 +1485,6 @@ static inline uint64_t tanpi_bits(uint64_t x) {
   return dd_bits(dd_div(sn, cs));
 }
 
-
-
-
 static inline uint64_t copysign_bits(uint64_t x, uint64_t y) {
   return (x & ~kSign) | (y & kSign);
 }
@@ -1682,22 +1492,17 @@ static inline uint64_t nextafter_bits(uint64_t x, uint64_t y) {
   if (is_nan(x) || is_nan(y)) return kQNaN;
   if (eq(x, y)) return y;
   if (is_zero(x)) return (y & kSign) | 1ull;  // the smallest subnormal of y's sign
-  // The encoding is monotone in the magnitude, so a step is one away from zero or
   // one toward it, which of the two depends on the sign of x and the direction.
   const uint64_t mag = x & ~kSign;
   const bool positive = (x >> 63) == 0ull;
   const bool away = (positive == lt(x, y));
-  // The step is one in the encoding, and the encoding is an integer: adding one to the
-  // magnitude walks away from zero and subtracting one walks toward it, with the sign
-  // carried separately. `add` here is the fp64 addition, handing it a bit pattern as
-  // if it were a number is what made this return a NaN for every operand pair.
+  // with the sign carried separately.
   const uint64_t m = away ? mag + 1ull : mag - 1ull;
   return (x & kSign) | m;
 }
 static inline uint64_t minmag_bits(uint64_t a, uint64_t b) {
   if (is_nan(a)) return is_nan(b) ? kQNaN : b;
   if (is_nan(b)) return a;
-  // Equal magnitudes are settled by the values, not by their magnitudes: the spec
   // says fmin, so minmag(-1, 1) is -1 rather than whichever came second.
   if (eq(abs_bits(a), abs_bits(b))) return lt(a, b) ? a : b;
   return lt(abs_bits(a), abs_bits(b)) ? a : b;
@@ -1713,9 +1518,6 @@ static inline uint64_t fdim_bits(uint64_t a, uint64_t b) {
   if (is_nan(a) || is_nan(b)) return kQNaN;
   return gt(a, b) ? sub(a, b) : 0ull;
 }
-// fmod is exact, so it is long division on the significands rather than a
-// subtraction in floating point: `a` and `b` are integers times a power of two, and
-// the remainder is `a` doubled `d` times modulo `b`, one step a bit.
 static inline uint64_t fmod_bits(uint64_t a, uint64_t b) {
   if (is_nan(a) || is_nan(b)) return kQNaN;
   const uint64_t sign = a & kSign;
@@ -1742,19 +1544,13 @@ static inline uint64_t fmod_bits(uint64_t a, uint64_t b) {
   }
   return round_pack((uint32_t)(sign != 0ull), e, r);
 }
-// The IEEE remainder is the fmod with the quotient rounded to nearest: the two
-// differ by one divisor, and both candidates are exact. Which way the divisor is
-// subtracted is the remainder's own sign, not the divisor's, for a positive divisor
-// and a negative dividend the nearest multiple is the other one, so subtracting the
-// divisor as given would walk away from zero instead of toward it.
+// differ by one divisor, and both candidates are exact.
 static inline uint64_t remainder_bits(uint64_t a, uint64_t b) {
   uint64_t r = fmod_bits(a, b);
   if (is_nan(r) || is_zero(r) || is_inf(b) || is_zero(b)) return r;
   const uint64_t twice = add(abs_bits(r), abs_bits(r));
   if (eq(twice, abs_bits(b))) {
-    // Exactly half of the divisor: the tie goes to the even quotient. A tie can only
-    // happen when that quotient fits in a significand, any larger and the product
-    // with the divisor would not, so its parity is exact here.
+    // Exactly half of the divisor: the tie goes to the even quotient.
     const dd k = dd_div(dd_sub(dd_of(abs_bits(a)), dd_of(mul(abs_bits(b), kHalf))),
                         dd_of(abs_bits(b)));
     if ((to_i64(rne_bits(dd_bits(k))) & 1) != 0)
@@ -1765,14 +1561,7 @@ static inline uint64_t remainder_bits(uint64_t a, uint64_t b) {
   return r;
 }
 
-//
-// Each pair is one decision, so both halves come from the same reading of the input:
-// a caller cannot be handed a fraction whose exponent came from another lane.
-//
-// frexp is the encoding's own exponent. Unpacking gives the unbiased exponent e such
-// that the value is M * 2^(e-52) with M in [2^52, 2^53), the power of two at or below
-// it, so the pair's exponent is one more than that, and the fraction is x with it
-// divided out.
+// lane. frexp is the encoding's own exponent.
 static inline uint64_t frexp_e_bits(uint64_t x) {
   if (is_nan(x) || is_inf(x) || is_zero(x)) return 0;
   int32_t e;
@@ -1784,8 +1573,6 @@ static inline uint64_t frexp_f_bits(uint64_t x) {
   if (is_nan(x) || is_inf(x) || is_zero(x)) return x;
   return ldexp_bits(x, -(int32_t)frexp_e_bits(x));
 }
-// modf is trunc, and the difference: it is under one in magnitude, so the
-// subtraction is exact.
 static inline uint64_t modf_i_bits(uint64_t x) { return trunc_bits(x); }
 static inline uint64_t modf_f_bits(uint64_t x) {
   if (is_nan(x)) return kQNaN;
@@ -1794,12 +1581,6 @@ static inline uint64_t modf_f_bits(uint64_t x) {
 }
 static inline uint64_t sincos_s_bits(uint64_t x) { return sin_bits(x); }
 static inline uint64_t sincos_c_bits(uint64_t x) { return cos_bits(x); }
-// The quotient of remquo is the integer the remainder is defined by, and the
-// specification wants its sign and its low thirty-two bits rather than its magnitude:
-// 1e20/3 is 33333333333333333333, an integer an int64 does not hold and whose low
-// bits are still defined. They come out of one exact fmod instead, x is n*y + r, so
-// x mod 2^32*y is (n mod 2^32)*y + r, and subtracting r and dividing by y leaves the
-// low bits themselves. Every step there is exact or within half an ulp of an integer,
 // which is why the division can be rounded to nearest afterwards.
 static inline int32_t remquo_q_bits(uint64_t x, uint64_t y) {
   if (is_nan(x) || is_nan(y) || is_inf(x) || is_zero(y)) return 0;
@@ -1822,10 +1603,7 @@ static inline uint64_t remquo_r_bits(uint64_t x, uint64_t y) {
 }  // namespace weft_fp64
 )WEFFF64";
 
-// The same text for the CPU column. `thread` and `constant` are Metal's
-// address spaces; in C++ the first is nothing and the second is `const`. The
-// definitions are undone straight after, so the module around this text is not
-// compiled with them.
+// The same text for the CPU column.
 inline std::string weft_f64_cpp_text() {
   return "#define thread\n#define constant const\n"
          "template <class T, class U>\n"

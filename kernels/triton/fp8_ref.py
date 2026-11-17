@@ -19,11 +19,7 @@ class Fmt:
         self.bias = (1 << (ebits - 1)) - 1
         self.maxexp = (1 << ebits) - 1
         self.emax = self.maxexp - (1 if inf_nan else 0)  # largest finite exponent
-        # The subnormal quantum is one binade below the smallest normal, so its
-        # exponent is bias+mbits-1, not bias+mbits.
         self.quantum = Fraction(1, 1 << (self.bias + mbits - 1))
-        # e4m3 has no infinities, and its top mantissa at the top exponent is
-        # NaN: the largest finite code is one below it, not all ones.
         self.maxmag = (self.emax << mbits) | ((1 << mbits) - (1 if inf_nan else 2))
 
 E4M3 = Fmt(4, 3, False)
@@ -41,7 +37,6 @@ def rne(v):
     return n
 
 def _frexp(ax):
-    # ax = m * 2^e with m in [0.5, 1), in exact arithmetic
     f = Fraction(ax)
     e = 0
     while f >= 1:
@@ -89,9 +84,6 @@ def dec(b, f):
     return sign * float(d)
 
 def gen(na, nb, path_a, path_b, f):
-    # Magnitudes that are exact binary fractions in both formats, so every
-    # product and every sum of 32 of them is exactly representable: a difference
-    # is a layout error, not a rounding one.
     pool = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, -0.5, -1.0, -2.0, 0.25, 0.0, 2.5]
     codes = [enc(v, f) for v in pool]
     a = bytes(codes[(i * 7 + 3) % len(codes)] for i in range(na))
@@ -100,10 +92,6 @@ def gen(na, nb, path_a, path_b, f):
     open(path_b, 'wb').write(b)
 
 def gen_cvt(path, f):
-    # Values that exercise every branch: saturation (449, 500), the largest
-    # finite value, a subnormal, a tie that rounds to zero, ties-to-even in both
-    # directions, negatives, and mantissas that round up into the exponent
-    # (500, -7.75).
     vals = [0.0, 1.0, -1.0, 0.5, 448.0, 449.0, 500.0, 0.001953125, 0.0009765625,
             1.0625, 1.09375, 2.5, 3.0, -0.25, 0.125, 100.0, 0.3, -7.75]
     if f is E5M2:

@@ -1,24 +1,5 @@
-// The multi-matrix forms of the two wider tile shapes. `ldmatrixsub` covers `.x2`
-// of the 6- and 4-bit containers and `ldmatrixb8` covers `.x1` of the byte shape,
-// so what is left is the second and later tile at a non-zero offset: a stride that
-// is off by one container passes the `.x1` rows and fails here.
-//
-// ldmpack4: `ldmatrix.m8n16.x4.b8x16.b6x16_p32` and its fp4 twin, four matrices of
-// eight 16-byte containers. Matrix m owns containers 8m..8m+7, and container c is
-// sixteen elements: 6-bit at bits 6*col, 4-bit at bits 4*col, the rest padding.
-// The values are chosen so a wrong matrix, row or column always shows:
-//     v6(c, col) = (7c + 13col) & 63      v4(c, col) = (5c + 3col) & 15
-// and 7, 13 are invertible modulo 64 and 5, 3 modulo 16, while the eight-container
-// stride moves c by 8, which changes both sums. The destination is CUTLASS's
-// `SM100_SU6_DU8x16_x1_LDSM_N` map: lane l holds row l>>2 at columns 4*(l&3)..+3 of
-// container 8m + (l>>2), widened to a byte. The same four tiles are loaded once
-// more through a per-lane address, lane a naming container a, which is the peer
-// lane 8m + row the register form asks for.
-//
-// ldmb8x2: `ldmatrix.m16n16.x2.trans.b8`, two 16x16 tiles. Byte k of tile m holds
-// k ^ (0x5A m), so the second tile's bytes all differ from the first's and a stride
-// of zero cannot pass. The map is the one `ldmatrixb8` states for one tile, applied
-// to each tile in turn.
+// The multi-matrix forms of the two wider tile shapes. What is left is the second and
+// later tile at a non-zero offset, where a stride off by one container fails.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -37,7 +18,7 @@
     mov.u32 %r1, %tid.x;
     mov.u64 %rd2, sub4;
 
-    // ---- thirty-two containers of six-bit elements: four words a lane, one container ----
+    // thirty-two containers of six-bit elements: four words a lane, one container
     mov.u32 %r20, 0;                        // word of this lane's container
 F6: setp.ge.u32 %p1, %r20, 4;
     @%p1 bra F6D;
@@ -82,7 +63,7 @@ F6D:
 
     ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b6x16_p32 {%r10, %r11, %r12, %r13}, [sub4];
 
-    // ---- the same four tiles through a per-lane address: lane a names container a ----
+    // the same four tiles through a per-lane address: lane a names container a
     shl.b32 %r34, %r1, 4;
     cvt.u64.u32 %rd4, %r34;
     add.s64 %rd5, %rd2, %rd4;
@@ -100,7 +81,7 @@ F6D:
     st.global.b32 [%rd8+8], %r16;
     st.global.b32 [%rd8+12], %r17;
 
-    // ---- the same containers as four-bit elements: two words of payload, two of padding ----
+    // the same containers as four-bit elements: two words of payload, two of padding
     bar.sync 0;
     mov.u32 %r20, 0;
 F4: setp.ge.u32 %p1, %r20, 4;
@@ -158,7 +139,7 @@ F4D:
     mov.u32 %r1, %tid.x;
     mov.u64 %rd4, tile8;
 
-    // ---- byte k of tile m holds k ^ (0x5A m) ----
+    // byte k of tile m holds k ^ (0x5A m)
     shl.b32 %r2, %r1, 4;
     mov.u32 %r5, 0;
 FB: setp.ge.u32 %p1, %r5, 16;

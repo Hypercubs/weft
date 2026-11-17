@@ -1,15 +1,3 @@
-// Does the packing formula in src/soft_math.hpp agree with the hardware's own
-// `pack_float_to_*` builtins?
-//
-// The formula is what both engines run, so the two columns cannot disagree with
-// each other, but they could both be wrong about what Metal means by a normalized
-// conversion. The rule that is not obvious is rounding: nearest, and at an exact
-// tie the hardware could round up, to even, or away from zero. This asks the
-// hardware instead of reading the spec, over every byte boundary, every 16-bit
-// boundary and exact ties in both signs.
-//
-// Build: clang++ -fobjc-arc -std=c++17 -framework Metal -framework Foundation \
-//          tools/pack_probe.mm -o /tmp/packprobe && /tmp/packprobe
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -23,10 +11,6 @@ static int32_t pack_round(float v) {
   return v < 0.0f ? -(int32_t)(0.5f - v) : (int32_t)(v + 0.5f);
 }
 
-// Is the product the formula rounds an exact tie at the precision it is computed
-// in? That is the only input class where the hardware's intermediate precision can
-// decide a different answer, and it is decided from the value rather than from the
-// two answers, so a formula that is wrong everywhere cannot hide behind it.
 static bool is_tie(float v, double scale) {
   const float p = (float)(v * (float)scale);
   const double a = std::fabs((double)p);
@@ -127,8 +111,6 @@ int main() {
       static const char* names[4] = {"unorm4x8", "snorm4x8", "unorm2x16", "snorm2x16"};
       for (int c = 0; c < 4; c++) {
         if (hw[i * 4 + c] == mine[c]) continue;
-        // A tie is where the hardware's intermediate precision decides, and this
-        // text cannot reproduce it. Anything else is a disagreement that matters.
         if (is_tie(v, scales[c])) {
           ties[c]++;
           continue;

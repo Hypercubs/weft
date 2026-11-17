@@ -1,12 +1,4 @@
 // Two instructions only the warp body can answer.
-//
-//     actm: out[gid] = activemask.b32            -- one bit per lane that is executing
-//     mvi:  out[gid] = movmatrix(m8n8, in[gid])  -- `.trans` is the only form PTX has,
-//           so the answer is the fragment read out of the transposed matrix
-//
-// The launch is a full warp of 32 lanes, which is what the warp body runs as one
-// thread. A mask that came back as a constant other than 0xFFFFFFFF would be wrong,
-// and a move that skipped the transpose would hand the fragment back unchanged.
 .version 8.6
 .target sm_100
 .address_size 64

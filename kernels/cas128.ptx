@@ -1,20 +1,4 @@
-// atom.cas.b128: sixteen bytes compared and written as one value. The widest atomic
-// instruction on either engine here is 64 bits, so the four words are read, compared
-// and written under a lock -- and the case that matters is the one the old refusal
-// warned about: an expected value that differs in the *high* half must not swap. A
-// translation comparing a prefix would pass the low-half case and fail that one.
-//
-// The compare and the new value are loaded from their own buffers rather than built
-// from immediates, because PTX has no sixteen-byte immediate and a `.b128` register is
-// the only operand the instruction takes.
-//
-//   cmp = A, new = B                 -> the bytes become B, both halves
-//   cmp = A with one low byte off    -> nothing is written, the bytes stay A
-//   cmp = A with one high byte off   -> nothing is written, the bytes stay A
-//
-// Every lane in the group asks with the same three values, so the first to reach the
-// word swaps it and the rest then find B and leave it: the answer does not depend on
-// the order the lanes ran in.
+// atom.cas.b128: sixteen bytes compared and written as one value.
 .version 8.3
 .target sm_90
 .address_size 64

@@ -1,11 +1,4 @@
-// Hand-written PTX for the atomic paths: a 32-bit counter, a 64-bit counter, and
-// two maxes whose answer is a constant because every value already in the buffer
-// is smaller. Buffers 0 and 2 are read-and-add so their answer depends on what
-// the buffer held before, check.sh runs the kernel with a zero grid first to
-// learn that, and compares against base + grid.
-//
-// Real codegen writes the scope and the memory semantics out in full
-// (`atom.acquire.sys.global.max.s64`), so both spellings are exercised here.
+// Hand-written PTX for the atomic paths: a 32-bit counter, a 64-bit counter.
 .version 7.0
 .target sm_70
 .address_size 64

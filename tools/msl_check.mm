@@ -1,12 +1,4 @@
 // Compile a file of Metal Shading Language with the runtime compiler.
-//
-//     clang++ -fobjc-arc -std=c++17 -framework Metal -framework Foundation \
-//       tools/msl_check.mm -o /tmp/mslcheck
-//     /tmp/mslcheck out.metal
-//
-// It is the same compiler the launcher hands its source to, so a file that
-// passes here is one the launcher will take, which is what makes it usable as a
-// build check for the GPU back end without a GPU present in the loop.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -41,10 +33,6 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "%s\n", [[err localizedDescription] UTF8String]);
       return 1;
     }
-    // A library that compiles is not the same thing as a kernel the GPU will
-    // accept: the pipeline step is where the Metal back end actually generates
-    // machine code, so a source that only fails there looks fine here. Build a
-    // pipeline for every function when asked with --pipeline.
     if (argc > 2 && std::string(argv[2]) == "--pipeline") {
       int built = 0;
       for (NSUInteger i = 0; i < lib.functionNames.count; i++) {

@@ -1,18 +1,5 @@
-// The four-value forms of the MX converts, split out of `cvtmx.ptx`.
-//
-// ptxas has no `.x4` spelling of these with `.rn`. What it does have is the pair
-// form, `cvt.rn.satfinite{.relu}.{e2m1,e2m3,e3m2}x2.f32 d, a, b`, whose destination
-// is a `.b8` register for fp4 and a `.b16` one for f6, and whose first source lands
-// in the high field. Two of those plus one shift are the four-value form's bits
-// exactly, because that form packs the first source highest and the last lowest:
-//
-//   {a, b, e, f} -> (a<<12 | b<<8 | e<<4 | f)      e2m1
-//                -> (a<<24 | b<<16 | e<<8 | f)      e2m3, e3m2
-//
-// The pair form puts its first source in the high field of the pair, so (a,b) is the
-// high half of the four-value answer and (e,f) the low one: the first is shifted up
-// and the second or-ed in. weft reads both spellings, and its suite checks the
-// values against the four-value form the fixture used to write.
+// The four-value forms of the MX converts, split out of `cvtmx.ptx`. ptxas has no `.x4`
+// spelling with `.rn`, so each is two pair converts and one shift.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -22,11 +9,6 @@
 //   {1.5, -2, 0.0625, 8} as e2m3x4 with .relu
 //                              -> 0c00001f  relu zeroes the negative; 1.5 -> 01100,
 //                                          8 saturates to 7.5 (011111), and 0.0625
-//                                          is a tie on the M/8 grid that takes 0
-//   {28, 0.25, 1.75, 1e6} as e3m2x4
-//                              -> 1f040f1f  28 is MAX_NORM itself (011111), 0.25 is
-//                                          the smallest normal (000100), 1.75 is
-//                                          001111, and 1e6 saturates
 .visible .entry cvtmx4(
     .param .u64 cvtmx4_param_0     // three words
 )

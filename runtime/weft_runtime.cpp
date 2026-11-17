@@ -8,7 +8,6 @@
 #include <mutex>
 #include <vector>
 
-
 namespace {
 
 ;
@@ -32,9 +31,6 @@ struct Pool {
     return shared;
   }
 
-  // bar.red needs tg_size slots for the per-thread values and 32 for the per-warp
-  // totals. It is a separate buffer from the shuffle scratch because both can be
-  // live in the same kernel and neither may clobber the other.
   uint32_t* ensure_red() {
     if (!red) {
       red = (uint32_t*)std::malloc((size_t)(kMaxThreadgroup + 32) * sizeof(uint32_t));
@@ -46,8 +42,6 @@ struct Pool {
     return red;
   }
 
-  // A warp's scan and fold trees are the same for its 32 lanes, so one cache
-  // slot per warp is enough: three key words and the 32 results.
   uint32_t* ensure_fold() {
     if (!fold) {
       const size_t n = (size_t)(kMaxThreadgroup / 32u) * weft::kFoldWords * sizeof(uint32_t);
@@ -62,10 +56,6 @@ struct Pool {
 
   uint32_t* ensure_warp() {
     if (!warp) {
-      // Two halves, so site N+1 cannot clobber the slot site N is being read from.
-      // The wide (16-byte) slots follow the word-wide ones in the same block, so
-      // a kernel that shuffles both a float and a float4 needs no extra scratch;
-      // Ctx::warp16 is the tail half of this allocation.
       const size_t n = (size_t)2 * kMaxThreadgroup * (sizeof(uint32_t) + weft::kWideSlotBytes);
       warp = (uint32_t*)std::malloc(n);
       if (!warp) {
@@ -95,9 +85,6 @@ struct Pool {
 namespace weft {
 
 struct WorkerState {
-  // A warp vote reads what the whole warp published, and every lane of the warp
-  // asks the same question in the same pass, so one answer serves all 32. The
-  // pass number is the key: within a pass the read buffer cannot change.
   uint32_t vote_pass = 0xFFFFFFFFu;
   uint32_t vote_mask = 0;
 };
@@ -122,21 +109,13 @@ using weft::WorkerState;
 namespace {
 
 // Per-group thread contexts, built once and then reused for every pass.
-// Rebuilding a Ctx per thread per pass was twelve stores on the hot path; a
-// barrier- or shuffle-heavy kernel does six passes over a threadgroup, so that
-// was most of the per-lane cost.
 struct StepGroup {
   std::vector<weft::Ctx> ctxs;
-  // Threadgroup memory for a state-machine kernel: a Metal kernel's
-  // `threadgroup T name[N]` is a slot in this, keyed by which declaration it is,
-  // the same way the coroutine path's is. Nothing about the slot depends on the
-  // pass, so a lane that re-enters on the next one finds the same memory.
   weft::SlotState slots{};
   uint32_t built = 0;  // lanes whose launch-invariant fields are already written
 };
 
-// Resumable kernels: one call per thread per barrier segment. No stacks, no
-// switches, the thread's registers are already in the state blob.
+// Resumable kernels: one call per thread per barrier segment.
 void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32_t grid,
                     WorkerState& ws, void* const* bufs, unsigned char* shared,
                     unsigned char* states, uint32_t* warp, uint32_t* red, uint32_t* fold,
@@ -150,18 +129,10 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   }
 
   g.ctxs.resize(live);
-  // A new group's scan caches start empty: the pass number counts from zero in
-  // every group, so a key left by the previous group could match this one's.
   for (uint32_t w = 0; w < (live + 31u) / 32u; w++) fold[(size_t)w * weft::kFoldWords] = 0u;
-  // Threadgroup memory is the group's, so it starts here and is not reused from
-  // the previous one.
   g.slots.bump = 0;
   g.slots.count = 0;
   for (int s = 0; s < 64; s++) g.slots.off[s] = 0;
-  // Nine of the twelve fields depend on the launch, not on the group, so they are
-  // written once per lane instead of once per lane per group: a barrier-heavy
-  // kernel sets this up 4,096 times for a 1M-lane grid, and every write past the
-  // first group is the same value again.
   if (g.built < live) {
     unsigned char* w16 = (unsigned char*)warp + (size_t)2 * kMaxThreadgroup * sizeof(uint32_t);
     for (uint32_t i = g.built; i < live; i++) {
@@ -186,8 +157,6 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
     c.tgid = tgid;
     c.shared = shared;
     c.pass = 0;
-    // The shared-memory cursor is per group: a lane that allocated a slot in the
-    // previous group must not carry its index into this one.
     c.slot = 0;
   }
 
@@ -195,10 +164,6 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   uint32_t pass = 1;
   while (remaining > 0) {
     if (k.group_step) {
-      // Whole group, one call: the lane loop, the pass number the shuffles key on
-      // and the count of lanes still running all live in the module's own
-      // function, so a segment costs one call per threadgroup rather than an
-      // indirect one per lane from here.
       remaining = k.group_step(g.ctxs.data(), states, stride, live, pass, bufs, shared);
     } else {
       unsigned char* st = states;
@@ -215,20 +180,13 @@ void run_group_step(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   }
 }
 
-// Warp kernels: 32 lanes execute together, one program counter per lane so that
-// divergence is just a split into groups. A barrier is the whole threadgroup
-// arriving, which the scheduler below enforces by running every warp until it
-// stops and only then releasing them all.
 void run_group_warp(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32_t grid,
                     void* const* bufs, unsigned char* shared, unsigned char* states,
                     std::vector<uint8_t>& status, std::vector<weft::WCtx>& ctxs,
                     uint32_t* red) {
   const uint32_t base = tgid * tg;
-  const uint32_t live = (base + tg <= grid) ? tg : (grid > base ? grid - base : 0);  const uint32_t warps = (live + 31) / 32;
-  // A last group that is short has lanes which do not exist: a kernel that reads
-  // a slot only they would have written reads the arena instead. The step and
-  // coroutine paths zero it there, so this one does too, the same rule, and it
-  // only touches a group the launch did not fill.
+  const uint32_t live = (base + tg <= grid) ? tg : (grid > base ? grid - base : 0);
+  const uint32_t warps = (live + 31) / 32;
   if (live < tg) std::memset(shared, 0, kSharedBytes);
 
   status.assign(warps, 0);  // 0 running, 1 at a barrier, 2 finished
@@ -243,12 +201,6 @@ void run_group_warp(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
     c.shared = shared;
     c.red = red;
     std::memset(states + (size_t)w * k.warp_size, 0, k.warp_size);
-    // A lane past the end of the launch does not exist, and a zeroed program counter
-    // means "about to start". Left alone, all 32 lanes of the last warp run, so the
-    // lanes the program does not have read and write the buffers: a store from one
-    // wrote 128 bytes into a 32-byte buffer, and `activemask` answered 0xFFFFFFFF for
-    // eight lanes. The state struct starts with one program counter per lane, so the
-    // lanes past the launch are marked finished before the body is called.
     const uint32_t rem = live > w * 32u ? live - w * 32u : 0u;
     const uint32_t live_w = rem > 32u ? 32u : rem;
     uint32_t* pc = reinterpret_cast<uint32_t*>(states + (size_t)w * k.warp_size);
@@ -265,8 +217,6 @@ void run_group_warp(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
     }
     if (ran) continue;
 
-    // Nothing left to run: either everyone is done, or every warp still going is
-    // waiting at a barrier. If any are waiting, they all leave together.
     bool released = false;
     for (uint32_t w = 0; w < warps; w++) {
       if (status[w] == 1) { status[w] = 0; released = true; }
@@ -298,13 +248,8 @@ void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
   g.slots.bump = 0;
   g.slots.count = 0;
   for (int k = 0; k < 64; k++) g.slots.off[k] = 0;
-  // The scan caches are per warp and keyed on the pass number, which counts from
-  // zero in every group: clear the keys so the previous group's cannot match.
   for (uint32_t w = 0; w < (live + 31u) / 32u; w++) fold[(size_t)w * weft::kFoldWords] = 0u;
 
-  // Same split as the step path: the launch-invariant fields once per lane, the
-  // per-group ones every group. `shared` is here because each group's arena is
-  // its own window and it is the one value that changes group to group.
   if (g.built < live) {
     unsigned char* w16 = (unsigned char*)warp + (size_t)2 * kMaxThreadgroup * sizeof(uint32_t);
     for (uint32_t i = g.built; i < live; i++) {
@@ -326,17 +271,11 @@ void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
     c.gid = base + i;
     c.tgid = tgid;
     c.shared = shared;
-    // Per group, like the pass: a stale cursor would point a lane's shared array
-    // into the previous group's offsets.
     c.slot = 0;
     c.pass = 0;  // the run up to the first yield is pass 0
     g.tasks.emplace_back(k.coro(c));  // runs up to the first barrier
   }
 
-  // A coroutine with no suspension point (a kernel that only asks for its lane
-  // id, say) is already finished when it is built, and the loop below only ever
-  // looks at tasks it resumes, so the live count has to come from the tasks
-  // themselves, or it would wait forever for a thread with nothing left to do.
   uint32_t remaining = 0;
   for (uint32_t i = 0; i < live; i++)
     if (!g.tasks[i].done()) remaining++;
@@ -345,8 +284,6 @@ void run_group_coro(const weft::KernelDef& k, uint32_t tgid, uint32_t tg, uint32
     for (uint32_t i = 0; i < live; i++) {
       if (g.tasks[i].done()) continue;
       g.ctxs[i].pass = pass;
-      // `resume()` re-checks what the loop just checked; this is the one call
-      // that runs 5M times in a 1M-lane scan.
       g.tasks[i].resume_ready();
       if (g.tasks[i].done()) remaining--;
     }
@@ -420,8 +357,6 @@ void* coro_alloc(std::size_t n) {
 void coro_arena_reset() { t_coro_used = 0; }
 
 namespace {
-// Several lanes reach these in the same instruction, and one message is the
-// whole of what a reader needs.
 std::atomic<bool> g_shared_reported{false};
 }  // namespace
 
@@ -451,7 +386,6 @@ void Task::promise_type::operator delete(void* p, std::size_t n) noexcept {
   (void)n;  // the whole arena is released with the threadgroup
 }
 
-
 static uint64_t g_params[64];
 
 void set_param(int index, uint64_t value) {
@@ -460,8 +394,6 @@ void set_param(int index, uint64_t value) {
 
 uint64_t param(int index) { return (index >= 0 && index < 64) ? g_params[index] : 0ull; }
 
-// Textures belong to a launch, like the scalar parameters: the host fills them
-// once before dispatch and every threadgroup reads the same image.
 static Texture g_textures[16];
 
 void set_texture_layers(int index, void* data, uint32_t width, uint32_t height, uint32_t elem,
@@ -487,8 +419,6 @@ const Texture* texture_ptr(int index) {
   return (index >= 0 && index < 16) ? &g_textures[index] : &kNone;
 }
 
-// Samplers are launch state for the same reason textures are: on a GPU they are
-// objects the host creates and binds, and a kernel cannot build one.
 static Sampler g_samplers[16];
 
 void set_sampler(int index, int filter, int addr) {
@@ -499,11 +429,6 @@ void set_sampler(int index, int filter, int addr) {
 
 Sampler sampler(int index) { return (index >= 0 && index < 16) ? g_samplers[index] : Sampler{}; }
 
-// A floating-point add has no atomic instruction on any of these cores, so it is
-// a compare-and-swap loop. Everything below that *does* have one uses the
-// builtin form: `__atomic_fetch_add` on arm64 is a single ldadd, while the
-// obvious load/CAS loop is a load, a compare, a store, and a retry under
-// contention, three times the cost for the same answer.
 float atom_add_f32(float* p, float v) {
   uint32_t* bits = reinterpret_cast<uint32_t*>(p);
   uint32_t old = __atomic_load_n(bits, __ATOMIC_RELAXED);
@@ -517,9 +442,6 @@ float atom_add_f32(float* p, float v) {
       return of;
   }
 }
-
-// min/max have no instruction either: a load, a compare and a conditional store
-// is a read-modify-write that can lose an update, so they stay a CAS loop.
 
 #define WEFT_ATOM_U32(name, expr)                                                       \
   uint32_t name(uint32_t* p, uint32_t v) {                                             \
@@ -555,9 +477,7 @@ uint32_t atom_cas_u32(uint32_t* p, uint32_t cmp, uint32_t v) {
   return cmp;  // the value that was there
 }
 
-// 64-bit atomics. Same argument as the 32-bit ones: these are the only shared
-// addresses two CPU threads touch at once, so they are real atomics. add/sub/
-// and/or/xor/exch are a single instruction on arm64; min/max are a CAS loop.
+// 64-bit atomics.
 #define WEFT_ATOM_U64(name, expr)                                                       \
   uint64_t name(uint64_t* p, uint64_t v) {                                             \
     uint64_t old = __atomic_load_n(p, __ATOMIC_RELAXED);                               \
@@ -666,9 +586,6 @@ float atom_max_f32(float* p, float v) {
 
 namespace {
 
-// Dispatch threads that outlive a launch: creating and joining seven pthreads
-// costs about a third of a 0.09 ms kernel, which is why `scale` measures faster
-// on one thread than on eight.
 struct DispPool {
   void (*fn)(void*, uint32_t) = nullptr;
   void* arg = nullptr;
@@ -726,8 +643,6 @@ struct DispPool {
   }
 };
 
-// The work item is a lambda, so the job carries its exact type rather than
-// forcing a std::function copy on every launch.
 template <class F>
 struct DispJob {
   F* fn;
@@ -740,15 +655,17 @@ void disp_thunk(void* p, uint32_t id) {
 
 }  // namespace
 
+extern "C" uint32_t weft_fault_word() { return weft::fault_words()[0]; }
+extern "C" uint32_t weft_fault_lane() { return weft::fault_words()[1]; }
+extern "C" void weft_fault_reset() {
+  weft::fault_words()[0] = 0u;
+  weft::fault_words()[1] = 0u;
+}
 
 void dispatch(const KernelDef& k, void* const* bufs, uint32_t grid, uint32_t tg) {
   if (grid == 0) return;
+  ++g_pass_gen;
   if (tg == 0 || tg > kMaxThreadgroup) {
-    // Not silent: a launch whose geometry is changed underneath it gives an answer
-    // for a grid the caller did not ask for, and a barrier kernel's is not even the
-    // same shape. It still runs, a caller of weft_run gets no refusal channel , 
-    // but it says so, and at the biggest group there is rather than an arbitrary
-    // small one.
     std::fprintf(stderr,
                  "weft: %u threads per threadgroup is not a group; this launch used %u\n",
                  tg, kMaxThreadgroup);
@@ -768,14 +685,7 @@ void dispatch(const KernelDef& k, void* const* bufs, uint32_t grid, uint32_t tg)
   auto work = [&](uint32_t id) {
     thread_local Pool pool;  // touched once per dispatch, not per thread
     WorkerState ws;
-    // The warp-vector backend is opt-in: it removes the resume a shuffle costs,
-    // but pays mask maintenance on every instruction, and on this machine that
-    // only comes out ahead for arithmetic-heavy warps (see README).
     static const bool warp_ok = std::getenv("WEFT_WARP") != nullptr;
-    // A kernel with no per-lane body has only the warp one: a tensor-core
-    // instruction reads registers that other lanes hold, which a per-lane state
-    // machine cannot express. It runs on the warp backend whatever the
-    // environment says.
     if (k.warp && (warp_ok || !k.step)) {
       unsigned char* shared = pool.ensure_shared();
       unsigned char* states =

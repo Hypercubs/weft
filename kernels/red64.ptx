@@ -1,16 +1,4 @@
 // 64-bit reductions: `red.global.{add,or,xor}.u64`.
-//
-// A `red` has no result, which is what lets these run on the GPU at all: the
-// answer does not need the pair read as one value, only to end up holding the
-// fold of everything applied to it. `add`/`sub` are a 32-bit atomic on each half
-// with the low half's carry (or borrow) carried into the high one; `or`/`xor`
-// fold each half on its own. All four are order-free, so the GPU and the CPU
-// agree without either side imposing an order.
-//
-// One buffer per operation, each sensitive in its own way: the count catches a
-// lost carry, the or-mask a lost bit, the sub counter catches a borrow applied
-// the wrong way round (it wraps, and the CPU wraps the same way), and the xor
-// mask catches a bit cancelled twice.
 .version 7.0
 .target sm_70
 .address_size 64

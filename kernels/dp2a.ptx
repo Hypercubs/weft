@@ -1,17 +1,4 @@
 // dp2a: two 16-bit lanes of `a` against two bytes of `b`, accumulated into `c`.
-//
-// `a` holds a0 in its low half and a1 in its high one, and both always take part.
-// `b` holds four bytes and the mode picks the pair: `.lo` is bytes 0 and 1, `.hi`
-// is bytes 2 and 3. Each lane is folded in at the signedness its suffix names, and
-// `c` is signed only when one of them is.
-//
-//   dp2alo   dp2a.lo.u32.u32: d = a0*b0 + a1*b1, unsigned lanes and bytes
-//   dp2ahi   dp2a.hi.u32.u32: d = a0*b2 + a1*b3
-//   dp2aslo  dp2a.lo.s32.s32: the same pair with both sides signed, so 0xFFFF is
-//            -1 and 0xFF is -1, and the answer is a different number
-//   dp2ashi  dp2a.hi.s32.s32
-//
-// c is zero here, which is the form a dot product without an accumulator takes.
 .version 7.0
 .target sm_61
 .address_size 64

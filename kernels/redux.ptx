@@ -1,22 +1,5 @@
 // `redux.sync` folds one value across the lanes of the warp and hands every lane the
-// same answer. Eleven words per lane, all lane-independent by definition, so a fold
-// that dropped a lane, used the wrong identity for a masked-out lane, or confused the
-// signed and unsigned forms moves a whole column.
-//
-//     row 0  add.u32 of lane            496, the sum 0..31
-//     row 1  min.u32 of lane            0
-//     row 2  max.u32 of lane            31
-//     row 3  and.b32 of lane            0
-//     row 4  or.b32  of lane            31
-//     row 5  xor.b32 of lane            0
-//     row 6  add.s32 of lane-16         -16
-//     row 7  min.s32 of lane-16         -16, which the unsigned form would call huge
-//     row 8  max.s32 of lane-16         15
-//     row 9  add.u32 over mask 0x0000FFFF   120, the sum 0..15
-//     row 10 or.b32  over mask 0x0000000F   3, the four low lanes
-//
-// The two masked rows are what prove the member mask: a fold that included the lanes
-// outside it would answer 496 and 31 there instead.
+// same answer.
 .version 8.6
 .target sm_100
 .address_size 64

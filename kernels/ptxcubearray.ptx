@@ -1,0 +1,92 @@
+// A cube *array* texture from PTX: two cubes, coordinate vector {layer, s, t, r}.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.global .texref cube;
+
+.visible .entry ptxcubearray(
+    .param .u64 ptxcubearray_param_0
+)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<24>;
+    .reg .u32 %ru<2>;
+    .reg .f32 %f<36>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxcubearray_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    // The size and the cube count the binding reports, not numbers in the kernel.
+    txq.width.b32 %r5, [cube];          // 8
+    txq.depth.b32 %r6, [cube];          // 2, the cubes rather than the faces
+
+    and.b32 %r7, %r4, 7;                // x = gid & 7
+    shr.u32 %r8, %r4, 3;
+    and.b32 %r8, %r8, 7;                // y = (gid >> 3) & 7
+    shr.u32 %r9, %r4, 6;
+    div.u32 %r10, %r9, 6;
+    mul.lo.s32 %r11, %r10, 6;
+    sub.s32 %r12, %r9, %r11;            // face = (gid >> 6) % 6
+    shr.u32 %r13, %r4, 9;
+    and.b32 %r13, %r13, 1;              // layer = (gid >> 9) & 1
+
+    // s and t across the face, each in [-1, 1).
+    cvt.rn.f32.u32 %f1, %r7;
+    add.f32 %f1, %f1, 0f3F000000;       // x + 0.5
+    cvt.rn.f32.u32 %f2, %r5;
+    div.rn.f32 %f1, %f1, %f2;           // u in (0, 1)
+    add.f32 %f1, %f1, %f1;
+    add.f32 %f1, %f1, 0fBF800000;       // s = 2u - 1
+    cvt.rn.f32.u32 %f13, %r8;
+    add.f32 %f13, %f13, 0f3F000000;     // y + 0.5
+    div.rn.f32 %f13, %f13, %f2;         // v in (0, 1)
+    add.f32 %f13, %f13, %f13;
+    sub.f32 %f2, 0f3F800000, %f13;      // t = 1 - 2v
+    neg.f32 %f3, %f1;                   // -s
+    neg.f32 %f4, %f2;                   // -t
+
+    // The direction a face and (s, t) stand for, from the programming guide's table.
+    setp.eq.s32 %p0, %r12, 0;
+    setp.eq.s32 %p1, %r12, 1;
+    setp.eq.s32 %p2, %r12, 2;
+    setp.eq.s32 %p3, %r12, 3;
+    setp.eq.s32 %p4, %r12, 4;
+    setp.eq.s32 %p5, %r12, 5;
+
+    mov.f32 %f5, %f1;
+    selp.f32 %f5, %f3, %f5, %p5;
+    selp.f32 %f5, 0f3F800000, %f5, %p0;
+    selp.f32 %f5, 0fBF800000, %f5, %p1;
+
+    mov.f32 %f6, %f4;
+    selp.f32 %f6, 0f3F800000, %f6, %p2;
+    selp.f32 %f6, 0fBF800000, %f6, %p3;
+
+    mov.f32 %f7, %f2;
+    selp.f32 %f7, %f4, %f7, %p3;
+    selp.f32 %f7, %f3, %f7, %p0;
+    selp.f32 %f7, %f1, %f7, %p1;
+    selp.f32 %f7, 0f3F800000, %f7, %p4;
+    selp.f32 %f7, 0fBF800000, %f7, %p5;
+
+    mov.u32 %ru1, %r13;
+    tex.acube.v4.f32.f32 {%f16,%f17,%f18,%f19}, [cube, {%ru1,%f5,%f6,%f7}];
+
+    mul.f32 %f20, %f16, 0f40000000;     // the texel, doubled
+    cvt.rn.f32.s32 %f21, %r12;          // with the face folded in
+    add.f32 %f22, %f20, %f21;
+    cvt.rn.f32.s32 %f23, %r13;
+    mul.f32 %f24, %f23, 0f40C00000;     // six to a layer
+    add.f32 %f25, %f22, %f24;
+    cvt.rn.f32.u32 %f26, %r6;           // and the cube count
+    add.f32 %f27, %f25, %f26;
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f27;
+    ret;
+}

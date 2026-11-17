@@ -1,14 +1,4 @@
-// A texture with one row, sampled by one coordinate, the twin of the 2-D case in
-// ptxtex.ptx:
-//
-//     w = txq.width(t), h = txq.height(t)      // a 64x1 binding
-//     x = gid & 63
-//     t = tex1D(t, (x + 0.5) / 64)             // nearest, clamped
-//     out[gid] = t * 2 + h
-//
-// The height is folded into the answer, so a binding of the wrong shape shows up
-// as a different number rather than as a sample that quietly agrees. Every sample
-// lands on a texel centre, so the answer is the texel itself.
+// A texture with one row, sampled by one coordinate.
 .version 7.0
 .target sm_70
 .address_size 64

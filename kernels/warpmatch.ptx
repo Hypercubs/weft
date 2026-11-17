@@ -1,15 +1,4 @@
 // match.any, match.all and elect, on an 8-lane warp.
-//
-//     electk     elect.sync over the full mask, then `p ? 1000 : 0` plus the elected
-//                lane's index, so lane 0 answers 1000 and every other lane answers 0
-//     matchny    match.any of the input value: the mask of lanes holding that value
-//     matchalld  match.all's mask: all ones when every lane agrees, zero otherwise
-//     matchallp  match.all's predicate, as 7 when true and 3 when false
-//
-// Two inputs: `wmmix.bin` (3,3,5,3,5,7,7,3) and `wmeq.bin` (eight 4s), so each kernel
-// runs once on values that agree and once on values that do not. A `match.any` that
-// compared against the wrong lane, an `all` that ignored the mask, or an election that
-// picked any lane but the lowest moves a whole row.
 .version 8.6
 .target sm_100
 .address_size 64

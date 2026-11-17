@@ -1,15 +1,4 @@
 // movmatrix: the transpose of the matrix `ldmatrix` distributes across a warp.
-//
-// Lane l holds row l>>2 of the 8x8 tile, at columns 2(l&3) and 2(l&3)+1, one half
-// each in its 32-bit register. The transposed tile is laid out by the same rule, so
-// lane l ends up with original elements (2(l&3), l>>2) in its low half and
-// (2(l&3)+1, l>>2) in its high half.
-//
-//   movmtx   one transpose:  out = frag(transpose(M))
-//   movmtx2  two transposes: out = frag(M), which is the input again
-//
-// The second kernel is the one that catches a transpose that moved the right
-// elements to the wrong halves: it is still a permutation, but it is not the inverse.
 .version 7.8
 .target sm_75
 .address_size 64

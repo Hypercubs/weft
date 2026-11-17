@@ -1,17 +1,6 @@
-// `stmatrix.x4` is four tiles back into shared memory. The `.x1` fixture proves the
-// map for a tile at offset zero, so what this adds is the 128-byte stride between
-// tiles and the transposed form at the same time: a store that put every tile at
-// offset zero, or ignored `.trans` for the tiles past the first, passes the `.x1`
-// row and fails here.
-//
-// The tile is four 8x8 tiles of halves holding 0..255 in row-major order, so half h
-// holds h. `ldmatrix.x4` reads them, `stmatrix.x4` writes them back into `back4`,
-// which therefore has to be the tile again, and `stmatrix.x4.trans` writes the
-// transposed fragment into `flip4`, which as a linear array of halves answers with
-//     half h holds  (h & ~63) | 8 (h & 7) | ((h >> 3) & 7)
-// -- each tile's element (r, c) holding what element (c, r) held. The first block
-// out is `back4` read back, the second `flip4`, both
-// sixteen bytes a lane, so the two blocks pin the plain and the transposed store.
+// `stmatrix.x4` is four tiles back into shared memory. The `.x1` fixture proves the map
+// at offset zero, so this adds the 128-byte stride between tiles and the transposed
+// form at once.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -32,7 +21,7 @@
     mov.u32 %r1, %tid.x;
     mov.u64 %rd4, tile4;
 
-    // ---- the tile: half h holds h, four words a lane at 16l ----
+    // the tile: half h holds h, four words a lane at 16l
     shl.b32 %r2, %r1, 4;
     cvt.u64.u32 %rd5, %r2;
     add.s64 %rd5, %rd4, %rd5;
@@ -58,13 +47,13 @@
     st.shared.u32 [%rd5+12], %r9;
     bar.sync 0;
 
-    // ---- four tiles out of the load, and back through both stores ----
+    // four tiles out of the load, and back through both stores
     ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r10, %r11, %r12, %r13}, [tile4];
     stmatrix.sync.aligned.m8n8.x4.shared.b16 [back4], {%r10, %r11, %r12, %r13};
     stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [flip4], {%r10, %r11, %r12, %r13};
     bar.sync 0;
 
-    // ---- out: sixteen bytes of each tile, a lane each ----
+    // out: sixteen bytes of each tile, a lane each
     mul.wide.s32 %rd2, %r1, 16;
     add.s64 %rd3, %rd1, %rd2;
     mov.u64 %rd6, back4;

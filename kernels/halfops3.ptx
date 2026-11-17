@@ -1,7 +1,5 @@
-// Threadgroup memory of a 16-bit float: the arena is byte addressed, so a half
-// array is two bytes an element. Lane l writes its input and reads the next
-// lane's, which a write to the wrong offset or a barrier that lets the read past
-// would both answer wrong.
+// Threadgroup memory of a 16-bit float: the arena is byte addressed, so a half array is
+// two bytes an element.
 .version 7.0
 .target sm_80
 .address_size 64

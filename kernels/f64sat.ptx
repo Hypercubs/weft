@@ -1,22 +1,5 @@
-// `.sat` on a 64-bit float destination, which the ISA defines as the [0, 1] clamp
-// with a NaN flushed to positive zero, not the destination's range. That distinction
-// is the whole fixture: 2.0 saturates down to 1 rather than staying 2, -0.5 goes up to
-// zero, a NaN becomes +0 and not a NaN, a value inside the range is untouched, and
-// -0.0 is *not* below zero, so it keeps its sign.
-//
-//     cvt.sat.f64.f64 2.0   -> 3ff0000000000000
-//     cvt.sat.f64.f64 -0.5  -> 0000000000000000
-//     cvt.sat.f64.f64 NaN   -> 0000000000000000
-//     cvt.sat.f64.f64 0.25  -> 3fd0000000000000   inside the range, untouched
-//     cvt.sat.f64.f64 -0.0  -> 8000000000000000   a zero is not a negative
-//     cvt.sat.f64.f64 +inf  -> 3ff0000000000000
-//     cvt.sat.f64.f64 -inf  -> 0000000000000000
-//     cvt.sat.f64.f64 1.0   -> 3ff0000000000000   the top of the range is legal
-//     cvt.sat.f64.f32 2.0   -> 3ff0000000000000   the same clamp on a converted source
-//
-// This GPU has no fp64, so each of these runs on the software double over the bits
-// while the CPU column runs the host's own, and the answers have to be the same
-// bytes, which is what makes the clamp worth writing over the software comparisons.
+// `.sat` on a 64-bit float destination, which the ISA defines as the [0, 1] clamp with
+// a NaN flushed to positive zero, not the destination's range.
 .version 7.0
 .target sm_70
 .address_size 64

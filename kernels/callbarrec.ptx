@@ -1,0 +1,43 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// Recursion with a barrier after the call. Each frame stops at the barrier and resumes,
+// so the stopped call has to keep its place and every frame has to outlive the stop.
+.visible .func rbaz(
+    .param .u32 n,
+    .param .u64 p
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<5>;
+    .reg .pred %p<2>;
+
+    ld.param.u32 %r1, [n];
+    ld.param.u64 %rd1, [p];
+    setp.gt.u32 %p1, %r1, 0;
+    @%p1 bra L1;
+    bra L2;
+L1:
+    sub.u32 %r2, %r1, 1;
+    call.uni rbaz, (%r2, %rd1);
+L2:
+    bar.sync 0;
+    ld.global.u32 %r3, [%rd1];
+    add.u32 %r3, %r3, 1;
+    st.global.u32 [%rd1], %r3;
+    ret;
+}
+
+.visible .entry callbarrec(
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<2>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, 3;
+    call.uni rbaz, (%r1, %rd1);
+    ret;
+}

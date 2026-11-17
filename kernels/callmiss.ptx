@@ -1,0 +1,39 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// Called with the one slot the declaration says it returns: the value lands in the
+// register the entry names, and the entry stores it.
+.visible .func (.param .b32 tri) trisum(
+    .param .u64 src
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [src];
+    ld.global.u32 %r1, [%rd1];
+    add.u32 %r2, %r1, %r1;
+    add.u32 %r2, %r2, %r1;
+    st.param.b32 [tri], %r2;
+    ret;
+}
+
+.visible .entry callmiss(
+    .param .u64 in,
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd1, %rd1, %rd3;
+    add.u64 %rd2, %rd2, %rd3;
+    call.uni (%r2), trisum, (%rd1);
+    st.global.u32 [%rd2], %r2;
+    ret;
+}

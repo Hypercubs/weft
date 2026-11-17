@@ -1,0 +1,52 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A recursive call whose return list mixes widths: a 64-bit sum and a float beside it.
+// Three down to zero is 6 in both slots, and the entry writes each to its own buffer.
+.visible .func (.reg .b64 acc, .reg .f32 sc) mix(
+    .param .u32 n
+)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<2>;
+
+    ld.param.u32 %r1, [n];
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra base;
+    sub.u32 %r2, %r1, 1;
+    call.uni (%rd1, %f1), mix, (%r2);
+    cvt.u64.u32 %rd2, %r1;
+    add.u64 %rd1, %rd1, %rd2;
+    cvt.rn.f32.u32 %f2, %r1;
+    add.f32 %f1, %f1, %f2;
+    mov.b64 acc, %rd1;
+    mov.f32 sc, %f1;
+    ret;
+base:
+    mov.u64 acc, 0;
+    mov.u32 %r3, 0;
+    cvt.rn.f32.u32 %f3, %r3;
+    mov.f32 sc, %f3;
+    ret;
+}
+
+.visible .entry callmix(
+    .param .u64 wout,
+    .param .u64 fout
+)
+{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<2>;
+    .reg .f32 %f<2>;
+
+    ld.param.u64 %rd1, [wout];
+    ld.param.u64 %rd2, [fout];
+    mov.u32 %r1, 3;
+    call.uni (%rd3, %f1), mix, (%r1);
+    st.global.u64 [%rd1], %rd3;
+    st.global.f32 [%rd2], %f1;
+    ret;
+}

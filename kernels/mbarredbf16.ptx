@@ -1,12 +1,5 @@
-// `cp.reduce.async.bulk` with bfloat16 elements, which the ISA requires in the
-// `.noftz` form for the 16-bit types. Eight bf16 counters 1..8 with 0.5, 1, ... 4
-// added give 1.5, 3, 4.5, 6, 7.5, 9, 10.5, 12, every one exact in a bf16, since a
-// bf16 holds eight significand bits and each of these needs three.
-//
-// The elements are written two to a word, which is how a tile is filled in
-// practice, and the reduction walks eight elements of two bytes rather than four
-// of four: a reduce that kept the 32-bit width would add (1,2) to (0.5,1) as one
-// number and land nowhere near these.
+// `cp.reduce.async.bulk` with bfloat16 elements, which the ISA requires in the `.noftz`
+// form for the 16-bit types.
 .version 8.0
 .target sm_90
 .address_size 64

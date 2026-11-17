@@ -1,18 +1,4 @@
-// Two `.shared` arrays declared at module scope. PTX makes them file scope, one
-// instance per threadgroup, so the arena the launch hands the kernel has to hold
-// both and a kernel that names them addresses them by their place in it.
-//
-//     a[j] = j + 1        b[j] = j + 100
-//     out[i] = a[(i+1)%16] * 1000 + b[(i+1)%16]
-//
-// Both arrays are read, so a layout that put the second one on the first one's
-// bytes answers with 100 wherever `a` should be, and an arena that was never
-// declared for a module-scope tile has no GPU column at all.
-//
-// The address is a 32-bit offset: `mov.u32 %r, ms_a` materialises where the array
-// starts and the index is added to it. A 64-bit register will not do -- ptxas reads
-// `[ms_a + %rd2]` as a syntax error -- because the shared window is addressed at 32
-// bits.
+// Two `.shared` arrays declared at module scope.
 .version 7.0
 .target sm_70
 .address_size 64

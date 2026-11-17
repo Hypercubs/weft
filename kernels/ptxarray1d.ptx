@@ -1,0 +1,47 @@
+// A 1D *array* texture from PTX: one row a layer, coordinate vector {layer, s}.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.global .texref tex;
+
+.visible .entry ptxarray1d(
+    .param .u64 ptxarray1d_param_0
+)
+{
+    .reg .b32 %r<16>;
+    .reg .u32 %ru<2>;
+    .reg .f32 %f<24>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxarray1d_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    // The slice count the binding reports, not a number written into the kernel.
+    txq.depth.b32 %r5, [tex];
+
+    and.b32 %r6, %r4, 63;               // x = gid & 63
+    shr.u32 %r7, %r4, 6;
+    and.b32 %r7, %r7, 3;                // layer = (gid >> 6) & 3
+
+    cvt.rn.f32.u32 %f1, %r6;
+    add.f32 %f3, %f1, 0f3F000000;       // x + 0.5
+    mul.f32 %f5, %f3, 0f3B800000;       // (x + 0.5) / 256
+
+    // The layer, then the coordinate: a 1D array's tuple is two elements wide.
+    mov.u32 %ru1, %r7;
+    tex.a1d.v4.f32.f32 {%f8,%f9,%f10,%f11}, [tex, {%ru1,%f5}];
+
+    mul.f32 %f12, %f8, 0f40000000;      // t * 2
+    cvt.rn.f32.u32 %f13, %r5;           // the slice count, from txq.depth
+    add.f32 %f14, %f12, %f13;
+    cvt.rn.f32.s32 %f15, %r7;
+    add.f32 %f16, %f14, %f15;
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f16;
+    ret;
+}

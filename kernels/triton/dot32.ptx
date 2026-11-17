@@ -49,7 +49,7 @@
 	shr.u32 	%r5, %r2, 2;              // g
 	and.b32 	%r6, %r2, 3;              // t
 
-	// ---- the A fragment: rows g and g+8, columns t and t+4 ----
+	// the A fragment: rows g and g+8, columns t and t+4
 	mad.lo.s32 	%r7, %r5, 8, %r6;
 	mul.wide.u32 	%rd9, %r7, 4;
 	add.s64 	%rd10, %rd5, %rd9;
@@ -58,7 +58,7 @@
 	ld.global.b32 	%r13, [%rd10+16];
 	ld.global.b32 	%r14, [%rd10+272];
 
-	// ---- the B fragment (column layout): rows t and t+4, column g ----
+	// the B fragment (column layout): rows t and t+4, column g
 	mad.lo.s32 	%r8, %r6, 8, %r5;
 	mul.wide.u32 	%rd11, %r8, 4;
 	add.s64 	%rd12, %rd7, %rd11;
@@ -71,7 +71,7 @@
 	mov.f32 	%f10, 0f00000000;
 	mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%f11, %f12, %f13, %f14}, {%r11, %r12, %r13, %r14}, {%r15, %r16}, {%f7, %f8, %f9, %f10};
 
-	// ---- rows g and g+8, columns 2t and 2t+1 ----
+	// rows g and g+8, columns 2t and 2t+1
 	shl.b32 	%r10, %r6, 1;
 	mad.lo.s32 	%r9, %r5, 8, %r10;
 	mul.wide.u32 	%rd13, %r9, 4;

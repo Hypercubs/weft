@@ -1,13 +1,4 @@
-// `prmt` in each of its six named modes, plus the generic form. The mode is a
-// 2-bit selector taken from the low bits of `c`, and the ISA's table for it is
-//   f4e  d.bj = src[(k + j) & 7]     b4e  d.bj = src[(k - j) & 7]
-//   rc8  d.bj = src[k]               rc16 d.bj = src[(k & 1) * 2 + (j & 1)]
-//   ecl  d.bj = src[max(k, j)]       ecr  d.bj = src[min(k, j)]
-// over the eight bytes of (a:b). The fixture's eight source bytes are consecutive
-// from 4*(lane&63), so the selector column spans all four values and the bytes
-// cross 0x80, which is the only way the generic form's sign replication and the
-// edge clamps that hold a high end are both reached. `c` is the lane, so the
-// generic form's four nibbles vary too.
+// `prmt` in each of its six named modes, plus the generic form.
 .version 8.0
 .target sm_80
 .address_size 64

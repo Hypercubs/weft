@@ -41,7 +41,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fp8_ref
 
 # k: the instruction's K. w: bytes per element. fmt: how a value is encoded.
-# cols: how many columns of the result the tile covers.
 SPECS = {
     'f16':    dict(k=16, w=2, fmt='f16',  cols=8),
     'f16n16': dict(k=16, w=2, fmt='f16',  cols=16),
@@ -60,13 +59,9 @@ SPECS = {
 
 ROWS = 64
 
-# Values exact in every float format above and ordinary integers in the integer
-# ones. The integer pools stay inside what both signedness can hold, so the same
-# bytes remain meaningful under either reading.
 POOL = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, -0.5, -1.0, -2.0, 0.25, 0.0, 2.5]
 POOL_I8 = [-4, -2, -1, 0, 1, 2, 3, 5]
 POOL_U8 = [0, 1, 2, 3, 4, 5, 7, 9]
-
 
 def _pool(fmt):
     if fmt == 's8':
@@ -74,7 +69,6 @@ def _pool(fmt):
     if fmt == 'u8':
         return POOL_U8
     return POOL
-
 
 def _enc(v, fmt):
     if fmt in ('e4m3', 'e5m2'):
@@ -84,7 +78,6 @@ def _enc(v, fmt):
     if fmt == 'bf16':
         return struct.pack('<H', struct.unpack('<I', struct.pack('<f', float(v)))[0] >> 16)
     return struct.pack('<e' if fmt == 'f16' else '<f', v)
-
 
 def _dec(b, fmt):
     if fmt in ('e4m3', 'e5m2'):
@@ -98,7 +91,6 @@ def _dec(b, fmt):
         return struct.unpack('<f', struct.pack('<I', struct.unpack('<H', b)[0] << 16))[0]
     return struct.unpack('<e' if fmt == 'f16' else '<f', b)[0]
 
-
 def gen(pa, pb, spec='f16'):
     s = SPECS[spec]
     K, fmt, pool = s['k'], s['fmt'], _pool(s['fmt'])
@@ -107,7 +99,6 @@ def gen(pa, pb, spec='f16'):
     open(pa, 'wb').write(b''.join(acodes))
     open(pb, 'wb').write(b''.join(bcodes))
 
-
 def check(pa, pb, pd, spec='f16'):
     s = SPECS[spec]
     K, w, fmt, cols = s['k'], s['w'], s['fmt'], s['cols']
@@ -115,8 +106,6 @@ def check(pa, pb, pd, spec='f16'):
     braw = open(pb, 'rb').read(K * cols * w)
     A = [_dec(araw[w * i:w * i + w], fmt) for i in range(ROWS * K)]
     B = [_dec(braw[w * i:w * i + w], fmt) for i in range(K * cols)]
-    # An integer accumulator holds the integer, not its float value: past 2^24
-    # those are different numbers, which is the whole reason the pair exists.
     iacc = s.get('iacc', False)
     D = struct.unpack(('<%di' if iacc else '<%df') % (ROWS * cols),
                       open(pd, 'rb').read(ROWS * cols * 4))
@@ -133,7 +122,6 @@ def check(pa, pb, pd, spec='f16'):
                 bad += 1
     print("  %d of %d accumulator elements differ" % (bad, ROWS * cols))
     return bad == 0
-
 
 if __name__ == '__main__':
     mode, args = sys.argv[1], sys.argv[2:]

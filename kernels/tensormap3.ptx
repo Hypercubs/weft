@@ -1,15 +1,6 @@
 // The convolution form: `.im2col` copies a *column* of the implicit GEMM rather than a
-// box. The object is the same 128 bytes; what changes is that it describes a tile of
-// `channelsPerPixel` by `pixelsPerColumn`, and the instruction names the filter window's
-// position beside the corner.
-//
-// The tensor is channels by width by height with `[c][w][h] = c + 2 * (w + 3 * h)`, so
-// channel 0 runs 0 to 8 across the width and height and channel 1 is one word further
-// along. A column of two channels by three pixels at the corner, filter offset (0, 0),
-// is 0, 1, 2, 3, 4, 5, three pixels along the width, both channels of each. The same
-// column at offset (1, 0) starts one pixel further along, so it reads 2, 3, 4, 5 and then
-// the pixel past the right edge, which is zero: what a padded convolution's edge looks
-// like, and the one thing a column copy cannot fake.
+// box. The object is the same 128 bytes, and it describes a tile of `channelsPerPixel`
+// by `pixelsPerColumn`.
 .version 8.3
 .target sm_90
 .address_size 64
@@ -30,7 +21,7 @@
     ld.param.u64 %rd2, [tensorim2col_param_1];
     ld.param.u64 %rd3, [tensorim2col_param_2];
 
-    // ---- the tensor: eighteen words ----
+    // the tensor: eighteen words
     mov.u32 %r1, 0;
 FILL: setp.ge.u32 %p1, %r1, 18;
     @%p1 bra FILLED;
@@ -41,7 +32,7 @@ FILL: setp.ge.u32 %p1, %r1, 18;
     bra FILL;
 FILLED:
 
-    // ---- the map: a column of two channels by three pixels ----
+    // the map: a column of two channels by three pixels
     mov.b64 {%r2, %r3}, %rd2;
     st.global.b32 [%rd3], %r2;
     add.s64 %rd4, %rd3, 4;
@@ -99,7 +90,7 @@ FILLED:
     mov.u32 %r10, 0x41544657;
     st.global.b32 [%rd4], %r10;
 
-    // ---- two columns: the window's first position, then one pixel to the right ----
+    // two columns: the window's first position, then one pixel to the right
     // `.im2col` has no spelling an assembler takes, so the column is gathered by hand
     // from the shape this fixture's map names: two channels a pixel, three pixels along
     // the width, a pixel steps once along it, and a pixel past the extent is the zero a
@@ -142,7 +133,7 @@ PIXD: add.u32 %r12, %r12, 1;
 COLD:
     bar.sync 0;
 
-    // ---- the twelve words, in the order the two columns landed ----
+    // the twelve words, in the order the two columns landed
     ld.shared.b32 %r16, [tile];
     st.global.b32 [%rd1], %r16;
     ld.shared.b32 %r16, [tile + 4];

@@ -1,16 +1,5 @@
-// Hand-written PTX for bar.red, the barrier whose result is a fold over the
-// whole threadgroup (`__syncthreads_count` and friends). Every answer here is a
-// constant that depends only on the thread's index, so check.sh compares them
-// against arithmetic rather than against another implementation:
-//
-//   out[0] = 100   popc of tid < 100
-//   out[1] = 0     and of tid < 200   (not every thread passes)
-//   out[2] = 1     or  of tid == 7
-//   out[3] = 48    popc written twice inside a loop: 32 then 16
-//
-// The loop is the point of the fourth one: the per-thread slots have to be safe
-// to reuse, since the group runs the reduction again before everyone has read
-// the first answer.
+// Hand-written PTX for bar.red, the barrier whose result is a fold over the whole
+// threadgroup (`__syncthreads_count` and friends).
 .version 7.0
 .target sm_70
 .address_size 64

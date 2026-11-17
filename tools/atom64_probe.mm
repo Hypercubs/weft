@@ -1,49 +1,17 @@
 // What does this host's Metal actually have for a 64-bit atomic?
-//
-// The header is misleading in both directions, so this asks the compiler and the
-// device rather than reading it. What it asks, one entry point at a time:
-//
 //   - `atomic_ulong` is *declared* (metal_atomic, behind `__HAVE_ATOMIC_ULONG__`).
-//   - `atomic_fetch_add_explicit` and the other fetching forms are SFINAE'd to
-//     32-bit pointer types (`_valid_fetch_*_type`), so they do not exist for
-//     `ulong` at all, a compile error, not a hardware answer.
-//   - `atomic_max_explicit` / `atomic_min_explicit` on `ulong` *do* compile and
-//     the pipeline for them is refused.
-//   - `atomic_load` / `store` / `exchange` / `compare_exchange` look generic over
-//     `_atomic<T>`, but each is constrained to 32-bit pointer types as well, so a
-//     `ulong` atomic has no operation at all except max/min. CAS is what every
-//     other 64-bit atomic would be built out of, so its absence is the answer to
-//     "can this be done with an instruction": no. The case that does run at the
-//     end is the 32-bit `fetch_add` over the same 4096 threads, printing its
-//     total, so an accepted pipeline is not mistaken for a correct one.
-//
-// A refusal that only exists at pipeline creation is exactly the kind that looks
-// like a compile error from a distance, which is why the answer is measured here
-// and not inferred.
-//
-// Build: clang++ -fobjc-arc -std=c++17 -framework Metal -framework Foundation \
-//          tools/atom64_probe.mm -o /tmp/atom64probe && /tmp/atom64probe
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
 #include <cstdio>
 #include <cstring>
 
-// Compiles `body` and, when it compiles, builds its pipeline too, the step where
-// a 64-bit atomic is actually refused.
-//
-// `threads` > 0 also runs the pipeline that many threads wide and prints the
-// first word of the buffer afterwards, so a case that is accepted can be checked
-// against the answer it is supposed to produce.
 static void probe(id<MTLDevice> dev, const char* label, const char* body, bool make_pipeline,
                   unsigned threads = 0) {
   NSString* src = [NSString stringWithFormat:
                                 @"#include <metal_stdlib>\nusing namespace metal;\n%s", body];
   NSError* err = nil;
   id<MTLLibrary> lib = nil;
-  // The compiler is a service, and it dies under load often enough that a single
-  // failure is not an answer: `weft` retries it three times for the same reason.
-  // Only a refusal the service actually *said* is printed as one.
   for (int attempt = 0; attempt < 4 && !lib; attempt++) {
     err = nil;
     lib = [dev newLibraryWithSource:src options:[MTLCompileOptions new] error:&err];
@@ -100,8 +68,6 @@ static void probe(id<MTLDevice> dev, const char* label, const char* body, bool m
   }
   unsigned long long w0 = 0;
   std::memcpy(&w0, base, 8);
-  // The counter the CAS loop builds should equal the number of threads that ran
-  // past its guard, which is `threads` exactly.
   std::printf("%-34s runs:     counter = %llu  (expected %u)  %s\n", label, w0, threads,
               w0 == (unsigned long long)threads ? "exact" : "WRONG");
 }
@@ -162,8 +128,6 @@ kernel void k(device ulong* p [[buffer(0)]]) {
 }
 )", true);
 
-    // ...and a CAS loop that has to give the exact total, which is what every
-    // unsigned 64-bit atomic operation can be written as.
     probe(dev, "atomic_ulong cas loop count", R"(
 kernel void k(device ulong* p [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
   device atomic_ulong* a = (device atomic_ulong*)&p[0];
@@ -192,8 +156,6 @@ kernel void k(device ulong* p [[buffer(0)]], uint lid [[thread_index_in_threadgr
 }
 )", true, 32);
 
-    // The 32-bit form, for contrast: it has a pipeline, which is why a 64-bit one
-    // being accepted by the compiler is not evidence of much.
     probe(dev, "atomic_uint fetch_add (contrast)", R"(
 kernel void k(device uint* p [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
   device atomic_uint* a = (device atomic_uint*)&p[0];

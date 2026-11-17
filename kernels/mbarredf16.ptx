@@ -1,15 +1,4 @@
 // `cp.reduce.async.bulk` with 16-bit float elements.
-//
-//     buffer = { 1, 2, 3, 4, 5, 6, 7, 8 }      as eight halves
-//     tile   = { 10, 11, 12, 13, 14, 15, 16, 17 }
-//     reduce.add.f16 into the buffer, 16 bytes
-//     buffer = { 11, 13, 15, 17, 19, 21, 23, 25 }
-//
-// Every sum is exact in a half, so the expected bytes are a constant. The halves
-// are written two to a word rather than as `b16` stores, which is also how a real
-// kernel fills a tile: 0x3C00 is 1.0 and the pairs run from there. A reduce that
-// added the words as 32-bit integers, or that walked four elements instead of
-// eight, lands somewhere else entirely.
 .version 8.0
 .target sm_90
 .address_size 64

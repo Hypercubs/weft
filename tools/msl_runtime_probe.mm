@@ -1,14 +1,3 @@
-// Does this host's Metal compiler have the runtime calls an emitted PTX kernel
-// needs?
-//
-// The PTX front end targets a small runtime: buffer addresses, atomics,
-// shuffles, ballots, threadgroup memory. Emitting MSL means those calls have to
-// exist with the same names and the same answers, so this probe asks the
-// compiler rather than assuming, the same way tools/imageblock_probe.mm asks
-// about imageblocks.
-//
-// Build: clang++ -fobjc-arc -std=c++17 -framework Metal -framework Foundation \
-//          tools/msl_runtime_probe.mm -o /tmp/rtprobe && /tmp/rtprobe
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 

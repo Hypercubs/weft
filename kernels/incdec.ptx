@@ -1,20 +1,5 @@
-// atom.inc and atom.dec: table 41 gives them one width, .u32, and this host has no
-// instruction for either. The successor is one step round a cycle bounded by b, as
-// the isa defines it:
-//
-//   inc(r, b) = (r >= b) ? 0 : r + 1
-//   dec(r, b) = (r == 0 || r > b) ? b : r - 1
-//
-// so each is a compare-exchange loop, and N lanes leave the start advanced N steps
-// whatever order they land in. The bound is 3 here, so the cycle is 0, 1, 2, 3 and a
-// test that never wrote the word is a different answer from the right one:
-//
-//   inc     3 lanes from 0: 1, 2, 3
-//   inc     5 lanes from 0: 1, 2, 3, 0, 1 -- the wrap, five steps round
-//   dec     3 lanes from 3: 2, 1, 0
-//   dec     2 lanes from 0: 3, 2 -- the wrap goes up to the bound, not below zero
-//   incgrab 1 lane from 0: value 0 comes back, the word becomes 1
-//   redinc  3 lanes from 0: the reduction form, same 3 with no result
+// atom.inc and atom.dec: table 41 gives them one width,.u32, and this host has no
+// instruction for either.
 .version 7.0
 .target sm_80
 .address_size 64

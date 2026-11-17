@@ -56,7 +56,6 @@ QUARTER_PI = PI / 4
 # the cap on any fraction that would otherwise round up to it.
 CAP_UNDER_ONE = Decimal(1) - Decimal(2) ** -53
 
-
 def d(x):
     """A float or an exact string as a Decimal with every bit the input had."""
     if isinstance(x, Decimal):
@@ -65,13 +64,11 @@ def d(x):
         return Decimal(x)  # exact: binary64 is a finite decimal
     return Decimal(x)
 
-
 def _want_nan(want):
     """A reference can say "not a number" as a Decimal or as a float; both count."""
     if isinstance(want, Decimal):
         return want.is_nan()
     return isinstance(want, float) and want != want
-
 
 def ulps(x, want):
     """Distance from the computed double `x` to the nearest double to `want`."""
@@ -105,7 +102,6 @@ def ulps(x, want):
         return float("inf")
     return steps
 
-
 def ref_sin(x):
     x = d(x)
     n = (x / TAU).to_integral_value(rounding=decimal.ROUND_HALF_EVEN)
@@ -118,7 +114,6 @@ def ref_sin(x):
         total += term
         k += 1
     return total
-
 
 def ref_cos(x):
     x = d(x)
@@ -133,10 +128,8 @@ def ref_cos(x):
         k += 1
     return total
 
-
 def ref_tan(x):
     return ref_sin(x) / ref_cos(x)
-
 
 def ref_atan(x):
     x = d(x)
@@ -159,7 +152,6 @@ def ref_atan(x):
         k += 1
     return total * 32
 
-
 def ref_atan2(y, x):
     y, x = d(y), d(x)
     if x > 0:
@@ -168,16 +160,13 @@ def ref_atan2(y, x):
         return ref_atan(y / x) + (PI if y >= 0 else -PI)
     return HALF_PI if y > 0 else (-HALF_PI if y < 0 else Decimal(0))
 
-
 def ref_asin(x):
     x = d(x)
     return ref_atan2(x, (1 - x * x).sqrt())
 
-
 def ref_acos(x):
     x = d(x)
     return ref_atan2((1 - x * x).sqrt(), x)
-
 
 def ref_pow(x, y):
     x, y = d(x), d(y)
@@ -187,35 +176,28 @@ def ref_pow(x, y):
         raise ValueError("negative base")
     return (y * x.ln()).exp()
 
-
 def ref_expm1(x):
     return d(x).exp() - 1
 
-
 def ref_log1p(x):
     return (1 + d(x)).ln()
-
 
 def ref_cbrt(x):
     x = d(x)
     return -((-x).ln().exp() / 3).exp() if False else (abs(x).ln() / 3).exp() * (1 if x >= 0 else -1)
 
-
 def ref_hypot(x, y):
     return (d(x) ** 2 + d(y) ** 2).sqrt()
-
 
 def ref_remainder(x, y):
     x, y = d(x), d(y)
     q = (x / y).to_integral_value(rounding=decimal.ROUND_HALF_EVEN)
     return x - y * q
 
-
 def ref_fmod(x, y):
     x, y = d(x), d(y)
     q = (x / y).to_integral_value(rounding=decimal.ROUND_DOWN)
     return x - y * q
-
 
 def ref_fract(x):
     """The part below the binary point, capped at the largest value under one. A NaN
@@ -226,7 +208,6 @@ def ref_fract(x):
         return CAP_UNDER_ONE
     r = x - x.to_integral_value(rounding=decimal.ROUND_FLOOR)
     return CAP_UNDER_ONE if r >= CAP_UNDER_ONE else r
-
 
 #
 # `erf` is the Maclaurin series in decimal, which is the same series the library uses
@@ -253,7 +234,6 @@ def ref_erf(x):
             break
     return total * 2 / PI.sqrt()
 
-
 def _bernoulli(n):
     a = [Fraction(0)] * (n + 1)
     for m in range(n + 1):
@@ -262,9 +242,7 @@ def _bernoulli(n):
             a[j - 1] = j * (a[j - 1] - a[j])
     return a[0]
 
-
 _BERN = [_bernoulli(2 * k) for k in range(1, 11)]
-
 
 def ref_lgamma(z):
     z = d(z)
@@ -273,7 +251,6 @@ def ref_lgamma(z):
         total += (Decimal(b.numerator) / Decimal(b.denominator)
                   / (2 * k * (2 * k - 1)) / z ** (2 * k - 1))
     return total
-
 
 def ref_sinpi(x):
     x = d(x)
@@ -288,7 +265,6 @@ def ref_sinpi(x):
         total += term
         k += 1
     return -total if n % 2 else total
-
 
 def ref_tgamma(x):
     x = d(x)
@@ -310,7 +286,6 @@ def ref_tgamma(x):
         total -= (x + j).ln()
     return total.exp()
 
-
 def ref_erfc_tail(x):
     """erfc of a positive x above six, as the continued fraction of the incomplete
     gamma: erfc(x) = exp(-x^2) / (x sqrt(pi)) * 1/(1 + v/(1 + 2v/(1 + 3v/...))) with
@@ -324,10 +299,9 @@ def ref_erfc_tail(x):
         cf = (k * v) / (1 + cf)
     return (-(x * x)).exp() / (x * PI.sqrt()) / (1 + cf)
 
-
 def ref_erfc(x):
     # Below six the decimal series keeps every bit of the difference. Above it the
-    # difference *is* the answer, 1 - erf would have nothing left to subtract from , 
+    # difference *is* the answer, 1 - erf would have nothing left to subtract from ,
     # and the continued fraction above gives it directly in decimal, so no reference
     # in this file leans on the host's libm.
     x = d(x)
@@ -336,9 +310,8 @@ def ref_erfc(x):
         return tail if x > 0 else 2 - tail
     return 1 - ref_erf(x)
 
-
 #
-# Each reference returns a pair, and both halves are computed in exact arithmetic , 
+# Each reference returns a pair, and both halves are computed in exact arithmetic ,
 # a Fraction, not a libm call, so the pair cannot inherit the mistake it is meant to
 # catch.  The second half is an integer where the specification says an integer.
 def ref_frexp(x):
@@ -355,17 +328,14 @@ def ref_frexp(x):
         e -= 1
     return (Decimal(fr.numerator) / Decimal(fr.denominator), e)
 
-
 def ref_modf(x):
     fr = Fraction(d(x))
     whole = int(fr)  # toward zero, which is what truncation means
     rest = fr - whole
     return (Decimal(rest.numerator) / Decimal(rest.denominator), Decimal(whole))
 
-
 def ref_sincos(x):
     return (ref_sin(x), ref_cos(x))
-
 
 def ref_remquo(x, y):
     fx, fy = Fraction(d(x)), Fraction(d(y))
@@ -375,7 +345,6 @@ def ref_remquo(x, y):
     if low >= 1 << 31:
         low -= 1 << 32
     return (Decimal(rest.numerator) / Decimal(rest.denominator), low)
-
 
 #
 # The reduction is exact before the decimal ever sees it: x = n + r with r in [-1/2, 1/2]
@@ -388,33 +357,26 @@ def ref_sinpi_via(x):
     n = int(x.to_integral_value(rounding=decimal.ROUND_HALF_EVEN))
     return n, x - n
 
-
 def ref_cospi(x):
     n, r = ref_sinpi_via(x)
     v = ref_cos(PI * r)
     return -v if n % 2 else v
 
-
 def ref_tanpi(x):
     n, r = ref_sinpi_via(x)
     return ref_tan(PI * r)
 
-
 def ref_asinpi(x):
     return ref_asin(x) / PI
-
 
 def ref_acospi(x):
     return ref_acos(x) / PI
 
-
 def ref_atanpi(x):
     return ref_atan(x) / PI
 
-
 def ref_atan2pi(y, x):
     return ref_atan2(y, x) / PI
-
 
 #
 # Everything here is decided by the encoding rather than by an approximation, so the
@@ -423,14 +385,11 @@ def ref_atan2pi(y, x):
 def _bits(v):
     return struct.unpack("<Q", struct.pack("<d", float(v)))[0]
 
-
 def _of(b):
     return struct.unpack("<d", struct.pack("<Q", b & 0xFFFFFFFFFFFFFFFF))[0]
 
-
 def _nan(v):
     return isinstance(v, float) and v != v
-
 
 def ref_sqrt(x):
     x = d(x)
@@ -438,26 +397,22 @@ def ref_sqrt(x):
         return Decimal("NaN")
     return x.sqrt()
 
-
 def ref_copysign(x, y):
     return _of((_bits(x) & ~(1 << 63)) | (_bits(y) & (1 << 63)))
-
 
 def ref_fdim(x, y):
     if _nan(x) or _nan(y):
         return Decimal("NaN")
     return d(x) - d(y) if d(x) > d(y) else Decimal(0)
 
-
 def ref_minmag(x, y):
     if _nan(x):
         return Decimal("NaN") if _nan(y) else y
     if _nan(y):
         return x
-    if abs(x) == abs(y):          # a tie is fmin, not simply the second operand
+    if abs(x) == abs(y):          # a tie is fmin, not the second operand
         return x if x < y else y
     return x if abs(x) < abs(y) else y
-
 
 def ref_maxmag(x, y):
     if _nan(x):
@@ -467,7 +422,6 @@ def ref_maxmag(x, y):
     if abs(x) == abs(y):
         return x if x > y else y
     return x if abs(x) > abs(y) else y
-
 
 def ref_nextafter(x, y):
     """One step in the encoding, which is monotone in the value: the next bit pattern,
@@ -482,14 +436,11 @@ def ref_nextafter(x, y):
     step = 1 if ((x < y) == (x > 0)) else -1
     return _of(bx + step)
 
-
 def ref_ldexp(x, n):
     return d(x) * (Decimal(2) ** int(n))
 
-
 def ref_pown(x, n):
     return d(x) ** int(n)
-
 
 def ref_rootn(x, n):
     x, n = d(x), int(n)
@@ -501,10 +452,8 @@ def ref_rootn(x, n):
         return -(((-x).ln()) / n).exp()
     return (x.ln() / n).exp()
 
-
 def ref_powr(x, y):
     return Decimal("NaN") if d(x) < 0 else ref_pow(x, y)
-
 
 # name -> (library function, number of arguments, reference)
 FUNCS = {
@@ -587,7 +536,6 @@ TWO_ARG = [(0.5, 3.0), (2.0, 10.0), (2.0, 0.5), (10.0, -2.0), (1e300, 0.0),
            (4.5, 3.0), (-4.5, 3.0), (7.5, 3.0), (1.5, 3.0),
            (3.0, 100.0), (1.0000001, 1e6), (0.9999999, 1e6), (2.0, -1074.0),
            (1e-300, 3.0), (7.0, 0.3333333333333333), (1.5, 1.5)]
-
 
 def inputs_for(name):
     if name in ("log", "log2", "log10"):
@@ -688,14 +636,12 @@ def inputs_for(name):
         return [(v,) for v in [1.0, 1.5, 2.0, 10.0, 1e20, 1e300]]
     return [(v,) for v in ONE_ARG]
 
-
 def library_text():
     src = open(os.path.join(os.path.dirname(__file__), "..", "src", "weft_f64.hpp")).read()
     m = re.search(r'R"WEFFF64\((.*)\)WEFFF64"', src, re.S)
     if not m:
         sys.exit("tools/f64_math.py: could not find the library text in src/weft_f64.hpp")
     return m.group(1)
-
 
 HARNESS = r"""
 #include <cmath>
@@ -796,18 +742,23 @@ int main() {
 }
 """
 
+def cxx():
+    import shutil
+    for name in (os.environ.get("CXX"), "clang++", "c++", "g++"):
+        if name and shutil.which(name):
+            return name
+    sys.exit("no C++ compiler on PATH")
 
 def build():
     tmp = tempfile.mkdtemp(prefix="f64math.")
     src = os.path.join(tmp, "harness.cpp")
     exe = os.path.join(tmp, "harness")
     open(src, "w").write(HARNESS % library_text())
-    cmd = ["clang++", "-std=c++20", "-O2", src, "-o", exe]
+    cmd = [cxx(), "-std=c++20", "-O2", src, "-o", exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit("the library did not compile as C++:\n" + r.stderr[:4000])
     return exe
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -849,9 +800,6 @@ def main():
             want, second = want
             got2 = unhex(words[1]) if len(words) > 1 else float("nan")
         if _want_nan(want):
-            # A pole, or a negative infinity: the answer is not a number, and the
-            # library has to say so. A finite answer here is a failure even when it
-            # looks plausible, so it is counted rather than skipped.
             if not (isinstance(got, float) and math.isnan(got)):
                 bad.append((name, argv, got, want, float("inf")))
             continue
@@ -883,7 +831,6 @@ def main():
             print(f"  {name}({argv}) = {got!r}, exact {want!r}, {u:.0f} ulp off")
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

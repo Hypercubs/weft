@@ -1,23 +1,4 @@
-// 16-bit float arithmetic. A `b16` register holds the *bits* of a half, and the
-// instruction's `.f16` is what says to read them as one. Sixteen results a lane,
-// each on a grid point chosen so a wrong reading is visible:
-//
-//   0  add 1.0 + b
-//   1  sub 1.0 - b
-//   2  mul 0.5 * b
-//   3  fma 2.0 * b + 1.0        one rounding of the product and the sum
-//   4  min 1.0, b               NaN hands back the other operand
-//   5  max 1.0, b
-//   6  neg b                    the sign bit, exact on a NaN
-//   7  abs b
-//   8  add.sat 0.75, b          the [0, 1] clamp, not the destination's range
-//   9  mul.sat 1.0, b
-//  10  fma 1.0, 1.0, 2^-11      exactly halfway between 1 and 1+2^-10: ties to even
-//  11  fma 1+2^-10, 1.0, 2^-11  halfway again, one ulp up, and even is two ulp
-//  12  add 65504, 1.0           inside the range, so still 65504
-//  13  mul 0.5, 65504           32752, exactly
-//  14  add 2^-24, 2^-24         the subnormal grid: 2^-23
-//  15  sub 2^-24, 2^-24         +0, not -0
+// 16-bit float arithmetic.
 .version 7.0
 .target sm_80
 .address_size 64

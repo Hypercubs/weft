@@ -1,27 +1,4 @@
-// The multifunction unit's seven approximations, all in one lane. PTX names each
-// operation itself -- `rcp.approx`, `rsqrt.approx`, `sqrt.approx`, `ex2`, `lg2`,
-// `sin`, `cos`, `tanh` -- where a SASS dump would say `mufu.<op>`.
-//
-//     a  = |in[gid]| + 1.5                 positive and bounded
-//     b  = 1 / (1 + a)                     in (0, 0.4]
-//     r  = mufu.rcp.approx     a           1/a
-//     q  = mufu.rsqrt.approx   a           1/sqrt(a)
-//     u  = mufu.sqrt.approx    a           sqrt(a)
-//     e  = mufu.ex2.approx     b - 1       in (1/8, 1]
-//     l  = mufu.lg2.approx     a
-//     s  = mufu.sin.approx     a
-//     c  = mufu.cos.approx     a
-//     t  = mufu.tanh.approx    a
-//     out[gid] = r + 2q + 4u + 8e + 16l + 32s + 64c + 128t
-//
-// `.approx` is the only mode the unit has, and the approximation is the silicon's
-// own polynomial: no CPU reproduces those bits, so the same argument that made
-// Metal's `sqrt` a library call applies here. Both columns run the portable text,
-// which is why this kernel can be compared byte for byte instead of by a
-// tolerance. Every term is a different weight, so one operation mapped to another
-// lands on a different number.
-// `tanh.approx.f32` is the one operation here that needs something newer than the
-// fixture's original baseline, so the target is one that has it.
+// The multifunction unit's seven approximations, all in one lane.
 .version 7.0
 .target sm_75
 .address_size 64

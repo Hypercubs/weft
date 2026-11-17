@@ -1,19 +1,4 @@
 // The tensor map feeding the matrix path.
-//
-// `kernels/triton/matmul.ptx` copies its A and B tiles into threadgroup memory itself
-// and rounds the floats to halves on the way. Here the same two tiles arrive through
-// `cp.async.bulk.tensor` instead: the kernel describes each tensor once, loads both
-// tiles with one barrier, and from there the matrix path is the one the Triton kernel
-// already uses, `ldmatrix` reads the fragments out of threadgroup memory,
-// `mma.sync.m16n8k16` multiplies them, and each lane stores the four outputs it owns.
-// Nothing between the copy and the multiply is special-cased, so what this checks is
-// that a tile delivered by a descriptor is in the layout the fragments are read in.
-//
-// A is 16x16 halves with 1.0 at or below the diagonal; B is 16x8 with 1.0 in column 0.
-// Row r of the product is therefore r+1 in column 0 and zero everywhere else, which a
-// tile that arrived a row or a column off does not produce, a descriptor with the
-// wrong stride walks the tensor by the wrong amount, and a box read in the wrong order
-// fills the tile transposed.
 .version 8.3
 .target sm_90
 .address_size 64
@@ -42,7 +27,7 @@
     ld.param.u64 %rd4, [tmadot_param_3];
     mov.u32 %r2, %tid.x;
 
-    // ---- A: lane l owns row l>>1, the eight columns starting at 8(l&1) ----
+    // A: lane l owns row l>>1, the eight columns starting at 8(l&1)
     shr.u32 %r3, %r2, 1;
     and.b32 %r5, %r2, 1;
     shl.b32 %r4, %r5, 3;
@@ -88,7 +73,7 @@
     add.s64 %rd6, %rd2, %rd5;
     st.global.v4.b32 [%rd6], {%r20, %r21, %r22, %r23};
 
-    // ---- B: lane l owns row l>>1, the four columns starting at 4(l&1) ----
+    // B: lane l owns row l>>1, the four columns starting at 4(l&1)
     and.b32 %r7, %r2, 1;
     setp.eq.s32 %p3, %r7, 0;
     selp.b32 %r24, 0x3C00, 0, %p3;
@@ -98,7 +83,7 @@
     add.s64 %rd8, %rd3, %rd7;
     st.global.v2.b32 [%rd8], {%r24, %r25};
 
-    // ---- the two maps: A, then B at the second half of the buffer ----
+    // the two maps: A, then B at the second half of the buffer
     mov.u64 %rd9, %rd4;
     add.s64 %rd10, %rd4, 128;
 
@@ -166,7 +151,7 @@
     add.s64 %rd11, %rd10, 124;
     st.global.b32 [%rd11], %r44;
 
-    // ---- both tiles, one barrier, 512 + 256 bytes ----
+    // both tiles, one barrier, 512 + 256 bytes
     // The barrier is the block's: all thirty-two lanes owe an arrival, and the lane that
     // issues the copies is the one that says how many bytes they will move. That is the
     // shape a Triton kernel has, elect a leader for the copies, then everyone arrives.
@@ -185,7 +170,7 @@ WAIT: mbarrier.try_wait.parity.shared.b64 %p4, [mbr], 0;
     @!%p4 bra WAIT;
     bar.sync 0;
 
-    // ---- four 8x8 tiles of A, then two of B transposed: the same fragment map the
+    // four 8x8 tiles of A, then two of B transposed: the same fragment map the
     // Triton kernel uses, read out of tiles that a descriptor filled ----
     mov.u64 %rd11, tileA;
     shr.u32 %r16, %r2, 3;
@@ -210,14 +195,14 @@ WAIT: mbarrier.try_wait.parity.shared.b64 %p4, [mbr], 0;
     add.s64 %rd19, %rd19, 512;
     ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r26, %r27}, [%rd19];
 
-    // ---- D = A * B, accumulated from zero ----
+    // D = A * B, accumulated from zero
     mov.f32 %f13, 0f00000000;
     mov.f32 %f14, 0f00000000;
     mov.f32 %f15, 0f00000000;
     mov.f32 %f16, 0f00000000;
     mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f17, %f18, %f19, %f20}, {%r20, %r21, %r22, %r23}, {%r26, %r27}, {%f13, %f14, %f15, %f16};
 
-    // ---- the four outputs this lane owns: rows g and g+8, columns 2t and 2t+1 ----
+    // the four outputs this lane owns: rows g and g+8, columns 2t and 2t+1
     and.b32 %r28, %r2, 3;
     shr.u32 %r29, %r2, 2;
     shl.b32 %r29, %r29, 5;

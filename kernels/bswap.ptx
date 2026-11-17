@@ -6,9 +6,7 @@
 // the width, where the byte has to cross the register rather than move inside it. The
 // 64-bit form repeats all of that one size up, and its two 32-bit halves trade places as
 // well.
-//
 // PTX has no `bswap`, so the word is `prmt` with the picking order that reverses the
-// four bytes, and the double word is two of those with the two halves exchanged.
 .visible .entry bswap(.param .u64 p0)
 {
     .reg .b32 %r<20>;

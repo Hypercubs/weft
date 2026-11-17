@@ -1,8 +1,5 @@
-// `cp.reduce.async.bulk` with 64-bit float elements: 1.5 and 2.5 with 0.25 added,
-// which is 1.75 and 2.75, all four exact in binary64, so the expected bits are a
-// constant. On the GPU a double is the `uint64_t` its bits live in and the sum is
-// `weft_fp64::add`; on the CPU it is the host's own double. A reduce that added the
-// words as integers, or walked four elements instead of two, lands elsewhere.
+// `cp.reduce.async.bulk` with 64-bit float elements: 1.5 and 2.5 with 0.25 added, which
+// is 1.75 and 2.75, all four exact in binary64.
 .version 8.0
 .target sm_90
 .address_size 64

@@ -1,28 +1,6 @@
 // The byte shapes: `ldmatrix.m16n16.b8` and `stmatrix.m16n8.b8`, the pair a Blackwell
-// kernel uses for fp8 and fp4 operands.
-//
-// Both write a closed form out, so what is checked is the map rather than two engines
-// agreeing with each other. The maps are CUTLASS's: `SM100_U8x8_LDSM_T` in
-// `cute/arch/copy_sm100.hpp` and its reference layout in `copy_traits_sm100.hpp` say a
-// lane's logical byte s of a 16x16 tile is
-//
-//     row = 2*(l&3) + (s&1) + 8*(s>>2),   col = (l>>2) + 8*((s>>1)&1)
-//
-// and the shuffle that same `copy()` applies to the raw result says logical byte s is
-// byte q of register r where s = 2*r + (q&1) + 4*(q>>1). A 16x16 tile holds 0..255 in
-// row-major order, so each of the sixty-four words out is four of those numbers in the
-// order the hardware hands them back.
-//
-// The store is the `m16n8` shape, one register a matrix, logical byte s at
-//
-//     row = 4*(l&3) + 2*(s&1) + ((s>>1)&1),   col = l>>2
-//
-// of a tile 16 rows by 8 bytes. Lane l's register holds 4l..4l+3, so every byte of the
-// 256-byte tile is written exactly once and each word out is the four numbers that
-// landed on those bytes.
-//
-// What this cannot check is agreement with a real GPU: these instructions are sm_100
-// and this host is not, so the fixture pins the implementation to the published map.
+// kernel uses for fp8 and fp4 operands. Both write a closed form out, so what is
+// checked is the map rather than two engines agreeing.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -44,7 +22,7 @@
 
     mov.u32 %r1, %tid.x;
 
-    // ---- the tile: byte k holds k, eight a lane ----
+    // the tile: byte k holds k, eight a lane
     shl.b32 %r2, %r1, 3;                    // 8l
     mov.u64 %rd4, tile;
     mov.u32 %r3, 0;
@@ -60,17 +38,17 @@ FILLED:
 
     bar.sync 0;
 
-    // ---- the fragment: two registers a lane ----
+    // the fragment: two registers a lane
     ldmatrix.sync.aligned.m16n16.x1.trans.shared.b8 {%r10, %r11}, [tile];
 
-    // ---- out: the eight bytes the lane holds ----
+    // out: the eight bytes the lane holds
     shl.b32 %r6, %r1, 3;
     cvt.u64.u32 %rd6, %r6;
     add.s64 %rd7, %rd1, %rd6;
     st.global.b32 [%rd7], %r10;
     st.global.b32 [%rd7+4], %r11;
 
-    // ---- the same fragment stored as two 16x8 tiles, then read back ----
+    // the same fragment stored as two 16x8 tiles, then read back
     stmatrix.sync.aligned.m16n8.x2.trans.shared.b8 [back], {%r10, %r11};
 
     bar.sync 0;

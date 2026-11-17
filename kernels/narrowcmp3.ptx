@@ -1,11 +1,4 @@
-// The packed forms: one instruction compares both halves. `set` answers a word with a
-// 0xFFFF per half that is true, and `setp` answers a pair of predicates written
-// `p|q`. `0x3C003800` is 1.0 above 0.5, so a lane equal to that pair answers all ones
-// and a lane below it answers 0xFFFF in the low half only.
-//
-//   0  set.eq  a, (1.0, 0.5)     the mask
-//   1  setp.lt a, (1.0, 0.5) p   low half below 0.5
-//   2  setp.lt a, (1.0, 0.5) q   high half below 1.0
+// The packed forms: one instruction compares both halves.
 .version 7.0
 .target sm_80
 .address_size 64

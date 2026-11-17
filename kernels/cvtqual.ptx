@@ -1,0 +1,394 @@
+// The qualifiers the narrow converts carry, each case pinned to a word. `rs` splits the
+// random word by operand, so the byte-wide destinations take `a` and `b` from the upper
+// half and `e` and `f` from the lower.
+.version 8.8
+.target sm_100a
+.address_size 64
+
+.visible .entry cvtrsx4(
+    .param .u64 cvtrsx4_param_0      // five words
+)
+{
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<12>;
+    .reg .b16 %rb<8>;
+    .reg .b8 %rc<8>;
+    .reg .pred %p<8>;
+
+    ld.param.u64 %rd1, [cvtrsx4_param_0];
+
+    // e4m3x4: three mantissa bits kept, so twenty are dropped
+    mov.u32 %r1, 0x3F880000;                // 1.0625, exactly half an ulp above 1
+    mov.u32 %r2, 0x3F880000;
+    mov.u32 %r3, 0x40000000;                // 2.0
+    mov.u32 %r4, 0xBF000000;                // -0.5
+    mov.u32 %r5, 0x807F0000;                // the random word
+    shr.u32 %r6, %r5, 24;                   // a's byte, from the upper half
+    and.b32 %r10, %r1, 0x000FFFFF;          // what the grid drops
+    and.b32 %r11, %r1, 0xFFF00000;          // what it keeps
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x08000080;      // above half, or half and the bit set
+    selp.b32 %r12, 0x00100000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f1, %r11;
+    shr.u32 %r6, %r5, 16;                   // b's byte
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r2, 0x000FFFFF;
+    and.b32 %r11, %r2, 0xFFF00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x08000080;
+    selp.b32 %r12, 0x00100000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f2, %r11;
+    shr.u32 %r6, %r5, 8;                    // e's byte, from the lower half
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r3, 0x000FFFFF;
+    and.b32 %r11, %r3, 0xFFF00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x08000080;
+    selp.b32 %r12, 0x00100000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f3, %r11;
+    and.b32 %r6, %r5, 0xFF;                 // f's byte
+    and.b32 %r10, %r4, 0x000FFFFF;
+    and.b32 %r11, %r4, 0xFFF00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x08000080;
+    selp.b32 %r12, 0x00100000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f4, %r11;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f2;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f3, %f4;
+    cvt.u32.u16 %r30, %rb1;
+    cvt.u32.u16 %r31, %rb2;
+    shl.b32 %r30, %r30, 16;                 // a and b are the upper pair
+    or.b32 %r32, %r30, %r31;
+    st.global.u32 [%rd1], %r32;
+
+    // the same tie one grid step wider, in four bits a value
+    mov.u32 %r1, 0x3FA00000;                // 1.25, half way between 1 and 1.5
+    mov.u32 %r2, 0x3FA00000;
+    mov.u32 %r3, 0x40000000;
+    mov.u32 %r4, 0xBF800000;
+    mov.u32 %r5, 0x80007F00;
+    shr.u32 %r6, %r5, 24;
+    and.b32 %r10, %r1, 0x003FFFFF;
+    and.b32 %r11, %r1, 0xFFC00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x20000080;
+    selp.b32 %r12, 0x00400000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f1, %r11;
+    shr.u32 %r6, %r5, 16;
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r2, 0x003FFFFF;
+    and.b32 %r11, %r2, 0xFFC00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x20000080;
+    selp.b32 %r12, 0x00400000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f2, %r11;
+    shr.u32 %r6, %r5, 8;
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r3, 0x003FFFFF;
+    and.b32 %r11, %r3, 0xFFC00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x20000080;
+    selp.b32 %r12, 0x00400000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f3, %r11;
+    and.b32 %r6, %r5, 0xFF;
+    and.b32 %r10, %r4, 0x003FFFFF;
+    and.b32 %r11, %r4, 0xFFC00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x20000080;
+    selp.b32 %r12, 0x00400000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f4, %r11;
+    cvt.rn.satfinite.e2m1x2.f32 %rc1, %f1, %f2;
+    cvt.rn.satfinite.e2m1x2.f32 %rc2, %f3, %f4;
+    cvt.u32.u8 %r30, %rc1;
+    cvt.u32.u8 %r31, %rc2;
+    shl.b32 %r30, %r30, 8;                  // a and b are the upper pair
+    or.b32 %r32, %r30, %r31;
+    st.global.u32 [%rd1+4], %r32;
+
+    // fp6: six-bit destinations, a byte apart
+    mov.u32 %r1, 0x3F900000;                // 1.125, half way to 1.25
+    mov.u32 %r2, 0x3F900000;
+    mov.u32 %r3, 0x3F800000;
+    mov.u32 %r4, 0xC0800000;
+    mov.u32 %r5, 0x807F0000;
+    shr.u32 %r6, %r5, 24;
+    and.b32 %r10, %r1, 0x001FFFFF;
+    and.b32 %r11, %r1, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f1, %r11;
+    shr.u32 %r6, %r5, 16;
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r2, 0x001FFFFF;
+    and.b32 %r11, %r2, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f2, %r11;
+    shr.u32 %r6, %r5, 8;
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r3, 0x001FFFFF;
+    and.b32 %r11, %r3, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f3, %r11;
+    and.b32 %r6, %r5, 0xFF;
+    and.b32 %r10, %r4, 0x001FFFFF;
+    and.b32 %r11, %r4, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f4, %r11;
+    cvt.rn.satfinite.e3m2x2.f32 %rb1, %f1, %f2;
+    cvt.rn.satfinite.e3m2x2.f32 %rb2, %f3, %f4;
+    cvt.u32.u16 %r30, %rb1;
+    cvt.u32.u16 %r31, %rb2;
+    shl.b32 %r30, %r30, 16;                 // a and b are the upper pair
+    or.b32 %r32, %r30, %r31;
+    st.global.u32 [%rd1+8], %r32;
+
+    // e5m2 keeps an infinity and a NaN, and the same tie rule
+    mov.u32 %r1, 0x3F900000;
+    mov.u32 %r2, 0x3F900000;
+    mov.u32 %r3, 0xC0000000;
+    mov.u32 %r4, 0x3E800000;
+    mov.u32 %r5, 0x807F0000;
+    shr.u32 %r6, %r5, 24;
+    and.b32 %r10, %r1, 0x001FFFFF;
+    and.b32 %r11, %r1, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f1, %r11;
+    shr.u32 %r6, %r5, 16;
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r2, 0x001FFFFF;
+    and.b32 %r11, %r2, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f2, %r11;
+    shr.u32 %r6, %r5, 8;
+    and.b32 %r6, %r6, 0xFF;
+    and.b32 %r10, %r3, 0x001FFFFF;
+    and.b32 %r11, %r3, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f3, %r11;
+    and.b32 %r6, %r5, 0xFF;
+    and.b32 %r10, %r4, 0x001FFFFF;
+    and.b32 %r11, %r4, 0xFFE00000;
+    shl.b32 %r10, %r10, 8;
+    add.u32 %r10, %r10, %r6;
+    setp.ge.u32 %p1, %r10, 0x10000080;
+    selp.b32 %r12, 0x00200000, 0, %p1;
+    add.u32 %r11, %r11, %r12;
+    mov.b32 %f4, %r11;
+    cvt.rn.satfinite.e5m2x2.f32 %rb1, %f1, %f2;
+    cvt.rn.satfinite.e5m2x2.f32 %rb2, %f3, %f4;
+    cvt.u32.u16 %r30, %rb1;
+    cvt.u32.u16 %r31, %rb2;
+    shl.b32 %r30, %r30, 16;                 // a and b are the upper pair
+    or.b32 %r32, %r30, %r31;
+    st.global.u32 [%rd1+12], %r32;
+
+    // `.relu` zeroes the negative before the convert; zero random bits carry
+    //      nothing, and every value here is already on the grid ----
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r1, 0xBF800000;
+    mov.b32 %f5, %r1;
+    max.f32 %f1, %f5, %f1;                  // the relu
+    mov.u32 %r2, 0x40800000;
+    mov.b32 %f2, %r2;
+    mov.u32 %r3, 0x40400000;
+    mov.b32 %f3, %r3;
+    mov.u32 %r4, 0x3F000000;
+    mov.b32 %f4, %r4;
+    cvt.rn.satfinite.e2m1x2.f32 %rc1, %f1, %f2;
+    cvt.rn.satfinite.e2m1x2.f32 %rc2, %f3, %f4;
+    cvt.u32.u8 %r30, %rc1;
+    cvt.u32.u8 %r31, %rc2;
+    shl.b32 %r30, %r30, 8;                  // a and b are the upper pair
+    or.b32 %r32, %r30, %r31;
+    st.global.u32 [%rd1+16], %r32;
+    ret;
+}
+
+// The truncating converts, on the pair forms: the dropped bits go, and nothing is
+// carried into what is kept.
+.visible .entry cvtrz2(
+    .param .u64 cvtrz2_param_0      // three words
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<8>;
+    .reg .b16 %rb<4>;
+    .reg .b8 %rc<4>;
+
+    ld.param.u64 %rd1, [cvtrz2_param_0];
+
+    // 1.1875 is three eighths of an ulp into a 0.125 grid: rn takes it up, rz does not
+    mov.u32 %r1, 0x3F980000;
+    and.b32 %r2, %r1, 0xFFF00000;
+    mov.b32 %f1, %r2;
+    mov.u32 %r3, 0xBF980000;
+    and.b32 %r4, %r3, 0xFFF00000;
+    mov.b32 %f2, %r4;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f2;
+    cvt.u32.u16 %r5, %rb1;
+    st.global.u32 [%rd1], %r5;
+
+    // 1.75 is exactly half way between two fp4 values, and a tie truncates down
+    mov.u32 %r6, 0x3FE00000;
+    and.b32 %r7, %r6, 0xFFC00000;
+    mov.b32 %f3, %r7;
+    mov.u32 %r8, 0xBFE00000;
+    and.b32 %r9, %r8, 0xFFC00000;
+    mov.b32 %f4, %r9;
+    cvt.rn.satfinite.e2m1x2.f32 %rc1, %f3, %f4;
+    cvt.u32.u8 %r10, %rc1;
+    st.global.u32 [%rd1+4], %r10;
+
+    // the 16-bit destination keeps its own form, which ptxas does have
+    mov.u32 %r11, 0x3F807000;
+    mov.u32 %r12, 0xBF807000;
+    mov.b32 %f1, %r11;
+    mov.b32 %f2, %r12;
+    cvt.rz.satfinite.f16x2.f32 %r13, %f1, %f2;
+    st.global.u32 [%rd1+8], %r13;
+    ret;
+}
+
+// The ue8m0 scales and `.pzo`.
+.visible .entry cvtscaled(
+    .param .u64 cvtscaled_param_0      // five words
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<12>;
+    .reg .b16 %rb<8>;
+
+    ld.param.u64 %rd1, [cvtscaled_param_0];
+
+    // 0x7e is 2^-1, so dividing by it doubles both sources
+    mov.u32 %r1, 0x40000000;
+    mov.b32 %f1, %r1;
+    mov.u32 %r2, 0x3F800000;
+    mov.b32 %f2, %r2;
+    mov.u32 %r3, 0x7E;
+    shl.b32 %r3, %r3, 23;                   // 2^(s - 127)
+    mov.b32 %f3, %r3;
+    div.rn.f32 %f1, %f1, %f3;
+    div.rn.f32 %f2, %f2, %f3;
+    cvt.rn.satfinite.e4m3x2.f32 %rb1, %f1, %f2;
+    cvt.u32.u16 %r4, %rb1;
+    st.global.u32 [%rd1], %r4;
+
+    // with the scale at 1.0 the underflow is the only thing happening: both sources
+    // are subnormals, and each becomes a zero keeping its own sign
+    mov.u32 %r5, 0x00000001;
+    mov.b32 %f4, %r5;
+    mov.u32 %r6, 0x80000001;
+    mov.b32 %f5, %r6;
+    mov.f32 %f6, 0f3F800000;                // 1.0
+    div.rn.f32 %f4, %f4, %f6;
+    div.rn.f32 %f5, %f5, %f6;
+    cvt.rn.satfinite.e4m3x2.f32 %rb2, %f4, %f5;
+    cvt.u32.u16 %r7, %rb2;
+    st.global.u32 [%rd1+4], %r7;
+
+    // the f16x2 source form: 2.0 and 1.0 halved by 0x80
+    mov.u32 %r8, 0x40003C00;
+    mov.b32 {%rb3, %rb4}, %r8;              // low half, high half
+    cvt.f32.f16 %f7, %rb4;                  // 2.0, the upper value
+    cvt.f32.f16 %f8, %rb3;                  // 1.0
+    mov.u32 %r9, 0x80;
+    shl.b32 %r9, %r9, 23;                   // 2^(0x80 - 127) = 2
+    mov.b32 %f9, %r9;
+    div.rn.f32 %f7, %f7, %f9;
+    div.rn.f32 %f8, %f8, %f9;
+    cvt.rn.satfinite.e4m3x2.f32 %rb5, %f7, %f8;
+    cvt.u32.u16 %r10, %rb5;
+    st.global.u32 [%rd1+8], %r10;
+
+    // `.pzo` folds the two negative zeros into positive ones
+    mov.u32 %r11, 0x80000000;
+    mov.b32 %f10, %r11;
+    mov.b32 %f11, %r11;
+    add.f32 %f10, %f10, 0f00000000;
+    add.f32 %f11, %f11, 0f00000000;
+    cvt.rn.satfinite.e4m3x2.f32 %rb6, %f10, %f11;
+    cvt.u32.u16 %r12, %rb6;
+    st.global.u32 [%rd1+12], %r12;
+
+    // the up-convert with two scales: 1.0 and 1.0, times 4 (0x81 is 2^2) and times 2
+    mov.u32 %r13, 0x00003838;               // two e4m3 bytes, each 1.0
+    and.b32 %r14, %r13, 0xFF;               // the lower value
+    shr.u32 %r15, %r13, 8;                  // the upper
+    and.b32 %r15, %r15, 0xFF;
+    shr.u32 %r16, %r14, 3;                  // e4m3: four exponent bits, bias 7
+    and.b32 %r16, %r16, 0x0F;
+    add.u32 %r16, %r16, 120;
+    shl.b32 %r16, %r16, 23;
+    and.b32 %r17, %r14, 7;
+    shl.b32 %r17, %r17, 20;
+    or.b32 %r16, %r16, %r17;
+    mov.b32 %f1, %r16;
+    shr.u32 %r18, %r15, 3;
+    and.b32 %r18, %r18, 0x0F;
+    add.u32 %r18, %r18, 120;
+    shl.b32 %r18, %r18, 23;
+    and.b32 %r19, %r15, 7;
+    shl.b32 %r19, %r19, 20;
+    or.b32 %r18, %r18, %r19;
+    mov.b32 %f2, %r18;
+    mov.u32 %r20, 0x00008180;               // the two scales, upper byte first
+    and.b32 %r21, %r20, 0xFF;
+    shl.b32 %r21, %r21, 23;                 // 2^1
+    mov.b32 %f3, %r21;
+    shr.u32 %r22, %r20, 8;
+    and.b32 %r22, %r22, 0xFF;
+    shl.b32 %r22, %r22, 23;                 // 2^2
+    mov.b32 %f4, %r22;
+    mul.f32 %f1, %f1, %f3;
+    mul.f32 %f2, %f2, %f4;
+    cvt.rn.bf16x2.f32 %r23, %f2, %f1;
+    st.global.u32 [%rd1+16], %r23;
+    ret;
+}

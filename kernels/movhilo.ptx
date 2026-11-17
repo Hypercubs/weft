@@ -1,9 +1,4 @@
 // `mov.b32 {lo, hi}, %r` on a 32-bit source: the halves split at 16 bits.
-//
-// This is the case that catches the wrong shift. Reading the shift from the
-// destination width made it 32, so the low half was right and the high half was
-// always zero, which a word with two different halves shows and a word of zeroes
-// does not.
 .version 8.8
 .target sm_100a
 .address_size 64

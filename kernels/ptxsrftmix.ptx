@@ -1,20 +1,4 @@
 // A surface and a sampled texture held by one module.
-//
-//     sust.2d [img, {x, y}], {gid}              // every lane writes its own texel
-//     bar.sync
-//     v = suld.2d [img, {x + 1 (mod 64), y}]    // the next lane along wrote that
-//     t = tex2D(tex, (x + .5)/64, (y + .5)/64)  // this lane's texel, through a filter
-//     out[gid] = 2 t
-//     aux[gid] = v
-//
-// PTX keeps the two spaces apart: `sust`/`suld` take a `.surfref` and `tex` takes a
-// `.texref`, and one symbol cannot be both (`Inconsistent redefinition`), so the
-// module declares one of each and `--textures 64x64,64x64` fills them in
-// declaration order. The surface read crosses lanes and the barrier is what makes
-// its answer another lane's write, so a write that never reached the image shows up
-// as a wrong word in `aux` rather than hiding in a register. The sample lands on a
-// texel centre under nearest/clamp, so the filter, the address mode and the size
-// all show up as a wrong number too.
 .version 7.0
 .target sm_70
 .address_size 64
@@ -41,9 +25,10 @@
     and.b32 %r5, %r4, 63;               // x
     shr.u32 %r6, %r4, 6;
     and.b32 %r6, %r6, 63;               // y
+    shl.b32 %r9, %r5, 2;                // x as a surface's byte offset
 
     cvt.rn.f32.s32 %f1, %r4;
-    sust.b.2d.clamp.b32 [img, {%r5,%r6}], {%f1};
+    sust.b.2d.clamp.b32 [img, {%r9,%r6}], {%f1};
 
     bar.sync 0;
 
@@ -51,6 +36,7 @@
     // last column reads what the first column put there.
     add.s32 %r7, %r5, 1;
     and.b32 %r7, %r7, 63;
+    shl.b32 %r7, %r7, 2;                // and its byte offset
     suld.b.2d.clamp.b32 %r8, [img, {%r7,%r6}];
 
     // And this lane's own texel of the sampled binding, through the sampler state.

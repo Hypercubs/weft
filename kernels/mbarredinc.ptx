@@ -1,14 +1,4 @@
 // `cp.reduce.async.bulk` with `.inc` and `.dec`, the two bounded integer forms.
-//
-//     counters 0, 1, 2, 3 with bounds 2, 2, 5, 0
-//     .inc  ->  1, 2, 3, 0      (a counter at or past its bound goes to zero)
-//     .dec  ->  2, 0, 1, 0      (zero, or past the bound, takes the bound)
-//
-// The bound is the *source element*, "a result in the range [0..x] where x is the
-// value at the source state space", so the tile carries it rather than a constant.
-// A plain `+1` would answer 4 for the third counter and 4 for the fourth, and an
-// unbounded decrement would wrap 0 to 0xFFFFFFFF, so both forms are distinguished
-// by these eight numbers.
 .version 8.0
 .target sm_90
 .address_size 64

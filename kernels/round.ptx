@@ -1,8 +1,5 @@
-// Hand-written PTX for the four rounding converts CUDA's __f2i_rn/_rz/_rm/_rp
-// compile to, plus a narrowing f64->f32 that rounds to zero and two exact
-// ties-to-even cases. LLVM's NVPTX backend only emits .rzi/.rni/.rmi for its own
-// idioms, so the .rn and .rp integer forms have to be written out to be tested.
-// The Metal kernel `roundk` computes the same numbers with rint/trunc/floor/ceil.
+// Hand-written PTX for the four rounding converts CUDA's `__f2i_rn`, `_rz`, `_rm` and
+// `_rp` compile to.
 .version 7.0
 .target sm_70
 .address_size 64

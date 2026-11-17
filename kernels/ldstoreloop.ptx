@@ -1,18 +1,4 @@
-// A store whose address changes from one iteration to the next. The warp backend
-// batches a store whose lanes walk consecutive addresses into one loop over that
-// run, which is only valid if the address is the same expression every time the
-// statement runs. It used to fold a register's first value into that address, so a
-// loop that walked a pointer wrote every iteration's word to the first iteration's
-// slot: the first block below is four stores written out, the second is the same
-// four from a loop that advances the pointer, and both have to answer the same
-// thing.
-//
-// Block 0 is at word 4l, one store a round, and block 1 at word 128 + 4l from the
-// loop, lane l's half h holding 8l + 2i for round i, so each word is
-//     h | (h + 1) << 16,  h = 8l + 2i
-// in both blocks. A folded address puts the loop's four words on one slot, so the
-// second block is the one that disagrees, and the first block stays right, which is
-// what makes the two halves a check on each other.
+// A store whose address changes from one iteration to the next.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -30,7 +16,7 @@
     mul.wide.s32 %rd2, %r1, 16;
     add.s64 %rd3, %rd1, %rd2;               // out + 16l
 
-    // ---- block 0: four stores, written out ----
+    // block 0: four stores, written out
     shl.b32 %r2, %r1, 3;                    // 8l
     add.u32 %r3, %r2, 1;
     shl.b32 %r3, %r3, 16;
@@ -52,7 +38,7 @@
     or.b32 %r6, %r6, %r2;
     st.global.b32 [%rd3+12], %r6;
 
-    // ---- block 1: the same four, walking the pointer ----
+    // block 1: the same four, walking the pointer
     add.s64 %rd4, %rd3, 512;
     shl.b32 %r7, %r1, 3;
     mov.u32 %r8, 0;

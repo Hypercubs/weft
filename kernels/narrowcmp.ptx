@@ -1,16 +1,4 @@
-// Comparing two narrow floats. The words of a half run in the same order as the values
-// only while it is positive, so a compare of the bit patterns orders -1 above 1 and
-// calls -0.5 greater than 0.25. Each of these widens first, which is exact, and the
-// answers are the masks `set` writes: every bit set for true, zero for false.
-//
-//   0  setp.lt  h, 1.0
-//   1  setp.ge  h, -0.5
-//   2  set.eq   h, h         always true, including for -0 and for a NaN
-//   3  set.ne   h, +0.0      false for either zero
-//   4  setp.nan h, h         false on every input here
-//   5  setp.num h, +0.0      the negation of the test above
-//   6  set.le   h, -0.0      true for both zeros and for the negatives
-//   7  setp.gt  h, -2.0
+// Comparing two narrow floats.
 .version 7.0
 .target sm_80
 .address_size 64

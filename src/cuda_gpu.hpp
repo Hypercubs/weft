@@ -1,11 +1,5 @@
 #pragma once
-// The GPU column on a host whose driver is CUDA's. PTX is that driver's own
-// input, so the kernel that runs is the one CUDA would run: the same text, not a
-// second translation of it.
-//
-// The driver is opened at run time and the entry points used here are declared
-// below, so this tree builds without the CUDA toolkit, its headers, or a device.
-// A host with no driver reports why and the run stays a CPU one.
+// The GPU column on a host whose driver is CUDA's.
 
 #include <chrono>
 #include <cstddef>
@@ -28,9 +22,6 @@
 
 namespace weft_cuda {
 
-// One texture binding as the launcher has it: the bytes of the texels in the
-// order the CPU runtime indexes them, the shape, and the sampler state the
-// command line asked for. The CUDA column uploads these into a CUDA array.
 struct Texture {
   std::string name;                    // the `.tex` the module declares
   std::vector<unsigned char> bytes;    // row-major texels, layer after layer
@@ -50,10 +41,7 @@ struct Column {
   std::vector<std::vector<unsigned char>> out;  // one blob per buffer, same size in
 };
 
-// A `.surf` declaration is a surface, not a sampled texture. The front end
-// numbers both in binding order, so the launcher hands one over like a texture
-// and the module has no texture reference for it: say that, rather than asking
-// the driver for a name it never declared.
+// A `.surf` declaration is a surface, not a sampled texture.
 inline bool is_surface(const std::string& ptx, const std::string& name) {
   size_t at = 0;
   while ((at = ptx.find(".surf", at)) != std::string::npos) {
@@ -76,9 +64,8 @@ using Module = void*;
 using Function = void*;
 using Array = void*;
 using Texref = void*;
+using Surfref = void*;
 
-// The driver's structs, field for field: the layout is the ABI, so the enum
-// fields are `int` and the padding that follows each of them is the header's.
 struct ArrayDesc {
   size_t width;
   size_t height;
@@ -131,8 +118,6 @@ struct Copy3D {
   size_t widthBytes, height, depth;
 };
 
-// The transcription, checked at compile time: a missing, extra or narrower field
-// would move everything after it, and the driver reads by offset.
 static_assert(sizeof(ArrayDesc) == 24, "CUDA_ARRAY_DESCRIPTOR is 24 bytes");
 static_assert(offsetof(ArrayDesc, format) == 16, "the format follows the extents");
 static_assert(sizeof(ArrayDesc3D) == 40, "CUDA_ARRAY3D_DESCRIPTOR is 40 bytes");
@@ -158,8 +143,7 @@ constexpr unsigned kNormalized = 0x02;
 constexpr unsigned kLayered = 0x01;
 constexpr unsigned kCubemap = 0x04;
 
-// Only the calls a launch needs. Each is looked up under its versioned name
-// first: the driver exports `cuMemAlloc_v2` and friends, not the unsuffixed name.
+// Only the calls a launch needs.
 struct Driver {
   void* lib = nullptr;
   Result (*init)(unsigned) = nullptr;
@@ -173,6 +157,7 @@ struct Driver {
   Result (*mem_up)(DevicePtr, const void*, size_t) = nullptr;
   Result (*mem_down)(void*, DevicePtr, size_t) = nullptr;
   Result (*mod_load)(Module*, const void*) = nullptr;
+  Result (*mod_load_ex)(Module*, const void*, unsigned, int*, void**) = nullptr;
   Result (*mod_unload)(Module) = nullptr;
   Result (*fn_get)(Function*, Module, const char*) = nullptr;
   Result (*fn_attr)(int*, int, Function) = nullptr;
@@ -186,6 +171,8 @@ struct Driver {
   Result (*texref_mode)(Texref, int, int) = nullptr;
   Result (*texref_flags)(Texref, unsigned) = nullptr;
   Result (*texref_border)(Texref, float*) = nullptr;
+  Result (*surfref_get)(Surfref*, Module, const char*) = nullptr;
+  Result (*surfref_array)(Surfref, Array, unsigned) = nullptr;
   Result (*array_create)(Array*, const ArrayDesc*) = nullptr;
   Result (*array3d_create)(Array*, const ArrayDesc3D*) = nullptr;
   Result (*array_destroy)(Array) = nullptr;
@@ -230,6 +217,7 @@ inline Driver* load(std::string& why) {
       pick(d.lib, "cuMemcpyHtoD_v2", "cuMemcpyHtoD", d.mem_up);
       pick(d.lib, "cuMemcpyDtoH_v2", "cuMemcpyDtoH", d.mem_down);
       pick(d.lib, "cuModuleLoadData", nullptr, d.mod_load);
+      pick(d.lib, "cuModuleLoadDataEx", nullptr, d.mod_load_ex);
       pick(d.lib, "cuModuleUnload", nullptr, d.mod_unload);
       pick(d.lib, "cuModuleGetFunction", nullptr, d.fn_get);
       pick(d.lib, "cuFuncGetAttribute", nullptr, d.fn_attr);
@@ -242,6 +230,8 @@ inline Driver* load(std::string& why) {
       pick(d.lib, "cuTexRefSetAddressMode", nullptr, d.texref_mode);
       pick(d.lib, "cuTexRefSetFlags", nullptr, d.texref_flags);
       pick(d.lib, "cuTexRefSetBorderColor", nullptr, d.texref_border);
+      pick(d.lib, "cuModuleGetSurfRef", nullptr, d.surfref_get);
+      pick(d.lib, "cuSurfRefSetArray", nullptr, d.surfref_array);
       pick(d.lib, "cuArrayCreate_v2", "cuArrayCreate", d.array_create);
       pick(d.lib, "cuArray3DCreate_v2", "cuArray3DCreate", d.array3d_create);
       pick(d.lib, "cuArrayDestroy", nullptr, d.array_destroy);
@@ -286,11 +276,6 @@ struct Owned {
 
 }  // namespace detail
 
-// One launch of a PTX kernel on the first CUDA device, timed the way the Metal
-// column is: one warm launch, then `bench` of them, best and mean reported.
-// `in` is the bytes of each buffer as the CPU path has them, `textures` are the
-// bindings the kernel declares, and `out` is what the kernel left behind, so the
-// two columns can be compared byte for byte.
 inline Column run(const std::string& ptx, const std::string& kernel,
                   const std::vector<TranslatedKernel::Param>& params,
                   const std::vector<std::vector<unsigned char>>& in,
@@ -345,9 +330,20 @@ inline Column run(const std::string& ptx, const std::string& kernel,
   c.device = name;
 
   detail::Owned owned(d);
-  r = d->mod_load(&owned.mod, (const void*)ptx.c_str());
+  // The driver's own diagnostic when it has one: "the JIT failed" alone does not
+  // say which declaration it would not take.
+  char log[2048] = {0};
+  int opts[2] = {6, 5};  // CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, then the buffer
+  void* vals[2] = {(void*)(intptr_t)sizeof log, log};
+  if (d->mod_load_ex)
+    r = d->mod_load_ex(&owned.mod, (const void*)ptx.c_str(), 2, opts, vals);
+  else
+    r = d->mod_load(&owned.mod, (const void*)ptx.c_str());
   if (r || !owned.mod) {
+    std::string said = log;
+    while (!said.empty() && (said.back() == '\n' || said.back() == ' ')) said.pop_back();
     c.why = "the driver refused the module: " + detail::text(*d, r);
+    if (!said.empty()) c.why += " (" + said + ")";
     return c;
   }
   detail::Function fn = nullptr;
@@ -357,9 +353,6 @@ inline Column run(const std::string& ptx, const std::string& kernel,
             (r ? ": " + detail::text(*d, r) : "");
     return c;
   }
-  // The block the kernel was compiled for is a property of the device, so this
-  // is asked rather than assumed: a launch wider than it is refused by the
-  // driver, and by then the module has been built for nothing.
   int max_threads = 1024;
   if (d->fn_attr) {
     int mt = 0;
@@ -370,11 +363,8 @@ inline Column run(const std::string& ptx, const std::string& kernel,
             " threads per block, the launch asked for " + std::to_string(threads);
     return c;
   }
-  // A grid smaller than one block is one short block, not a refusal: a block of
-  // `grid` threads runs the same lanes the CPU column runs and no others.
   if (grid < threads) threads = grid;
-  // Otherwise a launch is whole blocks. A partial last block would run lanes past
-  // the grid, which is a different launch from the one the CPU column ran.
+  // Otherwise a launch is whole blocks.
   if (grid == 0 || grid % threads != 0) {
     c.why = "a CUDA launch is whole blocks: " + std::to_string(grid) +
             " lanes do not divide into blocks of " + std::to_string(threads);
@@ -392,36 +382,28 @@ inline Column run(const std::string& ptx, const std::string& kernel,
     owned.mem.push_back(at);
   }
 
-  // A texture is a CUDA array, one channel wide, plus the texture reference the
-  // module declares by that name and the sampler state the command line chose.
-  // The array format is the width of the texel the launcher uploaded, so a half
-  // texture is read back as the halves it holds rather than widened first.
-  // The fixtures declare textures with `.tex`, which PTX keeps for backward
-  // compatibility and defines as equal to a module-scope `.global .texref` of the
-  // same name, so the driver's reference lookup finds it.
   for (const Texture& t : textures) {
-    if (is_surface(ptx, t.name)) {
-      c.why = "'" + t.name + "' is a surface, and the cuda column binds sampled textures";
-      return c;
-    }
-    if (!d->texref_get || !d->array_create) {
-      c.why = "the driver has no texture reference entry points";
+    const bool surface = is_surface(ptx, t.name);
+    if (surface ? (!d->surfref_get || !d->surfref_array)
+                : (!d->texref_get || !d->array_create)) {
+      c.why = surface ? "the driver has no surface reference entry points"
+                      : "the driver has no texture reference entry points";
       return c;
     }
     const int format = t.texel == 2 ? detail::kFmtHalf : detail::kFmtFloat;
-    const size_t depth = t.depth > 0 ? (size_t)t.depth : (t.cube ? 6u : (size_t)t.layers);
+    // A cube's layers are its faces, six to a cube, so the array's depth is the face count.
+    const size_t depth = t.depth > 0 ? (size_t)t.depth : (size_t)t.layers;
     detail::Array arr = nullptr;
     detail::Result made;
     if (t.one_d) {
-      // A 1-D binding is an array with no height, which is what the GPU means
-      // by `tex.1d`; the CPU runtime lowers the same thing to one row. The upload
-      // is a 2-D copy one row high, which is how a 1-D array is addressed: the
-      // array is a rectangle whose height is zero, and the copy covers row zero.
       const detail::ArrayDesc desc{t.w, 0, format, 1u};
       made = d->array_create(&arr, &desc);
     } else if (depth > 1) {
-      const detail::ArrayDesc3D desc{t.w, t.h, depth, format, 1u,
-                                     t.cube ? detail::kCubemap : detail::kLayered};
+      // A 3-D volume is its depth and no flag; only a 2-D array is layered.
+      const unsigned array_flags =
+          t.cube ? (depth > 6 ? (detail::kCubemap | detail::kLayered) : detail::kCubemap)
+                 : (t.depth > 0 ? 0u : detail::kLayered);
+      const detail::ArrayDesc3D desc{t.w, t.h, depth, format, 1u, array_flags};
       made = d->array3d_create ? d->array3d_create(&arr, &desc) : -1;
     } else {
       const detail::ArrayDesc desc{t.w, t.h, format, 1u};
@@ -463,6 +445,23 @@ inline Column run(const std::string& ptx, const std::string& kernel,
       return c;
     }
 
+    // A surface is bound through its own reference, and takes no sampler state.
+    if (surface) {
+      detail::Surfref binding = nullptr;
+      r = d->surfref_get(&binding, owned.mod, t.name.c_str());
+      if (r || !binding) {
+        c.why = "the module has no surface '" + t.name + "'" +
+                (r ? ": " + detail::text(*d, r) : "");
+        return c;
+      }
+      r = d->surfref_array(binding, arr, 0);
+      if (r) {
+        c.why = "cannot bind surface '" + t.name + "': " + detail::text(*d, r);
+        return c;
+      }
+      continue;
+    }
+
     detail::Texref ref = nullptr;
     r = d->texref_get(&ref, owned.mod, t.name.c_str());
     if (r || !ref) {
@@ -475,8 +474,6 @@ inline Column run(const std::string& ptx, const std::string& kernel,
       c.why = "cannot bind texture '" + t.name + "': " + detail::text(*d, r);
       return c;
     }
-    // The commands line's two choices, which are the CPU runtime's and Metal's:
-    // the filter, and what a coordinate outside the image means.
     if (d->texref_flags) d->texref_flags(ref, detail::kNormalized);
     if (d->texref_filter)
       d->texref_filter(ref, t.filter == 1 ? detail::kFilterLinear : detail::kFilterPoint);
@@ -492,9 +489,6 @@ inline Column run(const std::string& ptx, const std::string& kernel,
     }
   }
 
-  // One eight-byte cell per parameter and a pointer to it: the driver reads each
-  // parameter's own width from the address it is handed, so the cells need no
-  // packing and the signature's order is the only thing that matters.
   std::vector<unsigned long long> cells(params.size(), 0);
   std::vector<void*> argv(params.size());
   for (size_t i = 0; i < params.size(); i++) {
@@ -511,8 +505,6 @@ inline Column run(const std::string& ptx, const std::string& kernel,
       uint64_t raw = 0;
       for (const auto& a : args)
         if (a.first == p.scalar) raw = a.second;
-      // The CPU module reads this slot as `(T)raw`, so the driver has to see that
-      // same cast at the parameter's own width rather than the raw word.
       if (p.type == "f32") {
         const float v = (float)raw;
         std::memcpy(&cells[i], &v, 4);
@@ -535,11 +527,8 @@ inline Column run(const std::string& ptx, const std::string& kernel,
         return c;
       }
     }
-    // A pointer the body never reads is passed as zero: nothing dereferences it.
   }
 
-  // A dynamic shared array is sized by the launch, and the CPU runtime hands out
-  // 48 KiB, so the GPU is given the same window.
   const unsigned dyn_shared =
       ptx.find("extern .shared") != std::string::npos ? 48u * 1024u : 0u;
   const unsigned gx = grid / threads;

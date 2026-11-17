@@ -1,0 +1,66 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// Two functions tail-call each other and each one stops at a barrier. Three frames
+// means three adds, and the driver has to keep its place across the stops.
+.visible .func ca(
+    .param .u32 n,
+    .param .u64 p
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<4>;
+    .reg .pred %p<2>;
+
+    bar.sync 0;
+    ld.param.u64 %rd1, [p];
+    ld.global.u32 %r1, [%rd1];
+    add.u32 %r1, %r1, 1;
+    st.global.u32 [%rd1], %r1;
+    ld.param.u32 %r2, [n];
+    setp.gt.u32 %p1, %r2, 0;
+    @%p1 bra L1;
+    ret;
+L1:
+    sub.u32 %r3, %r2, 1;
+    call.uni cb, (%r3, %rd1);
+    ret;
+}
+
+.visible .func cb(
+    .param .u32 n,
+    .param .u64 p
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<4>;
+    .reg .pred %p<2>;
+
+    bar.sync 0;
+    ld.param.u64 %rd1, [p];
+    ld.global.u32 %r1, [%rd1];
+    add.u32 %r1, %r1, 1;
+    st.global.u32 [%rd1], %r1;
+    ld.param.u32 %r2, [n];
+    setp.gt.u32 %p1, %r2, 0;
+    @%p1 bra L1;
+    ret;
+L1:
+    sub.u32 %r3, %r2, 1;
+    call.uni ca, (%r3, %rd1);
+    ret;
+}
+
+.visible .entry cycbar(
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<2>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, 2;
+    call.uni ca, (%r1, %rd1);
+    ret;
+}

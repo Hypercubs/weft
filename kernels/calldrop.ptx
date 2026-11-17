@@ -1,0 +1,36 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A function that returns nothing, called with no return list: the call and the
+// declaration agree there is no slot to fill, so what the row reads is what the callee
+// stored.
+.visible .func quiet(
+    .param .u64 dst
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [dst];
+    mov.u32 %r1, %tid.x;
+    add.u32 %r2, %r1, 1;
+    mul.lo.u32 %r2, %r2, 7;
+    st.global.u32 [%rd1], %r2;
+    ret;
+}
+
+.visible .entry calldrop(
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<3>;
+    .reg .b32 %r<3>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd1, %rd1, %rd2;
+    call.uni quiet, (%rd1);
+    ret;
+}

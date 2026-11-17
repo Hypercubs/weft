@@ -4,8 +4,7 @@
 // The edge cases of the instructions whose plain form is easy and whose boundaries are
 // not: prmt's sign-replicate nibbles, the funnel shift at counts 0, 32 and past, bfind's
 // shiftamt, lop3's truth table, and every testp class on one bit pattern each. The last
-// one is the isa's special case -- +-0 is a normal number -- and it is here because the
-// first version of this translator answered 0 for it.
+// one is the isa's special case: +-0 is a normal number.
 .visible .entry isaedge(.param .u64 p0)
 {
     .reg .b32 %r<12>;

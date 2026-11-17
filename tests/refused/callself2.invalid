@@ -1,0 +1,30 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A self-call with no base case. It is the depth check's input: the eighth frame stops
+// the lane and the host names the stop, rather than the run finishing with a wrong word.
+.visible .func walk(
+    .param .u64 p
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<2>;
+
+    ld.param.u64 %rd1, [p];
+    call.uni walk, (%rd1);
+    ld.global.u32 %r1, [%rd1];
+    st.global.u32 [%rd1], %r1;
+    ret;
+}
+
+.visible .entry callself2(
+    .param .u64 in
+)
+{
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [in];
+    call.uni walk, (%rd1);
+    ret;
+}

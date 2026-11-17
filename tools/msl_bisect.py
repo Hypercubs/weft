@@ -40,7 +40,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKER_SRC = os.path.join(ROOT, "tools", "msl_check.mm")
 CHECKER = os.path.join(tempfile.gettempdir(), "weft-mslcheck")
 
-
 def build_checker():
     """Compile the checker the first time, and reuse it after that."""
     if os.path.exists(CHECKER) and os.path.getmtime(CHECKER) > os.path.getmtime(CHECKER_SRC):
@@ -53,7 +52,6 @@ def build_checker():
         sys.stderr.write(r.stderr.decode("utf-8", "replace"))
         return False
     return True
-
 
 def classify(text, timeout):
     """Compile one candidate. `crash` if the compiler dies, `error` if it refuses."""
@@ -74,7 +72,6 @@ def classify(text, timeout):
     if "XPC_ERROR" in err or "interrupted connection" in err or not re.search(r"error:", err):
         return "crash", err.splitlines()[0] if err else "no output"
     return "error", err.splitlines()[0]
-
 
 def statements(lines):
     """The lines that can be removed on their own: statements, not labels or braces.
@@ -103,10 +100,8 @@ def statements(lines):
         out.append(i)
     return out
 
-
 def with_removed(lines, drop):
     return "\n".join(l for i, l in enumerate(lines) if i not in drop)
-
 
 def shrink(lines, cand, timeout):
     """Standard ddmin over the removable statements, with a third outcome."""
@@ -130,7 +125,6 @@ def shrink(lines, cand, timeout):
                 break
             gran = min(len(keep), gran * 2)
     return keep
-
 
 def main():
     if len(sys.argv) < 2:
@@ -161,13 +155,6 @@ def main():
     print("%d candidate statements; bisecting…" % len(cand))
     keep = shrink(lines, cand, timeout)
 
-    # Two different answers are worth separating, because they point at different
-    # things. Either a small set of statements reproduces the failure on its own , 
-    # that is the construct, and the search above has already found it, or the body
-    # fails as a whole, in which case there is no construct and the question becomes
-    # which statements matter.
-    # Remove the candidates the search let go of, and leave every line that is not a
-    # candidate alone: the kernel signature and the helpers stay, or nothing compiles.
     rest = set(cand) - set(keep)
     alone, _ = classify(with_removed(lines, rest), timeout)
     if alone == "crash" and len(keep) <= 6:
@@ -200,7 +187,6 @@ def main():
         print("  construct. Look for the widest type or operation in it: a 128-bit")
         print("  multiply in a kernel this size is exactly what this looked like.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

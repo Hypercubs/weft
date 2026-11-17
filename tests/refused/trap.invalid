@@ -1,0 +1,19 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A trap. Hardware stops the lane here, and weft writes the stop to the word the host
+// reads, so the run ends with a named report instead of finishing quietly.
+.visible .entry trapstop(
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<2>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, 0;
+    st.global.u32 [%rd1], %r1;
+    trap;
+    ret;
+}

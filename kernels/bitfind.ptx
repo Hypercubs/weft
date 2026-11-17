@@ -1,17 +1,4 @@
 // Bit scans, and a half register declared as `.reg .f16`.
-//
-//   bfindu   bfind.u32: the highest set bit, counted from 0, and 0xFFFFFFFF when
-//            there is none. An input of 0 has to answer 0xFFFFFFFF and an input of
-//            1 has to answer 0, so a translation that used the count of leading
-//            zeros answers 32 and 31 instead.
-//   bfinds   bfind.s32: the highest bit that differs from the sign, so -1 and 0
-//            have none and -2 has bit 0. A translation that read the register as
-//            unsigned answers 31 for -1 rather than 0xFFFFFFFF.
-//   fns3     fns.b32 with base 0 and offset 2: the third set bit from bit 0.
-//   fnsbase  the same masks with base 4 and offset 1: the second set bit at or
-//            above bit 4, so a table that ignored the base lands on a lower bit.
-//   f16reg   `.reg .f16 %h<4>` and `add.rn.f16`: a half register is the 16 bits
-//            `.b16` names, and doubling a half is exact until it overflows.
 .version 7.0
 .target sm_70
 .address_size 64

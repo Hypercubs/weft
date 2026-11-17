@@ -1,13 +1,4 @@
 // `tld4`: the four texels around a coordinate, each on its own channel.
-//
-//     u = (x + 0.5) / 64, v = (y + 0.5) / 64
-//     g = tld4(tex, u, v)            // (x,y), (x+1,y), (x,y+1), (x+1,y+1)
-//     out[gid] = g.x + g.y + g.z + g.w
-//
-// A filter would blend those four into one number; a gather keeps them apart, so
-// an implementation that samples instead of gathering adds the same texel four
-// times and lands on a different answer for every lane that is not on a flat
-// patch of the image.
 .version 7.0
 .target sm_70
 .address_size 64

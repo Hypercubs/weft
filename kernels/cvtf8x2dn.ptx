@@ -1,29 +1,16 @@
-// The narrow pair converts, split out of `cvtf8x2.ptx`.
-//
-// ptxas takes these as pair forms keyed on the destination register's own width: an
-// `e2m1x2` needs a `.b8` destination, an `e2m3x2`, `e3m2x2`, `e4m3x2` or `e5m2x2` a
-// `.b16` one, and every one of them takes two `.f32` sources. It has no
-// `...x2.f16x2` spelling for e2m1, e2m3 or e3m2 at all, so the halves are unpacked
-// with `mov.b32`, widened with `cvt.f32.f16`, and converted as the two floats they
-// are. `.pzo` is not a modifier this assembler knows either; adding `+0.0` to each
-// source is the same rule on the same value, because -0.0 + 0.0 is +0.0 and nothing
-// else moves.
-//
-// The four-lane arithmetic that used to sit beside this kernel is in
-// `cvtf8x2simd.ptx`.
+// The narrow pair converts, split out of `cvtf8x2.ptx`. ptxas keys the pair form on the
+// destination width, a byte for fp4 and a half-word for f6, and takes two `.f32`
+// sources.
 .version 8.8
 .target sm_100a
 .address_size 64
 
 // The other direction, from two halves. The last word is the `.pzo` case, where a
 // -0.0 has to pack into the same bits as +0.0 rather than keeping the sign.
-//
 //   2.0, 1.0                    -> 00000042
 //   -2.0, 1.0 with .relu        -> 00000002
 //   7.5, 1.5 as e2m3x2          -> 00001f0c
 //   28, 0.25 as e3m2x2          -> 00001f04
-//   1.5, 1.0 as e4m3x2          -> 00003c38
-//   -0.0, 0.0                   -> 00000000
 .visible .entry cvtup(
     .param .u64 cvtup_param_0       // six words
 )

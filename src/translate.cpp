@@ -76,8 +76,6 @@ bool contains_word(const std::string& s, const std::string& word) {
   return false;
 }
 
-// Comments are dropped before anything else: a kernel that mentions
-// `return` in a comment should not lose its loop form.
 std::string strip_comments(const std::string& s) {
   std::string out;
   out.reserve(s.size());
@@ -108,11 +106,6 @@ std::string strip_comments(const std::string& s) {
   return out;
 }
 
-// Split a translation unit into top-level items: a `struct { ... };`, a function
-// `f(...) { ... }`, a `#define` line, a lone declaration. Everything a kernel
-// file defines for itself lives in one of these, and none of it belongs to a
-// kernel, it has to be carried over to the generated C++ too, or a kernel that
-// names its own struct type compiles on the GPU and not here.
 std::vector<std::string> top_level_items(const std::string& s) {
   std::vector<std::string> out;
   size_t i = 0, start = 0;
@@ -173,9 +166,6 @@ std::vector<std::string> split_top_level(const std::string& s) {
     char c = s[i];
     if (c == '(') paren++;
     else if (c == ')') paren--;
-    // `>` only closes a template argument list, and `a >> b` is a shift: without
-    // the guard the shift makes the angle depth negative and no comma after it
-    // splits any more.
     else if (c == '<') angle++;
     else if (c == '>' && angle > 0) angle--;
     else if (c == '[') bracket++;
@@ -235,9 +225,6 @@ std::string rewrite_shared_decls(const std::string& body, bool& found, std::stri
 
       skip_ws(j);
       if (j < body.size() && body[j] == ';') j++;
-      // The slot is the declaration's own ordinal, not a counter: a state machine
-      // resumes past declarations it has already run, and a counter would give the
-      // next one the previous one's storage.
       out += type + "* " + name + " = weft::shared_mem<" + type + ", " + std::to_string(count) +
              ">(ctx, " + std::to_string(slot_n++) + ");";
       found = true;
@@ -254,9 +241,6 @@ std::string rewrite_barriers(const std::string& body, bool& found, std::string& 
   std::string out;
   size_t i = 0;
   while (i < body.size()) {
-    // simdgroup_barrier waits for one warp; a threadgroup barrier is a superset
-    // of that, so waiting for the whole group is sound (it is what the hardware
-    // does for a workgroup barrier) and costs the same here.
     static const char* kNames[] = {"threadgroup_barrier", "simdgroup_barrier"};
     const char* bar = nullptr;
     size_t blen = 0;
@@ -288,21 +272,6 @@ std::string rewrite_barriers(const std::string& body, bool& found, std::string& 
   return out;
 }
 
-// simd_shuffle_*(value, delta) -> an awaitable, for the same reason a barrier is
-// one: a warp shuffle is a rendezvous, and in a coroutine a rendezvous is a
-// suspension. The lane's value is published before suspending and the peer's
-// slot is read when it is resumed.
-// simd_ballot / simd_all / simd_any: one predicate in, one warp-wide answer
-// out, so they are the shuffle rendezvous with a one-bit payload.
-// A swizzle read, `.xy` or `.zyx` or `.rgba`, of whatever is to its left. The
-// operand is walked back from the dot: a name, a name with field or subscript
-// parts, a call (`t.sample(...).xy`), or a brace-initialised value (which is what
-// the texture rewrite leaves behind, `float4{...}.xy`). Two component spellings
-// exist, `xyzw` for a vector and `rgba` for a colour, and mixing them in one
-// swizzle is an error on the GPU too.
-//
-// A swizzle that is *assigned* is a write to part of a value, which is a different
-// transform, so it is refused by name instead of being half-translated.
 std::string rewrite_swizzles(const std::string& body, std::string& err) {
   static const auto comp = [](char c) -> int {
     return c == 'x' || c == 'r' ? 0
@@ -316,16 +285,8 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
     while (q > 0 && (is_ident(body[q - 1]) || body[q - 1] == '.')) q--;
     return q;
   };
-  // The output is assembled from ranges of the input rather than character by
-  // character: the operand of a swizzle has already been written out by the time
-  // its dot is reached, so the range before it is copied and then the call is
-  // written in place of the whole `operand.xyz`.
   std::string out;
   size_t copied = 0, i = 0;
-  // Where each emitted rewrite sits in `out`, so an operand that a *previous*
-  // rewrite already covers, the `bump(a[g].xyz).zy` shape, a swizzle of a call
-  // whose argument was itself swizzled, can be cut out of the text that was
-  // emitted rather than out of the source, where it no longer exists.
   std::vector<std::pair<size_t, size_t>> map{{0, 0}};
   while (i < body.size()) {
     if (body[i] != '.' || comp(i + 1 < body.size() ? body[i + 1] : '\0') < 0) {
@@ -337,8 +298,7 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
     const size_t len = j - i - 1;
     const char before = i ? body[i - 1] : '\0';
     const bool operand_before = is_ident(before) || before == ')' || before == ']' || before == '}';
-    // A whole token: `.ba` is a swizzle of two components, `.base` is a member, and
-    // the difference is the character after the last component letter.
+    // A whole token.
     const char after_name = j < body.size() ? body[j] : '\0';
     if (len < 2 || len > 4 || !operand_before || is_ident(after_name)) {
       i++;
@@ -372,8 +332,6 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
         }
       }
       start = name_start(q);
-      // `weft_bitcast<float>(x).xy` and `as_type<float>(x).xy`: the name is past
-      // the template argument, so step over the closing `>` and its `<...>`.
       size_t t = q;
       while (t > 0 && std::isspace((unsigned char)body[t - 1])) t--;
       if (t > 0 && body[t - 1] == '>') {
@@ -396,27 +354,14 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
         continue;
       }
     }
-    // A swizzle on the left of an assignment is a store into named components,
-    // written as one call: `a.yx = b` is `weft_swz_w2(a, 1, 0, b)`, whose body
-    // takes b's components into locals before storing them, so `a.yx = a.xy`
-    // swaps instead of writing a member it then reads back. A compound form is a
-    // read-modify-write of part of a value and stays refused by name rather than
-    // emitted as C++ that cannot compile.
     size_t after = j;
     while (after < body.size() && std::isspace((unsigned char)body[after])) after++;
-    // `a.xy += b` is a read-modify-write of part of a value, and it lowers to the
-    // same store with the read in its argument: `weft_swz_w2(a, 0, 1,
-    // weft_swz(a, 0, 1) + b)`. The read is a value before the call is made, and the
-    // helper takes its argument's components into locals before storing them, so
-    // `a.xy += a.yx` adds the two old components instead of a mix of old and new.
     const char op_ch = after < body.size() ? body[after] : '\0';
     const bool compound = after + 1 < body.size() && body[after + 1] == '=' &&
                           std::string("+-*/%&|^<>").find(op_ch) != std::string::npos;
     const bool is_write = compound ||
                           (after < body.size() && body[after] == '=' &&
                            (after + 1 >= body.size() || body[after + 1] != '='));
-    // Everything up to the operand's end is in `out` now, and the operand itself
-    // starts at `operand_out` within it.
     out.append(body, copied, p - copied);
     size_t operand_out = out.size();
     if (start < copied) {
@@ -441,9 +386,6 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
     call += ", " + idxs;
     size_t rhs_end = j;
     if (is_write) {
-      // Where the right-hand side ends: the statement's `;`, a comma at the same
-      // depth, or a closer this scan did not open. Depth is tracked so
-      // `a.xy = f(b, c)` keeps its arguments.
       rhs_end = after + (compound ? 2 : 1);
       int depth = 0;
       for (size_t q = rhs_end; q < body.size(); q++) {
@@ -458,8 +400,6 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
         }
         rhs_end = q + 1;
       }
-      // The right-hand side can hold reads of its own, `a.xy = b.zyx * 2`, so it
-      // goes through this same rewrite rather than being copied raw.
       const size_t rhs_from = after + (compound ? 2 : 1);
       std::string rhs = body.substr(rhs_from, rhs_end - rhs_from);
       std::string rerr;
@@ -482,9 +422,7 @@ std::string rewrite_swizzles(const std::string& body, std::string& err) {
   return out;
 }
 
-// as_type<T>(x): Metal's bitcast. The conversion is a memcpy of the same bits,
-// which is exactly what weft_bitcast does, so the whole call is rewritten into
-// one rather than needing a type system here.
+// as_type<T>(x).
 std::string rewrite_as_type(const std::string& body, std::string& err) {
   std::string out = body;
   size_t pos = 0;
@@ -513,7 +451,6 @@ std::string rewrite_as_type(const std::string& body, std::string& err) {
   return out;
 }
 
-// Rename every whole-word occurrence of `from` to `to`.
 std::string rename_word(const std::string& s, const std::string& from, const std::string& to) {
   std::string out;
   size_t i = 0;
@@ -531,11 +468,6 @@ std::string rename_word(const std::string& s, const std::string& from, const std
   return out;
 }
 
-// A helper function the kernel file defines for itself. Most of them are
-// translated as written; one that waits on its warp or its threadgroup cannot be,
-// because the wait is a suspension of the *caller's* coroutine, so those are
-// expanded at each call site instead, as a statement expression. That keeps the
-// rendezvous inside the kernel body where the resume point lives.
 struct HelperFn {
   std::string name, ret, body;
   std::vector<std::pair<std::string, std::string>> params;  // type, name
@@ -593,9 +525,6 @@ HelperFn parse_helper(const std::string& item, size_t name_start, size_t paren) 
     std::string decl = p;
     std::vector<std::string> attrs;
     decl = strip_attributes(decl, attrs);
-    // A parameter's type names the address space it lives in, `threadgroup
-    // float* tile`, but an expanded helper is handed an argument that already
-    // names the storage, so the qualifier has to go or it lands in the C++.
     for (bool again = true; again;) {
       again = false;
       for (const char* space : {"threadgroup ", "device ", "constant ", "thread "}) {
@@ -623,8 +552,6 @@ HelperFn parse_helper(const std::string& item, size_t name_start, size_t paren) 
   return f;
 }
 
-// `return` -> `{ r = expr; goto end; }`, so an expanded helper can hand its
-// value back through the statement expression.
 std::string helper_returns(const std::string& body, const std::string& retname) {
   std::string out;
   size_t i = 0;
@@ -651,10 +578,6 @@ std::string helper_returns(const std::string& body, const std::string& retname) 
   return out;
 }
 
-// Where the statement holding this offset begins: after the last `;`, `{` or `}`
-// outside parentheses. A body is rewritten in place, so the offset is into the
-// text built so far, and the statement that call sits in has not been written
-// yet, the boundary is therefore the tail of that text.
 size_t statement_start(const std::string& s, size_t at) {
   size_t start = 0;
   int paren = 0;
@@ -675,9 +598,7 @@ bool has_word(const std::string& s, const char* w) {
   return false;
 }
 
-// `return expr;` -> `hv = (expr);`, with no jump. Reports whether every return in
-// the body could be written that way: one with code after it cannot, and the
-// caller then keeps the statement-expression form.
+// `return expr;` -> `hv = (expr);`, with no jump.
 std::string helper_returns_flat(const std::string& body, const std::string& retname,
                                 const std::string& endlbl, bool& jumped) {
   std::string out;
@@ -697,9 +618,6 @@ std::string helper_returns_flat(const std::string& body, const std::string& retn
       else if (c == ';' && paren == 0 && bracket == 0) break;
       j++;
     }
-    // An early return leaves through a label after the block, so whatever follows
-    // it in the helper is skipped rather than run. A return with nothing after it
-    // needs no jump: control reaches the label on its own.
     const std::string expr = trim(body.substr(i + 6, j - i - 6));
     std::string rep;
     if (!expr.empty()) rep += retname + " = (" + expr + "); ";
@@ -714,9 +632,6 @@ std::string helper_returns_flat(const std::string& body, const std::string& retn
       rep += "goto " + endlbl + "; ";
       jumped = true;
     }
-    // One `return` is one statement, so its replacement has to be one too: without
-    // the braces `if (c) return x;` became an `if` around the assignment and a jump
-    // taken whether the condition held or not.
     if (!rep.empty()) out += "{ " + rep + "} ";
     i = (j < body.size()) ? j + 1 : body.size();
   }
@@ -749,19 +664,11 @@ std::string expand_helper_calls(const std::string& in, const HelperFn& f, bool& 
     std::string body = f.body;
     for (size_t k = 0; k < f.params.size(); k++) body = rename_word(body, f.params[k].second, "__weft_a" + std::to_string(k));
 
-    // A helper that waits on the block cannot be a call: the rendezvous has to end
-    // up inside the kernel body, where the resume point is. Its body is placed as a
-    // plain block before the statement that called it, which keeps the wait at
-    // statement level, a statement expression would put it inside an expression,
-    // where a lane resuming half way through has no defined value to carry. An
-    // early `return` leaves that block through a label after it.
     std::string repl;
     bool hoisted = false;
     if (f.suspends) {
       const size_t at = statement_start(out, out.size());
       const std::string seg = out.substr(at);
-      // Reached only if the call is reached unconditionally, and evaluated with
-      // nothing of the statement around it already in flight.
       bool once = !has_word(seg, "if") && !has_word(seg, "else") && !has_word(seg, "for") &&
                   !has_word(seg, "while") && !has_word(seg, "do") &&
                   !has_word(seg, "switch") && !has_word(seg, "case");
@@ -805,9 +712,7 @@ std::string expand_helper_calls(const std::string& in, const HelperFn& f, bool& 
   return out;
 }
 
-// Everything a kernel file declares for itself. Plain declarations and functions
-// are carried over verbatim; a function that waits on its warp is kept aside so
-// its calls can be expanded into the kernels that make them.
+// Everything a kernel file declares for itself.
 struct CarriedDecls {
   std::string text;
   std::vector<HelperFn> helpers;
@@ -817,22 +722,28 @@ CarriedDecls carry_decls(const std::string& src) {
   CarriedDecls c;
   for (const std::string& item : top_level_items(src)) {
     if (item.empty()) continue;
-    if (starts_with(item, "kernel")) continue;    // rewritten as a kernel body
-    if (starts_with(item, "fragment")) continue;  // rewritten as a per-pixel body
+    std::string bare = item;
+    bool stage_attr = false;
+    while (bare.compare(0, 2, "[[") == 0) {
+      const size_t end = bare.find("]]");
+      if (end == std::string::npos) break;
+      const std::string attr = bare.substr(2, end - 2);
+      if (attr == "fragment" || attr == "kernel" || attr == "vertex" || attr == "tile")
+        stage_attr = true;
+      bare.erase(0, end + 2);
+      const size_t nz = bare.find_first_not_of(" \t\r\n");
+      bare.erase(0, nz == std::string::npos ? bare.size() : nz);
+    }
+    if (stage_attr) continue;                      // rewritten as a stage body
+    if (starts_with(bare, "kernel")) continue;    // rewritten as a kernel body
+    if (starts_with(bare, "fragment")) continue;  // rewritten as a per-pixel body
+    if (starts_with(bare, "vertex")) continue;    // the launcher supplies it
     if (starts_with(item, "#include") || starts_with(item, "#pragma")) continue;
-    // The other pipeline stages are not compute: the vertex function is supplied
-    // by the launcher, and a tile function never gets this far, a render pass
-    // that has one is refused before any kernel is translated.
     if (starts_with(item, "vertex")) continue;
     if (item.compare(0, 8, "[[tile]]") == 0) continue;
     size_t ns = 0, par = 0;
     if (looks_like_function(item, ns, par)) {
       HelperFn f = parse_helper(item, ns, par);
-      // A function that names a threadgroup waits on it, owns storage in it, or
-      // both, and either way the block belongs to the kernel, so the body has to
-      // be inside the kernel body, where the shared window and the resume point
-      // are. Those are expanded at each call site, as a block before the calling
-      // statement, so the wait stays at statement level.
       const bool shares = f.body.find("threadgroup") != std::string::npos;
       if ((f.suspends || shares) && !f.ret.empty() && !f.body.empty()) {
         c.helpers.push_back(f);
@@ -840,11 +751,9 @@ CarriedDecls carry_decls(const std::string& src) {
       }
     }
     std::string swz_err;
-    c.text += rewrite_swizzles(rewrite_math_calls(item), swz_err) + "\n\n";
+    c.text += rewrite_swizzles(rewrite_math_calls(replace_all(item, "constant ", "const ")),
+                               swz_err) + "\n\n";
   }
-  // A suspending helper may call another: expand until the calls are gone. A
-  // recursive one cannot be expanded and is left to fail as a call to an
-  // undefined function, which names it.
   for (int pass = 0; pass < 8; pass++) {
     bool any = false;
     for (auto& dst : c.helpers) {
@@ -861,24 +770,16 @@ CarriedDecls carry_decls(const std::string& src) {
   return c;
 }
 
-// A texture argument: `texture2d<float>`, `texture2d<uint, access::read>` or
-// `texture2d_array<float>`. The array form carries a layer index on every read and
-// sample, and its slice count is the binding's, not a constant in the source.
+// A texture argument.
 struct TexParam {
   std::string name;
   std::string value;  // "float", "uint", "int" or "half"
   bool array = false;
   bool is3d = false;   // `texture3d`: every read and sample names a plane
   bool cube = false;   // `texturecube`: a sample takes a direction
-  // `texture1d`: one row, so a coordinate is an x and the other axis is not there.
-  // It is bound as a Wx1 image, which is what the launcher hands the GPU and what
-  // the CPU runtime indexes, so the two see the same bytes.
   bool is1d = false;
 };
 
-// `constexpr sampler s(filter::nearest, address::clamp_to_edge);` is a compile
-// time constant on the GPU, so it is parsed and removed here and its two
-// meaningful choices are baked into the sample calls.
 std::string strip_samplers(const std::string& in, std::map<std::string, std::pair<int, int>>& out,
                            std::string& err) {
   std::string body = in;
@@ -903,8 +804,6 @@ std::string strip_samplers(const std::string& in, std::map<std::string, std::pai
     else if (args.find("address::repeat") != std::string::npos) addr = 2;
     out[name] = {filter, addr};
 
-    // Remove the whole declaration, qualifiers and semicolon included: its
-    // start is the statement boundary before it.
     size_t start = p;
     while (start > 0 && body[start - 1] != ';' && body[start - 1] != '{' && body[start - 1] != '}')
       start--;
@@ -946,12 +845,7 @@ std::string rewrite_textures(const std::string& in, const std::vector<TexParam>&
 
       if (member == "get_width") { out += "(" + t.name + ".width)"; i = close + 1; hit = true; break; }
       if (member == "get_height") { out += "(" + t.name + ".height)"; i = close + 1; hit = true; break; }
-      // A 3D texture's depth is its binding's outermost extent, which is the same
-      // number a 2D array reports as its slice count.
       if (member == "get_depth") { out += "(" + t.name + ".layers)"; i = close + 1; hit = true; break; }
-      // A 2D array's slice count is a property of the binding, so it comes from
-      // the weft::Texture the launcher filled; a plain texture is one slice. Mip
-      // levels are always one, because the launcher creates one.
       if (member == "get_array_size") {
         out += (t.array || t.cube) ? ("(" + t.name + ".layers)") : std::string("(1u)");
         i = close + 1;
@@ -966,10 +860,6 @@ std::string rewrite_textures(const std::string& in, const std::vector<TexParam>&
       }
 
       auto args = split_top_level(in.substr(p + 1, close - p - 1));
-      // Metal's texture reads always hand back four channels: a single-channel
-      // format comes back as (value, 0, 0, 1), and kernels take `.x` of it. That
-      // shape matters, `float v = img.read(...)` does not compile on the GPU
-      // either.
       const std::string vec = (t.value == "float")   ? "float4"
                               : (t.value == "half") ? "half4"
                               : (t.value == "int")  ? "int4"
@@ -977,8 +867,6 @@ std::string rewrite_textures(const std::string& in, const std::vector<TexParam>&
       const std::string zero = (t.value == "float" || t.value == "half") ? "0" : "0u";
       const std::string one = (t.value == "float" || t.value == "half") ? "1" : "1u";
       if (member == "read") {
-        // A cube is filterable only: a face is not a position, so there is no
-        // texel to name without a direction.
         if (t.cube) {
           err = "texture '" + t.name + "' is a cube, so there is no texel to read: sample "
                 "it with a direction";
@@ -1067,9 +955,6 @@ std::string rewrite_textures(const std::string& in, const std::vector<TexParam>&
             err = "sampler '" + trim(args[0]) + "' is not a constexpr sampler in this kernel";
             return in;
           }
-          // 0.5 is the centre of the single row, so every filter and every address
-          // mode lands on the texel the coordinate names instead of mixing in a row
-          // that is not there.
           const std::string call =
               "weft::tex_sample<float>(" + t.name + ", (float)(" + trim(args[1]) +
               "), 0.5f, " + std::to_string(s->second.first) + ", " +
@@ -1135,9 +1020,7 @@ std::string rewrite_textures(const std::string& in, const std::vector<TexParam>&
         hit = true;
         break;
       }
-      // A storage image: `img.write(float4(v), uint2(x, y))`. Metal's third
-      // argument is a mip level and the launcher creates one level, so a write
-      // with an explicit level is the same write.
+      // A storage image.
       if (member == "write") {
         if (t.cube) {
           err = "texture '" + t.name + "' is a cube, which cannot be written: a face has no "
@@ -1169,10 +1052,6 @@ std::string rewrite_textures(const std::string& in, const std::vector<TexParam>&
   return out;
 }
 
-// One table for the whole warp/quad library: the shuffles, the four scan and
-// four reduction families, the votes, and the three things that are just this
-// thread's own lane. Every one of them is either a rendezvous (an awaitable) or
-// an expression, so they share one scanner.
 std::string rewrite_group_ops(const std::string& body, bool& found, bool& lanes,
                               std::string& err) {
   struct Op {
@@ -1209,8 +1088,6 @@ std::string rewrite_group_ops(const std::string& body, bool& found, bool& lanes,
       // Per-thread facts. No rendezvous, so no suspension.
       {"simd_is_first", "expr", "", 0, 32, "((ctx.lid & 31u) == 0u)"},
       {"simd_is_helper_thread", "expr", "", 0, 32, "(false)"},
-      // The same functions over a quad: four consecutive lanes, so the group
-      // base moves and the masks narrow, and nothing else changes.
       {"quad_shuffle_and_fill_down", "fill", "weft::kShflDown", 0, 4, nullptr},
       {"quad_shuffle_and_fill_up", "fill", "weft::kShflUp", 0, 4, nullptr},
       {"quad_shuffle_down", "shfl", "weft::kShflDown", 0, 4, nullptr},
@@ -1259,9 +1136,6 @@ std::string rewrite_group_ops(const std::string& body, bool& found, bool& lanes,
           err = std::string(op.name) + " takes no arguments";
           return body;
         }
-        // Reading the lane id is not a rendezvous: no suspension, but it does
-        // mean the thread needs its own context, so the kernel cannot take the
-        // flattened loop form.
         out += op.expr;
         lanes = true;
         matched = true;
@@ -1287,10 +1161,6 @@ std::string rewrite_group_ops(const std::string& body, bool& found, bool& lanes,
           err = std::string(op.name) + " takes one value";
           return body;
         }
-        // The last argument is this call site's number: every lane of a warp
-        // walks the same tree here, so the runtime computes it once and the
-        // other 31 lanes read their entry. A site number (not the pass alone)
-        // keeps two different scans in one pass from answering for each other.
         out += "(co_await weft::prefix(ctx, (" + trim(a[0]) + "), " + inc + ", " + prod + ", " +
                width + ", " + std::to_string((unsigned long long)i + 1ull) + "u))";
       } else if (kind == "reduce") {
@@ -1321,19 +1191,9 @@ std::string rewrite_group_ops(const std::string& body, bool& found, bool& lanes,
   return out;
 }
 
-// The Metal standard library pieces a kernel actually leans on: vector types
-// with the operators Metal defines, and atomics backed by std::atomic.
 const char* kMslPreamble = R"WEFT(
-// Vector types with Metal's sizes and alignments. The 3-element ones carry tail
-// padding on purpose: float3 is 16 bytes on a GPU, so a kernel indexing a
-// device float3* depends on that stride, and char3/short3 are padded to 4/8.
+// Vector types with Metal's sizes and alignments.
 using half = _Float16;
-// Alignment is part of the ABI too: Metal aligns a 2-element vector to twice its
-// element, a 4-element one to four times, and a struct to its widest member and
-// rounds its size up to that. A `struct { float4 p; float2 uv; }` is 32 bytes on
-// the GPU (p at 0, uv at 16, size rounded from 24 to 16-aligned), so a C++ mirror
-// without the alignments would bind the same buffer at a 24-byte stride and read
-// every vertex after the first from the wrong place.
 struct alignas(8) float2 {
   float x = 0, y = 0;
   float2() {}
@@ -1346,7 +1206,6 @@ struct alignas(16) float3 {
   float3() {}
   float3(float v) : x(v), y(v), z(v) {}
   float3(float a, float b, float c) : x(a), y(b), z(c) {}
-  // The four-argument form keeps the tail padding, which is what the operator
   // macros pass to preserve it across arithmetic.
   float3(float a, float b, float c, float p) : x(a), y(b), z(c), _pad(p) {}
   float3(float2 v, float c) : x(v.x), y(v.y), z(c) {}
@@ -1360,6 +1219,10 @@ struct alignas(16) float4 {
   float4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
   float4(float3 v, float d) : x(v.x), y(v.y), z(v.z), w(d) {}
   float4(float a, float3 v) : x(a), y(v.x), z(v.y), w(v.z) {}
+  // A vector followed by scalars, which Metal's constructors accept.
+  float4(float2 v, float a, float b) : x(v.x), y(v.y), z(a), w(b) {}
+  float4(float a, float2 v, float b) : x(a), y(v.x), z(v.y), w(b) {}
+  float4(float a, float b, float2 v) : x(a), y(b), z(v.x), w(v.y) {}
   float4(float2 a, float2 b) : x(a.x), y(a.y), z(b.x), w(b.y) {}
 };
 inline float3::float3(float4 v) : x(v.x), y(v.y), z(v.z) {}
@@ -1407,8 +1270,7 @@ struct alignas(8) short4 { int16_t x, y, z, w; };
 struct alignas(4) ushort2 { uint16_t x, y; };
 struct alignas(8) ushort3 { uint16_t x, y, z, _pad; };
 struct alignas(8) ushort4 { uint16_t x, y, z, w; };
-// The 64-bit and boolean vectors. A bool vector is one byte per lane with no
-// padding at all, and the 64-bit ones pad a 3-element vector out to 32 bytes.
+// The 64-bit and boolean vectors.
 struct bool2 { bool x, y; };
 struct bool3 { bool x, y, z; };
 struct bool4 { bool x, y, z, w; };
@@ -1439,10 +1301,7 @@ static_assert(sizeof(weft_layout_probe) == 32 && alignof(weft_layout_probe) == 1
               "Metal lays this out as p at 0, uv at 16, size rounded to 32: a vertex "
               "struct is the case where alignment, not member size, decides the stride");
 
-// The packed vectors: the same element types with no tail padding, so a
-// packed_float3 is the 12 bytes a device buffer of xyz triples actually holds.
-// That is the whole point of the type, it is a layout, and the alignments are
-// the element's, which is why char3-packed is 3 bytes and not 4.
+// packed_float3 is the 12 bytes a device buffer of xyz triples holds.
 #define WEFT_PACKED_VECS(S, P)                                                     \
   struct packed_##P##2 { S x, y; };                                               \
   struct packed_##P##3 { S x, y, z; };                                            \
@@ -1463,10 +1322,7 @@ static_assert(sizeof(packed_float3) == 12 && sizeof(packed_half3) == 6 &&
 static_assert(sizeof(packed_float4) == 16 && sizeof(packed_char4) == 4,
               "a packed 4-element vector is four elements wide");
 
-// Elementwise arithmetic for the vectors a kernel computes with. The 8- and
-// 16-bit vectors stay data types: kernels poke at their fields, and defining
 // every promoted-integer operator would be a lot of code for no use.
-// Every operator keeps the destination type, so an overflow wraps the way the
 // hardware's does: char2(100) + char2(100) is -56 here and on the GPU.
 #define WEFT_VEC2(T, S)                                                            \
   static inline T operator+(T a, T b) { return T{(S)(a.x + b.x), (S)(a.y + b.y)}; } \
@@ -1538,13 +1394,125 @@ WEFT_VEC4(float4, float)
 WEFT_VEC2(half2, half)
 WEFT_VEC3(half3, half)
 WEFT_VEC4(half4, half)
+
+// column, which is why a float3x3 is 48 bytes and not 36.
+struct alignas(8) float2x2 {
+  float2 c[2];
+  float2x2() {}
+  float2x2(float d) : c{float2(d, 0.0f), float2(0.0f, d)} {}
+  float2x2(float2 a, float2 b) : c{a, b} {}
+  float2x2(float a0, float a1, float b0, float b1) : c{float2(a0, a1), float2(b0, b1)} {}
+  float2& operator[](int i) { return c[i]; }
+  const float2& operator[](int i) const { return c[i]; }
+};
+struct alignas(16) float3x3 {
+  float3 c[3];
+  float3x3() {}
+  float3x3(float d) : c{float3(d, 0.0f, 0.0f), float3(0.0f, d, 0.0f), float3(0.0f, 0.0f, d)} {}
+  float3x3(float3 a, float3 b, float3 d) : c{a, b, d} {}
+  float3x3(float a0, float a1, float a2, float b0, float b1, float b2, float d0, float d1,
+           float d2)
+      : c{float3(a0, a1, a2), float3(b0, b1, b2), float3(d0, d1, d2)} {}
+  float3& operator[](int i) { return c[i]; }
+  const float3& operator[](int i) const { return c[i]; }
+};
+struct alignas(16) float4x4 {
+  float4 c[4];
+  float4x4() {}
+  float4x4(float d)
+      : c{float4(d, 0, 0, 0), float4(0, d, 0, 0), float4(0, 0, d, 0), float4(0, 0, 0, d)} {}
+  float4x4(float4 a, float4 b, float4 d, float4 e) : c{a, b, d, e} {}
+  float4x4(float a0, float a1, float a2, float a3, float b0, float b1, float b2, float b3,
+           float d0, float d1, float d2, float d3, float e0, float e1, float e2, float e3)
+      : c{float4(a0, a1, a2, a3), float4(b0, b1, b2, b3), float4(d0, d1, d2, d3),
+          float4(e0, e1, e2, e3)} {}
+  float4& operator[](int i) { return c[i]; }
+  const float4& operator[](int i) const { return c[i]; }
+};
+struct alignas(4) half2x2 {
+  half2 c[2];
+  half2x2() {}
+  half2x2(half d) : c{half2(d, half(0)), half2(half(0), d)} {}
+  half2x2(half2 a, half2 b) : c{a, b} {}
+  half2& operator[](int i) { return c[i]; }
+  const half2& operator[](int i) const { return c[i]; }
+};
+struct alignas(8) half3x3 {
+  half3 c[3];
+  half3x3() {}
+  half3x3(half d)
+      : c{half3(d, half(0), half(0)), half3(half(0), d, half(0)), half3(half(0), half(0), d)} {}
+  half3x3(half3 a, half3 b, half3 d) : c{a, b, d} {}
+  half3& operator[](int i) { return c[i]; }
+  const half3& operator[](int i) const { return c[i]; }
+};
+struct alignas(8) half4x4 {
+  half4 c[4];
+  half4x4() {}
+  half4x4(half d) : c{half4(d, half(0), half(0), half(0)), half4(half(0), d, half(0), half(0)),
+                       half4(half(0), half(0), d, half(0)), half4(half(0), half(0), half(0), d)} {}
+  half4x4(half4 a, half4 b, half4 d, half4 e) : c{a, b, d, e} {}
+  half4& operator[](int i) { return c[i]; }
+  const half4& operator[](int i) const { return c[i]; }
+};
+static_assert(sizeof(float2x2) == 16 && sizeof(float3x3) == 48 && sizeof(float4x4) == 64,
+              "a float matrix is its columns: a float3x3 keeps the padded 16-byte column");
+static_assert(sizeof(half2x2) == 8 && sizeof(half3x3) == 24 && sizeof(half4x4) == 32,
+              "a half matrix is its columns: 4, 8 and 8 bytes each");
+static inline float weft_lane(float2 v, int i) { return i == 0 ? v.x : v.y; }
+static inline float weft_lane(float3 v, int i) { return i == 0 ? v.x : i == 1 ? v.y : v.z; }
+static inline float weft_lane(float4 v, int i) {
+  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+static inline half weft_lane(half2 v, int i) { return i == 0 ? v.x : v.y; }
+static inline half weft_lane(half3 v, int i) { return i == 0 ? v.x : i == 1 ? v.y : v.z; }
+static inline half weft_lane(half4 v, int i) {
+  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+#define WEFT_MAT(MT, VT, S, N)                                                     \
+  static inline VT operator*(MT m, VT v) {                                         \
+    VT r = m.c[0] * weft_lane(v, 0);                                               \
+    for (int i = 1; i < N; i++) r = r + m.c[i] * weft_lane(v, i);                  \
+    return r;                                                                      \
+  }                                                                                \
+  static inline MT operator*(MT a, MT b) {                                         \
+    MT r;                                                                          \
+    for (int i = 0; i < N; i++) r.c[i] = a * b.c[i];                               \
+    return r;                                                                      \
+  }                                                                                \
+  static inline MT operator*(MT a, S s) {                                          \
+    MT r;                                                                          \
+    for (int i = 0; i < N; i++) r.c[i] = a.c[i] * s;                               \
+    return r;                                                                      \
+  }                                                                                \
+  static inline MT operator*(S s, MT a) { return a * s; }                          \
+  static inline MT operator+(MT a, MT b) {                                         \
+    MT r;                                                                          \
+    for (int i = 0; i < N; i++) r.c[i] = a.c[i] + b.c[i];                          \
+    return r;                                                                      \
+  }                                                                                \
+  static inline MT operator-(MT a, MT b) {                                         \
+    MT r;                                                                          \
+    for (int i = 0; i < N; i++) r.c[i] = a.c[i] - b.c[i];                          \
+    return r;                                                                      \
+  }                                                                                \
+  static inline MT operator-(MT a) {                                               \
+    MT r;                                                                          \
+    for (int i = 0; i < N; i++) r.c[i] = -a.c[i];                                  \
+    return r;                                                                      \
+  }
+WEFT_MAT(float2x2, float2, float, 2)
+WEFT_MAT(float3x3, float3, float, 3)
+WEFT_MAT(float4x4, float4, float, 4)
+WEFT_MAT(half2x2, half2, half, 2)
+WEFT_MAT(half3x3, half3, half, 3)
+WEFT_MAT(half4x4, half4, half, 4)
 WEFT_VEC2(int2, int32_t)
 WEFT_VEC3(int3, int32_t)
 WEFT_VEC4(int4, int32_t)
 WEFT_VEC2(uint2, uint32_t)
 WEFT_VEC3(uint3, uint32_t)
 WEFT_VEC4(uint4, uint32_t)
-// The 8- and 16-bit vectors compute too, and the result is the same narrow
 // type, which is what makes an overflow wrap where the hardware wraps.
 WEFT_VEC2(char2, int8_t)
 WEFT_VEC3(char3, int8_t)
@@ -1558,8 +1526,6 @@ WEFT_VEC4(short4, int16_t)
 WEFT_VEC2(ushort2, uint16_t)
 WEFT_VEC3(ushort3, uint16_t)
 WEFT_VEC4(ushort4, uint16_t)
-// Packed vectors are arithmetic types as well: the element count is all the
-// operators care about, and the result is the packed type so it stays 12 bytes
 // rather than growing a padding lane.
 #define WEFT_PVEC2(T, S)                                                          \
   static inline T operator+(T a, T b) { return T{(S)(a.x + b.x), (S)(a.y + b.y)}; } \
@@ -1624,8 +1590,6 @@ WEFT_VEC4(ulong4, uint64_t)
 WEFT_VEC2(double2, double)
 WEFT_VEC3(double3, double)
 WEFT_VEC4(double4, double)
-// Boolean vectors are elementwise logic, not arithmetic, so they get their own
-// set of operators.
 #define WEFT_BVEC(T, N)                                                              \
   static inline T operator&&(T a, T b) {                                            \
     T r{};                                                                          \
@@ -1661,12 +1625,6 @@ static inline half2 make_half2(half x, half y) { return half2{x, y}; }
 static inline int3 make_int3(int32_t x, int32_t y, int32_t z) { return int3{x, y, z, 0}; }
 static inline uint3 make_uint3(uint32_t x, uint32_t y, uint32_t z) { return uint3{x, y, z, 0}; }
 static inline float4 make_float4(float x, float y, float z, float w) { return float4{x, y, z, w}; }
-static inline uint4 make_uint4(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
-  return uint4{x, y, z, w};
-}
-// Comparisons return a bool vector, element by element, for every vector type
-// Metal defines them on. A bool vector gets only equality: `<` of two bools is
-// not something MSL offers either.
 #define WEFT_VCMP2(T, B)                                                                  \
   static inline B operator==(T a, T b) { return B{a.x == b.x, a.y == b.y}; }              \
   static inline B operator!=(T a, T b) { return B{a.x != b.x, a.y != b.y}; }              \
@@ -1716,11 +1674,7 @@ static inline bool4 operator==(bool4 a, bool4 b) {
 static inline bool2 operator!=(bool2 a, bool2 b) { return !(a == b); }
 static inline bool3 operator!=(bool3 a, bool3 b) { return !(a == b); }
 static inline bool4 operator!=(bool4 a, bool4 b) { return !(a == b); }
-// A swizzle is a *read*: `.xy` of a float4 is a float2 built from two fields, and
-// `.zyx` is a float3 in the other order. C++ has no such syntax for a struct, so
-// the translator turns the read into one call whose overload decides the result
-// type from the receiver, `weft_swz(v, 2, 1, 0)`. The indices are literals by
-// construction, so the compiler folds the picks and the rewrite costs nothing.
+// and `.zyx` is a float3 in the other order.
 #define WEFT_SWZ(T2, T3, T4, S)                                                    \
   static inline S weft_pick(T2 v, int i) { return i == 0 ? v.x : v.y; }             \
   static inline S weft_pick(T3 v, int i) {                                          \
@@ -1758,11 +1712,7 @@ WEFT_SWZ(half2, half3, half4, half)
 WEFT_SWZ(int2, int3, int4, int32_t)
 WEFT_SWZ(uint2, uint3, uint4, uint32_t)
 
-// A swizzle *write* is the index list of a read applied the other way, and C++ has
-// no name for "the second member of this struct", so the store is one `weft_put`
-// per component and the translator emits one call for the whole assignment:
-// `a.yx = b` is `weft_swz_w2(a, 1, 0, b)`. The right-hand side is taken into
-// locals first, so `a.yx = a.xy` swaps rather than reading a member it just wrote.
+// locals first, so `a.yx = a.xy` swaps rather than reading a member it wrote.
 #define WEFT_PUT(T2, T3, T4, S)                                                        \
   static inline void weft_put(T2& v, int i, S x) { if (i == 0) v.x = x; else v.y = x; } \
   static inline void weft_put(T3& v, int i, S x) {                                     \
@@ -1808,21 +1758,9 @@ static inline void weft_swz_w4(D& d, int a, int b, int c, int e, V v) {
 
 static inline long2 make_long2(int64_t x, int64_t y) { return long2{x, y}; }
 static inline long3 make_long3(int64_t x, int64_t y, int64_t z) { return long3{x, y, z, 0}; }
-static inline long4 make_long4(int64_t x, int64_t y, int64_t z, int64_t w) {
-  return long4{x, y, z, w};
-}
 static inline ulong2 make_ulong2(uint64_t x, uint64_t y) { return ulong2{x, y}; }
-static inline ulong3 make_ulong3(uint64_t x, uint64_t y, uint64_t z) {
-  return ulong3{x, y, z, 0};
-}
-static inline ulong4 make_ulong4(uint64_t x, uint64_t y, uint64_t z, uint64_t w) {
-  return ulong4{x, y, z, w};
-}
 static inline double2 make_double2(double x, double y) { return double2{x, y}; }
 static inline double3 make_double3(double x, double y, double z) { return double3{x, y, z, 0.0}; }
-static inline double4 make_double4(double x, double y, double z, double w) {
-  return double4{x, y, z, w};
-}
 static inline bool2 make_bool2(bool x, bool y) { return bool2{x, y}; }
 static inline bool3 make_bool3(bool x, bool y, bool z) { return bool3{x, y, z}; }
 static inline bool4 make_bool4(bool x, bool y, bool z, bool w) { return bool4{x, y, z, w}; }
@@ -1835,10 +1773,7 @@ static inline float4& operator*=(float4& a, float b) { a = a * b; return a; }
 static inline float3& operator+=(float3& a, float3 b) { a = a + b; return a; }
 static inline float3& operator*=(float3& a, float b) { a = a * b; return a; }
 
-// The bitwise operators on integer vectors, which MSL has and C++ does not: a
-// kernel that writes `q |= m` or `q <<= 2` is ordinary Metal. Every one is built
-// through weft_pick and weft_put, the same pair the swizzle helpers use, so a
-// struct's padding is neither read nor written, `T r{}` zeroes it once.
+// kernel that writes `q |= m` or `q <<= 2` is ordinary Metal.
 #define WEFT_BITS2(T)                                                                  \
   static inline T operator&(T a, T b) {                                                \
     T r{};                                                                             \
@@ -1992,15 +1927,6 @@ WEFT_BITS4(int4)
 WEFT_BITS2(uint2)
 WEFT_BITS3(uint3)
 WEFT_BITS4(uint4)
-//
-// On a GPU an 8x8 simdgroup matrix is distributed across the 32 lanes, and the
-// three operations are collective: every lane passes the same pointers and gets
-// its own fragment. Here the whole matrix is the value every lane holds, and the
-// operations do the whole load, store and product. That is the same answer for
-// every program the hardware accepts, because a collective call by definition
-// has the same arguments in all 32 lanes, only where the pieces live differs.
-// The element order of a load/store is Metal's: row-major in memory with
-// `elements_per_row`, with an optional uint2 origin and transpose.
 template <class T, int Cols, int Rows> struct simdgroup_matrix {
   T e[Cols * Rows];
   T& at(int r, int c) { return e[r * Cols + c]; }
@@ -2033,9 +1959,7 @@ static inline void simdgroup_store(simdgroup_matrix<T, Cols, Rows> m, T* dst,
     }
 }
 
-// d = a * b + c, with a Rows x K, b K x Cols and c/d Rows x Cols. The accumulate
-// is a plain sum in program order, which is what the GPU's dot product does for
-// the fp32 case; half products accumulate in half here, as they do there.
+// d = a * b + c, with a Rows x K, b K x Cols and c/d Rows x Cols.
 template <class T, int Cols, int Rows>
 static inline void simdgroup_multiply_accumulate(simdgroup_matrix<T, Cols, Rows>& d,
                                                  simdgroup_matrix<T, Cols, Rows> a,
@@ -2102,16 +2026,6 @@ static inline bool atomic_compare_exchange_weak_explicit(std::atomic<T>* p, T* e
 
 }  // namespace
 
-// `blk.c` is Metal's tile-memory member access: the value of this pixel's
-// slice. Lowered, it is a member of one element of an array, so it becomes
-// `blk->c` for the CPU (a pointer at this pixel) and `blk[pixel].c` for the GPU
-// (the same array indexed by the pixel), one piece of memory, two spellings.
-// `.slice(n)` is the n-th slice at this pixel, which is an index.
-// `indexed` (optional) is used when the access carries a subscript: it is a
-// template whose `@` becomes that subscript, so `imblk[p].c` can become
-// `blk[p - gid].c` instead of collapsing to `blk->c`. Dropping the subscript
-// would silently turn a read of a neighbouring pixel into a read of your own,
-// which is not the same program, see the tile-memory note in translate_msl.
 std::string rewrite_member_access(const std::string& body, const std::string& name,
                                   const std::string& prefix, std::string& err,
                                   const std::string& indexed = std::string()) {
@@ -2170,11 +2084,267 @@ std::string rewrite_member_access(const std::string& body, const std::string& na
   return out;
 }
 
-// A fragment function's `return colour;` is the write to the colour attachment:
-// the target is the kernel's last buffer, one float per pixel, and the pixel is
-// this invocation's grid index.
+struct FragTarget {
+  std::string field;
+  std::string type;
+  int index = 0;
+  int width = 4;
+};
+
+// What a fragment's return type says about where its values go.
+struct FragLayout {
+  int width = 0;  // scalar or vector return: 1 to 4 channels, 0 for a struct
+  std::string type_name;  // the return type as the shader spells it
+  std::vector<FragTarget> colours;
+  bool depth = false;
+  std::string depth_field;
+  std::string depth_qual;
+};
+
+std::string depth_test_src(const std::string& qual, const std::string& value) {
+  const std::string cur = "weft_depth[ctx.gid]";
+  if (qual == "less") return value + " < " + cur;
+  if (qual == "less_equal") return value + " <= " + cur;
+  if (qual == "greater") return value + " > " + cur;
+  if (qual == "greater_equal") return value + " >= " + cur;
+  if (qual == "equal") return value + " == " + cur;
+  if (qual == "not_equal") return value + " != " + cur;
+  if (qual == "never") return "false";
+  return std::string();  // any: the value is stored whatever it is
+}
+
+bool parse_frag_layout(const std::string& src, const std::string& ret, FragLayout& lay,
+                       std::string& err) {
+  std::string t = trim(ret);
+  for (;;) {
+    if (t.rfind("[[", 0) == 0) {
+      const size_t rb = t.find("]]");
+      if (rb == std::string::npos) break;
+      t = trim(t.substr(rb + 2));
+      continue;
+    }
+    if (!t.empty() && t[0] == ']') {
+      t = trim(t.substr(1));
+      continue;
+    }
+    break;
+  }
+  std::string base;
+  size_t i = 0;
+  while (i < t.size() && (std::isalpha((unsigned char)t[i]) || t[i] == '_')) base += t[i++];
+  const bool vec = base == "float" || base == "half";
+  lay.type_name = base;
+  if (vec && i == t.size()) { lay.width = 1; return true; }
+  if (vec && i + 1 == t.size() && t[i] >= '1' && t[i] <= '4') {
+    lay.width = t[i] - '0';
+    return true;
+  }
+  if (base.empty()) {
+    err = "could not read the fragment's return type";
+    return false;
+  }
+  const std::string key = "struct " + base;
+  size_t at = src.find(key);
+  while (at != std::string::npos) {
+    const size_t after = at + key.size();
+    const bool whole = after >= src.size() || !is_ident(src[after]);
+    if (whole) {
+      const size_t b = src.find('{', after);
+      if (b != std::string::npos && trim(src.substr(after, b - after)).empty()) {
+        const size_t e = find_matching(src, b, '{', '}');
+        if (e == std::string::npos) break;
+        const std::string fields = src.substr(b + 1, e - b - 1);
+        size_t s = 0;
+        while (s < fields.size()) {
+          const size_t semi = fields.find(';', s);
+          if (semi == std::string::npos) break;
+          const std::string decl = trim(fields.substr(s, semi - s));
+          s = semi + 1;
+          const size_t ca = decl.find("[[color(");
+          const size_t da = decl.find("[[depth(");
+          if (ca == std::string::npos && da == std::string::npos) continue;
+          const size_t att = ca != std::string::npos ? ca : da;
+          const std::string head = trim(decl.substr(0, att));
+          const size_t sp = head.find_last_of(" \t");
+          const std::string fname = sp == std::string::npos ? head : head.substr(sp + 1);
+          if (da != std::string::npos) {
+            lay.depth = true;
+            lay.depth_field = fname;
+            const size_t q = da + 8, qe = decl.find(')', q);
+            lay.depth_qual = (qe != std::string::npos) ? trim(decl.substr(q, qe - q)) : "any";
+            if (lay.depth_qual.empty()) lay.depth_qual = "any";
+            continue;
+          }
+          const std::string ftype = sp == std::string::npos ? std::string() : trim(head.substr(0, sp));
+          const size_t a = decl.find('(', ca), b2 = decl.find(')', ca);
+          FragTarget tg;
+          tg.field = fname;
+          tg.index = (a != std::string::npos && b2 > a)
+                         ? std::atoi(trim(decl.substr(a + 1, b2 - a - 1)).c_str())
+                         : 0;
+          tg.type = ftype;
+          tg.width = 1;
+          for (const char c : ftype)
+            if (c >= '1' && c <= '4') tg.width = c - '0';
+          lay.colours.push_back(tg);
+        }
+        if (lay.colours.empty() && !lay.depth) {
+          err = "the fragment returns '" + base + "', which names no [[color(n)]] target";
+          return false;
+        }
+        for (size_t x = 0; x < lay.colours.size(); x++)
+          for (size_t y = x + 1; y < lay.colours.size(); y++)
+            if (lay.colours[y].index < lay.colours[x].index) {
+              const FragTarget tmp = lay.colours[x];
+              lay.colours[x] = lay.colours[y];
+              lay.colours[y] = tmp;
+            }
+        return true;
+      }
+    }
+    at = src.find(key, after);
+  }
+  err = "the fragment returns '" + base + "', which is not a struct in this file";
+  return false;
+}
+
+std::string pad_struct_src(const FragLayout& lay) {
+  std::string s = "struct weft_pad_" + lay.type_name + " {\n";
+  for (const FragTarget& tg : lay.colours)
+    s += "  float4 " + tg.field + " [[color(" + std::to_string(tg.index) + ")]];\n";
+  if (lay.depth)
+    s += "  float " + lay.depth_field + " [[depth(" + lay.depth_qual + ")]];\n";
+  s += "};\n";
+  return s;
+}
+
+std::string widen_returns(const std::string& body, const FragLayout& lay,
+                          std::string& err) {
+  const std::string pad_t = "weft_pad_" + lay.type_name;
+  std::string out;
+  size_t i = 0;
+  while (i < body.size()) {
+    const bool rel = body.compare(i, 6, "return") == 0 && (i == 0 || !is_ident(body[i - 1])) &&
+                     (i + 6 >= body.size() || !is_ident(body[i + 6]));
+    if (!rel) {
+      out.push_back(body[i]);
+      i++;
+      continue;
+    }
+    size_t j = i + 6;
+    int paren = 0, bracket = 0;
+    while (j < body.size()) {
+      const char c = body[j];
+      if (c == '(') paren++;
+      else if (c == ')') paren--;
+      else if (c == '[') bracket++;
+      else if (c == ']') bracket--;
+      else if (c == ';' && paren == 0 && bracket == 0) break;
+      j++;
+    }
+    const std::string expr = trim(body.substr(i + 6, j - i - 6));
+    if (expr.empty()) {
+      err = "a fragment function has to return a colour";
+      return body;
+    }
+    if (lay.width != 0) {
+      if (lay.width == 3)
+        out += "{ auto weft_v = (" + expr + "); return float4(weft_v, 1.0); }";
+      else if (lay.width == 2)
+        out += "{ auto weft_v = (" + expr +
+               "); return float4(weft_v.x, weft_v.y, 0.0, 1.0); }";
+      else
+        out += "{ auto weft_v = (" + expr +
+               "); return float4(weft_v, weft_v, weft_v, 1.0); }";
+    } else {
+      std::string stmt = "{ auto weft_o = (" + expr + "); " + pad_t + " weft_p;";
+      for (const FragTarget& tg : lay.colours) {
+        const std::string f = "weft_o." + tg.field;
+        if (tg.width == 4)
+          stmt += " weft_p." + tg.field + " = " + f + ";";
+        else if (tg.width == 3)
+          stmt += " weft_p." + tg.field + " = float4(" + f + ", 1.0);";
+        else if (tg.width == 2)
+          stmt += " weft_p." + tg.field + " = float4(" + f + ".x, " + f + ".y, 0.0, 1.0);";
+        else
+          stmt += " weft_p." + tg.field + " = float4(" + f + ", " + f + ", " + f + ", 1.0);";
+      }
+      if (lay.depth)
+        stmt += " weft_p." + lay.depth_field + " = weft_o." + lay.depth_field + ";";
+      out += stmt + " return weft_p; }";
+    }
+    i = (j < body.size()) ? j + 1 : body.size();
+  }
+  return out;
+}
+
+// One fragment whose colour output is narrower than its attachment.
+struct GpuPad {
+  std::string name;
+  std::string ret_type;
+  FragLayout lay;
+};
+
+// Rewrites the GPU copy of each such fragment.
+bool apply_gpu_pads(std::string& src, const std::vector<GpuPad>& pads, std::string& err) {
+  struct Edit {
+    size_t at;
+    size_t end;
+    std::string text;
+  };
+  std::vector<Edit> edits;
+  for (const GpuPad& gp : pads) {
+    const std::string sig = gp.ret_type + " " + gp.name + "(";
+    const size_t at = src.find(sig);
+    if (at == std::string::npos) {
+      err = "could not find '" + gp.name + "' to widen its colour output";
+      return false;
+    }
+    const size_t paren = at + sig.size() - 1;
+    const size_t close = find_matching(src, paren, '(', ')');
+    if (close == std::string::npos) {
+      err = "unbalanced parameter list in '" + gp.name + "'";
+      return false;
+    }
+    const size_t brace = src.find('{', close);
+    if (brace == std::string::npos) {
+      err = "fragment '" + gp.name + "' has no body";
+      return false;
+    }
+    const size_t cbrace = find_matching(src, brace, '{', '}');
+    if (cbrace == std::string::npos) {
+      err = "unbalanced body in '" + gp.name + "'";
+      return false;
+    }
+    edits.push_back({at, at + gp.ret_type.size(),
+                     gp.lay.width != 0 ? std::string("float4") : ("weft_pad_" + gp.lay.type_name)});
+    std::string berr;
+    const std::string body = src.substr(brace + 1, cbrace - brace - 1);
+    const std::string wide = widen_returns(body, gp.lay, berr);
+    if (!berr.empty()) {
+      err = "fragment '" + gp.name + "': " + berr;
+      return false;
+    }
+    edits.push_back({brace + 1, cbrace, wide});
+    if (gp.lay.width == 0) {
+      size_t ls = src.rfind('\n', at);
+      ls = (ls == std::string::npos) ? 0 : ls + 1;
+      edits.push_back({ls, ls, pad_struct_src(gp.lay)});
+    }
+  }
+  for (size_t x = 0; x < edits.size(); x++)
+    for (size_t y = x + 1; y < edits.size(); y++)
+      if (edits[y].at > edits[x].at) {
+        const Edit tmp = edits[x];
+        edits[x] = edits[y];
+        edits[y] = tmp;
+      }
+  for (const Edit& e : edits) src.replace(e.at, e.end - e.at, e.text);
+  return true;
+}
+
 std::string rewrite_frag_return(const std::string& body, const std::string& ret,
-                                  std::string& err) {
+                                const FragLayout& lay, std::string& err) {
   std::string out;
   size_t i = 0;
   while (i < body.size()) {
@@ -2197,44 +2367,60 @@ std::string rewrite_frag_return(const std::string& body, const std::string& ret,
       err = "a fragment function has to return a colour";
       return body;
     }
-    // The target is RGBA32Float: the four channels the fragment returns, at this
-    // invocation's pixel. A narrower return fills what it has and leaves the rest
-    // at the value the GPU gives a channel the shader never wrote, alpha 1,
-    // colour 0, so a float3 colour is an opaque pixel rather than a black one.
-    // The width comes from the declared return type, because an expression's type
-    // is not known here and guessing it would be the translator inventing a
-    // layout out of the spelling of a variable.
-    std::string fill;
-    if (ret.find("4") != std::string::npos) {
-      fill = "weft_px[0] = (float)weft_c.x; weft_px[1] = (float)weft_c.y;\n"
-             "      weft_px[2] = (float)weft_c.z; weft_px[3] = (float)weft_c.w;";
-    } else if (ret.find("3") != std::string::npos) {
-      fill = "weft_px[0] = (float)weft_c.x; weft_px[1] = (float)weft_c.y;\n"
-             "      weft_px[2] = (float)weft_c.z; weft_px[3] = 1.0f;";
-    } else if (ret.find("2") != std::string::npos) {
-      fill = "weft_px[0] = (float)weft_c.x; weft_px[1] = (float)weft_c.y;\n"
-             "      weft_px[2] = 0.0f; weft_px[3] = 1.0f;";
+    if (lay.width != 0) {
+      std::string fill;
+      if (lay.width == 4) {
+        fill = "weft_px[0] = (float)weft_c.x; weft_px[1] = (float)weft_c.y;\n"
+               "      weft_px[2] = (float)weft_c.z; weft_px[3] = (float)weft_c.w;";
+      } else if (lay.width == 3) {
+        fill = "weft_px[0] = (float)weft_c.x; weft_px[1] = (float)weft_c.y;\n"
+               "      weft_px[2] = (float)weft_c.z; weft_px[3] = 1.0f;";
+      } else if (lay.width == 2) {
+        fill = "weft_px[0] = (float)weft_c.x; weft_px[1] = (float)weft_c.y;\n"
+               "      weft_px[2] = 0.0f; weft_px[3] = 1.0f;";
+      } else {
+        fill = "weft_px[0] = weft_px[1] = weft_px[2] = (float)weft_c; weft_px[3] = 1.0f;";
+      }
+      out += "{ float* weft_px = weft_colour + (size_t)ctx.gid * 4u; auto weft_c = (" + expr +
+             ");\n      " + fill + " return; }";
     } else {
-      fill = "weft_px[0] = weft_px[1] = weft_px[2] = (float)weft_c; weft_px[3] = 1.0f;";
+      std::string stmt = "{\n      auto weft_r = (" + expr + ");";
+      std::string weft_depth_val;
+      if (lay.depth) {
+        weft_depth_val = "(float)weft_r." + lay.depth_field;
+        const std::string test = depth_test_src(lay.depth_qual, weft_depth_val);
+        if (!test.empty()) stmt += "\n      if (!(" + test + ")) return;";
+      }
+      for (const FragTarget& tg : lay.colours) {
+        const std::string px = "weft_px_" + std::to_string(tg.index);
+        const std::string f = "weft_r." + tg.field;
+        stmt += "\n      float* " + px + " = weft_colour_" + std::to_string(tg.index) +
+                " + (size_t)ctx.gid * 4u;";
+        if (tg.width == 4) {
+          stmt += "\n      " + px + "[0] = (float)" + f + ".x; " + px + "[1] = (float)" + f +
+                  ".y;\n      " + px + "[2] = (float)" + f + ".z; " + px +
+                  "[3] = (float)" + f + ".w;";
+        } else if (tg.width == 3) {
+          stmt += "\n      " + px + "[0] = (float)" + f + ".x; " + px + "[1] = (float)" + f +
+                  ".y;\n      " + px + "[2] = (float)" + f + ".z; " + px + "[3] = 1.0f;";
+        } else if (tg.width == 2) {
+          stmt += "\n      " + px + "[0] = (float)" + f + ".x; " + px + "[1] = (float)" + f +
+                  ".y;\n      " + px + "[2] = 0.0f; " + px + "[3] = 1.0f;";
+        } else {
+          stmt += "\n      " + px + "[0] = " + px + "[1] = " + px + "[2] = (float)" + f +
+                  "; " + px + "[3] = 1.0f;";
+        }
+      }
+      if (lay.depth) stmt += "\n      weft_depth[ctx.gid] = " + weft_depth_val + ";";
+      stmt += " return; }";
+      out += stmt;
     }
-    out += "{ float* weft_px = weft_colour + (size_t)ctx.gid * 4u; auto weft_c = (" + expr +
-           ");\n      " + fill + " return; }";
     i = (j < body.size()) ? j + 1 : body.size();
   }
   return out;
 }
 
-// The source Metal compiles: the file as written, with tile memory lowered. Tile
-// memory is an imageblock, and this host's Metal compiler cannot compile one in
-// any spelling, so the parameter becomes a device buffer of one element per pixel
-// and `blk.c` becomes `blk[pixel].c`, the same memory the CPU binds, at the same
-// index. This runs for every translation, because a compute run hands Metal the
-// whole file too and would otherwise fail on a tile stage it never runs.
 std::string lower_imageblocks(std::string src, uint32_t width) {
-  // Tile memory is a 32x32 block per tile, the unit the hardware hands a tile
-  // stage, not one slot per pixel of the target. A pixel's slot is its tile's
-  // block plus its position inside it, and the same expression is emitted for the
-  // GPU and for the CPU translation, so both address the same slot.
   const std::string wpix = std::to_string(width) + "u";
   const std::string wtiles = std::to_string((width + 31) / 32) + "u";
   bool any_imageblock = false;
@@ -2264,8 +2450,6 @@ std::string lower_imageblocks(std::string src, uint32_t width) {
     const std::string params = src.substr(paren + 1, close - paren - 1);
     const std::string body = src.substr(brace + 1, end - brace - 1);
     const std::string head = trim(src.substr(k + kw.size(), paren - k - kw.size()));
-    // A `kernel` with an imageblock is the pass's tile stage: a compute kernel
-    // cannot have one, and every fragment is spelled `fragment`.
     const bool is_tile = (kw == "kernel");
 
     std::string ib_name, ib_elem, pos_name, gid_name;
@@ -2325,9 +2509,7 @@ std::string lower_imageblocks(std::string src, uint32_t width) {
                 : ("((uint)" + pos_name + ".y * " + wpix + " + (uint)" + pos_name + ".x)");
     const std::string px = "weft_tile_slot(" + own_px + ", " + wpix + ", " + wtiles + ")";
     std::string err;
-    // An indexed access keeps its own pixel: `blk[q].c` is a read of pixel q,
-    // which is legal when q is in the same tile, so it must not collapse to the
-    // invocation's own pixel here either.
+    // An indexed access keeps its own pixel.
     out += rewrite_member_access(body, ib_name, ib_name + "[" + px + "].", err,
                                  ib_name + "[weft_tile_slot(@, " + wpix + ", " + wtiles + ")].");
     out += "}";
@@ -2346,25 +2528,11 @@ std::string lower_imageblocks(std::string src, uint32_t width) {
   return out;
 }
 
-// The module ABI (include/weft/weft.h), emitted after the kernels. Element widths
-// are `sizeof` of each buffer's declared C++ type, evaluated by the compiler that
-// builds this file, so a `float4*` is 16 bytes and a `packed_float3*` is 12, with
-// no layout engine here. A front end that cannot type its pointers (PTX binds
-// addresses, SPIR-V pointer values) reports nothing, and 4 bytes is assumed.
 static const char* kMslMathText = R"WEFT(
-//
-// `using std::` above covers the scalar functions; std has nothing for float3, so
-// these are the component-wise definitions Metal's specification gives, in the
-// order it gives them. That order is not cosmetic: `mix` is x + (y - x) * a and
-// not (1 - a) * x + a * y, and the two round differently.
+// the order it gives them.
 inline float saturate(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
 
-//
-// Metal defines these for `half` and std does not, so without the exact overload
-// `abs(h)` is ambiguous between the int and float ones. Each is a comparison or a
-// round-to-integer, which gives the same bits however it is compiled; the
-// functions that *do* have rounding freedom (sqrt, pow, sin, fma, smoothstep,
-// mix) are in the portable library instead, so both engines run the same text.
+// `abs(h)` is ambiguous between the int and float ones.
 inline half abs(half x) { return x < half(0) ? (half)(-x) : x; }
 inline half fabs(half x) { return abs(x); }
 inline half min(half a, half b) { return b < a ? b : a; }
@@ -2441,8 +2609,6 @@ inline float distance(float2 a, float2 b) { return length(a - b); }
 inline float distance(float3 a, float3 b) { return length(a - b); }
 inline float distance(float4 a, float4 b) { return length(a - b); }
 
-// One definition per width from one name: the expression forms below are written
-// out, because passing an expression where this expects a function would call it.
 #define WEFT_VEC1(NAME, FN)                                                        \
   inline float2 NAME(float2 v) { return float2{FN(v.x), FN(v.y)}; }                 \
   inline float3 NAME(float3 v) { return float3{FN(v.x), FN(v.y), FN(v.z)}; }        \
@@ -2483,6 +2649,88 @@ WEFT_MATH2(max, std::max)
 WEFT_MATH2(pow, std::pow)
 WEFT_VECS(fmod, std::fmod)
 WEFT_MATH2(fmod, std::fmod)
+
+// The matrix helpers: transpose, determinant and inverse for the float matrices.
+inline float2x2 transpose(float2x2 m) {
+  return float2x2{float2{m.c[0].x, m.c[1].x}, float2{m.c[0].y, m.c[1].y}};
+}
+inline float3x3 transpose(float3x3 m) {
+  return float3x3{float3{m.c[0].x, m.c[1].x, m.c[2].x}, float3{m.c[0].y, m.c[1].y, m.c[2].y},
+                  float3{m.c[0].z, m.c[1].z, m.c[2].z}};
+}
+inline float4x4 transpose(float4x4 m) {
+  return float4x4{float4{m.c[0].x, m.c[1].x, m.c[2].x, m.c[3].x},
+                  float4{m.c[0].y, m.c[1].y, m.c[2].y, m.c[3].y},
+                  float4{m.c[0].z, m.c[1].z, m.c[2].z, m.c[3].z},
+                  float4{m.c[0].w, m.c[1].w, m.c[2].w, m.c[3].w}};
+}
+inline float determinant(float2x2 m) { return m.c[0].x * m.c[1].y - m.c[1].x * m.c[0].y; }
+inline float determinant(float3x3 m) { return dot(m.c[0], cross(m.c[1], m.c[2])); }
+inline float determinant(float4x4 m) {
+  // Expansion along the first column, with the three remaining columns as rows.
+  const float3 r0{m.c[1].x, m.c[2].x, m.c[3].x};
+  const float3 r1{m.c[1].y, m.c[2].y, m.c[3].y};
+  const float3 r2{m.c[1].z, m.c[2].z, m.c[3].z};
+  const float3 r3{m.c[1].w, m.c[2].w, m.c[3].w};
+  return m.c[0].x * dot(r1, cross(r2, r3)) - m.c[0].y * dot(r0, cross(r2, r3)) +
+         m.c[0].z * dot(r0, cross(r1, r3)) - m.c[0].w * dot(r0, cross(r1, r2));
+}
+inline float2x2 inverse(float2x2 m) {
+  return float2x2{float2{m.c[1].y, -m.c[0].y}, float2{-m.c[1].x, m.c[0].x}} *
+         (1.0f / determinant(m));
+}
+inline float3x3 inverse(float3x3 m) {
+  // The adjugate: each column is the cross product of the other two columns.
+  return float3x3{cross(m.c[1], m.c[2]), cross(m.c[2], m.c[0]), cross(m.c[0], m.c[1])} *
+         (1.0f / determinant(m));
+}
+inline float4x4 inverse(float4x4 m) {
+  // remaining element chosen so a nearly singular matrix still divides once.
+  const float cols[4][4] = {{m.c[0].x, m.c[0].y, m.c[0].z, m.c[0].w},
+                            {m.c[1].x, m.c[1].y, m.c[1].z, m.c[1].w},
+                            {m.c[2].x, m.c[2].y, m.c[2].z, m.c[2].w},
+                            {m.c[3].x, m.c[3].y, m.c[3].z, m.c[3].w}};
+  float a[4][8];
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++) {
+      a[i][j] = cols[j][i];
+      a[i][j + 4] = (i == j) ? 1.0f : 0.0f;
+    }
+  for (int col = 0; col < 4; col++) {
+    int piv = col;
+    for (int r = col + 1; r < 4; r++)
+      if (std::abs(a[r][col]) > std::abs(a[piv][col])) piv = r;
+    if (a[piv][col] == 0.0f) return float4x4{0.0f};
+    for (int k = 0; k < 8; k++) {
+      const float t = a[col][k];
+      a[col][k] = a[piv][k];
+      a[piv][k] = t;
+    }
+    const float s = 1.0f / a[col][col];
+    for (int k = 0; k < 8; k++) a[col][k] *= s;
+    for (int r = 0; r < 4; r++) {
+      if (r == col) continue;
+      const float f = a[r][col];
+      for (int k = 0; k < 8; k++) a[r][k] -= f * a[col][k];
+    }
+  }
+  return float4x4{float4{a[0][4], a[1][4], a[2][4], a[3][4]},
+                  float4{a[0][5], a[1][5], a[2][5], a[3][5]},
+                  float4{a[0][6], a[1][6], a[2][6], a[3][6]},
+                  float4{a[0][7], a[1][7], a[2][7], a[3][7]}};
+}
+// select(a, b, c) is b where c holds and a elsewhere, which is Metal's order.
+inline float select(float a, float b, bool c) { return c ? b : a; }
+inline float2 select(float2 a, float2 b, bool2 c) {
+  return float2{c.x ? b.x : a.x, c.y ? b.y : a.y};
+}
+inline float3 select(float3 a, float3 b, bool3 c) {
+  return float3{c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z};
+}
+inline float4 select(float4 a, float4 b, bool4 c) {
+  return float4{c.x ? b.x : a.x, c.y ? b.y : a.y, c.z ? b.z : a.z, c.w ? b.w : a.w};
+}
+inline int select(int a, int b, bool c) { return c ? b : a; }
 #undef WEFT_VEC1
 #undef WEFT_VECS
 #undef WEFT_VEC2
@@ -2506,7 +2754,6 @@ inline float4 rsqrt(float4 v) {
   return float4{rsqrt(v.x), rsqrt(v.y), rsqrt(v.z), rsqrt(v.w)};
 }
 
-// step(edge, x): zero below the edge, one at or above it.
 inline float step(float edge, float x) { return x < edge ? 0.0f : 1.0f; }
 inline float2 step(float edge, float2 v) {
   return float2{step(edge, v.x), step(edge, v.y)};
@@ -2518,7 +2765,6 @@ inline float4 step(float edge, float4 v) {
   return float4{step(edge, v.x), step(edge, v.y), step(edge, v.z), step(edge, v.w)};
 }
 
-// Metal has fmod (a truncated remainder), not mod: the floored remainder is a
 // different function and a kernel that used it would not compile on the GPU.
 
 inline float2 normalize(float2 v) { return v / length(v); }
@@ -2572,19 +2818,6 @@ inline float4 smoothstep(float e0, float e1, float4 v) {
 }
 )WEFT";
 
-//
-// A mesh pipeline is hardware this device may not implement (MTLGPUFamilyApple9,
-// M3 and later). What a mesh *stage* produces is not a pipeline feature though:
-// it is two buffers, vertices and triangles, written by the lanes of a
-// threadgroup, and a task stage produces a payload and a meshgrid. Both are
-// ordinary memory, so the GPU side is lowered to a compute kernel that writes the
-// same buffers the CPU writes, and the two are compared like any other kernel.
-// This is the trade tile memory already makes: the missing hardware feature is
-// spelled as the memory the launcher binds.
-//
-// The shims below are what the body's own calls go to, so `set_vertex`, `vertices`,
-// `get_vertex`, `set_primitive`, `mgp.set_threadgroups_per_grid` and the payload
-// reference keep their spelling while addressing the same slots the CPU does.
 const char* kGpuStageShims = R"WEFT(
 
 template <class V, int NV, int NP>
@@ -2595,10 +2828,7 @@ struct weft_gpu_mesh {
     device V& operator[](uint i) { return b[o + i]; }
   };
   struct prow {
-    // A primitive is a uint3, and Metal pads it to 16 bytes. Storing a uint4
-    // whose fourth word is zero makes the padding defined, the CPU mirror writes
-    // the same zero, so the two primitive blocks compare byte for byte instead
-    // of agreeing only in their first three words.
+    // A primitive is a uint3, and Metal pads it to 16 bytes.
     device uint4* b;
     uint o;
     device uint4& operator[](uint i) { return b[o + i]; }
@@ -2616,9 +2846,6 @@ struct weft_gpu_mesh {
   void set_primitive(uint i, P t) { p[g * (uint)NP + i] = uint4(t.x, t.y, t.z, 0u); }
 };
 
-// A task stage's dispatch handle, writing the same three words the launcher reads.
-// Two overloads rather than one templated on `requires`: this Metal compiler has
-// no concepts, and `uint` and `uint3` are the only two forms the language takes.
 struct weft_gpu_mgp {
   device uint* o;
   void set_threadgroups_per_grid(uint x) {
@@ -2634,14 +2861,8 @@ struct weft_gpu_mgp {
 };
 )WEFT";
 
-// Rewrite every `[[mesh]]`/`[[object]]` stage in the source handed to Metal into
-// a compute kernel over the same buffers. The stages' own members keep their
-// names; what changes is that the stage is a kernel and its outputs are bindings.
 std::string lower_gpu_stages(std::string src) {
   bool used = false;
-  // The parameter list that contains `at` (its own `(` and the matching `)`), and
-  // the highest `[[buffer(N)]]` index in it, the stage's outputs bind above it,
-  // exactly where the CPU translation puts them.
   auto enclosing = [&](size_t at) -> size_t {
     int depth = 0;
     for (size_t i = at; i-- > 0;) {
@@ -2668,10 +2889,6 @@ std::string lower_gpu_stages(std::string src) {
       m = std::max(m, std::atoi(ps.c_str() + p + 7));
     return m;
   };
-  // Every stage needs the threadgroup index: it is what a mesh's slice and a
-  // task's payload element are addressed by. A stage that already declares
-  // [[threadgroup_position_in_grid]] uses that parameter, declaring a second one
-  // is a redeclaration error, and one that does not gets a fresh one.
   auto tg_expr_for = [&](size_t par, size_t par_end) -> std::string {
     const std::string ps = src.substr(par, par_end - par);
     const size_t a = ps.find("threadgroup_position_in_grid");
@@ -2733,15 +2950,12 @@ std::string lower_gpu_stages(std::string src) {
     const size_t par = src.find('(', at);
     const size_t par_end = par == std::string::npos ? std::string::npos : closing(par);
     if (par_end == std::string::npos) break;
-    // The stage's own threadgroup index, which the payload is indexed by.
     tg_expr_for(par, par_end);
     src.replace(at, 10, "kernel");
     at += 6;
     used = true;
   }
 
-  // `object_data T& p [[payload]]` becomes a binding plus a reference to this
-  // group's element, the same element the CPU binds.
   for (size_t at = 0; (at = src.find("[[payload]]", at)) != std::string::npos;) {
     const size_t par = enclosing(at);
     const size_t par_end = par == std::string::npos ? std::string::npos : closing(par);
@@ -2783,8 +2997,6 @@ std::string lower_gpu_stages(std::string src) {
     used = true;
   }
   if (!used) return src;
-  // The shims need metal_stdlib and the vector types, so they go after the
-  // file's includes rather than before them.
   size_t last_inc = 0;
   for (size_t p = 0; (p = src.find("#include", p)) != std::string::npos;) {
     p = src.find('\n', p);
@@ -2795,6 +3007,128 @@ std::string lower_gpu_stages(std::string src) {
   return src;
 }
 
+std::string emit_ir(const std::vector<TranslatedKernel>& kernels) {
+  std::string s = "weft-ir 1\n";
+  for (const TranslatedKernel& k : kernels) {
+    s += "kernel " + k.name + "\n";
+    s += "  bindings " + std::to_string(k.nargs) + "\n";
+    s += "  buffers " + std::to_string(k.nbufs) + "\n";
+    for (size_t b = 0; b < k.buf_type.size(); b++)
+      s += "  buffer " + std::to_string(b) + " " + k.buf_type[b] + "\n";
+    for (size_t p = 0; p < k.params.size(); p++) {
+      const TranslatedKernel::Param& pr = k.params[p];
+      s += "  param " + std::to_string(p) + " " + pr.type;
+      if (pr.buf >= 0) s += " buffer " + std::to_string(pr.buf);
+      if (pr.scalar >= 0) s += " scalar " + std::to_string(pr.scalar);
+      s += "\n";
+    }
+    size_t ntex = k.tex_name.size();
+    if (k.tex_shape.size() > ntex) ntex = k.tex_shape.size();
+    if (k.tex_rw.size() > ntex) ntex = k.tex_rw.size();
+    for (size_t t = 0; t < ntex; t++) {
+      s += "  texture " + std::to_string(t);
+      if (t < k.tex_name.size() && !k.tex_name[t].empty()) s += " " + k.tex_name[t];
+      if (t < k.tex_shape.size() && !k.tex_shape[t].empty()) s += " " + k.tex_shape[t];
+      if (t < k.tex_rw.size() && k.tex_rw[t]) s += " read_write";
+      s += "\n";
+    }
+    if (k.ntex) s += "  textures " + std::to_string(k.ntex) + "\n";
+    if (k.nsamp) s += "  samplers " + std::to_string(k.nsamp) + "\n";
+    if (k.tg_hint) s += "  threads " + std::to_string(k.tg_hint) + "\n";
+    if (k.fixed_threads) s += "  threads_fixed " + std::to_string(k.fixed_threads) + "\n";
+    if (k.def_threads) s += "  threads_default " + std::to_string(k.def_threads) + "\n";
+    if (k.slot_words) s += "  slot_words " + std::to_string(k.slot_words) + "\n";
+    if (k.slot_per) s += "  slot_per " + std::to_string(k.slot_per) + "\n";
+    if (k.tile_idx >= 0) s += "  tile_buffer " + std::to_string(k.tile_idx) + "\n";
+    if (k.colour_idx >= 0) s += "  colour_buffer " + std::to_string(k.colour_idx) + "\n";
+    if (k.payload_idx >= 0) s += "  payload_buffer " + std::to_string(k.payload_idx) + "\n";
+    if (k.props_idx >= 0) s += "  props_buffer " + std::to_string(k.props_idx) + "\n";
+    if (k.mesh) s += "  mesh " + std::to_string(k.mesh_nv) + " " + std::to_string(k.mesh_np) + "\n";
+    static const char* const kFlags[] = {"sync", "flat", "step", "warp", "warp_only",
+                                         "gpu_warp", "tile", "task", "wide"};
+    const bool vals[] = {k.sync,  k.flat,  k.step,     k.warp, k.warp_only,
+                         k.gpu_warp, k.tile, k.task, k.wide};
+    for (size_t f = 0; f < sizeof(vals) / sizeof(vals[0]); f++)
+      if (vals[f]) s += std::string("  flag ") + kFlags[f] + "\n";
+    for (const std::string& u : k.unused) s += "  unused " + u + "\n";
+  }
+  return s;
+}
+
+static std::string ir_quote(const std::string& s) {
+  std::string o = "\"";
+  for (char c : s) {
+    if (c == '"' || c == '\\') o += '\\';
+    o += c;
+  }
+  return o + "\"";
+}
+
+std::string emit_ir_json(const std::vector<TranslatedKernel>& kernels) {
+  std::string s = "{\"ir\":\"weft-ir\",\"version\":1,\"kernels\":[";
+  for (size_t i = 0; i < kernels.size(); i++) {
+    const TranslatedKernel& k = kernels[i];
+    if (i) s += ",";
+    s += "{\"name\":" + ir_quote(k.name);
+    s += ",\"bindings\":" + std::to_string(k.nargs);
+    s += ",\"buffer_count\":" + std::to_string(k.nbufs);
+    s += ",\"buffers\":[";
+    for (size_t b = 0; b < k.buf_type.size(); b++)
+      s += (b ? "," : "") + ir_quote(k.buf_type[b]);
+    s += "],\"params\":[";
+    for (size_t p = 0; p < k.params.size(); p++) {
+      if (p) s += ",";
+      s += "{\"type\":" + ir_quote(k.params[p].type) +
+           ",\"buffer\":" + std::to_string(k.params[p].buf) +
+           ",\"scalar\":" + std::to_string(k.params[p].scalar) + "}";
+    }
+    size_t ntex = k.tex_name.size();
+    if (k.tex_shape.size() > ntex) ntex = k.tex_shape.size();
+    if (k.tex_rw.size() > ntex) ntex = k.tex_rw.size();
+    s += "],\"textures\":[";
+    for (size_t t = 0; t < ntex; t++) {
+      if (t) s += ",";
+      s += "{\"name\":" + ir_quote(t < k.tex_name.size() ? k.tex_name[t] : std::string());
+      s += ",\"shape\":" + ir_quote(t < k.tex_shape.size() ? k.tex_shape[t] : std::string());
+      s += std::string(",\"read_write\":") + (t < k.tex_rw.size() && k.tex_rw[t] ? "true" : "false");
+      s += "}";
+    }
+    s += "],\"texture_count\":" + std::to_string(k.ntex);
+    s += ",\"sampler_count\":" + std::to_string(k.nsamp);
+    s += ",\"threads\":{\"declared\":" + std::to_string(k.tg_hint) +
+         ",\"fixed\":" + std::to_string(k.fixed_threads) +
+         ",\"default\":" + std::to_string(k.def_threads) + "}";
+    s += ",\"warp\":{\"slot_words\":" + std::to_string(k.slot_words) +
+         ",\"slot_per\":" + std::to_string(k.slot_per) + "}";
+    s += ",\"binding_indices\":{\"tile\":" + std::to_string(k.tile_idx) +
+         ",\"colour\":" + std::to_string(k.colour_idx) +
+         ",\"payload\":" + std::to_string(k.payload_idx) +
+         ",\"props\":" + std::to_string(k.props_idx) + "}";
+    if (k.mesh)
+      s += ",\"mesh\":{\"vertices\":" + std::to_string(k.mesh_nv) +
+           ",\"primitives\":" + std::to_string(k.mesh_np) + "}";
+    else
+      s += ",\"mesh\":null";
+    static const char* const kFlagNames[] = {"sync",  "flat",      "step", "warp",
+                                             "warp_only", "gpu_warp", "tile", "task", "wide"};
+    const bool flagVals[] = {k.sync,  k.flat,      k.step,     k.warp, k.warp_only,
+                             k.gpu_warp, k.tile,     k.task,     k.wide};
+    s += ",\"flags\":[";
+    bool first = true;
+    for (size_t f = 0; f < sizeof(flagVals) / sizeof(flagVals[0]); f++) {
+      if (!flagVals[f]) continue;
+      if (!first) s += ",";
+      s += ir_quote(kFlagNames[f]);
+      first = false;
+    }
+    s += "],\"unused\":[";
+    for (size_t u = 0; u < k.unused.size(); u++)
+      s += (u ? "," : "") + ir_quote(k.unused[u]);
+    s += "]}";
+  }
+  return s + "]}";
+}
+
 std::string emit_module_abi(const std::vector<TranslatedKernel>& kernels) {
   std::string code;
   for (size_t i = 0; i < kernels.size(); i++) {
@@ -2802,9 +3136,6 @@ std::string emit_module_abi(const std::vector<TranslatedKernel>& kernels) {
     if (k.buf_type.empty()) continue;
     code += "static const uint32_t weft_bytes_" + std::to_string(i) + "[] = {";
     for (size_t b = 0; b < k.buf_type.size(); b++) {
-      // A width is either a C++ type (the Metal front end, where `sizeof` is
-      // the compiler's answer and needs no layout engine here) or a byte count
-      // the front end derived itself (SPIR-V, whose layout is explicit).
       const std::string& w = k.buf_type[b];
       const bool literal = !w.empty() && w.find_first_not_of("0123456789") == std::string::npos;
       code += (b ? ", " : "") + std::string("(uint32_t)") +
@@ -2830,29 +3161,12 @@ std::string emit_module_abi(const std::vector<TranslatedKernel>& kernels) {
       "  return -1;\n"
       "}\n"
       "extern \"C\" void weft_set_sampler(int i, int f, int a) { weft::set_sampler(i, f, a); }\n"
-      // Tile memory's one undefined case, made visible: a kernel that reads a
-      // pixel outside its own tile has no answer the GPU defines, so the
-      // launcher can ask whether any such access happened.
       "extern \"C\" void weft_tile_reset() { weft::tile_reset(); }\n"
       "extern \"C\" uint64_t weft_tile_violations() { return weft::tile_violations(); }\n";
   return code;
 }
 
 // The math calls a shader makes that are hardware approximations on the GPU.
-// Both sides are rewritten to the portable implementation, so the comparison is
-// between two runs of the same code rather than of two different libraries.
-// A warp prefix scan is the CPU's tree, on the GPU as well.
-//
-// `simd_prefix_*` there is the hardware's own fold, and for floats a different
-// order of additions is a different answer, 6.1e-05 apart over 65,536 lanes. The
-// CPU runtime already runs the doubling (Kogge-Stone) tree, so the shader's calls
-// are pointed at that tree too (`weft::warp_prefix` in src/weft_msl.hpp) and both
-// engines then perform the identical sequence of additions.
-//
-// This rewrites the file the author wrote, not the runtime preamble emitted in
-// front of it: `warp_prefix` itself asks the hardware for an integer prefix (it is
-// exact, and it is how a helper learns its lane id), and rewriting that would
-// make the helper call itself.
 static std::string rewrite_warp_scans(const std::string& text) {
   struct Scan {
     const char* name;
@@ -2860,8 +3174,7 @@ static std::string rewrite_warp_scans(const std::string& text) {
     const char* prod;
     const char* width;
   };
-  // Longest name first: `..._product` contains `..._`, and the match requires the
-  // '(' straight after the name anyway.
+  // Longest name first.
   static const Scan kScans[] = {
       {"simd_prefix_inclusive_product", "true", "true", "32u"},
       {"simd_prefix_exclusive_product", "false", "true", "32u"},
@@ -2902,8 +3215,6 @@ static std::string rewrite_warp_scans(const std::string& text) {
 }
 
 std::string weft_math_preamble() {
-  // The order the Metal path uses: the vector types Metal's short spellings mean,
-  // then the vector half of the library, then the portable math over both.
   return std::string(kMslPreamble) +
          "using uint = unsigned int;\n"
          "using ushort = unsigned short;\n"
@@ -2911,10 +3222,271 @@ std::string weft_math_preamble() {
          kMslMathText + kWSoftMath + weft_f64_cpp_text();
 }
 
+// The other place the same choice is made.
+std::string fuse_mul_add(const std::string& src) {
+  auto skip_ws = [&](size_t& p) {
+    while (p < src.size() && (src[p] == ' ' || src[p] == '\t' || src[p] == '\n')) p++;
+  };
+  auto operand = [&](size_t& p) {
+    skip_ws(p);
+    const size_t from = p;
+    if (p < src.size() && src[p] == '-') {
+      p++;
+      skip_ws(p);
+    }
+    bool any = false;
+    while (p < src.size()) {
+      const char c = src[p];
+      if (is_ident(c) || c == '.') {
+        p++;
+        any = true;
+      } else if (c == '(' || c == '[') {
+        const char close = c == '(' ? ')' : ']';
+        int depth = 0;
+        for (; p < src.size(); p++) {
+          if (src[p] == c) depth++;
+          else if (src[p] == close) {
+            if (--depth == 0) {
+              p++;
+              break;
+            }
+          }
+        }
+        if (depth != 0) return std::string();
+        any = true;
+      } else {
+        break;
+      }
+    }
+    if (!any) return std::string();
+    const std::string e = trim(src.substr(from, p - from));
+    if (e.empty() || e.find("++") != std::string::npos || e.find("--") != std::string::npos ||
+        e.find('=') != std::string::npos || e.find(',') != std::string::npos)
+      return std::string();
+    return e;
+  };
+  std::string out;
+  size_t i = 0;
+  while (i < src.size()) {
+    const char before = i == 0 ? ' ' : src[i - 1];
+    // The last character that is not a space, before the operand at `i`.
+    size_t pb = i;
+    while (pb > 0 && (src[pb - 1] == ' ' || src[pb - 1] == '\t' || src[pb - 1] == '\n')) pb--;
+    const char pre = pb == 0 ? ' ' : src[pb - 1];
+    const bool bound = pre != '*' && pre != '/' && pre != '%';
+    const bool opens = before == '(' || before == ',' || before == '=' || before == '+' ||
+                       before == '-' || before == '*' || before == '/' || before == ';' ||
+                       before == '{' || before == '?' || before == ':' || before == '\n' ||
+                       before == ' ' || before == '\t';
+    std::vector<std::string> f;   // the product's factors, in source order
+    std::string add, repl;
+    bool neg_prod = false;  // `c - a * b` negates the product, not the addend
+    size_t end = i;
+    if (opens) {
+      size_t q = i;
+      std::string g = operand(q);
+      size_t r = q;
+      skip_ws(r);
+      if (!g.empty() && r < src.size() && (src[r] == '+' || src[r] == '-')) {
+        // The addend comes first: `c + a * b`, `c - a * b`.
+        const bool neg = src[r] == '-';
+        r++;
+        std::string h = operand(r);
+        if (!h.empty() && bound) {
+          f.push_back(h);
+          for (;;) {
+            size_t t = r;
+            skip_ws(t);
+            if (t >= src.size() || src[t] != '*') break;
+            t++;
+            std::string k = operand(t);
+            if (k.empty()) break;
+            f.push_back(k);
+            r = t;
+          }
+          if (f.size() >= 2) {
+            add = g;
+            neg_prod = neg;
+            end = r;
+          }
+        }
+      } else if (!g.empty() && bound) {
+        // The product comes first: `a * b - c`, `a * b * d + c`.
+        f.push_back(g);
+        for (;;) {
+          size_t t = q;
+          skip_ws(t);
+          if (t >= src.size() || src[t] != '*') break;
+          t++;
+          std::string k = operand(t);
+          if (k.empty()) break;
+          f.push_back(k);
+          q = t;
+        }
+        size_t t = q;
+        skip_ws(t);
+        if (f.size() >= 2 && t < src.size() && (src[t] == '+' || src[t] == '-')) {
+          const bool neg = src[t] == '-';
+          t++;
+          add = operand(t);
+          if (add.empty()) {
+            f.clear();
+          } else {
+            // The addend can be a product of its own.
+            std::string tail;
+            for (;;) {
+              size_t look = t;
+              skip_ws(look);
+              if (look + 1 >= src.size() || src[look] != '*') break;
+              size_t after = look + 1;
+              std::string k = operand(after);
+              if (k.empty()) break;
+              tail += " * " + k;
+              t = after;
+            }
+            if (!tail.empty()) add = "(" + add + tail + ")";
+            if (neg) add = "-(" + add + ")";
+            end = t;
+          }
+        } else {
+          f.clear();
+        }
+      }
+    }
+    if (f.size() < 2) {
+      out += src[i];
+      i++;
+      continue;
+    }
+    std::string prod = f[0];
+    for (size_t k = 1; k + 1 < f.size(); k++) prod += " * " + f[k];
+    if (neg_prod) prod = "-(" + prod + ")";
+    repl = "fma(" + prod + ", " + f.back() + ", " + add + ")";
+    auto once = [](const std::string& e) {
+      return e.empty() || e.find("++") != std::string::npos ||
+             e.find("--") != std::string::npos || e.find('=') != std::string::npos ||
+             e.find(',') != std::string::npos;
+    };
+    // A type name only counts as itself.
+    auto looks_float = [](const std::string& e) {
+      if (e.find("sizeof") != std::string::npos) return false;
+      for (const char* ty : {"float", "half"}) {
+        const size_t len = std::strlen(ty);
+        for (size_t at = e.find(ty); at != std::string::npos; at = e.find(ty, at + 1)) {
+          const bool left = at == 0 || !(std::isalnum((unsigned char)e[at - 1]) || e[at - 1] == '_');
+          const bool right = at + len >= e.size() ||
+                             !(std::isalpha((unsigned char)e[at + len]) || e[at + len] == '_');
+          if (left && right) return true;
+        }
+      }
+      for (size_t k = 1; k < e.size(); k++)
+        if ((e[k] == 'f' || e[k] == 'h') &&
+            (std::isdigit((unsigned char)e[k - 1]) || e[k - 1] == '.'))
+          return true;
+      return false;
+    };
+    bool floaty = looks_float(add), clean = !once(add);
+    for (const auto& g : f) {
+      floaty = floaty || looks_float(g);
+      clean = clean && !once(g);
+    }
+    if (!floaty || !clean) {
+      out += src[i];
+      i++;
+      continue;
+    }
+    size_t after = end;
+    skip_ws(after);
+    if (after < src.size() && (src[after] == '*' || src[after] == '/' || src[after] == '(' ||
+                              src[after] == '{')) {
+      out += src[i];
+      i++;
+      continue;
+    }
+    out += " " + repl;
+    i = end;
+  }
+  return out;
+}
+
+std::string fuse_accum_products(const std::string& src) {
+  std::string out;
+  size_t i = 0;
+  while (i < src.size()) {
+    const size_t at = src.find(" += ", i);
+    if (at == std::string::npos) break;
+    size_t lb = at;
+    while (lb > 0 && (is_ident(src[lb - 1]) || src[lb - 1] == '.' || src[lb - 1] == '[' ||
+                      src[lb - 1] == ']'))
+      lb--;
+    const std::string lhs = src.substr(lb, at - lb);
+    size_t j = at + 4;
+    int depth = 0;
+    size_t star = std::string::npos;
+    bool ok = !lhs.empty();
+    for (; j < src.size() && ok; j++) {
+      const char c = src[j];
+      if (c == '(' || c == '[') {
+        depth++;
+      } else if (c == ')' || c == ']') {
+        if (--depth < 0) ok = false;
+      } else if (depth == 0 && c == ';') {
+        break;
+      } else if (depth == 0 && c == '*') {
+        star = j;
+      } else if (depth == 0 && (c == '=' || c == ',' || c == '+' || c == '-')) {
+        ok = false;  // a sum, not one product: the other pass owns that shape
+      }
+    }
+    const std::string x = ok && star != std::string::npos ? trim(src.substr(at + 4, star - at - 4))
+                                                          : std::string();
+    const std::string y = ok && star != std::string::npos && j < src.size()
+                              ? trim(src.substr(star + 1, j - star - 1))
+                              : std::string();
+    auto once = [](const std::string& e) {
+      return e.empty() || e.find("++") != std::string::npos ||
+             e.find("--") != std::string::npos;
+    };
+    auto twice = [&](const std::string& e) {
+      return once(e) || e.find('(') != std::string::npos ||
+             e.find(',') != std::string::npos;
+    };
+    auto looks_float = [](const std::string& e) {
+      // A type name only counts as itself: a variable called `floaty` is not a float.
+      for (const char* ty : {"float", "half"}) {
+        const size_t len = std::strlen(ty);
+        for (size_t at = e.find(ty); at != std::string::npos; at = e.find(ty, at + 1)) {
+          const bool left = at == 0 || !(std::isalnum((unsigned char)e[at - 1]) || e[at - 1] == '_');
+          const bool right = at + len >= e.size() ||
+                             !(std::isalpha((unsigned char)e[at + len]) || e[at + len] == '_');
+          if (left && right) return true;
+        }
+      }
+      for (size_t k = 1; k < e.size(); k++)
+        if ((e[k] == 'f' || e[k] == 'h') &&
+            (std::isdigit((unsigned char)e[k - 1]) || e[k - 1] == '.'))
+          return true;
+      return false;
+    };
+    if (!looks_float(lhs) && !looks_float(x) && !looks_float(y)) {
+      out += src.substr(i, at + 4 - i);
+      i = at + 4;
+      continue;
+    }
+    if (j >= src.size() || star == std::string::npos || twice(lhs) || once(x) || once(y)) {
+      out += src.substr(i, at + 4 - i);
+      i = at + 4;
+      continue;
+    }
+    out += src.substr(i, lb - i) + lhs + " = fma(" + x + ", " + y + ", " + lhs + ")";
+    i = j;
+  }
+  out += src.substr(i);
+  return out;
+}
+
 std::string rewrite_math_calls(const std::string& text) {
   static const char* kNames[][2] = {
-      // Longest first where one name contains another; the match also requires a
-      // '(' straight after the name, so `sinh` and `sin` cannot shadow each other.
       {"inverseSqrt", "weft_rsqrt"}, {"normalize", "weft_normalize"},
       {"distance", "weft_distance"}, {"length", "weft_length"},
       {"rsqrt", "weft_rsqrt"},       {"sqrt", "weft_sqrt"},
@@ -2935,12 +3507,7 @@ std::string rewrite_math_calls(const std::string& text) {
       {"reflect", "weft_reflect"},   {"cross", "weft_cross"},
       {"mix", "weft_mix"},           {"fma", "weft_fma"},
       {"smoothstep", "weft_smoothstep"},
-      // Masks: a componentwise comparison yields a bool vector, and these are the
-      // three things a kernel does with one.
       {"select", "weft_select"}, {"any", "weft_any"}, {"all", "weft_all"},
-      // The packed formats: one formula for the byte and half-word layouts, run
-      // by both engines. A kernel that packs is usually storing into a compressed
-      // buffer, where one wrong rounding is a visible band in the data.
       {"pack_float_to_unorm4x8", "weft_pack_unorm4x8"},
       {"pack_float_to_snorm4x8", "weft_pack_snorm4x8"},
       {"pack_float_to_unorm2x16", "weft_pack_unorm2x16"},
@@ -2958,9 +3525,6 @@ std::string rewrite_math_calls(const std::string& text) {
       const bool left_ok = p == 0 || !is_ident(out[p - 1]);
       const size_t e = p + from.size();
       if (!left_ok || e >= out.size() || out[e] != '(') { p = e; continue; }
-      // `metal::sin(x)`, `fast::pow(...)`: the qualifier names a namespace whose
-      // functions are exactly the ones being replaced, so it is dropped rather
-      // than left in front of a function that namespace does not define.
       size_t begin = p;
       if (p >= 2 && out[p - 1] == ':' && out[p - 2] == ':') {
         size_t k = p - 2;
@@ -2974,23 +3538,6 @@ std::string rewrite_math_calls(const std::string& text) {
   return out;
 }
 
-//
-// A kernel that suspends used to be a coroutine: the compiler owns the frame, so
-// the body's locals survive a barrier. That is right, and it costs a frame resume
-// per lane per pass, which is most of what a barrier-heavy kernel spends. The same
-// visit through a `switch` on a resume point costs about half as much, so a body
-// this can split at its suspensions becomes the state machine the PTX and SPIR-V
-// front ends already emit: `s->pc = N; return;`, and a case that jumps to the
-// label after it.
-//
-// Splitting a body needs its locals to survive the return, so every local the body
-// declares moves into the state blob and every use is renamed to `s->name`. That
-// is a whole-body rename on purpose, a local left behind would be the one thing
-// that quietly keeps a stale value across a barrier.
-//
-// It bails rather than guesses. A construct this does not model leaves the kernel
-// on its coroutine, which is the shape it already has, so the transform only ever
-// adds a faster shape to a kernel it fully understands.
 namespace {
 
 bool suspends(const std::string& s) {
@@ -3018,10 +3565,7 @@ std::vector<std::string> split_semis(const std::string& s) {
   return out;
 }
 
-// Split a suspension's arguments on top-level commas. Only brackets count as
-// nesting here: an argument can hold a comparison, `(lane < 32u) != 0`, and a
-// splitter that reads that `<` as a template stops splitting every comma after it,
-// which is how a three-argument vote arrived as two.
+// Split a suspension's arguments on top-level commas.
 std::vector<std::string> split_args(const std::string& s) {
   std::vector<std::string> out;
   int depth = 0;
@@ -3040,8 +3584,6 @@ std::vector<std::string> split_args(const std::string& s) {
   return out;
 }
 
-// One statement of a body, kept with the text it covers: a statement with no
-// suspension in it is emitted exactly as written.
 struct Nd {
   enum Kind {
     Seq,
@@ -3063,12 +3605,6 @@ struct Nd {
   std::vector<Nd> kids;
 };
 
-// A `break` or `continue` written inside a statement that is emitted verbatim is
-// only legal if the loop it names is still a loop in the generated C++. A lowered
-// loop is a label and a `goto`, so a jump inside a block or an `if` that came
-// along unchanged would be outside any loop at all, the compiler says so. Those
-// nodes are lowered instead, and one that has no suspension of its own costs only
-// a label.
 bool node_has_jump(const Nd& n) {
   if (n.k == Nd::Brk || n.k == Nd::Cont) return true;
   for (const Nd& k : n.kids)
@@ -3213,9 +3749,6 @@ struct BodyParser {
       skip_ws();
       if (pos >= t.size() || t[pos] != '{') return bad("`switch` without a body");
       pos++;
-      // Each `case`/`default` label becomes a node of its own, so the arms keep
-      // their order and their fallthrough: what follows a label until the next one
-      // is that arm's statement list.
       for (;;) {
         skip_ws();
         if (pos >= t.size()) return bad("a `switch` that is not closed");
@@ -3282,9 +3815,7 @@ struct BodyParser {
       n.text = t.substr(first, pos - first);
       return true;
     }
-    // A label: `name:`. It is its own statement, and a `goto` may name it, both
-    // are emitted where they were written, so a jump that crosses a wait is a jump
-    // to a label further down the same function, which is what C++ means by it.
+    // A label.
     {
       size_t j = pos;
       while (j < t.size() && is_ident(t[j])) j++;
@@ -3308,7 +3839,6 @@ struct BodyParser {
       n.text = t.substr(first, pos - first);
       return true;
     }
-    // A simple statement: up to its `;`.
     int depth = 0;
     size_t i = pos;
     for (; i < t.size(); i++) {
@@ -3340,8 +3870,6 @@ struct StepEmitter {
   }
   std::string fresh() { return "weft_l" + std::to_string(label++); }
 
-  // Where a segment ends: the resume point, the case that re-enters at it, and
-  // the label the case jumps to.
   void park() {
     const std::string n = std::to_string(site);
     out += "  weft_s->pc = " + n + "u; return;\n";
@@ -3420,8 +3948,6 @@ struct StepEmitter {
       while (j < text.size() && std::isspace((unsigned char)text[j])) j++;
       if (j >= text.size() || text[j] != '(') return bad("a suspension without a call");
       const size_t close = find_matching(text, j, '(', ')');
-      // The front end always wraps a suspension as one expression, `(co_await
-      // weft::shfl(...))`, and a vote's `!= 0u` sits outside that.
       if (close == std::string::npos || close + 1 >= text.size() || text[close + 1] != ')')
         return bad("a suspension that is not one expression");
       const std::string inner = text.substr(j + 1, close - j - 1);
@@ -3454,14 +3980,6 @@ struct StepEmitter {
         out += "  weft_s->pc = weft::kThreadDone;\n  return;\n";
         return;
       case Nd::Switch: {
-        // Always lowered, even with no wait inside it: a `break` in an arm means
-        // this switch either way, and a `continue` in an arm names a loop that the
-        // generated code may have turned into labels rather than a loop.
-        //
-        // A chain of compares and a label per arm: the subject is read once, an arm
-        // with no `break` falls into the next exactly as `case` does, and `break`
-        // leaves for the end label. A switch is a break target but not a continue
-        // one, so it pushes an empty continue and the search below walks past it.
         const std::string end = fresh();
         std::vector<std::string> arms;
         std::string def;
@@ -3587,9 +4105,7 @@ struct StepEmitter {
   }
 };
 
-// Point a local's uses at the blob. A member that happens to share the name is
-// somebody else's field, `float4(..).x` is not the local `x`, so `.` and `->`
-// end a match before it starts.
+// Point a local's uses at the blob.
 std::string rename_blob_local(const std::string& s, const std::string& name) {
   const std::string to = "weft_s->" + name;
   std::string out;
@@ -3608,12 +4124,6 @@ std::string rename_blob_local(const std::string& s, const std::string& name) {
   return out;
 }
 
-// A lambda parameter whose name is also a local's is that parameter inside the
-// lambda and the blob outside it, and the rename below cannot tell the two apart:
-// `[](float v) { ... }` would come out as `[](float weft_s->v)`, which does not
-// parse. So the parameter is given a name of its own first, and its uses inside
-// the lambda follow it there. A name starting `weft` is one hoist_locals never
-// accepts for a local, so the fresh name cannot collide with one.
 bool freshen_lambda_params(std::string& body, const std::vector<std::string>& names,
                            std::string& why) {
   auto hoisted = [&](const std::string& n) {
@@ -3658,8 +4168,6 @@ bool freshen_lambda_params(std::string& body, const std::vector<std::string>& na
       why = "a lambda whose body this cannot read";
       return false;
     }
-    // A parameter's name is the last word of its declarator; one with no name
-    // (`[](float) { ... }`) declares nothing to rename.
     std::vector<std::string> params;
     const std::string list = body.substr(k + 1, par - k - 1);
     size_t st = 0;
@@ -3688,14 +4196,6 @@ bool freshen_lambda_params(std::string& body, const std::vector<std::string>& na
   }
 }
 
-// A capture list that names a local, `[v]`, `[&v]`, `[=]`, has to name
-// something that exists, and after the blob rename those names are `weft_s->v`,
-// which a capture list's grammar has no room for. Each one becomes an
-// init-capture of its own: `[weft_c_v = weft_s->v]` copies the value at the point
-// the lambda is written, `[&weft_c_v = weft_s->v]` binds it, and the body's uses
-// follow that name. Same object, same meaning, and it compiles. `[]` and `[&]`
-// need nothing: they bind to the blob pointer, which is what the renamed body
-// reads either way.
 bool rebuild_captures(std::string& body, const std::vector<std::string>& names,
                       std::string& why, const std::string& src = "weft_s->") {
   auto swap = [](const std::string& s, const std::string& from, const std::string& to) {
@@ -3718,8 +4218,6 @@ bool rebuild_captures(std::string& body, const std::vector<std::string>& names,
       if (i + pat.size() >= s.size() || !is_ident(s[i + pat.size()])) return true;
     return false;
   };
-  // What a capture list's grammar allows here: names, and the blob fields the
-  // rename has already turned them into.
   auto capture_list = [](const std::string& caps) {
     bool plain = true;
     for (char c : caps)
@@ -3738,7 +4236,6 @@ bool rebuild_captures(std::string& body, const std::vector<std::string>& names,
     if (cap == std::string::npos) continue;
     const std::string caps = body.substr(br + 1, cap - br - 1);
     if (!capture_list(caps)) continue;
-    // `[]` and `[&]` need no rewrite; `[=]` and a named capture do.
     bool has_ident = false;
     for (char c : caps)
       if (std::isalpha((unsigned char)c) || c == '_') has_ident = true;
@@ -3767,9 +4264,6 @@ bool rebuild_captures(std::string& body, const std::vector<std::string>& names,
       return false;
     }
     const std::string inner = body.substr(brace + 1, close - brace - 1);
-    // A lambda nested inside this one would have its own capture list rewritten to
-    // name a variable this one no longer has, and there is no shape of that worth
-    // guessing at.
     for (size_t b = inner.find('['); b != std::string::npos; b = inner.find('[', b + 1)) {
       if (b > 0 && (is_ident(inner[b - 1]) || inner[b - 1] == ']' || inner[b - 1] == ')')) continue;
       const size_t c2 = find_matching(inner, b, '[', ']');
@@ -3806,8 +4300,6 @@ bool rebuild_captures(std::string& body, const std::vector<std::string>& names,
         }
         const bool ref = one[0] == '&';
         std::string nm = ref ? trim(one.substr(1)) : one;
-        // The rename has already pointed a named capture at the blob, so the name
-        // to carry is the one behind `weft_s->`.
         const std::string blob = "weft_s->";
         if (nm.compare(0, blob.size(), blob) == 0) nm = trim(nm.substr(blob.size()));
         bool ident = !nm.empty();
@@ -3837,19 +4329,11 @@ bool rebuild_captures(std::string& body, const std::vector<std::string>& names,
   }
 }
 
-// Move every local the body declares into the state blob and point its uses at
-// it. Returns false, with a reason, for a body whose declarations this cannot
-// read, which leaves the kernel on its coroutine rather than on a blob that is
-// missing a field.
-// A statement start, with the extent of the scope it sits in.
 struct Start {
   size_t at, end;
 };
 
-// Every statement start in a body, and where each brace pair closes. A name
-// declared in two sibling scopes is two variables that never overlap, `d` in one
-// `for` and `d` in the next, so they can share a field. One nested inside the
-// other cannot, which is what `unshadow` deals with.
+// Every statement start in a body, and where each brace pair closes.
 void scan_starts(const std::string& body, std::vector<Start>& starts,
                  std::map<size_t, size_t>& closes) {
   starts.clear();
@@ -3880,16 +4364,8 @@ void scan_starts(const std::string& body, std::vector<Start>& starts,
     } else if (ch == ';') {
       note(i + 1, scope_end());
     } else if (ch == ':') {
-      // A declaration can follow a `case`/`default` label, and the switch lowering
-      // jumps past it, which C++ refuses for a variable with an initializer, and
-      // which would leave the local unrenamed. Treat a `:` as a boundary so those
-      // declarations become blob fields like every other local. A ternary's `:`
-      // only ever offers a candidate start that the ident-ident test rejects.
       note(i + 1, scope_end());
     }
-    // A `for` header declares its induction variable for the length of the loop,
-    // so the loop is the scope of its init, which is what makes two `for (uint d
-    // = ...)` in a row two variables rather than one declared twice.
     if (ch == 'f' && i + 3 <= body.size() && body.compare(i, 3, "for") == 0 &&
         (i == 0 || !is_ident(body[i - 1]))) {
       size_t j = i + 3;
@@ -3925,11 +4401,6 @@ void scan_starts(const std::string& body, std::vector<Start>& starts,
                starts.end());
 }
 
-// Place a brace initialiser into an N-dimensional array: `cells` gets an index text
-// and the value at it, so the caller can write one statement per element. A group
-// holds either sub-groups or values, and neither more of them than the extent at
-// that level allows; a group that mixes the two is C++ brace elision, which is
-// refused rather than guessed at.
 bool place_braces(const std::string& text, const std::vector<long>& ext, size_t level,
                   const std::string& prefix,
                   std::vector<std::pair<std::string, std::string>>& cells) {
@@ -3967,12 +4438,6 @@ bool place_braces(const std::string& text, const std::vector<long>& ext, size_t 
   return true;
 }
 
-// One name declared again while an earlier one is still in scope is two live
-// variables, and the blob holds one field per name. So the inner declaration and
-// every use of it inside its own scope are given a name of their own, which makes it
-// an ordinary local again, it is the same object, under a name nothing else has.
-// Each rename changes the body's length, so the scan is taken again; the pass ends
-// when no declaration overlaps a live one.
 void unshadow(std::string& body) {
   for (int round = 0; round < 256; round++) {
     std::vector<Start> starts;
@@ -4056,10 +4521,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
   std::vector<std::string> names;
   // Structs a `decltype` field is read against, written ahead of the blob.
   std::vector<std::string> type_helpers;
-  // A kernel parameter is recomputed at every entry and is not part of a closure.
-  // Its name is the identifier each declaration in `reserved` binds, the one
-  // before the `=`, so a type is never mistaken for one, and its declared type is
-  // the spelling a copy of it needs.
   std::vector<std::string> kparams;
   std::map<std::string, std::string> kparam_types;
   for (size_t eq = reserved.find('='); eq != std::string::npos; eq = reserved.find('=', eq + 1)) {
@@ -4071,16 +4532,12 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     if (qe <= q) continue;
     const std::string pname = reserved.substr(q, qe - q);
     kparams.push_back(pname);
-    // The declaration the parameter is bound by: its own statement, from the start
-    // to the name. `device const float* in = ...` gives `const float*`.
     size_t line0 = reserved.rfind(';', q);
     line0 = line0 == std::string::npos ? 0 : line0 + 1;
     size_t line_end = reserved.find(';', eq);
     const std::string decl = trim(reserved.substr(
         line0, (line_end == std::string::npos ? reserved.size() : line_end) - line0));
-    // The occurrence that is the declaration: a whole word the `=` follows. The
-    // name also turns up inside the initialiser, `uint lid = (uint)ctx.lid`, and a
-    // letter of the type, and neither is where the type ends.
+    // The occurrence that is the declaration: a whole word the `=` follows.
     size_t cut = std::string::npos;
     for (size_t w = decl.find(pname); w != std::string::npos; w = decl.find(pname, w + 1)) {
       if (w > 0 && is_ident(decl[w - 1])) continue;
@@ -4098,22 +4555,13 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       if (!(std::isalnum((unsigned char)c) || c == '_' || c == '*' || c == '&' || c == ':' ||
             c == ' ' || c == ',' || c == '<' || c == '>'))
         ok = false;
-    // A declaration ends in a name or a pointee; a cast or a call does not.
     if (ok && (is_ident(ty.back()) || ty.back() == '*' || ty.back() == '&'))
       kparam_types[pname] = ty;
   }
-  // Shadowing is renamed before anything is hoisted, so every name below stands
-  // for one variable.
   unshadow(body);
   std::vector<Start> starts;
   std::map<size_t, size_t> closes;
   scan_starts(body, starts, closes);
-  // A type the body declares for itself, `struct Tap { float w, v; };`, is what
-  // a local of that type needs in order to become a blob field, and the blob lives
-  // at file scope where the body's own declaration does not reach. So the
-  // declaration is lifted out whole, under a name keyed to this kernel, and every
-  // use in the body follows it there. Collect them first: the loop below walks
-  // statement starts, and a start inside a lifted type is part of it.
   struct TypeDecl {
     size_t from, to;
     std::string name, text;
@@ -4145,8 +4593,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     const size_t sc = body.find(';', nm);
     const size_t close =
         brace == std::string::npos ? std::string::npos : find_matching(body, brace, '{', '}');
-    // A forward declaration, `struct P;`, names a type without bodying it, and
-    // the brace after it belongs to the next statement.
     if (sc != std::string::npos && (brace == std::string::npos || sc < brace)) {
       why = "a " + kw + " declaration with no body";
       return false;
@@ -4159,10 +4605,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       why = "a " + kw + " declaration this cannot read";
       return false;
     }
-    // A method is not a problem: C++ already forbids a *local* class's member
-    // functions from naming the enclosing function's variables, so a body-declared
-    // type's methods only ever see its own members and file scope, which is what
-    // they see after the lift too. The declaration is moved verbatim.
+    // A method is not a problem.
     for (const TypeDecl& t : types_decl) {
       if (t.name == tname) {
         why = "'" + tname + "', which the body declares twice";
@@ -4171,19 +4614,12 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     }
     types_decl.push_back({st0.at, semi + 1, tname, body.substr(st0.at, semi + 1 - st0.at)});
   }
-  // A lambda stored in a local has a type with no name, so no field can hold it , 
-  // but it does not need one. Its declaration is a value the entry point can simply
-  // re-make: the closure binds to whatever the blob holds, so building it again on
-  // the next entry is the same object, exactly as the parameter setup above is
-  // recomputed each time. Those declarations move to the entry prologue.
   struct LambdaLocal {
     size_t from, to;
     std::string name, text;
     bool copies;  // the list takes a copy of a local: `[=]` or `[v]`
   };
   std::vector<LambdaLocal> lam_locals;
-  // `[=]` and a bare name copy the value the lambda is made with; `[&]` and `[&v]`
-  // bind to what the blob holds.
   auto list_copies = [](const std::string& caps) {
     size_t st = 0;
     for (size_t i = 0; i <= caps.size(); i++) {
@@ -4196,17 +4632,11 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     }
     return false;
   };
-  // An initialised capture, `[x = v * 2.0f]`, declares a variable nothing
-  // outside the lambda can name, so the blob never needs a field for it: the value
-  // the closure keeps is a member of the closure, taken where the lambda stands.
   for (const Start& st0 : starts) {
     size_t k = st0.at;
     auto skip_ws_k = [&](size_t& q) {
       while (q < body.size() && std::isspace((unsigned char)body[q])) q++;
     };
-    // A lambda written inside another lambda's body is part of that closure, not a
-    // statement of the kernel: its declaration stays where it is, inside the call
-    // operator, where what it captures is a member of the struct that owns it.
     bool nested = false;
     for (const LambdaLocal& t : lam_locals)
       if (st0.at > t.from && st0.at < t.to) nested = true;
@@ -4228,9 +4658,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     k++;
     skip_ws_k(k);
     if (k >= body.size() || body[k] != '[') continue;
-    // The declaration has to be a statement of its own: one written where only a
-    // single statement fits, the body of an `if` with no braces, or a `for`
-    // header, cannot become the two statements a copied capture needs.
     size_t back = st0.at;
     while (back > 0 && std::isspace((unsigned char)body[back - 1])) back--;
     if (back > 0 && body[back - 1] != '{' && body[back - 1] != ';' && body[back - 1] != ':' &&
@@ -4243,8 +4670,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     for (const LambdaLocal& t : lam_locals)
       if (t.name == lname) dup = true;
     if (dup) continue;
-    // The end of the statement: the first `;` outside every bracket pair, which is
-    // past the lambda's own braces.
     int depth = 0;
     size_t e = k;
     for (; e < body.size(); e++) {
@@ -4254,8 +4679,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       else if (c == ';' && depth == 0) break;
     }
     if (e >= body.size()) continue;
-    // A lambda local assigned again would be the entry's one after a resume rather
-    // than the one the body left there.
     bool reassigned = false;
     for (size_t w = 0; w + lname.size() <= body.size(); w++) {
       if (body.compare(w, lname.size(), lname) != 0) continue;
@@ -4269,8 +4692,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     if (reassigned) continue;
     lam_locals.push_back(
         {st0.at, e + 1, lname, body.substr(st0.at, e + 1 - st0.at), list_copies(caps)});
-    // A placeholder keeps the statement's place: the declaration is only finished
-    // once the types and the renames are known.
     edits.push_back(
         {st0.at, e + 1, "weft_lam_" + std::to_string(lam_locals.size() - 1) + ";"});
   }
@@ -4285,9 +4706,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     size_t s0 = st0.at;
     size_t i = s0;
     skip_ws(i);
-    // A type the body declares is not a value, so nothing about it has to survive a
-    // resume: the declaration is lifted out of the body here and its uses follow the
-    // lifted name once the edits land. A start inside one is part of it.
     bool in_type = false;
     const TypeDecl* lifted = nullptr;
     for (const TypeDecl& t : types_decl) {
@@ -4299,9 +4717,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       continue;
     }
     if (in_type) continue;
-    // A lambda local is finished once the types and the renames are known; its
-    // statement is a placeholder in the body until then. A start inside it is part
-    // of it.
     bool in_lam = false;
     const LambdaLocal* lam = nullptr;
     for (const LambdaLocal& t : lam_locals) {
@@ -4309,10 +4724,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       if (s0 >= t.from && s0 < t.to) in_lam = true;
     }
     if (lam || in_lam) continue;
-    // A statement start offered by a `{` or a `;` can be a label (`case 0u:`) or a
-    // jump, and both read as declarations: `goto x;` has the shape of a variable
-    // named `x` of type `goto`. A keyword that never begins a declaration is not a
-    // statement start at all.
     for (const char* kw : {"case", "default", "goto", "return", "break", "continue",
                            "co_return", "co_await", "throw", "delete", "else", "do", "if",
                            "while", "for", "switch"}) {
@@ -4340,11 +4751,8 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       stars.push_back(body[i++]);
       skip_ws(i);
     }
-    // A type with no name after it is not a declaration: `a[i] = ...`, `a += b`,
-    // and every other statement that happens to start with an identifier.
+    // A type with no name after it is not a declaration.
     if (i >= body.size() || !is_ident(body[i])) continue;
-    // One declaration can name several locals, `uint x = a, y = b;`, and each of
-    // them is its own field, in its own order: `s->x = a; s->y = b;`.
     struct Decl {
       std::string name, init, suffix;  // suffix is an array's `[N]`
     };
@@ -4360,12 +4768,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       Decl d;
       d.name = body.substr(name0, i - name0);
       skip_ws(i);
-      // An array local is a field like any other, `float taps[4]` is four floats the
-      // blob holds, so its extent is part of the declaration rather than a reason
-      // to give up. Only a brace initialiser is left out: an array cannot be
-      // assigned, and filling it element by element is a different rewrite.
-      // `float m[2][3]` is a field like any other: every extent is part of the
-      // declaration, so one dimension is not a reason to give up any more than two.
       while (i < body.size() && body[i] == '[') {
         const size_t close = find_matching(body, i, '[', ']');
         if (close == std::string::npos) {
@@ -4388,9 +4790,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
           } else if (ch == ';' && depth == 0) {
             break;
           } else if (ch == ',' && depth == 0) {
-            // A comma that names another local separates declarators; the one in a
-            // template argument list, `shared_mem<float, 256>(ctx)`, is part of
-            // the initializer, and a digit after it says so.
             size_t la = k + 1;
             while (la < body.size() && std::isspace((unsigned char)body[la])) la++;
             if (la < body.size() && is_ident(body[la]) &&
@@ -4405,8 +4804,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         d.init = trim(body.substr(i + 1, k - i - 1));
         i = k;
       } else if (i >= body.size() || (body[i] != ';' && body[i] != ',')) {
-        // An array local, a direct-initialised one, a function declaration: none of
-        // them is a plain local the blob can hold.
         why = "a declaration of '" + d.name + "' this cannot split";
         return false;
       }
@@ -4421,23 +4818,12 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     }
     std::string repl;
     for (const Decl& d : decls) {
-      // A body-declared type is at file scope under a name keyed to this kernel, so
-      // the field that holds a variable of it is written with that name.
       std::string field_ty = ty;
       for (const TypeDecl& t : types_decl)
         if (t.name == ty) field_ty = "weft_t_" + t.name + "_" + kname;
-      // `const` on a pointee is part of what a pointer may be assigned from, so it
-      // stays in the field's type; on a value it is not, because the field is
-      // written once at its declaration and only read afterwards.
       if (q_const && !stars.empty()) field_ty = "const " + field_ty;
       std::string full = field_ty + stars;
       if (full == "auto") {
-        // The blob needs a type it can name and the declaration does not write one,
-        // so it is asked for: `std::decay_t<decltype(...)>` of the initialiser is
-        // exactly what `auto` would have deduced, references and arrays included.
-        // At file scope the initialiser's names do not exist, so each one is stood
-        // in for by a field of a helper struct with the same name and type. Every
-        // part of it is unevaluated, so nothing is read.
         if (d.init.empty()) {
           why = "'" + d.name + "', an `auto` local with no initialiser to take a type from";
           return false;
@@ -4481,8 +4867,7 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         return false;
       }
       for (const auto& other : seen_at[d.name]) {
-        // Two scopes overlap when neither ends before the other starts. That is
-        // shadowing, and one field cannot be both.
+        // Two scopes overlap when neither ends before the other starts.
         if (st0.at < other.second && other.first < st0.end) {
           why = "'" + d.name + "', declared again where the first is still in scope";
           return false;
@@ -4495,23 +4880,14 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         why = "'" + d.name + "', which the kernel also binds as a parameter";
         return false;
       }
-      // The blob pointer and the runtime's own names are the only ones a local may
-      // not take; `s` is a perfectly ordinary kernel local, which is why the blob
-      // pointer is called `weft_s`.
       if (d.name == "ctx" || d.name.rfind("weft", 0) == 0) {
         why = "'" + d.name + "', which the runtime's own code uses";
         return false;
       }
       names.push_back(d.name);
-      // One field per name, however many scopes declared it: the blob holds the
-      // variable, and sibling scopes are the same variable as far as memory goes.
       if (first_decl) fields += "  " + field_ty + stars + " " + d.name + d.suffix + ";\n";
       if (!repl.empty()) repl += " ";
       if (!d.suffix.empty() && !d.init.empty()) {
-        // An array cannot be assigned as a whole, so a brace initialiser becomes one
-        // statement per element, in the order they are written, which is the order
-        // the source evaluates them in. Elements the list leaves out are zero, as in
-        // C++; the blob is zeroed before the first pass either way.
         if (d.init.front() != '{' || d.init.back() != '}') {
           why = "'" + d.name + "', an array initialised with something other than a brace list";
           return false;
@@ -4560,26 +4936,12 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
           }
         }
       } else {
-        // A local with no initializer needs no statement: the blob is zeroed before
-        // the first pass, and `weft_s->a;` is an expression with no effect.
         repl += d.init.empty() ? std::string(";") : (d.name + " = " + d.init + ";");
       }
     }
     edits.push_back({decl0, semi + 1, repl});
   }
-  // A lambda kept in a local. One that binds (`[&]`) is re-made at each entry and
-  // points at the same blob either way. One that *copies* has to carry the value it
-  // was made with, so each captured local gets a blob field of its own, written
-  // where the declaration stands; the entry prologue re-makes the lambda from those
-  // fields, which is the same object with the same values after a resume.
-  // A lambda kept in a local becomes a value with a name, so the blob can hold it.
-  // Its captures are members, a copy for `[=]`/`[v]`, a pointer into the blob for
-  // `[&]`/`[&v]`, which is what a capture means, and its call operator is the
-  // lambda's own body. Constructing it where the declaration stands records the
-  // copies once, so after a resume the closure is the one the lane made, with the
-  // values it saw; and a member function is the one shape that can be a field,
-  // because it has a name. (Two lambda expressions have two types, which is why the
-  // closure itself cannot be stored as a lambda.)
+  // A lambda kept in a local.
   std::vector<std::string> lam_real(lam_locals.size(), std::string()), lam_structs;
   auto param_names_of = [](const std::string& params) {
     std::vector<std::string> out;
@@ -4636,10 +4998,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       return false;
     }
     const std::string between = trim(t.substr(after, brace - after));
-    // `mutable` makes the call operator non-const, so a by-value capture can be
-    // written through it. Those copies are members of the struct in the blob, which
-    // is exactly where such a write has to land: the next entry restores it, the
-    // way the lane's own copy survived the wait.
     const bool is_mut = between.find("mutable") != std::string::npos;
     std::string ret = "auto";
     const size_t arrow = between.find("->");
@@ -4650,19 +5008,10 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         if (p == n) return true;
       return false;
     };
-    // A nested lambda inside the body needs no work of its own: what it captures is
-    // a member of this struct, and the call operator that holds it is in scope there.
-    // Its list is fixed up below, after the renames, because a member that stands
-    // for a reference is spelled `(*weft_c_v)` in the body and a capture list has no
-    // room for a dereference.
     std::string inner = t.substr(brace + 1, close - brace - 1);
-    // What it captures: the list's own items, or, for `[&]` and `[]`, the locals
-    // its body names.
     std::vector<std::pair<std::string, bool>> items;  // name, by reference
     std::vector<std::pair<std::string, std::string>> capinits;  // name, initialiser
     std::vector<std::pair<std::string, std::string>> capalias;  // name, the local it binds
-    // `[&x = a[i]]`: the name, the lvalue it names, and the local the lvalue starts
-    // from, the pointer is to an element of that.
     struct CapRef {
       std::string name, expr, base;
     };
@@ -4694,9 +5043,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
           bool cident = !cexpr.empty();
           for (char c : cexpr)
             if (!is_ident(c)) cident = false;
-          // `[&x = v]` binds a name to a variable: what the closure holds is the
-          // address of `v`, which is the blob's own field for it, and the body's `x`
-          // is that field.
           if (by_ref && cident && seen_type.count(cexpr)) {
             bool have = false;
             for (const auto& it2 : items)
@@ -4706,8 +5052,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
             continue;
           }
           if (by_ref) {
-            // `[&x = a[i]]` names an element of something the blob holds, so the
-            // member is a pointer to that element and the body's `x` is the object.
             size_t q2 = 0;
             while (q2 < cexpr.size() && is_ident(cexpr[q2])) q2++;
             const std::string base = cexpr.substr(0, q2);
@@ -4758,8 +5102,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
           break;
         }
       }
-      // A parameter is a name the body reads like any other, and a copy of one is
-      // what a closure holds.
       for (const std::string& n : kparams) {
         if (is_param(n)) continue;
         for (size_t w = 0; w + n.size() <= inner.size(); w++) {
@@ -4772,9 +5114,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       }
     }
     std::string members, args, rbody = inner;
-    // A bound name (`[&x = v]`) is the member the local it binds already has, so the
-    // body's `x` reads it the way `v` would. Applied first: an item's own rename
-    // never touches a `weft_c_` name, so the order is only about which name wins.
     for (const auto& al : capalias)
       rbody = rename_word(rbody, al.first, "(*weft_c_" + al.second + ")");
     auto extent_of = [](const std::string& suffix) -> long {
@@ -4790,8 +5129,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
     for (const auto& it : items) {
       const std::string& n = it.first;
       if (is_param(n)) continue;
-      // A parameter is recomputed at every entry, so a closure that reads one holds
-      // a copy of the written type, made where the lambda is written.
       const auto kt = kparam_types.find(n);
       if (kt != kparam_types.end()) {
         members += "  " + kt->second + " weft_c_" + n + ";\n";
@@ -4804,9 +5141,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
               "', which nothing the blob holds is called";
         return false;
       }
-      // An array is a member like any other, but it cannot be copy-initialised from
-      // an array: a copy of one is spelled element by element, and a reference to
-      // one is a pointer to the blob's array.
       const auto ae = array_extent.find(n);
       if (ae != array_extent.end()) {
         const long ext = extent_of(ae->second);
@@ -4833,13 +5167,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
       args += (args.empty() ? "" : ", ") + std::string(it.second ? "&" : "") + "weft_s->" + n;
       rbody = rename_word(rbody, n, it.second ? "(*weft_c_" + n + ")" : "weft_c_" + n);
     }
-    // `[x = expr]` declares a variable only the lambda's body can see, so no blob
-    // field has to hold the name and no argument list has to carry it: the value the
-    // closure keeps is a member, taken where the lambda stands. Its type is the type
-    // of `expr`, which C++ would deduce, and since the struct is written at file
-    // scope, where neither `weft_s` nor the entry's own locals exist, `decltype` of
-    // the expression is taken against a stand-in struct with the same names and the
-    // same types. Every part of it is unevaluated, so nothing is read.
     for (size_t ci = 0; ci < capinits.size(); ci++) {
       const std::string& iname = capinits[ci].first;
       const std::string& iexpr = capinits[ci].second;
@@ -4884,16 +5211,12 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         }
         hfields += "  " + kt->second + " " + n + ";\n";
         hty_expr = rename_word(hty_expr, n, "(((" + hname + "*)0)->" + n + ")");
-        // A parameter is already a value of the entry's own: it goes in as it is.
       }
       if (!hfields.empty()) lam_structs.push_back("struct " + hname + " {\n" + hfields + "};\n");
       members += "  std::decay_t<decltype(" + hty_expr + ")> weft_c_" + iname + ";\n";
       args += (args.empty() ? "" : ", ") + hval;
       rbody = rename_word(rbody, iname, "weft_c_" + iname);
     }
-    // A bound element holds its address, so a resume restores the pointer and the
-    // object it names is whatever the blob holds at the time, which is what a
-    // reference capture means.
     for (const CapRef& cr : capref) {
       members += "  " + seen_type[cr.base] + "* weft_c_" + cr.name + ";\n";
       std::string arg = cr.expr;
@@ -4918,10 +5241,6 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         return false;
       }
     }
-    // A nested lambda's capture list cannot hold `(*weft_c_v)`: the member stands
-    // for a reference, so the list names the pointer and the nested body's own use
-    // dereferences it, which is the same object, and what a reference capture
-    // means one level in.
     for (size_t b = rbody.find('['); b != std::string::npos; b = rbody.find('[', b + 1)) {
       if (b > 0 && (is_ident(rbody[b - 1]) || rbody[b - 1] == ']' || rbody[b - 1] == ')'))
         continue;
@@ -4934,15 +5253,9 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
         one.clear();
         if (it.empty()) return;
         std::string out = it;
-        // `(*weft_c_v)` is how the body spells a member that stands for a
-        // reference: what the nested closure copies is the pointer, and its own
-        // use dereferences that.
         if (it.size() > 3 && it.compare(0, 2, "(*") == 0 && it.back() == ')') {
           out = it.substr(2, it.size() - 3);
         }
-        // A member cannot be captured by name, only an automatic variable can , 
-        // so it becomes an init-capture of itself, which copies the value the
-        // member holds where the nested lambda stands.
         bool member = out.rfind("weft_c_", 0) == 0;
         for (char c : out)
           if (!is_ident(c)) member = false;
@@ -4970,16 +5283,11 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
   }
   std::sort(edits.begin(), edits.end(),
             [](const Edit& a, const Edit& b) { return a.from < b.from; });
-  // Applied from the end, so an edit can only move text to its right, which is
-  // already rewritten. Two edits may not nest: the inner lambda of a stored one is
-  // not a lambda local of the kernel, so its declaration is never an edit of its own.
   for (size_t e = edits.size(); e-- > 0;)
     body = body.substr(0, edits[e].from) + edits[e].text + body.substr(edits[e].to);
   // A lambda's own parameters first: the blob rename would rewrite them.
   if (!freshen_lambda_params(body, names, why)) return false;
   for (const std::string& n : names) body = rename_blob_local(body, n);
-  // The lifted types: the body's uses follow them to file scope, under a name no
-  // other kernel in the module can collide with.
   for (const TypeDecl& t : types_decl) {
     const std::string to = "weft_t_" + t.name + "_" + kname;
     types += rename_word(t.text, t.name, to) + "\n";
@@ -4987,12 +5295,8 @@ bool hoist_locals(std::string& body, const std::string& kname, const std::string
   }
   // Then the capture lists, which cannot name a blob field.
   if (!rebuild_captures(body, names, why)) return false;
-  // The lifted types go in ahead of the closure structs, which name their fields,
-  // and both go in after the helper structs a `decltype` field was read against.
   for (const std::string& s : type_helpers) types += s;
   for (const std::string& s : lam_structs) types += s;
-  // Last, the closure constructions, which are already in their final form: their
-  // members hold names the passes above would have re-read as a local's.
   for (size_t li = 0; li < lam_locals.size(); li++)
     body = replace_all(body, "weft_lam_" + std::to_string(li) + ";", lam_real[li]);
   return true;
@@ -5002,11 +5306,7 @@ bool lower_step(const std::string& body_in, const std::string& kname, const std:
                 std::string& fields, std::string& types, std::string& code, std::string& cases,
                 std::string& why) {
   std::string body = body_in;
-  // An address space says where a variable lives on the GPU. On the host every one of
-  // them is the same memory: `device` and `thread` say nothing a blob field does not
-  // already do, and `constant` is a read-only view, `const`. The words are rewritten
-  // out before a type is read from the body, which also covers a cast: `(device
-  // float*)` would otherwise reach the generated C++ and not compile there.
+  // An address space says where a variable lives on the GPU.
   auto drop_space = [](std::string s, const std::string& w, const std::string& to) {
     std::string out;
     size_t i = 0;
@@ -5031,8 +5331,6 @@ bool lower_step(const std::string& body_in, const std::string& kname, const std:
       return false;
     }
   }
-  // A helper that returns before its last statement is inlined as a statement
-  // expression with a `goto` out of it, and that shape has no resume point.
   if (body.find("({") != std::string::npos) {
     why = "an inlined helper that returns before its last statement";
     return false;
@@ -5044,9 +5342,6 @@ bool lower_step(const std::string& body_in, const std::string& kname, const std:
     why = bp.why;
     return false;
   }
-  // A body with no suspension is still worth taking: a kernel that declares
-  // threadgroup memory and never waits is straight-line code, and the state
-  // machine runs it once with none of a coroutine's frame machinery.
   StepEmitter em;
   em.emit(root);
   if (!em.ok) {
@@ -5060,14 +5355,438 @@ bool lower_step(const std::string& body_in, const std::string& kname, const std:
 
 }  // namespace
 
+std::string attr_field_name(const std::string& src, const std::string& type,
+                            const std::string& attr) {
+  const size_t def = src.find("struct " + type);
+  if (def == std::string::npos) return std::string();
+  const size_t open = src.find('{', def);
+  if (open == std::string::npos) return std::string();
+  const size_t close = find_matching(src, open, '{', '}');
+  if (close == std::string::npos || close < open) return std::string();
+  const std::string text = src.substr(open + 1, close - open - 1);
+  size_t at = 0;
+  while (true) {
+    const size_t semi = text.find(';', at);
+    if (semi == std::string::npos) break;
+    const std::string stmt = text.substr(at, semi - at);
+    at = semi + 1;
+    const size_t lb = stmt.find("[["), rb = stmt.find("]]", lb == std::string::npos ? 0 : lb);
+    if (lb == std::string::npos || rb == std::string::npos) continue;
+    if (trim(stmt.substr(lb + 2, rb - lb - 2)).rfind(attr, 0) != 0) continue;
+    const std::string head = trim(stmt.substr(0, lb));
+    size_t e = head.size();
+    while (e > 0 && !is_ident(head[e - 1])) e--;
+    size_t b = e;
+    while (b > 0 && is_ident(head[b - 1])) b--;
+    return head.substr(b, e - b);
+  }
+  return std::string();
+}
+
+struct StructField {
+  std::string type, name, attr;
+};
+
+// The fields a struct declares, in order.
+std::vector<StructField> read_struct_fields(const std::string& src, const std::string& type) {
+  std::vector<StructField> out;
+  const size_t def = src.find("struct " + type);
+  if (def == std::string::npos) return out;
+  const size_t open = src.find('{', def);
+  if (open == std::string::npos) return out;
+  const size_t close = find_matching(src, open, '{', '}');
+  if (close == std::string::npos || close < open) return out;
+  const std::string text = src.substr(open + 1, close - open - 1);
+  size_t at = 0;
+  while (true) {
+    const size_t semi = text.find(';', at);
+    if (semi == std::string::npos) break;
+    std::string f = text.substr(at, semi - at);
+    at = semi + 1;
+    StructField fd;
+    const size_t lb = f.find("[[");
+    if (lb != std::string::npos) {
+      const size_t rb = f.find("]]", lb);
+      if (rb != std::string::npos) {
+        fd.attr = trim(f.substr(lb + 2, rb - lb - 2));
+        f = f.substr(0, lb) + f.substr(rb + 2);
+      }
+    }
+    std::string word;
+    for (char c : f) {
+      if (std::isspace((unsigned char)c)) {
+        if (!word.empty()) {
+          if (fd.type.empty()) {
+            fd.type = word;
+          } else if (word[0] == '[' && !fd.name.empty()) {
+            fd.name += word;
+          } else {
+            fd.name = word;
+          }
+          word.clear();
+        }
+      } else {
+        word.push_back(c);
+      }
+    }
+    if (!word.empty()) {
+      if (fd.type.empty()) {
+        fd.type = word;
+      } else if (word[0] == '[' && !fd.name.empty()) {
+        fd.name += word;
+      } else {
+        fd.name = word;
+      }
+    }
+    if (!fd.name.empty()) out.push_back(fd);
+  }
+  return out;
+}
+
+struct VertexStage {
+  bool ok = false;
+  std::string name, ret;
+  std::string new_sig, orig_sig;  // the CPU signature and the file's own
+  std::string new_all, orig_all;  // the whole function, both spellings
+  std::string unsupplied;
+  struct Param {
+    std::string type, name;
+    std::string orig_type;
+    int buffer = -1;
+    bool vertex_id = false;
+    bool by_ref = false;
+    bool pointer = false;
+    bool is_const = false;
+    bool texture = false;
+    bool sampler = false;
+    bool zero_index = false;
+  };
+  std::vector<Param> params;
+  std::vector<Param> sampler_params;
+  std::vector<TexParam> textures;                       // sampled in the body
+  std::map<std::string, std::pair<int, int>> samplers;  // its constexpr ones
+  std::vector<int> samp_slots;                          // its [[sampler(n)]] ones
+  int ntex = 0;
+};
+
+VertexStage read_vertex_stage(std::string& src) {
+  VertexStage vs;
+  size_t at = 0;
+  while ((at = src.find("vertex", at)) != std::string::npos) {
+    if ((at > 0 && is_ident(src[at - 1])) || (at + 6 < src.size() && is_ident(src[at + 6]))) {
+      at += 6;
+      continue;
+    }
+    const size_t par = src.find('(', at);
+    if (par == std::string::npos) return vs;
+    const std::string head = trim(src.substr(at + 6, par - at - 6));
+    const size_t sp = head.find_last_of(" \t\r\n");
+    if (sp == std::string::npos) { at = par; continue; }
+    VertexStage out;
+    out.name = trim(head.substr(sp + 1));
+    out.ret = trim(head.substr(0, sp));
+    if (out.name.empty() || out.ret.empty()) { at = par; continue; }
+    const size_t close = find_matching(src, par, '(', ')');
+    if (close == std::string::npos) return vs;
+
+    std::string sig;
+    bool bad = false;
+    for (const std::string& rawp : split_top_level(src.substr(par + 1, close - par - 1))) {
+      if (trim(rawp).empty()) continue;
+      std::string decl = rawp;
+      VertexStage::Param p;
+      const size_t lb = decl.find("[[");
+      if (lb != std::string::npos) {
+        const size_t rb = decl.find("]]", lb);
+        if (rb == std::string::npos) { bad = true; break; }
+        const std::string attr = trim(decl.substr(lb + 2, rb - lb - 2));
+        decl = decl.substr(0, lb) + decl.substr(rb + 2);
+        if (attr == "vertex_id") {
+          p.vertex_id = true;
+        } else if (attr.rfind("texture", 0) == 0) {
+          const size_t a = attr.find('('), b = attr.find(')');
+          if (a == std::string::npos || b <= a) { bad = true; break; }
+          p.texture = true;
+          p.buffer = std::atoi(trim(attr.substr(a + 1, b - a - 1)).c_str());
+        } else if (attr.rfind("sampler", 0) == 0) {
+          const size_t a = attr.find('('), b = attr.find(')');
+          p.sampler = true;
+          p.buffer = (a == std::string::npos || b <= a)
+                         ? 0
+                         : std::atoi(trim(attr.substr(a + 1, b - a - 1)).c_str());
+        } else if (attr.rfind("buffer", 0) == 0) {
+          const size_t a = attr.find('('), b = attr.find(')');
+          if (a == std::string::npos || b <= a) { bad = true; break; }
+          p.buffer = std::atoi(trim(attr.substr(a + 1, b - a - 1)).c_str());
+        } else if (attr == "instance_id" || attr == "base_instance" ||
+                   attr == "base_vertex") {
+          // One instance, starting at vertex 0: the argument names a zero.
+          p.zero_index = true;
+        } else {
+          vs.unsupplied = attr;
+          bad = true;
+          break;
+        }
+      }
+      p.pointer = decl.find('*') != std::string::npos;
+      p.by_ref = decl.find('&') != std::string::npos;
+      decl = trim(decl);
+      decl = replace_all(decl, "constant ", "const ");
+      decl = replace_all(decl, "device ", "");
+      decl = replace_all(decl, "thread ", "");
+      p.is_const = decl.find("const ") != std::string::npos;
+      const size_t cut = decl.find_last_of(" \t\r\n");
+      if (cut == std::string::npos) { bad = true; break; }
+      p.name = trim(decl.substr(cut + 1));
+      p.type = trim(decl.substr(0, cut));
+      p.name.erase(std::remove(p.name.begin(), p.name.end(), '&'), p.name.end());
+      p.name.erase(std::remove(p.name.begin(), p.name.end(), '*'), p.name.end());
+      if (p.type.rfind("const ", 0) == 0) p.type = trim(p.type.substr(6));
+      for (const char* c : {"&", "*"})
+        p.type.erase(std::remove(p.type.begin(), p.type.end(), *c), p.type.end());
+      p.type = trim(p.type);
+      p.orig_type = p.type;
+      if (p.name.empty() || p.type.empty()) { bad = true; break; }
+      if (p.sampler) {
+        out.samplers[p.name] = {0, 0};
+        out.samp_slots.push_back(p.buffer);
+        out.sampler_params.push_back(p);
+        continue;
+      }
+      if (p.texture) {
+        TexParam tp;
+        tp.name = p.name;
+        tp.value = p.type.find("half") != std::string::npos ? "half" : "float";
+        tp.is1d = p.type.find("texture1d") != std::string::npos;
+        tp.is3d = p.type.find("texture3d") != std::string::npos;
+        tp.cube = p.type.find("cube") != std::string::npos;
+        tp.array = p.type.find("array") != std::string::npos;
+        out.textures.push_back(tp);
+        if (out.ntex <= p.buffer) out.ntex = p.buffer + 1;
+        decl = "weft::Texture " + p.name;
+      }
+      out.params.push_back(p);
+      if (!sig.empty()) sig += ", ";
+      sig += decl;
+    }
+    if (bad) { at = close + 1; continue; }
+
+    const std::string newsig = out.ret + " " + out.name + "(" + sig + ")";
+    const size_t brace0 = src.find('{', close);
+    const size_t bend0 = brace0 == std::string::npos ? std::string::npos
+                                                     : find_matching(src, brace0, '{', '}');
+    if (bend0 == std::string::npos) { at = close + 1; continue; }
+    out.orig_sig = src.substr(at, close - at + 1);
+    out.new_sig = newsig;
+    out.orig_all = src.substr(at, bend0 - at + 1);
+
+    src.replace(at, close - at + 1, newsig);
+    size_t brace = src.find('{', at);
+    size_t bend = brace == std::string::npos ? std::string::npos
+                                             : find_matching(src, brace, '{', '}');
+    if (bend == std::string::npos) { at = close + 1; continue; }
+    if (!out.textures.empty()) {
+      // The sample sites become the portable read, exactly as in a kernel.
+      std::string berr;
+      std::string body = src.substr(brace + 1, bend - brace - 1);
+      body = strip_samplers(body, out.samplers, berr);
+      if (berr.empty()) body = rewrite_textures(body, out.textures, out.samplers, berr);
+      if (!berr.empty()) { at = close + 1; continue; }
+      src.replace(brace + 1, bend - brace - 1, body);
+      brace = src.find('{', at);
+      bend = brace == std::string::npos ? std::string::npos
+                                        : find_matching(src, brace, '{', '}');
+      if (bend == std::string::npos) { at = close + 1; continue; }
+    }
+    out.new_all = src.substr(at, bend - at + 1);
+    out.ok = true;
+    vs = out;
+    at += newsig.size();
+  }
+  return vs;
+}
+
+std::string init_const_globals(const std::string& in) {
+  std::string out;
+  size_t at = 0;
+  while (at <= in.size()) {
+    const size_t nl = in.find('\n', at);
+    const std::string line = in.substr(at, (nl == std::string::npos ? in.size() : nl) - at);
+    const std::string t = trim(line);
+    std::string addr;
+    for (const char* p : {"constant ", "const "})
+      if (t.rfind(p, 0) == 0) { addr = p; break; }
+    const bool plain = !addr.empty() && t.size() > addr.size() + 2 && t.back() == ';' &&
+                       t.find('=') == std::string::npos &&
+                       t.find('(') == std::string::npos &&
+                       t.find('{') == std::string::npos &&
+                       t.find('[') == std::string::npos;
+    if (plain) {
+      const size_t indent = line.find_first_not_of(" \t");
+      const std::string lead = indent == std::string::npos ? std::string() : line.substr(0, indent);
+      out += lead + "const " +
+             trim(t.substr(addr.size(), t.size() - addr.size() - 1)) + " = {};";
+      if (nl != std::string::npos) out += '\n';
+    } else {
+      out += line;
+      if (nl != std::string::npos) out += '\n';
+    }
+    if (nl == std::string::npos) break;
+    at = nl + 1;
+  }
+  return out;
+}
+
+std::vector<std::string> vector_decl_names(const std::string& src) {
+  static const char* kBases[] = {"packed_float", "packed_half", "float", "half", "uint",
+                                 "int",          "ushort",      "short", "char", "uchar",
+                                 "bool"};
+  std::vector<std::string> names;
+  for (size_t i = 0; i < src.size();) {
+    if (!std::isalpha((unsigned char)src[i])) {
+      i++;
+      continue;
+    }
+    size_t j = i;
+    while (j < src.size() && is_ident(src[j])) j++;
+    const std::string w = src.substr(i, j - i);
+    bool wide = false;
+    if (w.size() > 2 && w.back() >= '2' && w.back() <= '4') {
+      const std::string base = w.substr(0, w.size() - 1);
+      for (const char* b : kBases)
+        if (base == b) wide = true;
+    }
+    if (wide) {
+      size_t k = j;
+      while (k < src.size() && std::isspace((unsigned char)src[k])) k++;
+      if (k < src.size() && (std::isalpha((unsigned char)src[k]) || src[k] == '_')) {
+        size_t e = k;
+        while (e < src.size() && is_ident(src[e])) e++;
+        const std::string nm = src.substr(k, e - k);
+        bool seen = false;
+        for (const std::string& s : names)
+          if (s == nm) seen = true;
+        if (!seen) names.push_back(nm);
+      }
+    }
+    i = j;
+  }
+  return names;
+}
+
+struct FragLower {
+  std::string name;
+  std::string interp;
+  std::string add;
+  std::string calls;
+};
+
+bool lower_fragment(std::string& src, const FragLower& l, const std::string& prelude) {
+  size_t at = 0, paren = std::string::npos;
+  while ((at = src.find(l.name, at)) != std::string::npos) {
+    if (at > 0 && is_ident(src[at - 1])) { at += l.name.size(); continue; }
+    const size_t p = src.find('(', at + l.name.size());
+    if (p == std::string::npos) return false;
+    paren = p;
+    break;
+  }
+  if (paren == std::string::npos) return false;
+  const size_t close = find_matching(src, paren, '(', ')');
+  if (close == std::string::npos) return false;
+
+  auto param_name = [](const std::string& p) -> std::string {
+    const size_t lb = p.find("[[");
+    const std::string head = trim(p.substr(0, lb == std::string::npos ? p.size() : lb));
+    size_t e = head.size();
+    while (e > 0 && !is_ident(head[e - 1])) e--;
+    size_t b = e;
+    while (b > 0 && is_ident(head[b - 1])) b--;
+    return head.substr(b, e - b);
+  };
+
+  std::string sig, extra, pos;
+  for (const std::string& p : split_top_level(src.substr(paren + 1, close - paren - 1))) {
+    if (p.find("[[stage_in]]") != std::string::npos) continue;
+    // The point selection the pass computed is the sprite coordinate.
+    if (p.find("[[point_coord]]") != std::string::npos) {
+      const std::string ty = trim(p.substr(0, p.find(' ')));
+      extra += "  const " + ty + " " + param_name(p) + " = " + ty +
+               "(weft_pcx, weft_pcy);\n";
+      continue;
+    }
+    // `[[barycentric_coord]]` names the same weights the interpolation computed.
+    if (p.find("barycentric_coord") != std::string::npos) {
+      const bool np = p.find("no_perspective") != std::string::npos;
+      extra += "  const float3 " + param_name(p) + " = float3(" +
+               (np ? "weft_l0, weft_l1, weft_l2"
+                   : "weft_q0 * weft_iq, weft_q1 * weft_iq, weft_q2 * weft_iq") +
+               ");\n";
+      continue;
+    }
+    if (p.find("[[position]]") != std::string::npos) pos = param_name(p);
+    if (!sig.empty()) sig += ", ";
+    sig += p;
+  }
+  std::string add = l.add;
+  if (pos.empty()) add = "float4 weft_frag_pos [[position]]" + (add.empty() ? "" : ", " + add);
+  if (!sig.empty() && !add.empty()) sig += ", ";
+  sig += add;
+
+  // Metal's library has the same names without the namespace.
+  std::string interp = replace_all(l.interp, "std::", "");
+  const std::string px = (pos.empty() ? std::string("weft_frag_pos") : pos) + ".x";
+  const std::string py = (pos.empty() ? std::string("weft_frag_pos") : pos) + ".y";
+  interp = replace_all(interp, "@PX@", px);
+  interp = replace_all(interp, "@PY@", py);
+  interp = replace_all(interp, "@RET@", "discard_fragment();");
+
+  const size_t brace = src.find('{', close);
+  if (brace == std::string::npos) return false;
+  src.replace(brace + 1, 0, "\n" + l.calls + interp + extra);
+  src.replace(paren + 1, close - paren - 1, sig);
+  if (!prelude.empty()) {
+    size_t start = at;
+    while (start > 0 && src[start - 1] != '}') start--;
+    src.insert(start, "\n" + prelude + "\n");
+  }
+  return true;
+}
+
 TranslateResult translate_msl(const std::string& raw, const RenderMode* render) {
   TranslateResult r;
   std::string src = strip_comments(raw);
+  src = fuse_mul_add(fuse_accum_products(src));
+  // The `[[function_constant(n)]]` globals, in binding order.
+  std::vector<std::pair<int, std::string>> fn_consts;
+  VertexStage vstage;
+  if (render) vstage = read_vertex_stage(src);
+  // A fragment that reads `[[point_coord]]` makes the pass a point pass.
+  const bool file_points = render && src.find("point_coord") != std::string::npos;
+  const std::string vpos_name =
+      vstage.ok ? attr_field_name(src, vstage.ret, "position") : std::string();
+  const std::string vsize_name =
+      vstage.ok ? attr_field_name(src, vstage.ret, "point_size") : std::string();
+  std::string vbody;
+  if (vstage.ok) {
+    const size_t at = src.find(vstage.name + "(");
+    const size_t brace = at == std::string::npos ? std::string::npos : src.find('{', at);
+    const size_t end =
+        brace == std::string::npos ? std::string::npos : find_matching(src, brace, '{', '}');
+    if (brace != std::string::npos && end != std::string::npos) vbody = src.substr(brace, end - brace + 1);
+  }
+  const bool vheavy = vbody.size() > 240 || vbody.find("for (") != std::string::npos ||
+                      vbody.find("for(") != std::string::npos ||
+                      vbody.find("while (") != std::string::npos ||
+                      vbody.find("while(") != std::string::npos ||
+                      vbody.find("texture") != std::string::npos;
+  bool vstage_pure = vstage.ok && vheavy;
+  for (const auto& p : vstage.params) {
+    if (p.pointer) vstage_pure = false;
+    if (p.texture && p.orig_type.find("write") != std::string::npos) vstage_pure = false;
+  }
+  std::vector<FragLower> lowers;
+  int stage_in_fns = 0;
 
-  // A task stage (`[[object]]`) is a kernel too: it runs first, writes a payload
-  // and calls `set_threadgroups_per_grid`, and the mesh stage then runs over that
-  // meshgrid. Its name is recorded before the rewrite so the kernel loop knows
-  // which functions are tasks.
   std::vector<std::string> task_fns;
   for (size_t at = 0; (at = src.find("[[object]]", at)) != std::string::npos;) {
     size_t after = at + 10;
@@ -5082,11 +5801,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       at += 10;
     }
   }
-  // An object stage is a kernel over one mesh's slots, vertices and primitives
-  // written by the lanes of the group together, so it is spelled `kernel` from
-  // here on and translated like one. Only the *stage* attribute is rewritten:
-  // the `[[mesh]]` on a `mesh<V, NV, NP>` parameter is a binding, and the
-  // parameter loop below binds the two blocks it names.
   for (size_t at = 0; (at = src.find("[[mesh]]", at)) != std::string::npos;) {
     size_t after = at + 8;
     while (after < src.size() && std::isspace((unsigned char)src[after])) after++;
@@ -5098,10 +5812,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     }
   }
 
-  // The Metal preamble belongs to the GPU's compilation, not to the generated
-  // C++, whose runtime header supplies the same names. It is dropped from the
-  // text the carried declarations are read from and kept in `src`, because `src`
-  // is also what Metal is handed back (see the GPU source below).
   std::string decl_src = src;
   for (const char* inc : {"#include <metal_stdlib>\n", "#include <metal_stdlib>",
                           "#include <metal_math>\n", "#include <metal_math>",
@@ -5110,20 +5820,35 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   }
   decl_src = replace_all(decl_src, "using namespace metal;", "");
 
-  // Everything the file defines for itself, structs, enums, constants, helper
-  // functions, is carried over as written. Only a kernel is rewritten.
+  for (size_t at = 0; (at = decl_src.find("[[function_constant", at)) != std::string::npos;) {
+    const size_t rb = decl_src.find("]]", at);
+    if (rb == std::string::npos) break;
+    const size_t a = decl_src.find('(', at), b = decl_src.find(')', at);
+    const int slot = (a != std::string::npos && b != std::string::npos && b > a && b < rb)
+                         ? std::atoi(trim(decl_src.substr(a + 1, b - a - 1)).c_str())
+                         : 0;
+    size_t ls = decl_src.rfind('\n', at);
+    ls = (ls == std::string::npos) ? 0 : ls + 1;
+    std::string decl = trim(decl_src.substr(ls, at - ls));
+    for (const char* addr : {"constant ", "const "})
+      if (decl.rfind(addr, 0) == 0) { decl = trim(decl.substr(std::strlen(addr))); break; }
+    const size_t sp = decl.find_first_of(" \t");
+    std::string type = sp == std::string::npos ? decl : decl.substr(0, sp);
+    if (type.empty()) type = "bool";
+    fn_consts.emplace_back(slot, type);
+    decl_src.erase(at, rb + 2 - at);
+  }
+  decl_src = init_const_globals(decl_src);
+
   const CarriedDecls carried = carry_decls(decl_src);
 
   std::string body_out;
   int kcount = 0;
+  std::vector<int> frag_sampler_slots;  // every `[[sampler(n)]]` a fragment names
+  std::vector<GpuPad> gpu_pads;  // fragments whose colour output needs widening
+  bool points_run = false;       // a fragment reads `[[point_coord]]`
+  bool vertex_used = false;  // the pass fills `stage_in` with a vertex stage
 
-  // A compute pass translates `kernel` functions, a render pass `fragment` ones:
-  // a fragment's grid is the target's pixels, so it is the same shape of
-  // translation with a different way of naming the thread.
-  //
-  // A `[[tile]]` function is a render pass's first stage, it fills tile memory
-  // before any fragment of that tile runs, and it is shaped exactly like a
-  // kernel over the same pixels, so it is translated as one and run first.
   std::vector<std::string> tile_fns;
   if (render) {
     size_t t = 0;
@@ -5137,8 +5862,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     }
     src = replace_all(src, "[[tile]]", "kernel");
   }
-  // A render pass reads `fragment` functions and the tile stage, which is
-  // spelled `kernel` after the rewrite above; a compute pass only `kernel`.
   size_t pos = 0;
   while (true) {
     std::string kw;
@@ -5162,7 +5885,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       pos = k + kw.size();
       continue;
     }
-    // Signature: `kernel void name(params)` or `fragment float4 name(params)`
     size_t paren = src.find('(', k);
     if (paren == std::string::npos) break;
     size_t semi = src.find(';', k);
@@ -5189,9 +5911,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     body = rewrite_math_calls(body);
     const bool is_tile = std::find(tile_fns.begin(), tile_fns.end(), name) != tile_fns.end();
     const bool is_task = std::find(task_fns.begin(), task_fns.end(), name) != task_fns.end();
-    // A render pass translates its fragment stages and its tile stage. A compute
-    // kernel that happens to live in the same file is not part of the pass, so
-    // it is left exactly as written.
+    // A render pass translates its fragment stages and its tile stage.
     if (render && kw == "kernel" && !is_tile) {
       pos = close_brace + 1;
       continue;
@@ -5200,29 +5920,22 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     std::string locals;      // everything, for the per-thread form
     std::string buf_locals;  // buffers only, for the loop form
     std::vector<TexParam> textures;
+    std::map<std::string, std::pair<int, int>> samplers_for_body;
     std::vector<std::pair<std::string, std::string>> gid_params;
     bool only_gid = true;
     int nargs = 0;
     bool unsupported = false;
     std::string why;
     std::string ib_type, ib_name;  // tile memory: its element type and name
-    // Element types by binding number, not by declaration order: a mesh stage's
-    // outputs bind after every `[[buffer(N)]]` the kernel wrote, so the two can
-    // never land on the same slot. `buf_bytes[i]` has to mean buffer i.
     std::vector<std::pair<int, std::string>> buf_types_at;
-    // A mesh stage's outputs are bound but are not buffers the caller passes, so
-    // they are counted here and subtracted from the count `--buffers` matches.
     bool is_mesh = false;
     int mesh_nv = 0, mesh_np = 0;
     std::string mesh_vtype;
-    // Buffers the launcher creates rather than the caller, the mesh blocks, a
-    // task payload, the meshgrid handle, and the binding each one was given.
     int extra_bufs = 0;
     int payload_idx = -1, props_idx = -1;
     std::string payload_type;
 
-    // The highest binding the kernel declares. Mesh outputs bind above it, so
-    // they can never collide with an index the shader itself wrote.
+    // The highest binding the kernel declares.
     int max_buf_idx = -1;
     for (const std::string& rp : split_top_level(params)) {
       const size_t ba = rp.find("buffer(");
@@ -5232,13 +5945,158 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     }
     int next_idx = max_buf_idx + 1;  // the first binding the launcher supplies
 
+    bool points_prelude = false;
+    // The clip distances the pass declares, expanded to one name per plane.
+    std::vector<std::string> clip_fields;
+    std::string points_gpu, points_params;
+    auto ensure_points_prelude = [&]() -> bool {
+      if (points_prelude) return true;
+      if (vpos_name.empty()) {
+        unsupported = true;
+        why = "[[point_coord]] needs the vertex stage's `[[position]]` field";
+        return false;
+      }
+      const std::string dw = std::to_string(render->width);
+      const std::string dh = std::to_string(render->height);
+      std::vector<std::string> parts;
+      for (const auto& p : vstage.params) {
+        if (p.texture) {
+          parts.push_back(p.orig_type + " weft_stage_tex_" + std::to_string(p.buffer) +
+                          " [[texture(" + std::to_string(p.buffer) + ")]]");
+        } else if (p.buffer >= 0) {
+          parts.push_back((p.pointer ? "device " + p.type + "* " : "constant " + p.type + "& ") +
+                          "weft_stage_buf_" + std::to_string(p.buffer) + " [[buffer(" +
+                          std::to_string(p.buffer) + ")]]");
+          if (nargs <= p.buffer) nargs = p.buffer + 1;
+        }
+      }
+      for (const auto& p : vstage.sampler_params) {
+        parts.push_back("sampler weft_stage_smp_" + std::to_string(p.buffer) +
+                        " [[sampler(" + std::to_string(p.buffer) + ")]]");
+        frag_sampler_slots.push_back(p.buffer);
+      }
+      for (const std::string& part : parts) {
+        if (!points_params.empty()) points_params += ", ";
+        points_params += part;
+      }
+      std::string out, gpu;
+      for (int i = 0; i < 3; i++) {
+        std::string args, gargs;
+        for (const auto& p : vstage.params) {
+          if (!args.empty()) { args += ", "; gargs += ", "; }
+          if (p.vertex_id) {
+            args += std::to_string(i) + "u";
+            gargs += std::to_string(i) + "u";
+          } else if (p.zero_index) {
+            args += "0u";
+            gargs += "0u";
+          } else if (p.texture) {
+            args += "weft::texture(" + std::to_string(p.buffer) + ")";
+            gargs += "weft_stage_tex_" + std::to_string(p.buffer);
+          } else if (p.buffer >= 0) {
+            args += p.pointer
+                        ? "(" + p.type + "*)weft::buffer(ctx, " + std::to_string(p.buffer) + ")"
+                        : "*(const " + p.type + "*)weft::buffer(ctx, " + std::to_string(p.buffer) +
+                              ")";
+            gargs += "weft_stage_buf_" + std::to_string(p.buffer);
+          } else {
+            unsupported = true;
+            why = "vertex stage parameter '" + p.name +
+                  "' is neither a vertex id nor a buffer";
+            return false;
+          }
+        }
+        for (const auto& p : vstage.sampler_params)
+          gargs += (gargs.empty() ? "" : ", ") + std::string("weft_stage_smp_") +
+                   std::to_string(p.buffer);
+        out += "  " + vstage.ret + " weft_v" + std::to_string(i) + " = " + vstage.name + "(" +
+               args + ");\n";
+        gpu += "  " + vstage.ret + " weft_v" + std::to_string(i) +
+               " = weft_plain_vstage(" + gargs + ");\n";
+      }
+      auto body = [&](const std::string& xexpr, const std::string& yexpr,
+                      const std::string& ret) -> std::string {
+        std::string t;
+        t += "  const float weft_ppx = " + xexpr + ";\n";
+        t += "  const float weft_ppy = " + yexpr + ";\n";
+        t += "  int weft_which = -1;  // the point this pixel shows, if any\n";
+        t += "  float weft_pcx = 0.5f, weft_pcy = 0.5f;\n";
+        for (int i = 0; i < 3; i++) {
+          const std::string v = "weft_v" + std::to_string(i);
+          const std::string sx =
+              "std::round((weft_clip.x / weft_clip.w * 0.5f + 0.5f) * " + dw +
+              ".0f * 256.0f) * 0.00390625f";
+          const std::string sy =
+              "std::round((0.5f - weft_clip.y / weft_clip.w * 0.5f) * " + dh +
+              ".0f * 256.0f) * 0.00390625f";
+          t += "  {\n";
+          t += "    const float4 weft_clip = " + v + "." + vpos_name + ";\n";
+          t += "    if (weft_clip.w > 0.0f) {\n";
+          t += "      const float weft_psx = " + sx + ";\n";
+          t += "      const float weft_psy = " + sy + ";\n";
+          t += "      const float weft_psz = " +
+               (vsize_name.empty() ? std::string("0.0f")
+                                   : "(" + v + "." + vsize_name + ")") +
+               ";\n";
+          std::string clip_ok;
+          for (const std::string& cn : clip_fields)
+            clip_ok += " && " + v + "." + cn + " >= 0.0f";
+          t += "      if (weft_ppx >= weft_psx - weft_psz * 0.5f &&\n";
+          t += "          weft_ppx < weft_psx + weft_psz * 0.5f &&\n";
+          t += "          weft_ppy >= weft_psy - weft_psz * 0.5f &&\n";
+          t += "          weft_ppy < weft_psy + weft_psz * 0.5f" + clip_ok + ") {\n";
+          t += "        weft_which = " + std::to_string(i) + ";\n";
+          t += "        weft_pcx = (weft_ppx - (weft_psx - weft_psz * 0.5f)) / weft_psz;\n";
+          t += "        weft_pcy = (weft_ppy - (weft_psy - weft_psz * 0.5f)) / weft_psz;\n";
+          t += "      }\n    }\n  }\n";
+        }
+        t += "  if (weft_which < 0) " + ret + "\n";
+        return t;
+      };
+      out += body("((float)(ctx.gid % " + dw + "u) + 0.5f)",
+                  "((float)(ctx.gid / " + dw + "u) + 0.5f)", "return;");
+      gpu += body("@PX@", "@PY@", "@RET@");
+      locals += out;
+      points_gpu = gpu;
+      points_prelude = true;
+      return true;
+    };
+
+    clip_fields.clear();
+    if (render && vstage.ok) {
+      for (const StructField& vf : read_struct_fields(src, vstage.ret)) {
+        if (vf.attr.find("clip_distance") == std::string::npos) continue;
+        std::string nm = vf.name;
+        const size_t lbk = nm.find('[');
+        std::string count;
+        if (lbk != std::string::npos) {
+          const size_t rb = nm.find(']', lbk);
+          if (rb == std::string::npos) {
+            r.error = "the vertex stage's clip array '" + vf.name + "' has no bound";
+            return r;
+          }
+          count = nm.substr(lbk + 1, rb - lbk - 1);
+          nm = nm.substr(0, lbk);
+        }
+        if (vf.type != "float" ||
+            (!count.empty() && (count.size() > 2 ||
+                                count.find_first_not_of("0123456789") != std::string::npos))) {
+          r.error = "[[clip_distance]] needs float planes, not " + vf.type + " " + vf.name;
+          return r;
+        }
+        if (count.empty()) {
+          clip_fields.push_back(nm);
+        } else {
+          for (int e = 0; e < std::stoi(count); e++)
+            clip_fields.push_back(nm + "[" + std::to_string(e) + "]");
+        }
+      }
+    }
+
     for (const std::string& rawp : split_top_level(params)) {
       if (rawp.empty() || rawp == "void") continue;
       std::vector<std::string> attrs;
       std::string decl = strip_attributes(rawp, attrs);
-      // `mesh_grid_properties mgp` is a plain parameter, not a binding: it is the
-      // task stage's own output about the size of the stage after it. It is bound
-      // above everything the shader declared, like a mesh block.
       if (decl.find("mesh_grid_properties") != std::string::npos) {
         const std::string rest = trim(decl.substr(decl.find("mesh_grid_properties") + 20));
         std::string gname = rest.substr(0, rest.find_first_of(" \t,)"));
@@ -5268,12 +6126,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       std::string attr = trim(attrs[0]);
       std::string name_field, type_field;
 
-      // A mesh stage's output: `mesh<V, NV, NP> out [[mesh]]`. It is not a buffer
-      // the caller passes, a mesh is a threadgroup, so the launcher creates one
-      // vertex block and one triangle block per group and the view below is this
-      // invocation's slice of them. `out.vertices[i]`, `out.set_vertex(i, v)`,
-      // `out.set_primitive(i, uint3)` and `out.get_vertex(i)` are the members a
-      // mesh object stage writes through.
+      // A mesh stage's output.
       if (attr == "mesh") {
         const size_t lt = decl.find('<'), gt = decl.rfind('>');
         if (lt == std::string::npos || gt == std::string::npos || gt < lt) {
@@ -5289,9 +6142,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
           break;
         }
         const std::string vtype = trim(ms[0]);
-        // `mesh<V, 16, 16> out` and `mesh<V, 16, 16> out[kind::triangle]` are the
-        // two spellings; the kind only picks the primitive type, and both write
-        // triangles.
         std::string rest = trim(decl.substr(gt + 1));
         const std::string mname = trim(rest.substr(0, rest.find('[')));
         if (mname.empty() || vtype.empty()) {
@@ -5311,9 +6161,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         const std::string mt =
             "weft::mesh_view<" + vtype + ", " + std::to_string(mesh_nv) + ", " +
             std::to_string(mesh_np) + ">";
-        // The view is this group's slice: `buffer` is the whole block, and a
-        // group's part of it starts NV (or NP) elements in. That offset is the
-        // only thing that stops one mesh from writing another's vertices.
+        // The view is this group's slice.
         const std::string mline =
             "  " + mt + " " + mname + " = " + mt + "{ (" + vtype +
             "*)weft::buffer(ctx, " + std::to_string(vb) + ") + (size_t)ctx.tgid * " +
@@ -5325,10 +6173,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         continue;
       }
 
-      // The task payload: `object_data T& p [[payload]]`. One element per task
-      // threadgroup, written by the task stage and read by the mesh stage that
-      // group spawned, which is why the module indexes it by `tgid % groups`
-      // rather than by the mesh index alone.
+      // The task payload.
       if (attr == "payload") {
         std::vector<std::string> pw;
         std::string cur;
@@ -5353,10 +6198,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         extra_bufs += 1;
         payload_type = ptype;
         buf_types_at.emplace_back(payload_idx, ptype);
-        // The payload is indexed by this invocation's own threadgroup: the
-        // launcher gives a task group one element and a mesh exactly the element
-        // of the task group that owns it, so neither stage borrows an index it
-        // has to compute.
         const std::string pline = "  " + ptype + "& " + pname + " = ((" + ptype +
                                   "*)weft::buffer(ctx, " + std::to_string(payload_idx) +
                                   "))[ctx.tgid];\n";
@@ -5366,8 +6207,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         continue;
       }
 
-      // A texture is not a buffer: it has its own binding space, its own size
-      // query and a filtering sampler, so it is bound to a weft::Texture.
       if (decl.find("texture") != std::string::npos) {
         if (attr.rfind("texture", 0) != 0) {
           unsupported = true;
@@ -5422,10 +6261,53 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
           std::string w = words[wi];
           if (w == "const") is_const = true;
         }
-        // Tile memory: `imageblock<T> blk`. It is lowered to a buffer of T, one
-        // element per pixel, so it binds after the kernel's own buffers and is
-        // addressed by the pixel, the same memory the GPU source below hands
-        // Metal.
+        if (render && (attr == "barycentric_coord" ||
+                       attr == "barycentric_coord_no_perspective")) {
+          if (file_points && vstage.ok) {
+            unsupported = true;
+            why = "a point primitive has no barycentric coordinates (" + rawp + ")";
+            break;
+          }
+          if (!vertex_used) {
+            unsupported = true;
+            why = "[[barycentric_coord]] needs a `[[stage_in]]` parameter before it, which is "
+                  "what declares the triangle (" + rawp + ")";
+            break;
+          }
+          if (type_field != "float3") {
+            unsupported = true;
+            why = "[[barycentric_coord]] is a float3, not " + type_field + " (" + rawp + ")";
+            break;
+          }
+          const bool np = attr.find("no_perspective") != std::string::npos;
+          locals += "  const float3 " + name_field + " = float3(" +
+                    (np ? "weft_l0, weft_l1, weft_l2"
+                        : "weft_q0 * weft_iq, weft_q1 * weft_iq, weft_q2 * weft_iq") +
+                    ");\n";
+          continue;
+        }
+        if (render && attr == "point_coord") {
+          points_run = true;
+          if (vstage.ok) {
+            if (!ensure_points_prelude()) break;
+            locals += "  " + type_field + " " + name_field + " = " + type_field +
+                      "(weft_pcx, weft_pcy);\n";
+            only_gid = false;
+            // A point pass with a vertex stage draws the points that stage writes.
+            if (params.find("[[stage_in]]") == std::string::npos) {
+              lowers.push_back(FragLower{name, points_gpu, points_params, std::string()});
+              stage_in_fns++;
+            }
+            continue;
+          }
+          locals += "  " + type_field + " " + name_field + " = " + type_field + "(0.5);\n";
+          continue;
+        }
+        if (render && attr.rfind("color", 0) == 0 && attr.find('(') != std::string::npos) {
+          locals += "  " + type_field + " " + name_field + " = " + type_field + "(0.0);\n";
+          continue;
+        }
+        // Tile memory.
         if (attr == "imageblock_data") {
           if (!render) {
             unsupported = true;
@@ -5442,18 +6324,23 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
           ib_name = name_field;
           continue;
         }
-        if (stars == 0 && attr.rfind("buffer", 0) == 0) {
-          unsupported = true;
-          why = "only pointer parameters can bind a buffer (" + rawp + ")";
-          break;
-        }
         if (attr.rfind("buffer", 0) == 0) {
           size_t a = attr.find('('), b = attr.find(')');
           std::string idx = (a != std::string::npos && b > a) ? attr.substr(a + 1, b - a - 1) : "";
           if (idx.empty()) { unsupported = true; why = "buffer() without an index"; break; }
-          std::string line = "  " + std::string(is_const ? "const " : "") + type_field + "* " +
-                             name_field + " = (" + std::string(is_const ? "const " : "") +
-                             type_field + "*)weft::buffer(ctx, " + idx + ");\n";
+          type_field.erase(std::remove(type_field.begin(), type_field.end(), '&'),
+                           type_field.end());
+          const std::string cq = is_const ? "const " : "";
+          std::string line;
+          if (stars > 0) {
+            line = "  " + cq + type_field + "* " + name_field + " = (" + cq + type_field +
+                   "*)weft::buffer(ctx, " + idx + ");\n";
+          } else {
+            name_field.erase(std::remove(name_field.begin(), name_field.end(), '&'),
+                             name_field.end());
+            line = "  " + cq + type_field + "& " + name_field + " = *(" + cq + type_field +
+                   "*)weft::buffer(ctx, " + idx + ");\n";
+          }
           const int bidx = std::atoi(trim(idx).c_str());
           locals += line;
           buf_locals += line;
@@ -5461,9 +6348,375 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
           if (nargs <= bidx) nargs = bidx + 1;
           continue;
         }
-        // `[[position]]` in a fragment is the pixel centre: (x + 0.5, y + 0.5),
-        // with x taken modulo the target's width. That is the same coordinate a
-        // GPU hands a fragment, so a body that uses it computes the same thing.
+        if (render && attr.rfind("sampler", 0) == 0) {
+          const size_t a = attr.find('('), b = attr.find(')');
+          const int slot = (a != std::string::npos && b > a)
+                               ? std::atoi(trim(attr.substr(a + 1, b - a - 1)).c_str())
+                               : 0;
+          std::string nm = name_field;
+          nm.erase(std::remove(nm.begin(), nm.end(), '&'), nm.end());
+          samplers_for_body[nm] = {0, 0};
+          frag_sampler_slots.push_back(slot);
+          continue;
+        }
+        // `[[stage_in]]` is what the vertex stage wrote for this pixel.
+        if (render && attr == "stage_in") {
+          std::string nm = name_field;
+          nm.erase(std::remove(nm.begin(), nm.end(), '&'), nm.end());
+          const size_t def = src.find("struct " + type_field);
+          const size_t open = def == std::string::npos ? std::string::npos : src.find('{', def);
+          size_t close = std::string::npos, depth = 0;
+          if (open != std::string::npos) {
+            for (size_t i = open; i < src.size(); i++) {
+              if (src[i] == '{') depth++;
+              else if (src[i] == '}' && --depth == 0) { close = i; break; }
+            }
+          }
+          if (close == std::string::npos) {
+            unsupported = true;
+            why = "stage_in struct '" + type_field + "' is not declared in this file (" + rawp +
+                  ")";
+            break;
+          }
+          struct StageField {
+            std::string type, name, attr;
+            bool position() const { return attr.find("position") != std::string::npos; }
+            bool flat() const { return attr.find("flat") != std::string::npos; }
+          };
+          std::vector<StageField> fields;
+          {
+            const std::string text = src.substr(open + 1, close - open - 1);
+            size_t at = 0;
+            while (true) {
+              const size_t semi = text.find(';', at);
+              if (semi == std::string::npos) break;
+              std::string f = text.substr(at, semi - at);
+              at = semi + 1;
+              StageField fd;
+              const size_t lb = f.find("[["), rb = f.find("]]");
+              if (lb != std::string::npos && rb > lb) {
+                fd.attr = trim(f.substr(lb + 2, rb - lb - 2));
+                f = f.substr(0, lb) + f.substr(rb + 2);
+              }
+              std::string word;
+              for (char c : f) {
+                if (std::isspace((unsigned char)c)) {
+                  if (!word.empty()) {
+                    if (fd.type.empty()) {
+                      fd.type = word;
+                    } else if (word[0] == '[' && !fd.name.empty()) {
+                      fd.name += word;  // an array bound written after the name
+                    } else {
+                      fd.name = word;
+                    }
+                    word.clear();
+                  }
+                } else {
+                  word.push_back(c);
+                }
+              }
+              if (!word.empty()) {
+                if (fd.type.empty()) {
+                  fd.type = word;
+                } else if (word[0] == '[' && !fd.name.empty()) {
+                  fd.name += word;
+                } else {
+                  fd.name = word;
+                }
+              }
+              if (!fd.name.empty()) fields.push_back(fd);
+            }
+          }
+          const std::string w = std::to_string(render->width);
+          const std::string h = std::to_string(render->height);
+          const std::string px = "((float)(ctx.gid % " + w + "u) + 0.5f)";
+          const std::string py = "((float)(ctx.gid / " + w + "u) + 0.5f)";
+          std::string pos_field;
+          for (const StageField& fd : fields)
+            if (fd.position()) pos_field = fd.name;
+          stage_in_fns++;
+          bool bad = false;
+          std::string decl;
+
+          const std::vector<StructField> vfields =
+              vstage.ok ? read_struct_fields(src, vstage.ret) : std::vector<StructField>();
+          bool vmatch = vstage.ok && !pos_field.empty();
+          for (const StageField& fd : fields) {
+            if (!vmatch) break;
+            const StructField* hit = nullptr;
+            for (const StructField& vf : vfields)
+              if (vf.name == fd.name) hit = &vf;
+            if (!hit) {
+              unsupported = true;
+              why = "the fragment reads '" + fd.name + "', which the vertex stage '" +
+                    vstage.name + "' does not write (" + rawp + ")";
+              bad = true;
+              vmatch = false;
+            } else if (hit->type != fd.type) {
+              unsupported = true;
+              why = "the fragment reads '" + fd.name + "' as " + fd.type +
+                    ", and the vertex stage writes " + hit->type + " (" + rawp + ")";
+              bad = true;
+              vmatch = false;
+            }
+          }
+          if (bad) break;
+          if (vmatch) {
+            for (const auto& p : vstage.params)
+              if (p.buffer >= 0 && nargs <= p.buffer) nargs = p.buffer + 1;
+            if (file_points) {
+              if (!ensure_points_prelude()) { bad = true; break; }
+              decl += "  " + type_field + " " + nm + ";\n";
+              for (const StageField& fd : fields) {
+                if (fd.name == pos_field) {
+                  decl += "  " + nm + "." + fd.name + " = float4(" + px + ", " + py +
+                          ", 0.0f, 1.0f);\n";
+                  continue;
+                }
+                decl += "  if (weft_which == 0) " + nm + "." + fd.name + " = weft_v0." +
+                        fd.name + ";\n";
+                decl += "  else if (weft_which == 1) " + nm + "." + fd.name + " = weft_v1." +
+                        fd.name + ";\n";
+                decl += "  else " + nm + "." + fd.name + " = weft_v2." + fd.name + ";\n";
+              }
+              if (!points_gpu.empty()) {
+                std::string decl_gpu = replace_all(replace_all(decl, px, "@PX@"), py, "@PY@");
+                lowers.push_back(
+                    FragLower{name, points_gpu + decl_gpu, points_params, std::string()});
+              }
+              locals += decl;
+              only_gid = false;
+              vertex_used = true;
+              continue;
+            }
+            if (vstage_pure) {
+              decl += "  static thread_local " + vstage.ret +
+                      " weft_hv0, weft_hv1, weft_hv2;\n"
+                      "  static thread_local uint64_t weft_hgen = ~0ull;\n"
+                      "  if (weft_hgen != weft::pass_generation()) {\n"
+                      "    weft_hgen = weft::pass_generation();\n";
+            }
+            for (int i = 0; i < 3 && !bad; i++) {
+              std::string args;
+              for (const auto& p : vstage.params) {
+                if (!args.empty()) args += ", ";
+                if (p.vertex_id) {
+                  args += std::to_string(i) + "u";
+                } else if (p.zero_index) {
+                  args += "0u";
+                } else if (p.texture) {
+                  args += "weft::texture(" + std::to_string(p.buffer) + ")";
+                } else if (p.buffer >= 0) {
+                  args += p.pointer
+                              ? "(" + p.type + "*)weft::buffer(ctx, " + std::to_string(p.buffer) + ")"
+                              : "*(const " + p.type + "*)weft::buffer(ctx, " +
+                                    std::to_string(p.buffer) + ")";
+                } else {
+                  unsupported = true;
+                  why = "vertex stage parameter '" + p.name +
+                        "' is neither a vertex id nor a buffer (" + rawp + ")";
+                  bad = true;
+                  break;
+                }
+              }
+              if (!bad)
+                decl += vstage_pure
+                            ? ("    weft_hv" + std::to_string(i) + " = " + vstage.name + "(" +
+                               args + ");\n")
+                            : ("  " + vstage.ret + " weft_v" + std::to_string(i) + " = " +
+                               vstage.name + "(" + args + ");\n");
+            }
+            if (vstage_pure) {
+              decl += "  }\n"
+                      "  const " + vstage.ret + "& weft_v0 = weft_hv0;\n"
+                      "  const " + vstage.ret + "& weft_v1 = weft_hv1;\n"
+                      "  const " + vstage.ret + "& weft_v2 = weft_hv2;\n";
+            }
+            if (bad) break;
+            decl += "  const float weft_px = " + px + ", weft_py = " + py + ";\n";
+            decl += "  const float4 weft_c0 = weft_v0." + pos_field + ", weft_c1 = weft_v1." +
+                    pos_field + ", weft_c2 = weft_v2." + pos_field + ";\n";
+            for (int i = 0; i < 3; i++) {
+              const std::string c = "weft_c" + std::to_string(i);
+              const std::string sx =
+                  "std::round(((" + c + ".x / " + c + ".w * 0.5f + 0.5f) * " + w +
+                  ".0f) * 256.0f) * 0.00390625f";
+              const std::string sy =
+                  "std::round(((0.5f - " + c + ".y / " + c + ".w * 0.5f) * " + h +
+                  ".0f) * 256.0f) * 0.00390625f";
+              decl += "  const float2 weft_s" + std::to_string(i) + " = float2(" + sx + ", " +
+                      sy + ");\n";
+            }
+            decl +=
+                "  const float weft_d = (weft_s1.x - weft_s0.x) * (weft_s2.y - weft_s0.y) - "
+                "(weft_s2.x - weft_s0.x) * (weft_s1.y - weft_s0.y);\n"
+                "  const float weft_l0 = ((weft_s1.x - weft_px) * (weft_s2.y - weft_py) - "
+                "(weft_s2.x - weft_px) * (weft_s1.y - weft_py)) / weft_d;\n"
+                "  const float weft_l1 = ((weft_s2.x - weft_px) * (weft_s0.y - weft_py) - "
+                "(weft_s0.x - weft_px) * (weft_s2.y - weft_py)) / weft_d;\n"
+                "  const float weft_l2 = 1.0f - weft_l0 - weft_l1;\n";
+            decl += "  if (!(weft_l0 >= 0.0f && weft_l1 >= 0.0f && weft_l2 >= 0.0f)) return;\n";
+            decl += "  const float weft_q0 = weft_l0 / weft_c0.w;\n"
+                    "  const float weft_q1 = weft_l1 / weft_c1.w;\n"
+                    "  const float weft_q2 = weft_l2 / weft_c2.w;\n"
+                    "  const float weft_iq = 1.0f / (weft_q0 + weft_q1 + weft_q2);\n";
+            for (size_t ci = 0; ci < clip_fields.size(); ci++) {
+              const std::string& cn = clip_fields[ci];
+              const std::string t = std::to_string(ci);
+              decl += "  const float weft_clip" + t + " = (weft_v0." + cn +
+                      " * weft_q0 + weft_v1." + cn + " * weft_q1 + weft_v2." + cn +
+                      " * weft_q2) * weft_iq;\n";
+              decl += "  if (weft_clip" + t + " < 0.0f) return;\n";
+            }
+            decl += "  " + type_field + " " + nm + ";\n";
+            std::vector<StageField> expanded;
+            for (const StageField& fd : fields) {
+              const size_t lbk = fd.name.find('[');
+              if (lbk == std::string::npos) {
+                expanded.push_back(fd);
+                continue;
+              }
+              const size_t rb = fd.name.find(']', lbk);
+              const std::string count =
+                  rb == std::string::npos ? std::string() : fd.name.substr(lbk + 1, rb - lbk - 1);
+              if (fd.type != "float" || count.empty() || count.size() > 2 ||
+                  count.find_first_not_of("0123456789") != std::string::npos) {
+                unsupported = true;
+                why = "stage_in field '" + fd.name + "' is an array weft cannot blend (" + rawp +
+                      ")";
+                bad = true;
+                break;
+              }
+              const std::string base = fd.name.substr(0, lbk);
+              for (int e = 0; e < std::stoi(count); e++) {
+                StageField el = fd;
+                el.name = base + "[" + std::to_string(e) + "]";
+                expanded.push_back(el);
+              }
+            }
+            for (const StageField& fd : expanded) {
+              if (fd.name == pos_field) {
+                decl += "  " + nm + "." + fd.name + " = float4(" + px + ", " + py +
+                        ", 0.0f, 1.0f);\n";
+              } else if (fd.flat()) {
+                decl += "  " + nm + "." + fd.name + " = weft_v0." + fd.name + ";\n";
+              } else if (fd.type == "float" || fd.type == "float2" || fd.type == "float3" ||
+                         fd.type == "float4" || fd.type == "half" || fd.type == "half2" ||
+                         fd.type == "half3" || fd.type == "half4") {
+                const bool np = fd.attr.find("no_perspective") != std::string::npos;
+                const std::string q0 = np ? "weft_l0" : "weft_q0";
+                const std::string q1 = np ? "weft_l1" : "weft_q1";
+                const std::string q2 = np ? "weft_l2" : "weft_q2";
+                const std::string scale = np ? std::string() : " * weft_iq";
+                auto blend = [&](const std::string& comp) {
+                  return "((float)weft_v0." + fd.name + comp + " * " + q0 + " + (float)weft_v1." +
+                         fd.name + comp + " * " + q1 + " + (float)weft_v2." + fd.name + comp +
+                         " * " + q2 + ")" + scale;
+                };
+                if (fd.type.rfind("half", 0) != 0) {
+                  decl += "  " + nm + "." + fd.name + " = (weft_v0." + fd.name + " * " + q0 +
+                          " + weft_v1." + fd.name + " * " + q1 + " + weft_v2." + fd.name + " * " +
+                          q2 + ")" + scale + ";\n";
+                } else if (fd.type == "half") {
+                  decl += "  " + nm + "." + fd.name + " = half(" + blend("") + ");\n";
+                } else {
+                  static const char* const comps[] = {"x", "y", "z", "w"};
+                  const int lanes = fd.type.back() - '0';
+                  decl += "  " + nm + "." + fd.name + " = " + fd.type + "(";
+                  for (int c = 0; c < lanes; c++) {
+                    if (c) decl += ", ";
+                    decl += "half(" + blend(std::string(".") + comps[c]) + ")";
+                  }
+                  decl += ");\n";
+                }
+              } else {
+                unsupported = true;
+                why = "stage_in field '" + fd.name + "' has type " + fd.type +
+                      ", which the CPU interpolator does not blend (" + rawp + ")";
+                bad = true;
+                break;
+              }
+            }
+            if (bad) break;
+            const size_t interp_at = decl.find("  const float weft_px");
+            if (interp_at != std::string::npos) {
+              std::string decl_gpu = decl.substr(interp_at);
+              decl_gpu = replace_all(decl_gpu, px, "@PX@");
+              decl_gpu = replace_all(decl_gpu, py, "@PY@");
+              decl_gpu = replace_all(decl_gpu, " return;\n", " @RET@\n");
+              std::string add, calls;
+              std::vector<std::string> parts;
+              for (const auto& p : vstage.params) {
+                if (p.texture) {
+                  parts.push_back(p.orig_type + " weft_stage_tex_" + std::to_string(p.buffer) +
+                                  " [[texture(" + std::to_string(p.buffer) + ")]]");
+                } else if (p.buffer >= 0) {
+                  parts.push_back((p.pointer ? "device " + p.type + "* "
+                                             : "constant " + p.type + "& ") +
+                                  "weft_stage_buf_" + std::to_string(p.buffer) + " [[buffer(" +
+                                  std::to_string(p.buffer) + ")]]");
+                }
+              }
+              for (const auto& p : vstage.sampler_params) {
+                parts.push_back("sampler weft_stage_smp_" + std::to_string(p.buffer) +
+                                " [[sampler(" + std::to_string(p.buffer) + ")]]");
+                frag_sampler_slots.push_back(p.buffer);
+              }
+              for (const std::string& part : parts) {
+                if (!add.empty()) add += ", ";
+                add += part;
+              }
+              for (int i = 0; i < 3; i++) {
+                std::string args;
+                for (const auto& p : vstage.params) {
+                  if (!args.empty()) args += ", ";
+                  args += p.vertex_id  ? (std::to_string(i) + "u")
+                        : p.zero_index ? std::string("0u")
+                        : p.texture    ? ("weft_stage_tex_" + std::to_string(p.buffer))
+                                       : ("weft_stage_buf_" + std::to_string(p.buffer));
+                }
+                for (const auto& p : vstage.sampler_params)
+                  args += (args.empty() ? "" : ", ") + std::string("weft_stage_smp_") +
+                          std::to_string(p.buffer);
+                calls += "  const " + vstage.ret + " weft_v" + std::to_string(i) +
+                         " = weft_plain_vstage(" + args + ");\n";
+              }
+              if (!file_points) lowers.push_back(FragLower{name, decl_gpu, add, calls});
+            }
+            locals += decl;
+            only_gid = false;
+            vertex_used = true;
+            continue;
+          }
+
+          if (vstage.ok) {
+            unsupported = true;
+            why = "the `[[stage_in]]` struct '" + type_field +
+                  "' has no `[[position]]` field, or the vertex stage does not write it (" +
+                  rawp + ")";
+            break;
+          }
+          decl = "  " + type_field + " " + nm + ";\n";
+          for (const StageField& fd : fields) {
+            if (fd.name == pos_field) {
+              decl += "  " + nm + "." + fd.name + " = float4(" + px + ", " + py + ", 0.0f, 1.0f);\n";
+            } else if (fd.type == "float2") {
+              decl += "  " + nm + "." + fd.name + " = float2(" + px + " / " + w + ".0f, 1.0f - " +
+                      py + " / " + h + ".0f);\n";
+            } else {
+              unsupported = true;
+              why = "stage_in field '" + fd.name + "' has type " + fd.type +
+                    ", which a full-screen pass has no value for (" + rawp + ")";
+              bad = true;
+              break;
+            }
+          }
+          if (bad) break;
+          locals += decl;
+          only_gid = false;
+          continue;
+        }
+        // `[[position]]` in a fragment is the pixel centre.
         if (render && attr == "position") {
           locals += "  float4 " + name_field + " = float4((float)(ctx.gid % " +
                      std::to_string(render->width) + "u) + 0.5f, (float)(ctx.gid / " +
@@ -5471,13 +6724,31 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
           only_gid = false;
           continue;
         }
+        // The inputs the pipeline supplies itself.
+        if (render && attr == "front_facing") {
+          std::string line = "  bool " + name_field + " = false;\n";
+          locals += line;
+          buf_locals += line;
+          continue;
+        }
+        if (render && (attr == "primitive_id" || attr == "sample_id")) {
+          std::string line = "  " + type_field + " " + name_field + " = 0u;\n";
+          locals += line;
+          buf_locals += line;
+          continue;
+        }
+        // One sample per pixel, so the only sample a mask can name is the first.
+        if (render && attr == "sample_mask") {
+          std::string line = "  " + type_field + " " + name_field + " = 1u;\n";
+          locals += line;
+          buf_locals += line;
+          continue;
+        }
         if (attr == "thread_position_in_grid") {
           locals += "  " + type_field + " " + name_field + " = (" + type_field + ")ctx.gid;\n";
           gid_params.emplace_back(type_field, name_field);
           continue;
         }
-        // Group-relative indices depend on the thread, so they rule out the
-        // loop form. Counts do not, so they are hoisted instead.
         if (attr == "thread_position_in_threadgroup" || attr == "thread_index_in_threadgroup") {
           locals += "  " + type_field + " " + name_field + " = (" + type_field + ")ctx.lid;\n";
           only_gid = false;
@@ -5488,8 +6759,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
           only_gid = false;
           continue;
         }
-        // The sub-warp indices: a simdgroup is 32 lanes of a threadgroup, a quad
-        // is 4. Both are functions of the lane, so they rule out the loop form.
         if (attr == "thread_index_in_simdgroup") {
           locals += "  " + type_field + " " + name_field + " = (" + type_field +
                     ")(ctx.lid & 31u);\n";
@@ -5534,8 +6803,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
           continue;
         }
         // The counts, which are quotients of the two sizes the launcher knows.
-        // A last threadgroup or last group of lanes can be short, and a GPU
-        // still reports a whole one, so these round up.
         if (attr == "threadgroups_per_grid") {
           std::string line = "  " + type_field + " " + name_field + " = (" + type_field +
                              ")((ctx.grid + ctx.tg_size - 1u) / ctx.tg_size);\n";
@@ -5553,27 +6820,142 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
 
     bool shared_found = false, barrier_found = false;
     std::string berr;
-    int tile_idx = -1, colour_idx = -1;
+    int tile_idx = -1, colour_idx = -1, colour_targets = 1, depth_idx = -1;
+    // The qualifier a `[[depth(.)]]` output names.
+    std::string depth_qual = "any";
     const int user_nbufs = nargs;
     if (render) {
-      // Tile memory is an imageblock, and this host's Metal compiler cannot
-      // compile one in any spelling. Both sides therefore lower it to the same
-      // thing: one element per pixel of the target, addressed by the pixel's
-      // index. The tile stage writes it and the fragments of that tile read it,
-      // which is exactly what tile memory is for a pixel that only touches its
-      // own slot.
+      if (!is_tile && !file_points && vstage.ok && !clip_fields.empty() &&
+          params.find("[[stage_in]]") == std::string::npos) {
+        const std::vector<std::string>& cuts = clip_fields;
+        if (!cuts.empty()) {
+          if (vpos_name.empty()) {
+            r.error = "the vertex stage's struct has no `[[position]]` field, so there is no "
+                      "primitive for its [[clip_distance]] to cut";
+            return r;
+          }
+          const std::string w = std::to_string(render->width);
+          const std::string h = std::to_string(render->height);
+          const std::string cpx = "((float)(ctx.gid % " + w + "u) + 0.5f)";
+          const std::string cpy = "((float)(ctx.gid / " + w + "u) + 0.5f)";
+          for (const auto& p : vstage.params)
+            if (p.buffer >= 0 && nargs <= p.buffer) nargs = p.buffer + 1;
+          std::string add, calls;
+          std::vector<std::string> parts;
+          for (const auto& p : vstage.params) {
+            if (p.texture) {
+              parts.push_back(p.orig_type + " weft_stage_tex_" + std::to_string(p.buffer) +
+                              " [[texture(" + std::to_string(p.buffer) + ")]]");
+            } else if (p.buffer >= 0) {
+              parts.push_back((p.pointer ? "device " + p.type + "* "
+                                         : "constant " + p.type + "& ") +
+                              "weft_stage_buf_" + std::to_string(p.buffer) + " [[buffer(" +
+                              std::to_string(p.buffer) + ")]]");
+            }
+          }
+          for (const auto& p : vstage.sampler_params) {
+            parts.push_back("sampler weft_stage_smp_" + std::to_string(p.buffer) +
+                            " [[sampler(" + std::to_string(p.buffer) + ")]]");
+            frag_sampler_slots.push_back(p.buffer);
+          }
+          for (const std::string& part : parts) {
+            if (!add.empty()) add += ", ";
+            add += part;
+          }
+          std::string cd;
+          if (vstage_pure) {
+            cd += "  static thread_local " + vstage.ret + " weft_hv0, weft_hv1, weft_hv2;\n"
+                  "  static thread_local uint64_t weft_hgen = ~0ull;\n"
+                  "  if (weft_hgen != weft::pass_generation()) {\n"
+                  "    weft_hgen = weft::pass_generation();\n";
+          }
+          for (int i = 0; i < 3; i++) {
+            std::string args, gargs;
+            for (const auto& p : vstage.params) {
+              if (!args.empty()) { args += ", "; gargs += ", "; }
+              if (p.vertex_id) {
+                args += std::to_string(i) + "u";
+                gargs += std::to_string(i) + "u";
+              } else if (p.zero_index) {
+                args += "0u";
+                gargs += "0u";
+              } else if (p.texture) {
+                args += "weft::texture(" + std::to_string(p.buffer) + ")";
+                gargs += "weft_stage_tex_" + std::to_string(p.buffer);
+              } else if (p.buffer >= 0) {
+                args += p.pointer
+                            ? ("(" + p.type + "*)weft::buffer(ctx, " + std::to_string(p.buffer) + ")")
+                            : ("*(const " + p.type + "*)weft::buffer(ctx, " +
+                               std::to_string(p.buffer) + ")");
+                gargs += "weft_stage_buf_" + std::to_string(p.buffer);
+              }
+            }
+            for (const auto& p : vstage.sampler_params)
+              gargs += (gargs.empty() ? "" : ", ") + std::string("weft_stage_smp_") +
+                       std::to_string(p.buffer);
+            cd += vstage_pure
+                      ? ("    weft_hv" + std::to_string(i) + " = " + vstage.name + "(" + args +
+                         ");\n")
+                      : ("  const " + vstage.ret + " weft_v" + std::to_string(i) + " = " +
+                         vstage.name + "(" + args + ");\n");
+            calls += "  const " + vstage.ret + " weft_v" + std::to_string(i) +
+                     " = weft_plain_vstage(" + gargs + ");\n";
+          }
+          if (vstage_pure) {
+            cd += "  }\n"
+                  "  const " + vstage.ret + "& weft_v0 = weft_hv0;\n"
+                  "  const " + vstage.ret + "& weft_v1 = weft_hv1;\n"
+                  "  const " + vstage.ret + "& weft_v2 = weft_hv2;\n";
+          }
+          cd += "  const float weft_px = " + cpx + ", weft_py = " + cpy + ";\n";
+          cd += "  const float4 weft_c0 = weft_v0." + vpos_name + ", weft_c1 = weft_v1." +
+                vpos_name + ", weft_c2 = weft_v2." + vpos_name + ";\n";
+          for (int i = 0; i < 3; i++) {
+            const std::string c = "weft_c" + std::to_string(i);
+            const std::string sx = "std::round(((" + c + ".x / " + c + ".w * 0.5f + 0.5f) * " + w +
+                                   ".0f) * 256.0f) * 0.00390625f";
+            const std::string sy = "std::round(((0.5f - " + c + ".y / " + c + ".w * 0.5f) * " + h +
+                                   ".0f) * 256.0f) * 0.00390625f";
+            cd += "  const float2 weft_s" + std::to_string(i) + " = float2(" + sx + ", " + sy +
+                  ");\n";
+          }
+          cd += "  const float weft_d = (weft_s1.x - weft_s0.x) * (weft_s2.y - weft_s0.y) - "
+                "(weft_s2.x - weft_s0.x) * (weft_s1.y - weft_s0.y);\n"
+                "  const float weft_l0 = ((weft_s1.x - weft_px) * (weft_s2.y - weft_py) - "
+                "(weft_s2.x - weft_px) * (weft_s1.y - weft_py)) / weft_d;\n"
+                "  const float weft_l1 = ((weft_s2.x - weft_px) * (weft_s0.y - weft_py) - "
+                "(weft_s0.x - weft_px) * (weft_s2.y - weft_py)) / weft_d;\n"
+                "  const float weft_l2 = 1.0f - weft_l0 - weft_l1;\n";
+          cd += "  if (!(weft_l0 >= 0.0f && weft_l1 >= 0.0f && weft_l2 >= 0.0f)) return;\n";
+          cd += "  const float weft_q0 = weft_l0 / weft_c0.w;\n"
+                "  const float weft_q1 = weft_l1 / weft_c1.w;\n"
+                "  const float weft_q2 = weft_l2 / weft_c2.w;\n"
+                "  const float weft_iq = 1.0f / (weft_q0 + weft_q1 + weft_q2);\n";
+          for (size_t ci = 0; ci < cuts.size(); ci++) {
+            const std::string t = std::to_string(ci);
+            cd += "  const float weft_clip" + t + " = (weft_v0." + cuts[ci] + " * weft_q0 + weft_v1." +
+                  cuts[ci] + " * weft_q1 + weft_v2." + cuts[ci] + " * weft_q2) * weft_iq;\n";
+            cd += "  if (weft_clip" + t + " < 0.0f) return;\n";
+          }
+          const size_t at_px = cd.find("  const float weft_px");
+          std::string cd_gpu = cd.substr(at_px);
+          cd_gpu = replace_all(cd_gpu, cpx, "@PX@");
+          cd_gpu = replace_all(cd_gpu, cpy, "@PY@");
+          cd_gpu = replace_all(cd_gpu, " return;\n", " @RET@\n");
+          lowers.push_back(FragLower{name, cd_gpu, add, calls});
+          locals += cd;
+          only_gid = false;
+          vertex_used = true;
+          stage_in_fns++;
+        }
+      }
       if (!ib_name.empty()) {
         const std::string idx = std::to_string(nargs);
         tile_idx = nargs;
         nargs += 1;
-        // The base of all tile memory: the slot is computed per access, because a
-        // tile is a block and the invocation's own pixel is not offset 0 of it.
+        buf_types_at.emplace_back(tile_idx, ib_type);
         locals += "  " + ib_type + "* " + ib_name + " = (" + ib_type + "*)weft::buffer(ctx, " +
                   idx + ");\n";
-        // An indexed access keeps its subscript and goes through `tile_px`,
-        // which counts any pixel outside this invocation's 32x32 tile: the GPU
-        // leaves that read undefined, so a kernel doing it has no answer that
-        // two runs could agree on and the launcher refuses it.
         const std::string wpix = std::to_string(render->width) + "u";
         const std::string wtiles = std::to_string((render->width + 31) / 32) + "u";
         const std::string at_own =
@@ -5583,18 +6965,40 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         if (!berr.empty()) { r.error = "kernel '" + name + "': " + berr; return r; }
       }
       if (!is_tile) {
-        // The colour attachment, four floats per pixel (RGBA32Float), which is
-        // where `return` writes.
-        const std::string colour = std::to_string(nargs);
-        locals += "  float* weft_colour = (float*)weft::buffer(ctx, " + colour + ");\n";
+        FragLayout lay;
+        if (!parse_frag_layout(src, ret_type, lay, berr)) {
+          r.error = "fragment '" + name + "': " + berr;
+          return r;
+        }
+        // Metal wants each colour output as wide as its attachment.
+        bool narrow = lay.width != 0 && lay.width < 4;
+        for (const FragTarget& ft : lay.colours)
+          if (ft.width < 4) narrow = true;
+        if (narrow) gpu_pads.push_back(GpuPad{name, ret_type, lay});
         colour_idx = nargs;
-        nargs += 1;
-        body = rewrite_frag_return(body, ret_type, berr);
+        if (lay.width != 0) {
+          locals += "  float* weft_colour = (float*)weft::buffer(ctx, " + std::to_string(nargs) +
+                    ");\n";
+          nargs += 1;
+        } else {
+          const int n = lay.colours.back().index + 1;
+          for (int i = 0; i < n; i++)
+            locals += "  float* weft_colour_" + std::to_string(i) +
+                      " = (float*)weft::buffer(ctx, " + std::to_string(nargs + i) + ");\n";
+          nargs += n;
+          colour_targets = n;
+        }
+        if (lay.depth) {
+          depth_idx = nargs;
+          depth_qual = lay.depth_qual;
+          locals += "  float* weft_depth = (float*)weft::buffer(ctx, " + std::to_string(nargs) +
+                    ");\n";
+          nargs += 1;
+        }
+        body = rewrite_frag_return(body, ret_type, lay, berr);
         if (!berr.empty()) { r.error = "fragment '" + name + "': " + berr; return r; }
       }
     }
-    // A helper that waits on its warp is expanded here, so the suspension it
-    // needs is this kernel's.
     for (const HelperFn& h : carried.helpers) {
       bool hit = false;
       body = expand_helper_calls(body, h, hit, berr);
@@ -5605,8 +7009,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     body = rewrite_barriers(body, barrier_found, berr);
     if (!berr.empty()) { r.error = "kernel '" + name + "': " + berr; return r; }
 
-    std::map<std::string, std::pair<int, int>> samplers;
-    if (!textures.empty() || body.find("sampler") != std::string::npos) {
+    std::map<std::string, std::pair<int, int>> samplers = samplers_for_body;
+    if (!textures.empty() || !samplers.empty() || body.find("sampler") != std::string::npos) {
       body = strip_samplers(body, samplers, berr);
       if (!berr.empty()) { r.error = "kernel '" + name + "': " + berr; return r; }
     }
@@ -5615,12 +7019,45 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       if (!berr.empty()) { r.error = "kernel '" + name + "': " + berr; return r; }
     }
 
+    {
+      const std::vector<std::string> vecs = vector_decl_names(src);
+      std::string fixed;
+      for (size_t k = 0; k < body.size(); k++) {
+        if (body[k] != '.' || k + 1 >= body.size()) {
+          fixed += body[k];
+          continue;
+        }
+        const char c = body[k + 1];
+        const char nx = (k + 2 < body.size()) ? body[k + 2] : '\0';
+        if (std::string("rgba").find(c) == std::string::npos ||
+            std::string("rgba").find(nx) != std::string::npos || is_ident(nx)) {
+          fixed += body[k];
+          continue;
+        }
+        size_t s = k;
+        while (s > 0 && is_ident(body[s - 1])) s--;
+        const std::string recv = body.substr(s, k - s);
+        bool vec = false;
+        for (const std::string& v : vecs)
+          if (v == recv) vec = true;
+        if (!vec) {
+          fixed += body[k];
+          continue;
+        }
+        fixed += '.';
+        fixed += c == 'r' ? 'x' : c == 'g' ? 'y' : c == 'b' ? 'z' : 'w';
+        k++;
+      }
+      body = fixed;
+    }
+    if (body.find("discard_fragment") != std::string::npos) {
+      body = replace_all(body, "discard_fragment()", "return;");
+      only_gid = false;
+    }
     body = replace_all(body, "metal::", "");
     body = replace_all(body, "fast::", "");
     body = replace_all(body, "precise::", "");
-    // The ballot's return type. A warp is 32 lanes and a quad is 4, so the mask
-    // is a 32-bit word whatever width the GPU's vote type happens to have (it is
-    // 64 bits on Apple silicon), and the vote rewrite hands back one of those.
+    // The ballot's return type.
     body = replace_all(body, "simd_vote::vote_t", "uint32_t");
     body = replace_all(body, "quad_vote::vote_t", "uint32_t");
     body = replace_all(body, "simd_vote", "uint32_t");
@@ -5635,8 +7072,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     bool shfl_found = false, lane_expr = false;
     body = rewrite_group_ops(body, shfl_found, lane_expr, berr);
     if (!berr.empty()) { r.error = "kernel '" + name + "': " + berr; return r; }
-    // Anything from the warp/quad library the table above does not know: name it
-    // rather than emit C++ that will not compile.
     for (const char* pre : {"simd_", "quad_"}) {
       const size_t sp = body.find(pre);
       if (sp == std::string::npos) continue;
@@ -5647,42 +7082,25 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     }
 
     const bool is_sync = shared_found || barrier_found || shfl_found;
-    // A body this can split becomes a state machine; one it cannot keeps the
-    // coroutine below, so nothing that works today changes shape.
     bool is_step = false;
     if (is_sync) {
       std::string fields, types, code, cases, why;
       const bool step_ok = lower_step(body, name, locals, fields, types, code, cases, why);
-      // A kernel that stays on its coroutine is still correct, only slower, so the
-      // reason is not worth a line in every run, `WEFT_STEP_WHY=1` asks for it.
       if (!step_ok && std::getenv("WEFT_STEP_WHY"))
         std::fprintf(stderr, "weft: %s stays on its coroutine: %s\n", name.c_str(), why.c_str());
       if (step_ok) {
         is_step = true;
-        // Ahead of the struct: a field of a body-declared type names it.
         body_out += types;
         body_out += "struct weft_st_" + name + " {\n  uint32_t pc;\n" + fields + "};\n";
-        // The body itself, emitted once. It goes *inside* the lane loop below
-        // rather than into a function every lane calls: at six instructions of
-        // call and prologue a visit, against nine of work, the call was most of a
-        // barrier segment (measured in the generated assembly, not assumed).
-        // `return` in a lambda leaves the lambda, which is exactly what a segment
-        // boundary means, that is the whole trick.
         std::string inner;
         inner += "    weft_st_" + name + "* weft_s = (weft_st_" + name + "*)st;\n";
         inner += "    (void)bufs; (void)sh;\n";
-        // The threadgroup-memory cursor is per entry: a declaration is the k-th in
-        // the group, so replaying the declarations from zero finds the slot the
-        // first pass gave each of them.
         inner += "    ctx.slot = 0;\n";
         inner += locals;
         inner += "    if (weft_s->pc != 0u) {\n      switch (weft_s->pc) {\n" + cases +
                  "        default: goto weft_done;\n      }\n    }\n";
         inner += code;
         inner += "    weft_done:;\n    weft_s->pc = weft::kThreadDone;\n";
-        // The group form: the lane loop, the pass number the shuffles key on and
-        // the count of lanes still running all live here, so a barrier segment
-        // costs one call per threadgroup instead of an indirect one per lane.
         body_out += "static uint32_t weft_g_" + name +
                     "(weft::Ctx* ctxs, unsigned char* states, size_t stride, uint32_t live,\n"
                     " uint32_t pass, void* const* bufs, unsigned char* sh) {\n"
@@ -5698,18 +7116,11 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
                     "  }\n"
                     "  return left;\n"
                     "}\n\n";
-        // One lane, for the paths that resume a single thread: the same body, not
-        // a second copy of it (`stride` 0 and one live lane is `states == stp`).
         body_out += "static void weft_k_" + name +
                     "(weft::Ctx& ctx, void* stp, void* const* bufs, unsigned char* sh) {\n"
                     "  weft_g_" + name + "(&ctx, (unsigned char*)stp, 0, 1, ctx.pass, bufs, sh);\n"
                     "}\n\n";
       } else {
-        // Emit a coroutine: the compiler owns the frame, so the body's locals
-        // survive a barrier without switching stacks. This is what makes a Metal
-        // barrier cost a resume instead of a context switch. The reason it was not
-        // split goes into the file, so a reader of the generated code does not have
-        // to guess.
         body_out += "// no state machine for '" + name + "'" +
                     (why.empty() ? std::string() : (": " + why)) + "\n";
         std::string cbody =
@@ -5723,20 +7134,14 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
                   "\n}\n\n";
     }
 
-    // A `return` (or break/continue) inside the body would leave the loop form
-    // early, so kernels with one keep the per-thread form.
     const bool has_jump = contains_word(body, "return") || contains_word(body, "break") ||
                           contains_word(body, "continue");
-    // Tile memory is a pointer at this pixel rather than a buffer the loop form
-    // can hoist out of it, so a kernel that has one keeps the per-thread form.
     const bool can_flat = !(shared_found || barrier_found || shfl_found) && only_gid &&
                           !has_jump && !lane_expr && ib_name.empty();
     if (can_flat) {
       std::string gid_decls;
       for (const auto& g : gid_params)
         gid_decls += "    " + g.first + " " + g.second + " = (" + g.first + ")weft_i;\n";
-      // The induction variable is named for the runtime, not for the kernel: a
-      // kernel local called `i` would otherwise be redeclared inside the loop.
       body_out += "static void weft_k_" + name + "_loop(weft::Ctx& ctx, uint32_t begin, uint32_t end) {\n" +
                   buf_locals + "  for (uint32_t weft_i = begin; weft_i < end; weft_i++) {\n" + gid_decls +
                   "    " + body + "\n  }\n}\n\n";
@@ -5745,12 +7150,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     TranslatedKernel tk;
     tk.name = name;
     tk.nargs = nargs;
-    // Mesh blocks, payloads, the meshgrid handle and tile memory are created by
-    // the launcher, so they are bound but are not part of `--buffers`: only the
-    // caller's own bindings count.
     tk.nbufs = user_nbufs - extra_bufs;
-    // One width per binding, in binding order. A slot nothing declared reports
-    // 0 (unknown) rather than a guessed 4, so `weft_arg_bytes` keeps its fallback.
+    // One width per binding, in binding order.
     std::vector<std::string> buf_types((size_t)nargs, std::string("0"));
     for (const auto& bt : buf_types_at)
       if (bt.first >= 0 && (size_t)bt.first < buf_types.size())
@@ -5758,6 +7159,9 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     tk.buf_type = buf_types;
     tk.tile_idx = tile_idx;
     tk.colour_idx = colour_idx;
+    tk.colour_targets = colour_targets;
+    tk.depth_idx = depth_idx;
+    tk.depth_qual = depth_qual;
     tk.tile = is_tile;
     tk.mesh = is_mesh;
     tk.mesh_nv = mesh_nv;
@@ -5766,8 +7170,8 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     tk.payload_idx = payload_idx;
     tk.props_idx = props_idx;
     tk.ntex = (int)textures.size();
-    // What each binding is, by name, from the parameter's own type, the same
-    // answer the launcher has to give it from the command line.
+    // A vertex stage that samples a texture is bound the same table.
+    if (vertex_used && vstage.ntex > tk.ntex) tk.ntex = vstage.ntex;
     for (const TexParam& tp : textures)
       tk.tex_shape.push_back(tp.cube ? "cube"
                                      : tp.is3d ? "3d"
@@ -5779,11 +7183,72 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
     r.kernels.push_back(tk);
     kcount++;
 
-
     pos = close_brace + 1;
   }
+  if (stage_in_fns > 0 && !vstage.unsupplied.empty()) {
+    r.error = "the file's vertex stage names [[" + vstage.unsupplied +
+              "]], which weft cannot supply";
+    return r;
+  }
+  if (stage_in_fns == 0 && vstage.ok && !file_points) {
+    for (const StructField& vf : read_struct_fields(src, vstage.ret)) {
+      if (vf.attr.find("clip_distance") == std::string::npos) continue;
+      r.error = "the vertex stage writes a [[clip_distance]] and the pass draws no triangle "
+                "for the cut to run on";
+      return r;
+    }
+  }
+  if (vertex_used) {
+    r.vertex_name = vstage.name;
+    r.vertex_sampler_slots = vstage.samp_slots;
+  }
+  r.points = points_run;
+  r.fragment_sampler_slots = frag_sampler_slots;
+  r.function_constants = fn_consts;
+  std::string pad_err;
+  if (!apply_gpu_pads(src, gpu_pads, pad_err)) { r.error = pad_err; return r; }
+  std::string gpu_text = src;
+  gpu_text = replace_all(gpu_text, "[[early_fragment_tests]]",
+                         "__attribute__((early_fragment_tests))");
+  if (vstage.ok && !vstage.new_all.empty())
+    gpu_text = replace_all(gpu_text, vstage.new_all, vstage.orig_all);
+  if (!lowers.empty() && stage_in_fns == (int)lowers.size() && vstage.ok) {
+    std::string text = gpu_text;
+    std::string params_gpu;
+    for (const auto& p : vstage.params) {
+      if (!params_gpu.empty()) params_gpu += ", ";
+      if (p.by_ref) {
+        params_gpu += (p.is_const ? "constant " : "device ") + p.orig_type + "& " + p.name;
+      } else if (p.pointer) {
+        params_gpu += (p.is_const ? "const device " : "device ") + p.orig_type + "* " + p.name;
+      } else {
+        params_gpu += p.orig_type + " " + p.name;
+      }
+    }
+    for (const auto& p : vstage.sampler_params) {
+      if (!params_gpu.empty()) params_gpu += ", ";
+      params_gpu += "sampler " + p.name;
+    }
+    const std::string plain =
+        vstage.ret + " weft_plain_vstage(" + params_gpu + ")" +
+        vstage.orig_all.substr(vstage.orig_sig.size());
+    bool all = true;
+    for (size_t i = 0; i < lowers.size(); i++)
+      if (!lower_fragment(text, lowers[i], i == 0 ? plain : std::string())) all = false;
+    if (all) {
+      gpu_text = text;
+      r.lowered = true;
+    } else {
+      for (const FragLower& l : lowers)
+        if (l.interp.find("weft_clip") != std::string::npos) {
+          r.error = "the pass clips with [[clip_distance]] but its fragment cannot use "
+                    "weft's interpolation, so the cut would be lost on the gpu";
+          return r;
+        }
+    }
+  }
   r.gpu_src = lower_gpu_stages(
-      rewrite_warp_scans(lower_imageblocks(src, render ? render->width : 0)));
+      rewrite_warp_scans(lower_imageblocks(gpu_text, render ? render->width : 0)));
 
   if (render) {
     int tile_stages = 0;
@@ -5795,16 +7260,11 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
         chosen = &k;
       }
     }
-    // One tile stage per pass: two would leave the launcher guessing which one
-    // fills tile memory, and guessing is how a wrong answer ships.
     if (tile_stages > 1) {
       r.error = "a render pass has one `[[tile]]` stage; this file has " +
                 std::to_string(tile_stages);
       return r;
     }
-    // A fragment that reads tile memory needs a stage that fills it. Without one
-    // it reads whatever the launcher left there, and both sides would agree on a
-    // number neither of them computed.
     if (chosen && chosen->tile_idx >= 0 && tile_stages == 0) {
       r.error = "fragment '" + chosen->name +
                 "' reads tile memory, but the pass has no `[[tile]]` stage to fill it";
@@ -5826,22 +7286,10 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       "#include <cstdint>\n"
       "#include <cstring>\n";
   code += kMslPreamble;
-  // The software double, for a kernel that carries one: the host's own double is
-  // used for the arithmetic, which IEEE pins, and these functions for the calls it
-  // does not, the same text the GPU runs, so both columns answer alike.
   code += weft_f64_cpp_text();
-  // Metal's short integer names are part of the language, so they have to exist
-  // before the file's own declarations: a `struct Payload { uint n; }` is written
-  // above the kernel that uses it and must compile there, not only inside a body.
   code += "using uint = unsigned int;\n"
       "using ushort = unsigned short;\n"
       "using uchar = unsigned char;\n";
-  // glibc and the BSDs declare `ulong` themselves, in <sys/types.h> and as
-  // `unsigned long`. Declaring it again as `unsigned long long` is a conflicting
-  // declaration rather than the same alias twice, so those hosts keep the
-  // library's name, under LP64 it is the same 64-bit unsigned integer Metal
-  // means, and the assertion turns a 32-bit target into a message instead of a
-  // silently narrow `ulong`.
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
   code += "static_assert(sizeof(ulong) == 8, \"weft: ulong is not 64 bits on this target\");\n";
 #else
@@ -5852,7 +7300,7 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
   code += carried.text;
   // as_type<T> becomes this: a bit-for-bit reinterpretation.
   code += "template <class T, class U>\n"
-      "// A narrow source -- an integer literal under a 64-bit destination -- fills the low\n"
+      "// A narrow source, an integer literal under a 64-bit destination, fills the low\n"
       "// bytes of a zeroed destination instead of reading past itself.\n"
       "static inline T weft_bitcast(U u) {\n"
       "  T t{};\n"
@@ -5872,8 +7320,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
       "\n" +
       body_out + "static const weft::KernelDef weft_table[] = {\n";
   for (const auto& k : r.kernels) {
-    // A state-machine kernel fills the step slot and its blob's size; a
-    // coroutine one fills the coroutine slot. The two are never both set.
     code += "  {\"" + k.name + "\", " +
             (k.sync ? std::string("nullptr") : ("weft_k_" + k.name)) + ", " +
             std::to_string(k.nargs) + ", " + (k.sync ? "true" : "false") + ", " +
@@ -5901,8 +7347,6 @@ TranslateResult translate_msl(const std::string& raw, const RenderMode* render) 
 
   r.code = code;
   r.ok = true;
-  // Portable math goes in after the vector types and before the library that
-  // uses it, so the translated code and the GPU run the same implementation.
   const size_t soft_at = r.code.find("inline float dot(float a, float b)");
   if (soft_at != std::string::npos) r.code.insert(soft_at, kWSoftMath);
   return r;

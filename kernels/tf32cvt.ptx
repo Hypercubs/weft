@@ -1,17 +1,5 @@
-// `cvt.*.tf32.f32`: tf32 is a float32 with the low thirteen mantissa bits dropped,
-// so the three rounding modes differ only in those bits. A multiply sees the
-// rounded value, which is why every tensor-core path converts its operands first.
-//
-// The first entry walks the eight lanes through the interesting places: an exact
-// value (lane 0), a tie with an even kept bit (1), an exact value whose kept bit is
-// odd (2), a tie with an odd kept bit (3), and four values just above or below.
-// `rna` and `rn` part company only where a tie lands, and `rz` differs from both
-// wherever anything was dropped, 24 words that a truncation-only or a
-// nearest-even-only implementation cannot reproduce.
-//
-// The second entry is the two modifiers: `.relu` zeroes a negative, `.satfinite`
-// clamps an infinity to the largest finite tf32 and turns a NaN into zero, and the
-// last line has both on a value that neither should touch.
+// `cvt.*.tf32.f32`: tf32 is a float32 with the low thirteen mantissa bits dropped, so
+// the three rounding modes differ only in those bits.
 .version 8.6
 .target sm_100a
 .address_size 64

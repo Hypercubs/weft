@@ -1,16 +1,4 @@
 // Video instructions: packed lanes that do not carry into their neighbour.
-//
-// Each lane of `a` and `b` is widened at the signedness its own suffix names, the
-// operation runs in 32 bits, and the answer is cut back to the lane width. The
-// fourth operand belongs to the merge form and is not read by these.
-//
-//   vadd2u   vadd2.u32.u32.u32      16-bit lanes, unsigned, sum wraps per lane
-//   vadd2s   vadd2.s32.s32.s32      the same with signed lanes and signed bytes...
-//   vmin4s   vmin4.s32.s32.s32      8-bit lanes, signed, minimum
-//   vabs4u   vabsdiff4.u32.u32.u32  8-bit lanes, unsigned, absolute difference
-//   vadd4u   vadd4.u32.u32.u32      8-bit lanes, unsigned, sum wraps inside the byte
-//   vavg4s   vavrg4.s32.s32.s32     8-bit lanes, signed, rounded average, which rounds
-//                                   a negative sum down and a non-negative one up
 .version 7.0
 .target sm_70
 .address_size 64

@@ -1,10 +1,5 @@
-// slct: `d = (c >= 0) ? a : b`, the select that real codegen emits where the
-// comparison is only used to pick an operand. The sign of c is the whole test, and
-// the two arguments are distinct enough that picking the wrong one is visible: 1.0
-// and 2.0 as halves for an integer c, 111 and 222 for a float c.
-//
-//   slcti   c is a signed int: 5 and 0 pick a, -5 picks b
-//   slctf   c is a float, where -0.0 is not less than zero, so it picks a too
+// slct: `d = (c >= 0) ? a : b`, the select that real codegen emits where the comparison
+// is only used to pick an operand.
 .version 7.0
 .target sm_80
 .address_size 64

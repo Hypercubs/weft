@@ -1,20 +1,6 @@
-// `cvt.rn{.relu}{.satfinite}.f16.f32` and its bf16 twin: the scalar 16-bit float
-// converts, which is what `__float2half` compiles to. Eight cases, each chosen so a
-// wrong implementation is visible in the word:
-//
-//   1.0                        -> 3c00    the ordinary answer
-//   1 + 1.5*2^-10              -> 3c02    a tie whose lower candidate is odd, so
-//                                          nearest-even takes the even one upward
-//   1e5, .satfinite            -> 7bff    past 65504, clamped to the largest finite
-//   NaN, .satfinite            -> 0000    a NaN under .satfinite is zero
-//   -2.5, .relu                -> 0000    a negative under .relu is zero
-//   -2.5                       -> c100    ... and without it, the negative stays
-//   1.0 as bf16                -> 3f80    eight significand bits instead of ten
-//   +inf, .relu and .satfinite -> 7f7f    the largest finite bf16, not an infinity
-//
-// The results stay in `b32` registers: the value of a 16-bit float convert is 16
-// bits, and a word-sized store keeps this fixture on paths that are not themselves
-// under test.
+// `cvt.rn{.relu}{.satfinite}.f16.f32` and its bf16 twin, the scalar 16-bit float
+// converts `__float2half` compiles to. Eight cases, each chosen so a wrong
+// implementation is visible in the word.
 .version 8.1
 .target sm_80
 .address_size 64
@@ -66,7 +52,6 @@
 }
 
 // `.rz`: the same converts with the tail dropped instead of rounded.
-//
 //   1 + 3.5*2^-10               -> 3c03    rn would take this tie to 3c04
 //   1e5, .satfinite             -> 7bff    the largest finite half
 //   +inf                        -> 7c00    an infinity has nothing to truncate
@@ -108,13 +93,10 @@
 
 // `.sat` on a floating-point destination is the [0, 1] clamp with a NaN flushed to
 // positive zero, the ISA's own note, and not the destination's range:
-//
 //   2.0            -> 3f800000    clamped down to 1
 //  -0.5            -> 00000000    clamped up to 0
 //   NaN            -> 00000000    +0, not a NaN and not a 1
 //   0.25           -> 3e800000    inside the range, untouched
-//   2.0 as an f16   -> 00003c00    the same clamp before the 16-bit conversion
-//  -1.0 as an f16   -> 00000000
 .visible .entry cvtsat(
     .param .u64 cvtsat_param_0      // six words
 )

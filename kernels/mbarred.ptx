@@ -1,13 +1,4 @@
 // `cp.reduce.async.bulk`: the bulk store that combines instead of overwriting.
-//
-//     buffer = { 1, 2, 3, 4 }
-//     tile   = { 10, 20, 30, 40 }
-//     reduce.add into the buffer, 16 bytes
-//     buffer = { 11, 22, 33, 44 }
-//
-// Descriptor-free like the plain bulk store: the size is in the instruction and the
-// group commit is a no-op. A copy that overwrote instead of adding would read
-// 10, 20, 30, 40, and one that added the wrong address would not land on 11, 22, 33, 44.
 .version 8.0
 .target sm_90
 .address_size 64

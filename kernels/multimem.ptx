@@ -1,14 +1,4 @@
 // multimem: one address, whose value every replica of a multicast mapping holds.
-//
-// This runtime binds one replica, so a reduce across the replicas of a value is that
-// value, whatever the operation: add, min and max all fold a single operand. A
-// multicast store writes the one copy there is. The three kernels therefore answer
-// the input unchanged, which is the only thing a single replica can show -- and it is
-// exactly what a wrong translation (a dropped store, a reduce of nothing) breaks.
-//
-//   mmld   multimem.ld_reduce.global.add.u32   the value, as an add of one
-//   mmmin  multimem.ld_reduce.global.min.u32   the value, as a min of one
-//   mmst   multimem.st.global.u32              the same bytes land at the address
 .version 8.1
 .target sm_90
 .address_size 64

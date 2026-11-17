@@ -1,17 +1,4 @@
-// bf16 division, reciprocal and square root, on the same one-rounding path as the half:
-// the quotient keeps 48 bits above the 8-bit significand so the round bit and the
-// sticky are both real. ptxas has no bf16 `div`, `rcp` or `sqrt`, so each is the bf16
-// widened (exact) to a float, then a double, the double form, and one rounding back.
-// Eight results a lane:
-//
-//   0  div  2.0 / 3.0
-//   1  div  1.0 / 3.0
-//   2  div  1.0 / (1+2^-7)
-//   3  rcp  3.0                 the same quotient as slot 1
-//   4  sqrt 2.0
-//   5  sqrt largest finite      about 1.84e19, still finite
-//   6  div  2^-133 / 3.0        a subnormal result, rounded on its own grid
-//   7  div  0.0 / 0.0           the canonical NaN
+// bf16 division, reciprocal and square root, on the same one-rounding path as the half.
 .version 8.0
 .target sm_90
 .address_size 64

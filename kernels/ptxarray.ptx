@@ -1,17 +1,4 @@
-// A 2D *array* texture from PTX, the twin of basic.metal's `texarray`:
-//
-//     n = txq.depth(tex)                          // the slices an `.a2d` binding has
-//     x = gid & 63, y = (gid >> 6) & 63, l = (x + y) & 3
-//     t = tex.a2d(tex, (x + 0.5) / 64, (y + 0.5) / 64, l)   // nearest, clamped
-//     out[gid] = t * 2 + n + l
-//
-// `.a2d` is the layered form: the third coordinate is the slice, and it is a
-// float at the instruction boundary, CUDA's `tex2DLayered` passes it as one,
-// which the translator truncates to the index the slice has. `txq.depth` on such
-// a binding reports the slice count, because that is the one number a layered
-// kernel has no other way to learn. Both are folded into the value, so a wrong
-// slice, a wrong count, or a sample that ignored the layer all show up as a
-// different number rather than hiding in a register.
+// A 2D *array* texture from PTX, the twin of basic.metal's `texarray`.
 .version 7.0
 .target sm_70
 .address_size 64

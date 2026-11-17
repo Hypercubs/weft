@@ -1,11 +1,4 @@
-// A task stage and the mesh stage it feeds. The task stage runs first, fills the
-// payload for its own threadgroup and says how many meshes should follow; the
-// mesh stage then runs over that meshgrid and reads the payload of the task group
-// that spawned it.
-//
-// As with the mesh stage, there is no GPU answer to compare against on this
-// machine (mesh pipelines need MTLGPUFamilyApple9), so `check.sh` recomputes the
-// whole result independently and compares bytes.
+// A task stage and the mesh stage it feeds.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -18,8 +11,7 @@ struct Vtx {
     float4 p;
 };
 
-// One payload element per task threadgroup. Written by lane 0, so the answer does
-// not depend on which lane a per-lane engine happens to run last.
+// One payload element per task threadgroup.
 [[object]] void taskgen(object_data Payload& p [[payload]],
                         mesh_grid_properties mgp,
                         uint gid  [[thread_position_in_grid]],
@@ -32,8 +24,6 @@ struct Vtx {
     mgp.set_threadgroups_per_grid(uint3(4u, 1u, 1u));
 }
 
-// The mesh stage: 8 vertices and one triangle per mesh, plus a line of results so
-// the payload it read is visible in an ordinary buffer too.
 [[mesh]] void meshuse(mesh<Vtx, 8, 8> out [[mesh]],
                       object_data Payload& p [[payload]],
                       device float* result [[buffer(0)]],

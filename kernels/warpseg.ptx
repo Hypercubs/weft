@@ -1,34 +1,4 @@
 // The same warp instructions where the warp is neither full nor uniform.
-//
-// `c` packs two fields: a clamp value in bits 4:0 and a sub-segment mask in bits
-// 12:8. The spec's model is that a lane reads only inside its segment, the source
-// index is clamped at the segment's end, and a lane whose source falls outside the
-// clamp keeps its own value. A predicated instruction also deactivates its lane, and
-// `activemask` counts a predicated-off lane as a zero bit.
-//
-//     row 0   activemask under @%p1            00FFFFFF, the 24 lanes that ran
-//     row 1   ballot over membermask 00FFFFFF  00AAAAAA
-//     row 2   vote.all over that mask          1
-//     row 3   vote.any of lane 27              0: lane 27 is outside the mask
-//     row 4   shfl.idx over that mask          30, the source lane's value
-//     row 5   shfl.bfly over that mask         lane xor 2
-//     row 6   shfl.up   1, clamp 8             lanes 0..8 keep their own value
-//     row 7   shfl.down 1, clamp 15            lanes 15.. keep their own value
-//     row 8   shfl.down by (lane & 7) + 1, clamp 31
-//     row 9   shfl.up   by the same register distance, clamp 0
-//     row 10  shfl.idx  from lane xor 5
-//     row 11  ballot of lane 3 over the partial mask  8
-//     row 12  shfl.bfly 8 with c = 0x1f1f      the segment mask is bit 4, so the
-//             clamp is the lane itself and a lane reads its partner only where the
-//             partner is below it, which is bit 3 set
-//     row 13  shfl.up   2, clamp 0
-//     row 14  shfl.down 2, clamp 31
-//     row 15  shfl.idx  from lane 0            0
-//     row 16  shfl.idx  from lane 3, c = 0x0f0f  minLane is lane & 15, so a lane
-//             reads lane & 15 and never leaves its own segment
-//
-// A lane outside the membermask has no defined answer to write, so lanes 24..31 do not
-// store and the comparison only reads the low 24.
 .version 8.6
 .target sm_100
 .address_size 64

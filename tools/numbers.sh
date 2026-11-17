@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Regenerates the `Numbers` table in the README from the kernels themselves, so
-# the table is a measurement rather than eight numbers typed once. Prints the
-# markdown rows; `make numbers` runs it and drops the README's paragraph
-# unchanged unless the numbers move.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

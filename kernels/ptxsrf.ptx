@@ -1,14 +1,4 @@
 // A surface: one lane writes a texel, the next lane reads it back.
-//
-//     sust.2d [s, {x, y}], {in[gid]}
-//     bar.sync
-//     out[gid] = suld.2d [s, {x ^ 1, y}]
-//
-// `x ^ 1` stays inside the same 64-lane group and the same row, so the value that
-// comes out is the neighbour's and a write that never reached the image answers
-// with the wrong number instead of hiding in a register. `.surf` declares the
-// binding; it shares the numbering `.tex` uses, so the launcher fills both with
-// `--textures`.
 .version 7.0
 .target sm_70
 .address_size 64
@@ -39,12 +29,14 @@
     and.b32 %r5, %r1, 63;               // x
     shr.u32 %r6, %r4, 6;
     and.b32 %r6, %r6, 63;               // y
+    shl.b32 %r9, %r5, 2;                // x as a surface's byte offset
 
-    sust.b.2d.clamp.b32 [srf, {%r5,%r6}], {%f1};
+    sust.b.2d.clamp.b32 [srf, {%r9,%r6}], {%f1};
 
     bar.sync 0;
 
     xor.b32 %r7, %r5, 1;                // the neighbour inside this group
+    shl.b32 %r7, %r7, 2;                // and its byte offset
     suld.b.2d.clamp.b32 %r8, [srf, {%r7,%r6}];
 
     add.s64 %rd5, %rd2, %rd3;

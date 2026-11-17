@@ -1,14 +1,5 @@
 // The cluster forms of shared memory, which are the whole of a one-CTA launch: a
-// cluster is one CTA wide here, so `.shared::cluster` and `.shared::cta` name the same
-// window and `mapa` of rank 0 is the address it was given. The two instructions that
-// still have to place the address correctly are the vector load and store, whose
-// operand is a list in braces, and `mapa`, whose answer is used as an address.
-//
-//   sclv4     eight lanes write four words each into the window in cluster space, then
-//             each lane reads the next lane's four words back out. A lane/offset slip
-//             reads a different set, so the answer is not the one written.
-//   sclmapa   each lane writes its own word, asks `mapa` for its own address at rank
-//             0, and reads through what came back: the identity is the answer.
+// cluster is one CTA wide here.
 .version 8.3
 .target sm_90
 .address_size 64

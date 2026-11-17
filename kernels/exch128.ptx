@@ -1,0 +1,19 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// atom.exch.b128: sixteen bytes swapped as one value, the old value returned.
+.visible .entry exch128(
+    .param .u64 p,
+    .param .u64 src
+)
+{
+    .reg .b128 %q<3>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [p];
+    ld.param.u64 %rd2, [src];
+    ld.global.b128 %q1, [%rd2];
+    atom.global.exch.b128 %q2, [%rd1], %q1;
+    ret;
+}

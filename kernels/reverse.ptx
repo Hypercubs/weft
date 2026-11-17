@@ -1,11 +1,4 @@
-// Hand-written PTX with threadgroup memory and a barrier, the PTX counterpart
-// of the `reverse` kernel in basic.metal:
-//     threadgroup float tile[256];
-//     tile[lid] = in[gid];
-//     threadgroup_barrier(mem_threadgroup);
-//     out[gid] = tile[tgsize - 1 - lid];
-//
-// Run it with: goc run kernels/reverse.ptx --kernel reverse --grid N --threads 256
+// Hand-written PTX with threadgroup memory and a barrier.
 .version 7.0
 .target sm_70
 .address_size 64

@@ -1,0 +1,33 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A callee that stops at a barrier and then writes. The call site is a resume point, and
+// on the gpu column that point is a case in the body's switch: it has no labels.
+.visible .func stow(
+    .param .u64 p,
+    .param .u32 v
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<2>;
+
+    ld.param.u64 %rd1, [p];
+    ld.param.u32 %r1, [v];
+    bar.sync 0;
+    st.global.u32 [%rd1], %r1;
+    ret;
+}
+
+.visible .entry callstop(
+    .param .u64 out
+)
+{
+    .reg .b64 %rd<2>;
+    .reg .b32 %r<2>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, 7;
+    call.uni stow, (%rd1, %r1);
+    ret;
+}

@@ -1,16 +1,4 @@
 // `cp.async.bulk` completing an mbarrier, which is the pair to `expect_tx`.
-//
-//     init  [mbr], 1              one arrival owed
-//     expect_tx [mbr], 16         and sixteen bytes
-//     cp.async.bulk ... 16        the copy moves them and completes the transaction
-//     arrive                      the one arrival
-//     try_wait.parity [mbr], 0    until the phase flips
-//     out[0] = tile[0]            the first word the copy moved
-//
-// One lane: the count is the group size and every lane copies, so thirty-two lanes
-// would expect thirty-two times. `tile[0]` is the input buffer's first float, so a copy
-// that never happened reads the arena and a copy that moved the wrong address reads the
-// wrong word, both show up in the number.
 .version 8.0
 .target sm_90
 .address_size 64

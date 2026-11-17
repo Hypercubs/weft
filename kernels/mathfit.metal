@@ -41,7 +41,7 @@ kernel void fnprobe(device const float* in [[buffer(0)]], device float* out [[bu
   out[o+29u] = mix(a.x, b.x, a.y) - fma(a.y, b.x - a.x, a.x);   // builtin vs fma form
   out[o+30u] = sqrt(u) - u * rsqrt(u);
   out[o+31u] = (a.x * a.x + a.y * a.y) - fma(a.y, a.y, a.x * a.x);
-  // The rest of the approximated set: trigonometry, exp10/log10, powr, hyperbolic.
+// The rest of the approximated set: trigonometry, exp10/log10, powr, hyperbolic.
   out[o+32u] = sin(a.x);
   out[o+33u] = cos(a.y);
   out[o+34u] = tan(a.x * 0.5f);
@@ -58,16 +58,14 @@ kernel void fnprobe(device const float* in [[buffer(0)]], device float* out [[bu
   out[o+45u] = exp10(a.y);
   out[o+46u] = log10(fabs(a.x) + 0.5f);
   out[o+47u] = powr(fabs(a.x) + 0.5f, a.y);
-  // The geometric compositions, whose multiply-adds could fuse differently.
+// The geometric compositions, whose multiply-adds could fuse differently.
   out[o+48u] = cross(a, b).x;
   out[o+49u] = reflect(normalize(a), normalize(b)).x;
   out[o+50u] = refract(normalize(a), normalize(b), 0.75f).x;
   out[o+51u] = faceforward(a, b, a).z;
-  // The one function that returns through pointers.
+// The one function that returns through pointers.
   float sc_s = 0.0f, sc_c = 0.0f;
   sincos(a.x, &sc_s, &sc_c);
   out[o+52u] = sc_s + sc_c;
-  // A qualified call: the rewrite drops the namespace, because the portable
-  // function is what both engines should run.
   out[o+53u] = metal::cos(a.z);
 }

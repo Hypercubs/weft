@@ -1,3 +1,5 @@
 build/
 kernels/spirv/*.spv
 __pycache__/
+.DS_Store
+dist/

@@ -1,14 +1,4 @@
-// A texture read from PTX, the twin of basic.metal's `texmix`:
-//
-//     w = txq.width(tex), h = txq.height(tex)
-//     x = gid & 63, y = (gid >> 6) & 63          // a 64x64 binding
-//     t = tex2D(tex, (x + 0.5) / 64, (y + 0.5) / 64)   // nearest, clamped
-//     out[gid] = t * 2
-//
-// Every sample lands on a texel centre, so the answer is the texel itself: a
-// filter, an address mode, or a size that is off by one all show up as a wrong
-// number instead of hiding in a register. `.tex` declares the binding, and the
-// declarations are numbered in order, the order `--textures` fills.
+// A texture read from PTX, the twin of basic.metal's `texmix`.
 .version 7.0
 .target sm_70
 .address_size 64

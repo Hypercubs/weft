@@ -1,25 +1,5 @@
-// Float to integer, at the ends of the destination range.
-//
-// `F2I` saturates: a value past the destination's range clamps to its end, and a
-// NaN answers zero (the `.NTZ` bit). A C++ cast is undefined for all of these, and
-// the CPU column answered 0 for both infinities until this fixture existed. The
-// rounding modes are here because the clamp has to happen after the rounding, not
-// before it: 2.5 rounds up to 3 under .rpi and truncates to 2 under .rzi.
-//
-//   0  rzi.s32  NaN        -> 00000000
-//   1  rzi.s32  +inf       -> 7FFFFFFF
-//   2  rzi.s32  -inf       -> 80000000
-//   3  rzi.s32  2.5        -> 00000002
-//   4  rzi.u32  -1.5       -> 00000000   an unsigned destination cannot hold -1
-//   5  rzi.s32  -1.5       -> FFFFFFFF
-//   6  rzi.u32  NaN        -> 00000000
-//   7  rni.s32  2.5        -> 00000002   ties to even
-//   8  rni.s32  3.5        -> 00000004
-//   9  rmi.s32  -2.5       -> FFFFFFFD
-//  10  rpi.s32  2.1        -> 00000003
-//  11  sat.f32  2.0        -> 3F800000   1.0, the [0, 1] clamp
-//  12  sat.f32  -1.0       -> 00000000
-//  13  sat.f32  NaN        -> 00000000
+// Float to integer, at the ends of the destination range. `F2I` saturates, so a value
+// past the range clamps to its end and a NaN answers zero.
 .version 7.1
 .target sm_86
 .address_size 64

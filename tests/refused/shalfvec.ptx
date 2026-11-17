@@ -1,0 +1,59 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// The vector half atomics in the window. .v2.f16.min takes the smaller of each half,
+// .v2.f16x2.max the larger of each packed pair.
+.visible .entry shvmin(
+    .param .u64 out
+)
+{
+    .shared .align 4 .b32 w[1];
+
+    .reg .f16 %hs<4>;
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    mov.b32 %r2, 0x44003C00;      // 1.0 low, 4.0 high
+    @%p1 st.shared.b32 [w], %r2;
+    bar.sync 0;
+
+    mov.b16 %hs2, 0x3E00;         // 1.5
+    mov.b16 %hs3, 0x4100;         // 2.5
+    atom.shared.v2.f16.min.noftz {%hs0, %hs1}, [w], {%hs2, %hs3};
+
+    bar.sync 0;
+    ld.shared.b32 %r2, [w];
+    @%p1 st.global.b32 [%rd1], %r2;
+    ret;
+}
+
+.visible .entry shvmaxp(
+    .param .u64 out
+)
+{
+    .shared .align 4 .b32 w[1];
+
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    mov.b32 %r2, 0x38004000;      // 2.0 low, 0.5 high
+    @%p1 st.shared.b32 [w], %r2;
+    bar.sync 0;
+
+    mov.b32 %r3, 0x3C004080;      // 4.0 low, 1.0 high
+    atom.shared.v2.f16x2.max.noftz {%r2, %r3}, [w], {%r3, %r3};
+
+    bar.sync 0;
+    ld.shared.b32 %r2, [w];
+    @%p1 st.global.b32 [%rd1], %r2;
+    ret;
+}

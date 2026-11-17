@@ -1,25 +1,6 @@
-// The four-lane narrow arithmetic, split out of `cvtf8x2dn.ptx`.
-//
-// No `add`, `sub`, `mul` or `fma` over packed fp8 or fp6 exists in this PTX: the
-// kernel's `add.rn.satfinite.e4m3x4.e4m3x4` answers `Illegal modifier '.satfinite'`
-// at PTX 8.8 and at PTX 9.1, with `.rn` alone or with no rounding modifier, and
-// `.e2m1p4x4` is an unknown modifier.
-//
-// So each case is written as what the instruction means: decode the lane's operand
-// byte through its own bit layout into binary32, do the one arithmetic operation in
-// binary32, and encode the answer back with the pair convert that does exist. Every
-// case is exact in the destination -- the operands and answers are all dyadic -- so a
-// wrong decode, a wrong bias or a wrong destination format shows up as a wrong byte,
-// and the seven words are the ones the packed instruction would have written. Each
-// case's four lanes carry the same byte, so one lane's decode speaks for the four.
-//
-//   1.5 + 1.5 as e4m3                     -> 44444444  3.0 in every lane
-//   1.5 - 1.0 as e4m3, into e5m2          -> 38383838  0.5 in every lane
-//   1.5 * 1.5 as e2m3, into e4m3          -> 41414141  2.25
-//   2.0 * 2.0 + 1.5 as e4m3               -> 4b4b4b4b  5.5
-//   448 + 448, satfinite                  -> 7e7e7e7e  896 clamps to MAX_NORM
-//   1.5 * 2^1, the scale from ue8m0 0x80  -> 44444444  3.0
-//   1.5 * 2.0, the fp4 operand a byte     -> 44444444  a nibble per byte
+// The four-lane narrow arithmetic, split out of `cvtf8x2dn.ptx`. No packed `add`,
+// `sub`, `mul` or `fma` over fp8 or fp6 exists, so each case decodes, computes once in
+// binary32, and encodes with the pair convert.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -35,7 +16,7 @@
 
     ld.param.u64 %rd1, [cvtsimd_param_0];
 
-    // ---- 1.5 + 1.5: e4m3 in, e4m3 out ----
+    // 1.5 + 1.5: e4m3 in, e4m3 out
     mov.u32 %r1, 0x3C3C3C3C;
     and.b32 %r2, %r1, 0xFF;                 // the lane: e4m3 1.5
     shr.u32 %r3, %r2, 3;                    // four exponent bits, bias 7
@@ -58,7 +39,7 @@
     or.b32 %r6, %r10, %r11;
     st.global.u32 [%rd1], %r6;
 
-    // ---- 1.5 - 1.0: e4m3 operands, e5m2 answer ----
+    // 1.5 - 1.0: e4m3 operands, e5m2 answer
     mov.u32 %r1, 0x3C3C3C3C;
     and.b32 %r2, %r1, 0xFF;
     shr.u32 %r3, %r2, 3;
@@ -88,7 +69,7 @@
     or.b32 %r6, %r10, %r11;
     st.global.u32 [%rd1+4], %r6;
 
-    // ---- 1.5 * 1.5: e2m3 operands, e4m3 answer ----
+    // 1.5 * 1.5: e2m3 operands, e4m3 answer
     mov.u32 %r1, 0x0C0C0C0C;
     and.b32 %r2, %r1, 0xFF;
     shr.u32 %r3, %r2, 3;                    // two exponent bits, bias 1
@@ -108,7 +89,7 @@
     or.b32 %r6, %r10, %r11;
     st.global.u32 [%rd1+8], %r6;
 
-    // ---- 2.0 * 2.0 + 1.5: e4m3 in and out ----
+    // 2.0 * 2.0 + 1.5: e4m3 in and out
     mov.u32 %r1, 0x40404040;
     and.b32 %r2, %r1, 0xFF;
     shr.u32 %r3, %r2, 3;
@@ -139,7 +120,7 @@
     or.b32 %r6, %r10, %r11;
     st.global.u32 [%rd1+12], %r6;
 
-    // ---- 448 + 448: the saturation, at the top of the e4m3 range ----
+    // 448 + 448: the saturation, at the top of the e4m3 range
     mov.u32 %r1, 0x7E7E7E7E;
     and.b32 %r2, %r1, 0xFF;
     shr.u32 %r3, %r2, 3;
@@ -159,7 +140,7 @@
     or.b32 %r6, %r10, %r11;
     st.global.u32 [%rd1+16], %r6;
 
-    // ---- 1.5 * 2^1: the ue8m0 scale is a power of two, so it is an exponent ----
+    // 1.5 * 2^1: the ue8m0 scale is a power of two, so it is an exponent
     mov.u32 %r1, 0x3C3C3C3C;
     and.b32 %r2, %r1, 0xFF;
     shr.u32 %r3, %r2, 3;
@@ -183,7 +164,7 @@
     or.b32 %r6, %r10, %r11;
     st.global.u32 [%rd1+20], %r6;
 
-    // ---- 1.5 * 2.0: the fp4 operand, one nibble in a byte ----
+    // 1.5 * 2.0: the fp4 operand, one nibble in a byte
     mov.u32 %r1, 0x03030303;
     and.b32 %r2, %r1, 0xFF;
     shr.u32 %r3, %r2, 1;                    // two exponent bits, bias 1

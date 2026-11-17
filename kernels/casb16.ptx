@@ -1,14 +1,5 @@
 // atom.cas.b16: table 41 of the isa gives the 16-bit width exactly one atomic, a
-// compare-exchange, and this host's atomics are 32 bits. So the half addressed is
-// compared and written on its own, and the half beside it keeps its value. The buffer
-// starts as 1.0 above 0.5, both non-zero, so a translation that wrote the whole word
-// would show up as the wrong high half rather than as a zero nobody notices.
-//
-//   casb16      compare 1.0 matches: the low half becomes 2.0, the high half stays
-//               0.5, and the half the slot held before comes back in buffer 1
-//   casb16miss  compare 4.0 does not match: nothing is written, the old half returns
-//   casb16race  eight lanes all compare 1.0 and swap in 2.0: the first match writes,
-//               the rest see 2.0 and leave it alone, so the answer is order-free
+// compare-exchange, and this host's atomics are 32 bits.
 .version 7.0
 .target sm_80
 .address_size 64

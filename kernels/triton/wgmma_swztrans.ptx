@@ -80,7 +80,7 @@
 	ld.global.u16 	%r30, [%rd7+224];
 	st.shared.u16 	[%rd8+14], %r30;
 
-	// ---- B: K-major, one 16-byte chunk of every row: lane = row * 16 + k ----
+	// B: K-major, one 16-byte chunk of every row: lane = row * 16 + k
 	setp.lt.u32 	%p1, %r1, 128;
 	shr.u32 	%r14, %r1, 4;			// n
 	and.b32 	%r15, %r1, 15;			// k

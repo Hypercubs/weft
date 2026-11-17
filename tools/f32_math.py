@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sweep the portable float library against an exact reference.
 
-`src/soft_math.hpp` is one text compiled twice, MSL for the GPU, C++ for the CPU , 
+`src/soft_math.hpp` is one text compiled twice, MSL for the GPU, C++ for the CPU ,
 which is why the two columns cannot disagree. That is a statement about agreement,
 not about correctness: a library both engines run can be wrong on both of them, and
 the fp32 set has never been measured against anything but itself. This measures it.
@@ -39,7 +39,6 @@ F32_MIN_NORMAL = 1.1754943508222875e-38
 F32_MIN_SUB = 1.401298464324817e-45
 BASELINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "f32_baseline.json")
 
-
 def f32(v):
     """The nearest float32 to a Python float or Decimal, as a float."""
     if isinstance(v, Decimal):
@@ -51,7 +50,6 @@ def f32(v):
         return struct.unpack("<f", struct.pack("<f", v))[0]
     except OverflowError:
         return math.copysign(math.inf, v)
-
 
 def f32_key(x):
     """A monotone integer per float32, so a distance is a subtraction.
@@ -66,12 +64,10 @@ def f32_key(x):
         return -(b & 0x7FFFFFFF)
     return b
 
-
 def f32_from_key(k):
     """The float32 a key names."""
     b = k if k >= 0 else (0x80000000 | -k)
     return struct.unpack("<f", struct.pack("<I", b & 0xFFFFFFFF))[0]
-
 
 def f32_next(x, y):
     """The next float32 after x toward y, the float32 reference for nextafter."""
@@ -81,7 +77,6 @@ def f32_next(x, y):
         return y
     k = f32_key(x)
     return f32_from_key(k + (1 if f32_key(y) > k else -1))
-
 
 def ulps32(got, want):
     """Distance from the computed float32 to the nearest float32 to `want`."""
@@ -101,12 +96,10 @@ def ulps32(got, want):
         return 0
     return abs(f32_key(got) - f32_key(target))
 
-
 def _want_nan(want):
     if isinstance(want, Decimal):
         return want.is_nan()
     return isinstance(want, float) and want != want
-
 
 # `expr` is the call the harness makes; `pair` marks a second answer: None,
 # "int" for an integer half, or a call expression for a float one.
@@ -170,7 +163,6 @@ EXTRA = [F32_MAX, F32_MIN_NORMAL, F32_MIN_SUB, -F32_MIN_SUB, 1e7, -1e7,
 DEFAULT_INPUTS = [0.0, -0.0, F32_MIN_SUB, F32_MIN_NORMAL, 1e-8, 0.25, 0.5, 0.75,
                   1.0, 1.5, 2.0, 10.0, 1e7, F32_MAX]
 
-
 def reference(name, argv):
     """The reference of the fp64 sweep, where the mathematics is the same."""
     if name == "rsqrt":
@@ -204,7 +196,6 @@ def reference(name, argv):
     if f is not None:
         return f[2](argv)
     return None
-
 
 def inputs_for(name):
     """The fp64 sweep's inputs for that function, rounded to float32."""
@@ -240,7 +231,6 @@ def inputs_for(name):
     if out and len(out[0]) == 1:
         out.extend((f32(v),) for v in EXTRA)
     return out
-
 
 # The library is written in Metal's vocabulary. Only the scalar entries are called,
 # but its vector overloads have to compile, so this is the smallest set of types that
@@ -289,14 +279,12 @@ static inline float3 operator/(float3 a, float s) { return float3(a.x / s, a.y /
 static inline float4 operator/(float4 a, float s) { return float4(a.x / s, a.y / s, a.z / s, a.w / s); }
 """
 
-
 def library_text():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "soft_math.hpp")
     m = re.search(r'R"WEFTMATH\((.*)\)WEFTMATH"', open(path).read(), re.S)
     if not m:
         sys.exit("tools/f32_math.py: could not find the library text in src/soft_math.hpp")
     return m.group(1)
-
 
 def f64_text():
     """The fp64 library, as the CPU column compiles it: `weft_tgamma` calls into it."""
@@ -311,7 +299,6 @@ def f64_text():
             "template <class T, class U>\n"
             "static inline T as_type(U u) { T t; std::memcpy(&t, &u, sizeof(T)); return t; }\n" +
             m.group(1) + "\n#undef thread\n#undef constant\n")
-
 
 def harness():
     chain = []
@@ -347,18 +334,23 @@ int main() {
 }
 """
 
+def cxx():
+    import shutil
+    for name in (os.environ.get("CXX"), "clang++", "c++", "g++"):
+        if name and shutil.which(name):
+            return name
+    sys.exit("no C++ compiler on PATH")
 
 def build():
     tmp = tempfile.mkdtemp(prefix="f32math.")
     src = os.path.join(tmp, "harness.cpp")
     exe = os.path.join(tmp, "harness")
     open(src, "w").write(harness())
-    r = subprocess.run(["clang++", "-std=c++20", "-O2", src, "-o", exe],
+    r = subprocess.run([cxx(), "-std=c++20", "-O2", src, "-o", exe],
                        capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit("the library did not compile as C++:\n" + r.stderr[:4000])
     return exe
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -368,8 +360,6 @@ def main():
     args = ap.parse_args()
     exe = build()
 
-    # The inputs travel as the bits of the float32 they are, so the harness cannot
-    # round them again and both sides of the comparison see the same number.
     lines, plan = [], []
     for name, expr, pair in CALLS:
         if args.only and name != args.only:
@@ -400,17 +390,12 @@ def main():
         except (ValueError, ArithmeticError, decimal.InvalidOperation, OverflowError):
             want = None
         if want is None:
-            # Every reference here is the exact number, and a few inputs have none:
-            # 1/sqrt(0), log(0), the arctangent of an infinity. They are counted, not
-            # silently dropped, because a sweep that skips quietly is a sweep that
-            # proves less than it says.
             skipped[name] = skipped.get(name, 0) + 1
             continue
         second = None
         if isinstance(want, tuple):
             want, second = want
         if isinstance(want, int):
-            # an exponent or a quotient: exact, not an ulp question
             u = 0.0 if int(words[2]) == want else float("inf")
         else:
             u = ulps32(got, want)
@@ -418,11 +403,6 @@ def main():
                 bad.append((name, argv, got, want, float("inf")))
                 continue
             if isinstance(second, int):
-                # The integer half travels as the float the library returned, so it is
-                # read from the same field as the other halves. Past 2^24 the quotient
-                # is not a float any more, `remquo` only promises its low bits, and a
-                # float cannot hold those either, so there only the remainder is
-                # graded, rather than grading the library on an unrepresentable number.
                 if abs(second) < 16777216 and int(unhex(words[1])) != second:
                     u = float("inf")
             elif second is not None:
@@ -457,10 +437,6 @@ def main():
         print(f"baseline written to {os.path.relpath(BASELINE)}")
         return 0
 
-    # The float set was written for agreement between the two columns, not for the
-    # last bit, so this sweep is not held to an ulp. What it is held to is the file
-    # beside it: a change that costs accuracy anywhere shows up here as a regression,
-    # and the numbers behind the claim are in the file rather than in a paragraph.
     if os.path.exists(BASELINE):
         base = json.load(open(BASELINE))
         worse, missing = [], []
@@ -487,7 +463,6 @@ def main():
             print(f"  {name}({argv}) = {got!r}, exact {float(want)!r}, {u:.0f} ulp off")
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

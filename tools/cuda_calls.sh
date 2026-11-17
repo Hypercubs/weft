@@ -1,9 +1,4 @@
 #!/bin/sh
-# Runs the CUDA column against the stand-in driver in tools/fake_cuda.cpp on this
-# host, whatever it has: the launcher is the non-Metal build, and the loader is
-# pointed at the stand-in instead of a driver. Every call the column makes is
-# recorded and checked here, so the binding, the uploads and the launch are
-# tested without CUDA. Run it with `make cuda-calls`.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -22,9 +17,6 @@ case "$(uname -s)" in
   Darwin) cxx="${CXX:-clang++}"; lib="-dynamiclib" ;;
   *) cxx="${CXX:-cc}"; lib="-shared -fPIC" ;;
 esac
-# The file is named for what the loader asks for, not for the host's convention:
-# dlopen("libcuda.so.1") finds it by name under the library path below.
-# shellcheck disable=SC2086
 $cxx -std=c++20 -O1 $lib -o "$out/libcuda.so.1" tools/fake_cuda.cpp || {
   echo "FAIL  the stand-in driver did not build"
   exit 1
@@ -78,8 +70,6 @@ case_rows() {
   fi
 }
 
-# A kernel whose result is only ever a texture sample: the array shape, the
-# upload and the reference are what a driver sees.
 if run_case tex kernels/ptxtex.ptx --grid 4096 --buffers 4096 --textures 64x64 \
    --samplers nearest/clamp --bench 1; then
   case_rows "texture 2-D float" "$out/tex.log" \
@@ -99,8 +89,6 @@ else
   sed 's/^/      /' "$out/tex.out" | head -6
 fi
 
-# A half image is a different array format and half the row: the launcher says
-# the texel is two bytes, and nothing is widened before the upload.
 if run_case half kernels/ptxtex.ptx --grid 4096 --buffers 4096 --textures 64x64 \
    --texel-bytes 2 --bench 1; then
   case_rows "texture 2-D half" "$out/half.log" \
@@ -110,8 +98,6 @@ else
   bad "texture 2-D half (exit $st)"
 fi
 
-# Layers, a volume and a cube differ only in the descriptor: depth 4 and 8 are
-# layered, six faces are a cubemap.
 if run_case layers kernels/ptxarray.ptx --grid 4096 --buffers 4096 \
    --textures '64x64*4' --bench 1; then
   case_rows "texture 2-D array, four layers" "$out/layers.log" \
@@ -137,8 +123,6 @@ else
   bad "texture cube (exit $st)"
 fi
 
-# weft lowers `tex1D` to a two-dimensional array with one row, so that is the
-# binding the driver is handed.
 if run_case row kernels/ptx1d.ptx --grid 65536 --buffers 65536 --textures 64x1 --bench 1; then
   case_rows "texture one row" "$out/row.log" \
     "cuArrayCreate w=64 h=1 fmt=0x20 ch=1" \
@@ -147,8 +131,6 @@ else
   bad "texture one row (exit $st)"
 fi
 
-# The sampler's two choices reach the driver as a filter and an address mode per
-# axis, and zero addressing also sets the border colour it reads.
 if run_case repeat kernels/ptxtex.ptx --grid 4096 --buffers 4096 --textures 64x64 \
    --samplers nearest/repeat --bench 1; then
   case_rows "sampler nearest, repeat" "$out/repeat.log" \
@@ -175,9 +157,7 @@ else
   bad "sampler linear, zero border (exit $st)"
 fi
 
-# A `.surf` is not a sampled texture, and asking the driver for a texture
-# reference it never declared would be a worse answer than saying so.
-if run_case surf kernels/ptxsrftmix.ptx --grid 4096 --buffers 4096 --textures 64x64 --bench 1; then
+if run_case surf kernels/ptxsrftmix.ptx --grid 4096 --buffers 4096,4096 --textures 64x64,64x64 --bench 1; then
   grep -qF "'img' is a surface, and the cuda column binds sampled textures" "$out/surf.out" &&
     ok "surface refused by name" || bad "surface refused by name"
   if grep -qF "cuArrayCreate" "$out/surf.log"; then
@@ -189,8 +169,6 @@ else
   bad "surface (exit $st)"
 fi
 
-# One parameter per width the column encodes, each stored at its own width by
-# the kernel, so a cell holds the same bytes whichever column wrote it.
 cat > "$out/params.ptx" <<'PTX'
 .version 7.0
 .target sm_70
@@ -256,17 +234,12 @@ else
   bad "the half scalar stores what the driver was handed"
 fi
 
-# A grid smaller than the threadgroup runs as one short block of exactly the
-# lanes the CPU column runs.
 if run_case short kernels/ptxtex.ptx --grid 32 --buffers 32 --textures 64x64 --bench 1; then
   case_rows "grid smaller than a block" "$out/short.log" "cuLaunchKernel grid=1x1x1 block=32x1x1 shared=0"
 else
   bad "grid smaller than a block (exit $st)"
 fi
 
-# A driver that loaded but refused the module: the launcher names the refusal
-# and the CPU column still runs, which is the line the harness reads when it
-# decides whether a skip is a missing column or a broken one.
 WEFT_FAKE_REFUSE=1
 export WEFT_FAKE_REFUSE
 if run_case refuse kernels/ptxtex.ptx --grid 4096 --buffers 4096 --textures 64x64 --bench 1; then
@@ -285,8 +258,6 @@ else
 fi
 unset WEFT_FAKE_REFUSE
 
-# The launch is fed the kernel's input, not the buffer the CPU column has just
-# finished writing. A loaded 0x11 has to come back as 0x11.
 dd if=/dev/zero of="$out/eleven.bin" bs=128 count=1 2>/dev/null
 tr '\000' '\021' < "$out/eleven.bin" > "$out/eleven.tmp" && mv "$out/eleven.tmp" "$out/eleven.bin"
 if run_case feed "$out/params.ptx" --grid 256 --buffers 32 --arg 0=2 \
@@ -304,7 +275,6 @@ else
   bad "pristine input (exit $st)"
 fi
 
-# A CPU-only run never opens the driver at all.
 rm -f "$out/cpuonly.log"
 if run_case cpuonly kernels/ptxtex.ptx --grid 4096 --buffers 4096 --textures 64x64 \
    --cpu-only --bench 1; then

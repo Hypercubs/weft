@@ -1,15 +1,5 @@
 // The clamp in a register, which is how a front end writes a `width` below 32: the
 // segment end differs per lane, so `c` cannot be an immediate.
-//
-//     row 0  shfl.up   1 with c = lane & ~7   lane i reads i-1 unless it starts a segment
-//     row 1  shfl.down 1 with c = lane |  7   lane i reads i+1 unless it ends a segment
-//     row 2  shfl.bfly 4 with c = lane |  7   i xor 4, inside the 8-lane segment
-//     row 3  shfl.bfly 2 with c = lane |  7   i xor 2
-//
-// A clamp read as one number would put these on the whole warp, so lane 7 would read
-// lane 8 in row 0 and lane 8 would read lane 9 in row 1; both are segment crossings.
-// The clamp in a register: a front end writes a `width` below 32 this way, because the
-// segment end differs per lane.
 .version 8.6
 .target sm_100
 .address_size 64

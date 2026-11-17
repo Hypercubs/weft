@@ -1,24 +1,5 @@
-// mul.hi at 64 bits: the high word of a 64x64 product, and the carry chain that
-// builds it out of four 32x32 multiplies.
-//
-// The interesting operands are the ones where the high word is not just the low
-// word shifted: a product whose operands both have the top bit set, a negative
-// times a negative, and a mixed pair. Two input words per lane are packed into a
-// 64-bit register and the sign bits are forced, so every lane exercises those
-// paths rather than the small numbers a ramp of floats would produce.
-//
-//   a = {in[gid*4+0], in[gid*4+1] | 0x80000000}     // negative as a signed word
-//   b = {in[gid*4+2], in[gid*4+3] | 0xFF000000}     // large, and negative too
-//
-//   out[gid*10+0..1] = mul.hi.u64 a, b
-//   out[gid*10+2..3] = mul.hi.s64 a, b
-//   out[gid*10+4..5] = mul.hi.s64 -a, -b
-//   out[gid*10+6]    = mul.hi.u32 of the low words
-//   out[gid*10+7]    = mul.hi.s32 of the low words
-//   out[gid*10+8..9] = mul.wide.u32 of the low words
-//
-// The Metal twin is the same translation, and both engines have to agree on all
-// 40960 words.
+// mul.hi at 64 bits: the high word of a 64x64 product, and the carry chain that builds
+// it out of four 32x32 multiplies.
 .version 7.0
 .target sm_70
 .address_size 64

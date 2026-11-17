@@ -1,29 +1,6 @@
 // `stmatrix.m16n8.b8`: the byte tile, four matrices at a time, and the lane-supplied
-// address form. The `.x1` byte row in `check.sh` only proves the 256 bytes are each
-// written once, which a permutation satisfies, so this one puts a number in every byte
-// that names the place it belongs:
-//
-//     byte at offset o of matrix m  =  (o & 127) ^ (64 m)
-//
-// The offsets are 8 row + column of a 16x8 tile, so a store that took a row for a
-// column, put a matrix at the wrong stride, or used the wrong lane's address writes a
-// number that is not the one the read-back expects. All four matrices carry the same
-// offsets, so the XOR is what tells them apart: swapping two of them changes every
-// byte of both.
-//
-// The instruction takes eight addresses a matrix, one per 16-byte block of two rows,
-// from lanes 8m to 8m+7 (PTX ISA, "Warp-level matrix store: stmatrix"), so the last
-// store below hands every lane the address of its own block and lets the instruction
-// pair each byte with the lane that supplied it. `.trans` is mandatory for the 16x8
-// shape -- it is the column-major form -- so all three stores carry it.
-//
-//     plain   x4 at a symbol: four matrices, 128 bytes apart
-//     one     x1 at symbol+256: the single-matrix form at a non-zero offset
-//     tile    x4 through per-lane addresses
-//
-// `one` is cleared first: the single-matrix store writes 128 of its 512 bytes, and
-// threadgroup memory that no store touched reads back differently on the GPU than in
-// the replica, which is a disagreement about nothing rather than about the map.
+// address form. The `.x1` row only proves each byte is written once, which a
+// permutation satisfies, so every byte here names its own place.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -42,7 +19,7 @@
     ld.param.u64 %rd1, [stmb8_param_0];
     mov.u32 %r1, %tid.x;
 
-    // ---- the four registers, a byte a position ----
+    // the four registers, a byte a position
     // Byte q of a lane is at row = 4*(l&3) + 2*(q&1) + ((q>>1)&1), column = l>>2, so
     // its offset is 32*(l&3) + 16*(q&1) + 8*((q>>1)&1) + (l>>2). One multiply by
     // 0x01010101 puts the same base in all four bytes and the constant adds what
@@ -59,7 +36,7 @@
     xor.b32 %r12, %r5, 0x80808080;
     xor.b32 %r13, %r5, 0xC0C0C0C0;
 
-    // ---- sixteen bytes a lane ----
+    // sixteen bytes a lane
     shl.b32 %r8, %r1, 4;
     cvt.u64.u32 %rd8, %r8;
     mov.u32 %r9, 0;
@@ -73,7 +50,7 @@
     stmatrix.sync.aligned.m16n8.x4.trans.shared.b8 [plain], {%r10, %r11, %r12, %r13};
     stmatrix.sync.aligned.m16n8.x1.trans.shared.b8 [one+256], {%r10};
 
-    // ---- the same four through each lane's own address ----
+    // the same four through each lane's own address
     mov.u64 %rd5, tile;
     and.b32 %r6, %r1, 7;                    // block in the matrix
     shl.b32 %r6, %r6, 4;                    // 16 bytes a block
@@ -85,7 +62,7 @@
     stmatrix.sync.aligned.m16n8.x4.trans.shared.b8 [%rd7], {%r10, %r11, %r12, %r13};
     bar.sync 0;
 
-    // ---- out: sixteen bytes of each region, a lane each ----
+    // out: sixteen bytes of each region, a lane each
     add.s64 %rd9, %rd1, %rd8;               // out + 16l
     mov.u64 %rd5, plain;
     add.s64 %rd6, %rd5, %rd8;

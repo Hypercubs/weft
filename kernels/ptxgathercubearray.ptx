@@ -1,0 +1,86 @@
+// `tld4.acube`: a gather at a direction inside one layer, tuple {layer, s, t, r}.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.global .texref cube;
+
+.visible .entry ptxgathercubearray(
+    .param .u64 ptxgathercubearray_param_0
+)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<24>;
+    .reg .f32 %f<32>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxgathercubearray_param_0];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    and.b32 %r5, %r4, 63;               // sx
+    shr.u32 %r6, %r4, 6;
+    and.b32 %r6, %r6, 63;               // sy
+    shr.u32 %r12, %r4, 11;
+    and.b32 %r12, %r12, 1;              // layer
+    add.s32 %r7, %r5, %r6;
+    div.u32 %r8, %r7, 6;
+    mul.lo.s32 %r9, %r8, 6;
+    sub.s32 %r7, %r7, %r9;              // face = (sx + sy) % 6
+
+    shl.b32 %r10, %r5, 1;
+    sub.s32 %r10, %r10, 63;
+    shl.b32 %r11, %r6, 1;
+    sub.s32 %r11, %r11, 63;
+    cvt.rn.f32.s32 %f1, %r10;
+    cvt.rn.f32.s32 %f2, %r11;
+    mul.f32 %f1, %f1, 0f3B800000;       // s
+    mul.f32 %f2, %f2, 0f3B800000;       // t
+    neg.f32 %f3, %f1;                   // -s
+    neg.f32 %f4, %f2;                   // -t
+
+    setp.eq.s32 %p0, %r7, 0;
+    setp.eq.s32 %p1, %r7, 1;
+    setp.eq.s32 %p2, %r7, 2;
+    setp.eq.s32 %p3, %r7, 3;
+    setp.eq.s32 %p4, %r7, 4;
+    setp.eq.s32 %p5, %r7, 5;
+
+    mov.f32 %f5, %f1;
+    selp.f32 %f5, %f3, %f5, %p5;
+    selp.f32 %f5, 0f3F800000, %f5, %p0;
+    selp.f32 %f5, 0fBF800000, %f5, %p1;
+
+    mov.f32 %f6, %f4;
+    selp.f32 %f6, 0f3F800000, %f6, %p2;
+    selp.f32 %f6, 0fBF800000, %f6, %p3;
+
+    mov.f32 %f7, %f2;
+    selp.f32 %f7, %f4, %f7, %p3;
+    selp.f32 %f7, %f3, %f7, %p0;
+    selp.f32 %f7, %f1, %f7, %p1;
+    selp.f32 %f7, 0f3F800000, %f7, %p4;
+    selp.f32 %f7, 0fBF800000, %f7, %p5;
+
+    tld4.b.acube.v4.f32.f32 {%f16,%f17,%f18,%f19}, [cube, {%r12,%f5,%f6,%f7}];
+
+    mul.f32 %f12, %f17, 0f40000000;     // 2 g.y
+    add.f32 %f13, %f16, %f12;
+    mul.f32 %f14, %f18, 0f40400000;     // 3 g.z
+    add.f32 %f13, %f13, %f14;
+    mul.f32 %f15, %f19, 0f40A00000;     // 5 g.w
+    add.f32 %f13, %f13, %f15;
+    cvt.rn.f32.s32 %f20, %r7;           // the face, folded in
+    mul.f32 %f20, %f20, 0f41300000;     // 11
+    add.f32 %f13, %f13, %f20;
+    cvt.rn.f32.s32 %f21, %r12;          // and the layer
+    mul.f32 %f21, %f21, 0f40E00000;     // 7
+    add.f32 %f13, %f13, %f21;
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    st.global.f32 [%rd4], %f13;
+    ret;
+}

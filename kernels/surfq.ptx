@@ -1,8 +1,4 @@
 // A surface answering its own size.
-//
-// The launcher binds a 64x64 image, so the answer has to be 64, 64 and 1, and their
-// sum has to be 129. A query that derived an extent from the launch geometry, or
-// that assumed a square, would not produce those four numbers together.
 .version 7.0
 .target sm_70
 .address_size 64

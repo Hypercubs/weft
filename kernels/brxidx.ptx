@@ -1,18 +1,4 @@
 // brx.idx: an indirect branch through a jump table.
-//
-//   ts: .branchtargets L0, L1, L2;
-//   brx.idx %r1, ts;
-//
-// The table is a directive at a label, and the instruction names that label
-// second; the index comes first. The list is a list of destinations, not
-// storage, so nothing is loaded and nothing is declared.
-//
-//   brxidx   out[gid] = 10, 11, 12 for an index of 0, 1, 2, and 99 for anything
-//            else, which is the instruction after the table
-//   brxpred  the same table in the compact form `M<3>` (M0, M1, M2), behind a
-//            `@%p` guard: an index of 3 or more fails the guard and answers 99,
-//            an index of 2 answers 22 -- so a table that ignored the guard or
-//            mis-expanded the range answers a number the reference does not.
 .version 7.0
 .target sm_70
 .address_size 64

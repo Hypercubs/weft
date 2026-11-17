@@ -42,7 +42,7 @@
 	add.s64 	%rd7, %rd2, %rd6;
 	add.s64 	%rd8, %rd3, %rd6;
 
-	// ---- A -> shared as bf16, eight contiguous floats a lane ----
+	// A -> shared as bf16, eight contiguous floats a lane
 	shl.b32 	%r5, %r2, 5;
 	cvt.u64.u32 	%rd9, %r5;
 	add.s64 	%rd10, %rd5, %rd9;
@@ -58,7 +58,7 @@
 	add.s64 	%rd13, %rd11, %rd12;
 	st.shared.v4.b32 	[%rd13], {%r10, %r11, %r12, %r13};
 
-	// ---- B -> shared, four contiguous floats a lane ----
+	// B -> shared, four contiguous floats a lane
 	shl.b32 	%r7, %r2, 4;
 	cvt.u64.u32 	%rd14, %r7;
 	add.s64 	%rd15, %rd7, %rd14;
@@ -73,7 +73,7 @@
 
 	bar.sync 	0;
 
-	// ---- the four 8x8 tiles of A ----
+	// the four 8x8 tiles of A
 	shr.u32 	%r16, %r2, 3;
 	and.b32 	%r17, %r2, 7;
 	and.b32 	%r18, %r16, 1;
@@ -87,7 +87,7 @@
 	add.s64 	%rd18, %rd11, %rd18;
 	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r20, %r21, %r22, %r23}, [%rd18];
 
-	// ---- the two 8x8 tiles of B, transposed ----
+	// the two 8x8 tiles of B, transposed
 	shl.b32 	%r19, %r16, 3;
 	and.b32 	%r24, %r2, 7;
 	add.s32 	%r24, %r24, %r19;

@@ -82,6 +82,7 @@ nometal: build/weft-nometal
 cuda-calls: build/weft-nometal
 	@sh tools/cuda_calls.sh
 
+
 gen: $(GEN)
 
 build/embed_kernel.cpp: $(GEN) kernels/basic.metal
@@ -164,9 +165,107 @@ spirv:
 clean:
 	rm -rf build
 
-.PHONY: all demo ptx spirv gen embed nometal cuda-calls clean
+.PHONY: all demo ptx spirv gen embed nometal cuda-calls vmetal vmetal-c vmetal-picture vmetal-tile clean
 
 # Regenerate the README Numbers table from a measurement rather than memory.
 # BENCH=5 for a quick pass; the default is the best of 30.
 numbers:
 	@./tools/numbers.sh
+
+# The virtual Metal device end to end: `weft-gen` writes the module, this host's
+# compiler builds it as a shared library, and the demo opens it through
+# runtime/vmetal.hpp with no GPU and no launcher.
+ifeq ($(UNAME),Darwin)
+VSHARED := -dynamiclib
+VEXT    := dylib
+else ifneq (,$(strip $(filter MINGW% MSYS% CYGWIN%,$(UNAME))))
+VSHARED := -shared
+VEXT    := dll
+else
+VSHARED := -shared
+VEXT    := so
+endif
+
+build/vmetal_kernel.$(VEXT): kernels/basic.metal $(GEN)
+	@mkdir -p build
+	./$(GEN) kernels/basic.metal --kernel saxpy -o build/vmetal_saxpy.cpp
+	$(CXX) -std=c++20 -O2 -fno-strict-aliasing -fsigned-char $(VSHARED) -fPIC \
+	      -I include -I runtime build/vmetal_saxpy.cpp runtime/weft_runtime.cpp -o $@.n
+	mv $@.n $@
+
+build/vmetal_demo: examples/vmetal/vmetal_demo.cpp build/vmetal_kernel.$(VEXT)
+	$(CXX) -std=c++20 -O2 -I include -I runtime examples/vmetal/vmetal_demo.cpp $(FW) -o $@.n
+	mv $@.n $@
+
+vmetal: build/vmetal_demo
+	./build/vmetal_demo build/vmetal_kernel.$(VEXT) saxpy 4096 256
+
+# The same device as a C ABI, for a binding in another language: a shared
+# library over runtime/vmetal.h, and a C11 test that runs a kernel through it and
+# compares the result with a direct call.
+ifeq ($(UNAME),Darwin)
+VRPATH   := -Wl,-rpath,@executable_path
+VINSTALL := -Wl,-install_name,@rpath/libvmetal.$(VEXT)
+else
+VRPATH   := -Wl,-rpath,'$$ORIGIN'
+VINSTALL :=
+endif
+
+build/libvmetal.$(VEXT): runtime/vmetal_c.cpp runtime/vmetal.hpp include/weft/weft.h
+	@mkdir -p build
+	$(CXX) -std=c++20 -O2 -fPIC $(VSHARED) $(VINSTALL) -I runtime -I include \
+	      runtime/vmetal_c.cpp -o $@.n
+	mv $@.n $@
+
+build/vmetal_c_test: examples/vmetal/vmetal_c_test.c build/libvmetal.$(VEXT)
+	$(CC) -std=c11 -O2 -I runtime examples/vmetal/vmetal_c_test.c \
+	      -Lbuild -lvmetal $(VRPATH) $(FW) -o $@.n
+	mv $@.n $@
+
+vmetal-c: build/vmetal_c_test build/vmetal_kernel.$(VEXT)
+	./build/vmetal_c_test build/vmetal_kernel.$(VEXT) saxpy 4096 256
+
+# A picture instead of a number, so the match is something you can look at.
+# kernels/mandel.metal counts escapes per pixel; the fragment beside it paints
+# the same set into a colour target, and --out writes both columns' frames as
+# PNGs, which `cmp` can compare byte for byte.
+build/vmetal_mandel.$(VEXT): kernels/mandel.metal $(GEN)
+	@mkdir -p build
+	./$(GEN) kernels/mandel.metal --kernel mandel -o build/vmetal_mandel.cpp
+	$(CXX) -std=c++20 -O2 -fno-strict-aliasing -fsigned-char $(VSHARED) -fPIC \
+	      -I include -I runtime build/vmetal_mandel.cpp runtime/weft_runtime.cpp -o $@.n
+	mv $@.n $@
+
+# The three columns on the same picture: the M1's GPU against its CPU column,
+# then the virtual device's frame against the same CPU column, then the same
+# kernel driven from Python through the C ABI.
+vmetal-picture: $(BIN) build/vmetal_mandel.$(VEXT) build/libvmetal.$(VEXT)
+	./$(BIN) run kernels/mandel.metal --kernel mandel --grid 8192 --threads 64 \
+	         --buffers 8192,8192 --exact
+	./$(BIN) run kernels/mandelfrag.metal --kernel mandelfrag --render 256x256 \
+	         --grid 65536 --threads 64 --buffers 65536 --out build/mandelfrag-cpu.png \
+	         --out-gpu build/mandelfrag-gpu.png
+	cmp build/mandelfrag-cpu.png build/mandelfrag-gpu.png && echo "gpu     the M1 and the cpu column wrote the same file"
+	./$(BIN) run kernels/mandelfrag.metal --kernel mandelfrag --render 256x256 \
+	         --grid 65536 --threads 64 --buffers 65536 --virtual-gpu \
+	         --out build/mandelfrag-cpu2.png --out-gpu build/mandelfrag-vmetal.png
+	cmp build/mandelfrag-cpu2.png build/mandelfrag-vmetal.png && echo "vmetal  no gpu, same file, pixel for pixel"
+	python3 examples/vmetal/mandel.py build/libvmetal.$(VEXT) build/vmetal_mandel.$(VEXT)
+
+# The Metal-only pass, run three ways on this host: on the M1's GPU, on the
+# virtual device, and through a launcher compiled with the Metal column removed.
+# kernels/tileframe.metal keeps every cross-pixel read inside its own tile, which
+# is the case Apple's GPU defines, so the frames can be compared as files.
+vmetal-tile: $(BIN) build/weft-nometal
+	./$(BIN) run kernels/tileframe.metal --kernel shadetile --render 128x128 \
+	         --grid 16384 --buffers 16384 \
+	         --out build/tile-cpu.png --out-gpu build/tile-gpu.png
+	cmp build/tile-cpu.png build/tile-gpu.png && echo "gpu      the M1 agrees with the cpu column"
+	./$(BIN) run kernels/tileframe.metal --kernel shadetile --render 128x128 \
+	         --grid 16384 --buffers 16384 --virtual-gpu \
+	         --out build/tile-cpu2.png --out-gpu build/tile-vmetal.png
+	cmp build/tile-gpu.png build/tile-vmetal.png && echo "vmetal   no gpu, same frame as the M1"
+	./build/weft-nometal run kernels/tileframe.metal --kernel shadetile --render 128x128 \
+	         --grid 16384 --buffers 16384 --virtual-gpu \
+	         --out build/tile-cpu3.png --out-gpu build/tile-nometal.png
+	cmp build/tile-gpu.png build/tile-nometal.png && echo "nometal  launcher without Metal, same frame again"

@@ -1,22 +1,5 @@
 // The tensor-core shapes past `m16n8k16`: the two narrow-K forms and the eight-row
-// integer one. Each is a warp-wide instruction, so the kernel is one warp and every
-// lane loads the pieces of A and B its fragment owns, straight from the buffers.
-//
-//   1. `mma.m16n8k8.row.col.f32.f16.f16.f32`, half the K of the shape Triton emits
-//      for a 16-wide reduction. A lane holds A[g][2t..2t+1] and A[g+8][2t..2t+1] in
-//      two registers, and both halves of its B column in one.
-//   2. `mma.m16n8k4.row.col.f32.tf32.tf32.f32`, the four-wide tf32 form, one element
-//      a register: A[g][t], A[g+8][t] and B[t][g].
-//   3. `mma.m8n8k16.row.col.s32.s8.s8.s32`, the eight-row integer dot, four bytes a
-//      register and only two accumulators a lane.
-//
-// B is stored transposed (`Bt[n][k] = B[k][n]`) except for the tf32 shape, whose
-// fragment is one element and needs no transpose: a lane's B values are then four or
-// eight contiguous bytes, which is what an `ldmatrix` would have handed it.
-//
-// Every input is a small integer, so each product and each sum is exact in binary32
-// and exact in binary64 as well, a disagreement is a fragment-map bug and never a
-// rounding one.
+// integer one.
 .version 8.1
 .target sm_80
 .address_size 64
@@ -170,9 +153,7 @@
 // standard's fragment table is `row = lane>>2` (and `+8` above the half-way point),
 // `col = 8*(lane%4) + (i&7)`, `col += 32` for the last two registers, which is the
 // eight-elements-a-register map every other shape here uses.
-//
 // The operands are signed nibbles, so a lane's four bytes hold eight values with the
-// sign in bit 3 of each: a widen that dropped it would read -3 as 13.
 .visible .entry mmak64s4(
     .param .u64 mmak64s4_param_0,   // A: 16 x 64 nibbles, 32 bytes a row
     .param .u64 mmak64s4_param_1,   // Bt: 8 x 64 nibbles, 32 bytes a row

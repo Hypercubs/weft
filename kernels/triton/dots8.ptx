@@ -37,13 +37,13 @@
 	shr.u32 %r2, %r1, 2;                    // g
 	and.b32 %r3, %r2, 7;
 
-	// ---- A: the row's value in all four bytes of every operand register ----
+	// A: the row's value in all four bytes of every operand register
 	add.s32 %r4, %r3, 1;                    // g + 1
 	mul.lo.s32 %r5, %r4, 0x01010101;
 	add.s32 %r6, %r3, 9;                    // g + 9
 	mul.lo.s32 %r7, %r6, 0x01010101;
 
-	// ---- B: the four byte weights of the column this slot names ----
+	// B: the four byte weights of the column this slot names
 	shr.u32 %r8, %r1, 3;                    // the column pair
 	shl.b32 %r8, %r8, 1;
 	shr.u32 %r9, %r1, 2;
@@ -59,7 +59,7 @@
 
 	mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%d1, %d2, %d3, %d4}, {%r5, %r7, %r5, %r7}, {%r14, %r14}, {%d1, %d2, %d3, %d4};
 
-	// ---- rows g and g+8, columns 2t and 2t+1 ----
+	// rows g and g+8, columns 2t and 2t+1
 	shl.b32 %r20, %r3, 5;
 	and.b32 %r21, %r1, 3;
 	shl.b32 %r21, %r21, 3;

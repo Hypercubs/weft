@@ -1,13 +1,4 @@
 // Does a spinlock made of this host's Metal atomics actually make progress?
-//
-// The warp target wants a lock for a 64-bit atomic: one thread holds all 32
-// lanes, so the lanes never contend, and what is left is another warp on the same
-// counter. That is only sound if a spinning thread can observe the holder's
-// release, so this asks the hardware directly, with a bounded spin so a broken
-// primitive reports rather than hangs.
-//
-// Build: clang++ -fobjc-arc -std=c++17 -framework Metal -framework Foundation \
-//          tools/atomic_probe.mm -o /tmp/atomicprobe && /tmp/atomicprobe
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -39,8 +30,6 @@ kernel void cas_lock(device uint* locks [[buffer(0)]], device uint* out [[buffer
   out[256u + gid] = spins;
 }
 
-// The same lock built from fetch_add, in case compare-exchange is the part this
-// host gets wrong.
 kernel void add_lock(device uint* locks [[buffer(0)]], device uint* out [[buffer(1)]],
                      uint gid [[thread_position_in_grid]]) {
   device atomic_uint* s = (device atomic_uint*)&locks[0];

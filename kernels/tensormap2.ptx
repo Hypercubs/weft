@@ -1,8 +1,6 @@
-// The same instruction with a 128-byte swizzle, which is the pattern a `wgmma` fragment
-// read is laid out in. The tensor is two rows of thirty-two, so the box is 256 bytes and
-// its second row starts at byte 128, which the swizzle moves sixteen bytes along, to
-// 144. Reading there has to give element (1, 0), which is 32; a decode that ignored the
-// swizzle would leave element 32 at 128 and hand back 36 instead.
+// The same instruction with a 128-byte swizzle, the pattern a `wgmma` fragment read is
+// laid out in. The box's second row starts at byte 128, the swizzle moves it to 144,
+// and element (1, 0) must read 32.
 .version 8.3
 .target sm_90
 .address_size 64

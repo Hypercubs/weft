@@ -1,0 +1,34 @@
+.version 8.3
+.target sm_90
+.address_size 64
+
+// A 64-bit add in the window: eight lanes add one, then the two words of the answer
+// are read back as words so nothing here depends on a 64-bit shared load.
+.visible .entry satom64(
+    .param .u64 satom64_param_0
+)
+{
+    .shared .align 8 .b64 v[1];
+
+    .reg .b64 %rd<3>;
+    .reg .b32 %r<4>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [satom64_param_0];
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    mov.b64 %rd2, 0;
+    @%p1 st.shared.b64 [v], %rd2;
+    bar.sync 0;
+
+    mov.b64 %rd2, 1;
+    red.shared.add.u64 [v], %rd2;
+
+    bar.sync 0;
+    ld.shared.b32 %r2, [v];
+    @%p1 st.global.b32 [%rd1], %r2;
+    ld.shared.b32 %r3, [v+4];
+    add.s64 %rd2, %rd1, 4;
+    @%p1 st.global.b32 [%rd2], %r3;
+    ret;
+}

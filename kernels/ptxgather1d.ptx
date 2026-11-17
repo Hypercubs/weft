@@ -1,16 +1,4 @@
-// A gather on a 1-D binding, which is a plane one row high. PTX has no 1-D `tld4`, so
-// the two texels the 2x2 footprint takes from the one row are two 1-D fetches and the
-// two from the row below are nothing -- the rule the gather follows at an edge.
-//
-//     u = (x + 0.5) / 64
-//     g = tld4(row, u)                   // (x,0), (x+1,0), then the row below
-//     out[gid] = g.x + 2 g.y + 3 g.z + 5 g.w
-//
-// The footprint is still 2x2: the second row of it is outside a binding that has one
-// row, so those two texels are nothing and the answer is the two along x. That is
-// the same rule the 2-D form follows at an edge, which is why this is a comparison
-// rather than a tolerance, a footprint that silently wrapped would add the texel at
-// the start of the row twice.
+// A gather on a 1-D binding, which is a plane one row high.
 .version 7.0
 .target sm_70
 .address_size 64

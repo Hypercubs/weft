@@ -1,16 +1,4 @@
-// Atomics in the shared window. `atom.shared`, `.shared::cta` and `.shared::cluster` are
-// the same window to a launch this wide, and its address is an offset inside that
-// window rather than a pointer -- which is what the device form used to be handed, an
-// atomic on address zero. Every kernel here is order-free by construction (an add of
-// powers of two, a max over a fixed set, a compare-exchange only the first match takes),
-// and every one sets its own words first: the window arrives holding whatever the last
-// launch left there, and the harness runs a kernel more than once to time it.
-//
-//   satadd   a u32 add, a float add, a u32 max and a u32 min, each on its own word
-//   satb16   atom.cas.b16 on the low half of a word whose high half must survive
-//   satpack  atom.add.noftz.f16x2, the whole word, both halves at once
-//   satret   the value the add returned: each lane's is its own, so the sum of the eight
-//            is 0+1+...+7 whatever order they landed in
+// Atomics in the shared window.
 .version 8.3
 .target sm_90
 .address_size 64
@@ -30,7 +18,7 @@
     mov.u32 %r1, %tid.x;
 
     // Zero, zero, zero, and all ones for the min to come down from. An f32 atomic is not
-    // a `.min` ptxas takes, and neither is a scalar half one -- the float types it names
+    // a `.min` ptxas takes, and neither is a scalar half one, the float types it names
     // for `.min` are the halves, and those want a vector modifier, which it allows only
     // in global memory. So the fourth word is a u32 min, and its lanes ask for 1..8 so
     // the answer is not the zero every word starts at.

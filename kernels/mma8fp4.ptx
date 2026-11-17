@@ -1,11 +1,4 @@
 // The fp4 and fp6 shapes of `mma`, split out of `mma8.ptx`.
-//
-// ptxas has no plain `.f32.e2m1.e2m1` (or `.e3m2`) multiply, but it does take the
-// dense form of both under `.kind::f8f6f4`: the operands are the accumulators, A,
-// B and C, there are no block scales, and the product is the same instruction.
-// That spelling needs `sm_120a` and, for four-bit and six-bit codes, it exists only
-// at `m16n8k32` -- the wider k of 64 lives in `mma8fp4k64.ptx`, which this
-// assembler refuses.
 .version 8.8
 .target sm_120a
 .address_size 64
@@ -13,11 +6,8 @@
 // with `.e3m2` (fp6). Their fragment map is the byte forms', `col = 4*(lane%4) +
 // (i&3)`, `col += 16` for the last two registers, so only the decode differs, and
 // the accumulate is `f32`.
-//
 // The packing is the one the `cvt` forms of these formats already use: an fp4 code is
 // a nibble, two to a byte, and an fp6 code sits in the low six bits of its own byte.
-// The values are dyadic, so every product and every sum of them is exact in binary32
-//, a difference is the decode or the map, never a rounding.
 .visible .entry mmak32e2m1(
     .param .u64 mmak32e2m1_param_0,   // A: 16 x 32 fp4 codes, 16 bytes a row
     .param .u64 mmak32e2m1_param_1,   // Bt: 8 x 32 fp4 codes, 16 bytes a row

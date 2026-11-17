@@ -1,10 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// `double` is not supported on Apple GPUs, the Metal compiler rejects it, so
-// the double vectors are checked on the CPU only, against the same arithmetic
-// written out with scalars. What that covers is the operators and the layout,
-// which is all this front end can get wrong.
 kernel void dblvec(device const float* in [[buffer(0)]],
                    device float* out      [[buffer(1)]],
                    uint gid               [[thread_position_in_grid]]) {

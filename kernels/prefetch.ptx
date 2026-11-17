@@ -1,17 +1,5 @@
-// The prefetch hints, which are the one family of instruction whose translation
-// cannot be wrong: `prefetch.global.L2`, `prefetchu.L1` and the bulk tensor prefetch
-// ask for a line to be brought up and report nothing back, so a copy kernel that
-// interleaves them with its arithmetic has to answer exactly as it would without.
-//
-//     out[gid] = in[gid]
-//
-// and check.sh compares the output buffer against the input one byte for byte, so an
-// implementation that "did something" with a hint, read the address, zeroed a line,
-// hung on a size, shows up as a different buffer rather than as a silent no-op that
-// happened to look fine.
-//
-// `cp.async.bulk.prefetch.L2.global` takes an address and a size, no barrier and no
-// bulk group: nothing waits on it, which is why it is a hint too.
+// The prefetch hints, which are the one family of instruction whose translation cannot
+// be wrong: `prefetch.global.L2`.
 .version 8.0
 .target sm_90
 .address_size 64

@@ -1,17 +1,4 @@
 // weft-gen, translate a GPU kernel file to C++ at build time.
-//
-//     weft-gen kernels/basic.metal --kernel saxpy -o build/saxpy.cpp
-//     weft-gen kernels/spirv/blockreduce.spv -o build/reduce.cpp
-//     weft-gen kernels/basic.metal --describe
-//
-// The output is a translation unit that links against runtime/weft_runtime.cpp
-// and exposes the ABI in include/weft/weft.h. Doing this at build time is what
-// makes the CPU path a dependency instead of a subprocess: no `clang++` at run
-// time, no dylib, no dlopen, no Metal device.
-//
-// `--describe` prints what the module contains, one line per kernel, so a build
-// script or a test fixture can size its buffers from the kernel's own
-// declarations instead of being told the layout out of band.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,9 +66,6 @@ int main(int argc, char** argv) {
   std::string file, out, kernel;
   uint32_t rw = 0, rh = 0;
   bool describe = false, render = false, gpu = false;
-  // PTX has no typed pointers: a kernel parameter is a .u64 address, so the
-  // module cannot say how wide one element is. Rather than guess, weft-gen
-  // takes the answer and bakes it into the module, where the ABI reports it.
   std::vector<std::pair<int, uint32_t>> widths;
   auto parse_widths = [&](const std::string& v) {
     size_t pos = 0;
@@ -185,8 +169,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // A stated width wins over anything the front end inferred: it exists to fill
-  // the gaps of a front end that has nothing to infer from.
   for (auto& k : tr.kernels) {
     if (k.buf_type.size() < (size_t)(k.nbufs > 0 ? k.nbufs : 0)) k.buf_type.resize(k.nbufs);
     for (const auto& w : widths) {
@@ -201,9 +183,6 @@ int main(int argc, char** argv) {
       if (k.buf_type[b].empty()) k.buf_type[b] = "0";  // unknown: the ABI says so
   }
 
-  // --gpu is the only thing that writes Metal: the other front ends hand back a
-  // C++ translation unit, and a .metal file's `gpu_src` is the source the GPU
-  // compiles, which is not what -o means there.
   if (gpu && !tr.gpu_src.empty()) tr.code = tr.gpu_src;
 
   if (describe) {

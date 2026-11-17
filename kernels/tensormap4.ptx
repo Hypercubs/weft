@@ -1,17 +1,6 @@
-// The column going back the other way: `.im2col` in the store direction scatters
-// threadgroup memory into the window it describes. The same tensor and the same column
-// shape are used as above, and two columns are written in turn:
-//
-//   101..106 at the corner, which land on elements 0 to 5, the window's first three
-//           pixels, both channels of each;
-//   201..206 one pixel to the right, which land on elements 2 to 5 and then run past the
-//           edge on their third pixel, where a store has nothing to write and so writes
-//           nothing rather than spilling into the next row.
-//
-// The tensor is read back afterwards, so a scatter that moved the wrong element, walked
-// the column in the wrong order, or wrapped instead of stopping changes the eighteen
-// numbers. Elements 6 to 17 were never inside a window and have to be untouched, which
-// is the half of the answer a scatter that wrote past its box would spoil.
+// The column going the other way: `.im2col` in the store direction scatters threadgroup
+// memory into the window it describes. The same tensor and column shape as above, with
+// two columns written in turn.
 .version 8.3
 .target sm_90
 .address_size 64
@@ -32,7 +21,7 @@
     ld.param.u64 %rd2, [tensorim2st_param_1];
     ld.param.u64 %rd3, [tensorim2st_param_2];
 
-    // ---- the tensor: eighteen words ----
+    // the tensor: eighteen words
     mov.u32 %r1, 0;
 FILL: setp.ge.u32 %p1, %r1, 18;
     @%p1 bra FILLED;
@@ -43,7 +32,7 @@ FILL: setp.ge.u32 %p1, %r1, 18;
     bra FILL;
 FILLED:
 
-    // ---- two columns, twelve words, side by side in threadgroup memory ----
+    // two columns, twelve words, side by side in threadgroup memory
     mov.u32 %r6, 101;
     st.shared.b32 [col], %r6;
     mov.u32 %r7, 102;
@@ -69,7 +58,7 @@ FILLED:
     mov.u32 %r11, 206;
     st.shared.b32 [col + 44], %r11;
 
-    // ---- the same map as the load kernel: two channels by three pixels ----
+    // the same map as the load kernel: two channels by three pixels
     mov.b64 {%r2, %r3}, %rd2;
     st.global.b32 [%rd3], %r2;
     add.s64 %rd4, %rd3, 4;
@@ -129,7 +118,7 @@ FILLED:
 
     bar.sync 0;
 
-    // ---- threadgroup memory -> the tensor, twice ----
+    // threadgroup memory -> the tensor, twice
     // `.im2col` in the store direction has no spelling either, so the column is walked
     // back into the tensor by hand, on the same shape the map names and in the same
     // order: a pixel's two channels together, a pixel stepping once along the width.
@@ -169,7 +158,7 @@ PIXD: add.u32 %r12, %r12, 1;
     bra COL;
 COLD:
 
-    // ---- the tensor as the two scatters left it ----
+    // the tensor as the two scatters left it
     mov.u32 %r16, 0;
 BACK: setp.ge.u32 %p3, %r16, 18;
     @%p3 bra BACKED;

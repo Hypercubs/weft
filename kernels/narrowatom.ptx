@@ -1,13 +1,4 @@
-// A 16-bit float atomic add. The hardware's atomics are 32 bits wide and two halves
-// can share one of those words, so the add is a compare-exchange on the word with only
-// the half being added replaced. That is what this fixture is built to catch: the two
-// halves of one word are contended by different values at once, and the neighbour has
-// to keep its own total.
-//
-//   narrowatom  64 lanes, each adding 1.0 to the low half and 0.5 to the high one
-//               of the same word: 64.0 and 32.0, both exact whatever order they land
-//   redatom     64 lanes, each adding the pair (1.0, 0.5) with `red`, no result:
-//               64.0 above 32.0
+// A 16-bit float atomic add.
 .version 7.0
 .target sm_80
 .address_size 64

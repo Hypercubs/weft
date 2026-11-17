@@ -1,13 +1,4 @@
 // `mbarrier.expect_tx`: the byte count a bulk copy will complete the phase with.
-//
-//     init  [mbr], 4              four arrivals owed
-//     bar.sync 0
-//     expect_tx [mbr], 12         the phase now also waits for 12 bytes   -> 16
-//     arrive.expect_tx %rd, [mbr], 8   8 more bytes, and one arrival      -> 23
-//     read the two words          owed 23, count 4 with phase 0 (4 << 1 = 8)
-//
-// A single lane, so the numbers are the instructions' own: the count is the group
-// size, and thirty-two lanes expecting would add thirty-two times.
 .version 8.0
 .target sm_90
 .address_size 64

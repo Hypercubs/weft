@@ -1,6 +1,5 @@
-// Hand-written PTX, the shape nvcc emits for:
-//     out[gid] = 2.0f * a[gid] + 0.5f * b[gid];
-// Run it with:  goc run kernels/saxpy.ptx --kernel saxpy --grid N
+// Hand-written PTX, the shape nvcc emits for `out[gid] = 2.0f * a[gid] + 0.5f *
+// b[gid]`.
 .version 7.0
 .target sm_70
 .address_size 64

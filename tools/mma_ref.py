@@ -18,14 +18,12 @@ never a rounding one.
 import struct
 import sys
 
-
 def read(path, fmt, count):
     data = open(path, 'rb').read()
     size = struct.calcsize(fmt)
     if len(data) < count * size:
         raise SystemExit('%s holds %d bytes and %d are needed' % (path, len(data), count * size))
     return list(struct.unpack('<%d%s' % (count, fmt), data[:count * size]))
-
 
 def read_nibbles(path, count):
     """Signed four-bit elements, two to a byte, the low one first."""
@@ -41,7 +39,6 @@ def read_nibbles(path, count):
         out.append(n - 16 if n > 7 else n)
     return out
 
-
 def read_nibbles_u(path, count):
     """Four-bit codes, two to a byte, the low one first, with no sign applied: the
     code of an fp4 is a sign bit and three magnitude bits, not a two's complement."""
@@ -54,7 +51,6 @@ def read_nibbles_u(path, count):
         out.append((byte & 0xF) if i % 2 == 0 else (byte >> 4))
     return out
 
-
 def mx(code, eb, mb):
     """One narrow float, decoded the way `weft_mx_decode` decodes it: a sign bit above
     the exponent, subnormals on the same grid when the exponent is zero."""
@@ -64,7 +60,6 @@ def mx(code, eb, mb):
     ex = (1 if e == 0 else e) - bias - mb
     d = ((0 if e == 0 else (1 << mb)) + mant) * (2.0 ** ex)
     return -d if (code >> (eb + mb)) else d
-
 
 def matmul(a, bt, rows, cols, k, transposed):
     out = []
@@ -76,7 +71,6 @@ def matmul(a, bt, rows, cols, k, transposed):
                 s += a[r * k + i] * b
             out.append(s)
     return out
-
 
 def main():
     if len(sys.argv) != 5:
@@ -119,7 +113,6 @@ def main():
         return 1
     print('%s: %d values match' % (shape, len(want)))
     return 0
-
 
 if __name__ == '__main__':
     sys.exit(main())

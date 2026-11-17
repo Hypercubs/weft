@@ -1,9 +1,4 @@
 // The tangent, as the quotient of the two approximations the instruction set does have.
-// PTX spells `sin.approx` and `cos.approx` but no `tan.approx`, so this is `sin/cos`
-// rounded once, and the row checks it against a double's tangent inside an ulp.
-//
-//     a = in[gid]
-//     out[gid] = tan.approx.f32 a
 .version 7.0
 .target sm_70
 .address_size 64

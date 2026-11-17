@@ -1,22 +1,4 @@
 // The fp4 multiply at K of 64, split out of `mma8fp4.ptx`.
-//
-// `mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.kind::f8f6f4` is not a shape
-// this assembler has: it answers `Incorrect instruction type specified for mma with
-// shape '.m16n8k64'`, and so does the same shape with e2m3, e3m2 or e4m3. The product
-// is the sum over sixty-four codes, though, and a sum over sixty-four is the sum of
-// two sums over thirty-two, so it is written here as two `m16n8k32` multiplies with
-// the second accumulating into the first -- two legal instructions whose answer is
-// the one the wider shape would have given.
-//
-// The code-to-lane map is the `k32` one, `col = 4*(lane%4) + (i&3)` with `col += 16`
-// for the second register pair, because that is the instruction actually issued. The
-// second half of K is the same map sixteen bytes along each row, which is why the
-// loads below are the first half's offsets plus sixteen. Everything is exact in
-// binary32 -- the codes are dyadic and their products are sums of powers of two -- so
-// the split can only be exact too.
-//
-// weft reads both shapes, and `tools/mma_ref.py k64e2m1` still checks this kernel's
-// output against a product over all sixty-four.
 .version 8.8
 .target sm_120a
 .address_size 64

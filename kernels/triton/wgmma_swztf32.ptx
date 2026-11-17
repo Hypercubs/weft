@@ -36,7 +36,7 @@
 	mov.u32 	%r1, %tid.x;
 	mov.u64 	%rd5, weft_ab;
 
-	// ---- A: one 16-byte chunk of one row, four floats ----
+	// A: one 16-byte chunk of one row, four floats
 	and.b32 	%r2, %r1, 63;			// row
 	shr.u32 	%r3, %r1, 6;			// which chunk of the row
 	shl.b32 	%r6, %r3, 4;			// chunk * 16
@@ -55,7 +55,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: one float, row n = lane / 2, half of its 32 bytes = lane % 2 ----
+	// B: one float, row n = lane / 2, half of its 32 bytes = lane % 2
 	setp.lt.u32 	%p1, %r1, 16;
 	shr.u32 	%r14, %r1, 1;
 	and.b32 	%r14, %r14, 7;			// n

@@ -1,14 +1,4 @@
-// The two min/max forms that are not the plain one. `.NaN` answers a canonical NaN
-// where the plain form hands the other operand back, and `.xorsign.abs` compares the
-// magnitudes and keeps the exclusive or of the two signs. Six answers, each picked so
-// the plain form would differ:
-//
-//   0  min.NaN  NaN, 1.0          the payload is replaced, not passed through
-//   1  min.NaN  1.0, 2.0          no NaN, so the plain answer
-//   2  min.xorsign.abs  -1, 2     magnitude 1 under the xor of the signs: -1
-//   3  max.xorsign.abs  -1, 2     magnitude 2, same sign: -2
-//   4  min.xorsign.abs  +0, -0    both magnitudes 0, xor of the signs: -0
-//   5  min.xorsign.abs  3, -4     magnitude 3, signs cancel: +3
+// The two min/max forms that are not the plain one.
 .version 7.2
 .target sm_86
 .address_size 64

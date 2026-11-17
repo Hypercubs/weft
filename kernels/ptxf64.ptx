@@ -1,21 +1,4 @@
 // 64-bit floating point, which this GPU has no instruction for.
-//
-//     x  = in[gid]
-//     y  = ((x + 1) * 3) / 2 - 0.5
-//     z  = max(min(abs(-y), (x + 1) * 3 / 2), y)
-//     out[gid] = (float)((double)(float)z + (double)(int)abs(-y))
-//
-// Every operation on a double is exact IEEE-754 binary64 on both columns: the CPU
-// runs the host's own doubles, and the GPU runs the software one in `weft_fp64`
-// over the bits, so the comparison is of the same arithmetic rather than of an
-// approximation of it. The literals are `0d...` forms, which is what used to have no
-// GPU spelling at all, a double here is the `uint64_t` its bits live in, so the
-// constant is handed over as bits and the register holding it is that same word.
-//
-// The last line crosses back to binary32 so the result is one four-byte value per
-// lane: a rounding that disagreed would show up as a different float, and the two
-// conversions in the middle (`cvt.rni.s32.f64` and `cvt.f64.s32`) check the integer
-// bridge in both directions.
 .version 7.0
 .target sm_70
 .address_size 64

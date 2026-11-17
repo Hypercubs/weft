@@ -1,0 +1,45 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// A recursive call that returns two values. The pair comes back through the frame the
+// call kept, and the entry writes each into its own buffer: four down to zero is 10 and 4.
+.visible .func (.reg .b32 lo, .reg .b32 hi) pairs(
+    .param .u32 n
+)
+{
+    .reg .b32 %r<8>;
+    .reg .pred %p<2>;
+
+    ld.param.u32 %r1, [n];
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra base;
+    sub.u32 %r2, %r1, 1;
+    call.uni (%r3, %r4), pairs, (%r2);
+    add.u32 %r3, %r3, %r1;
+    add.u32 %r4, %r4, 1;
+    mov.b32 lo, %r3;
+    mov.b32 hi, %r4;
+    ret;
+base:
+    mov.u32 lo, 0;
+    mov.u32 hi, 0;
+    ret;
+}
+
+.visible .entry callpair(
+    .param .u64 sumout,
+    .param .u64 cntout
+)
+{
+    .reg .b64 %rd<3>;
+    .reg .b32 %r<8>;
+
+    ld.param.u64 %rd1, [sumout];
+    ld.param.u64 %rd2, [cntout];
+    mov.u32 %r1, 4;
+    call.uni (%r2, %r3), pairs, (%r1);
+    st.global.u32 [%rd1], %r2;
+    st.global.u32 [%rd2], %r3;
+    ret;
+}

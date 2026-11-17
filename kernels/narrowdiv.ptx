@@ -1,29 +1,4 @@
-// Division, reciprocal and square root of a half. Each is one rounding to the nearest
-// half, computed on the significands: a quotient keeps 48 bits above the grid with the
-// remainder as sticky, and a root is the integer root of an even-exponent significand.
-//
-// ptxas has no half `div`, `rcp` or `sqrt`, so each is the half widened to a double (an
-// exact widening), the double form -- 53 bits of quotient, which is past every half tie
-// these inputs can make -- and one rounding back to the half grid. The canonical NaN the
-// isa answers with is written out too: the double's quotient carries its own payload.
-// Sixteen results a lane, chosen where a widening to float would round twice:
-//
-//   0  div  2.0 / 3.0
-//   1  div  1.0 / 3.0
-//   2  div  1.0 / 7.0
-//   3  div  1.0 / (1+2^-10)
-//   4  rcp  3.0                 the same quotient as slot 1, from the reciprocal form
-//   5  rcp  1 + 2^-9
-//   6  sqrt 2.0
-//   7  sqrt 3.0
-//   8  sqrt 65504
-//   9  sqrt 2^-24               subnormal in, normal out
-//  10  div  2^-24 / 3.0         a subnormal result, rounded on its own grid
-//  11  div  2^-24 / 1.5         the same grid, landing one step up
-//  12  div  1.0 / 65504         a subnormal result from a normal quotient
-//  13  div  1.0 / 0.0           +inf
-//  14  div  0.0 / 0.0           the canonical NaN
-//  15  sqrt -1.0                the canonical NaN
+// Division, reciprocal and square root of a half.
 .version 7.0
 .target sm_80
 .address_size 64
@@ -166,15 +141,11 @@
 }
 
 // The infinities, zeros and the one exact tie a subnormal can make:
-//
 //   0  div  5.0 / inf        +0
 //   1  div -5.0 / inf        -0, which a zero written as +0 would lose
 //   2  div  inf / inf        the canonical NaN
 //   3  div  inf / -2.0       -inf
 //   4  rcp  0.0              +inf
-//   5  sqrt -0.0             -0
-//   6  div  2^-24 / 2.0      exactly halfway between 0 and 2^-24: ties to even, +0
-//   7  sqrt 1 + 2^-10        just under the midpoint, so it rounds to 1.0
 .visible .entry narrowdiv2(
     .param .u64 narrowdiv2_param_0  // out: eight halfs a lane
 )

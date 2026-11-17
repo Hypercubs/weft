@@ -1,18 +1,5 @@
 // The packed half transcendentals: one word in, three words out, each the same input
 // answered by a different approximation.
-//
-//     out0 = ex2.approx.f16x2(in)
-//     out1 = lg2.approx.f16x2(in)
-//     out2 = tanh.approx.f16x2(in)
-//
-// `lg2` has no `.f16x2` spelling in ptxas, so that word answers each half in float and
-// packs the two rounded halves back together.
-//
-// Each half is widened, answered and rounded on its own, so the reference is the
-// double-precision library rounded once to the half grid -- an independent answer, not
-// this library run again. The input keeps every value in [0.0625, 4]: positive for lg2,
-// small enough that exp2 stays inside the half range and large enough that it does not
-// land on a subnormal, where a rounding difference would be invisible in the bits.
 .version 8.6
 .target sm_100
 .address_size 64

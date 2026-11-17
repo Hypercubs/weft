@@ -1,0 +1,35 @@
+.version 8.6
+.target sm_100
+.address_size 64
+
+// The window form of the sixteen-byte exchange, with the lane that holds it read back.
+.visible .entry exch128s(
+    .param .u64 out,
+    .param .u64 src
+)
+{
+    .shared .align 16 .b64 v[2];
+
+    .reg .b128 %q<3>;
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<3>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [out];
+    ld.param.u64 %rd2, [src];
+    ld.global.b128 %q1, [%rd2];
+
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    mov.b64 %rd3, 0;
+    @%p1 st.shared.b64 [v], %rd3;
+    @%p1 st.shared.b64 [v+8], %rd3;
+    bar.sync 0;
+
+    atom.shared.exch.b128 %q2, [v], %q1;
+
+    bar.sync 0;
+    ld.shared.b64 %rd3, [v];
+    @%p1 st.global.b64 [%rd1], %rd3;
+    ret;
+}

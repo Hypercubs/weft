@@ -34,7 +34,7 @@
 	mov.u32 	%r1, %tid.x;
 	mov.u64 	%rd5, weft_ab;
 
-	// ---- A: lane -> one row and one K core matrix, 16 bytes each ----
+	// A: lane -> one row and one K core matrix, 16 bytes each
 	and.b32 	%r2, %r1, 63;
 	shr.u32 	%r3, %r1, 6;
 	shl.b32 	%r4, %r2, 5;
@@ -55,7 +55,7 @@
 	add.s64 	%rd6, %rd5, %rd6;
 	st.shared.v4.b32 	[%rd6], {%r10, %r11, %r12, %r13};
 
-	// ---- B: lane -> one row and one column, a single half after the A tile ----
+	// B: lane -> one row and one column, a single half after the A tile
 	shr.u32 	%r14, %r1, 3;			// K row
 	and.b32 	%r15, %r1, 7;			// column
 	shl.b32 	%r16, %r14, 4;

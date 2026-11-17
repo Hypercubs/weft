@@ -28,7 +28,6 @@ PROBE_SRC = os.path.join(ROOT, "tools", "f64_probe.mm")
 PROBE = os.path.join(tempfile.gettempdir(), "weft-f64probe")
 WEFT = os.path.join(ROOT, "build", "weft")
 
-
 def build_probe():
     if os.path.exists(PROBE) and os.path.getmtime(PROBE) > os.path.getmtime(PROBE_SRC):
         return True
@@ -41,7 +40,6 @@ def build_probe():
         return False
     return True
 
-
 def preamble():
     """Everything the emitter puts above the kernel: the helpers, unmodified."""
     r = subprocess.run([WEFT, "run", "kernels/spirv/fp64.spv", "--kernel", "fp64", "--emit-gpu"],
@@ -53,14 +51,11 @@ def preamble():
         sys.exit(1)
     return src[:cut]
 
-
 def bits(x):
     return struct.unpack("<Q", struct.pack("<d", x))[0]
 
-
 def dbl(b):
     return struct.unpack("<d", struct.pack("<Q", b))[0]
-
 
 INF = float("inf")
 NAN = float("nan")
@@ -103,7 +98,6 @@ def _third(a, b, i):
         return a
     return dbl(_rng.getrandbits(64))
 
-
 CASES = [(a, b, _third(a, b, i)) for i, (a, b) in enumerate(PAIRS)]
 
 # `F64_EXTRA=6000 python3 tools/f64_check.py fma` runs a longer sweep than the suite
@@ -117,7 +111,6 @@ for _ in range(int(os.environ.get("F64_EXTRA", "0"))):
             break
     CASES.append((a, b, _third(a, b, len(CASES))))
 
-
 def kernel(op_expr):
     return ("kernel void probe(device uint64_t* in [[buffer(0)]],\n"
             "                    device uint64_t* out [[buffer(1)]],\n"
@@ -127,18 +120,14 @@ def kernel(op_expr):
             "  const uint64_t c = in[3u * id + 2u];\n"
             "  out[id] = " + op_expr + ";\n}\n")
 
-
 def expect_add(a, b):
     return bits(a + b)
-
 
 def expect_sub(a, b):
     return bits(a - b)
 
-
 def expect_mul(a, b):
     return bits(a * b)
-
 
 def expect_div(a, b):
     if b == 0.0:
@@ -147,40 +136,33 @@ def expect_div(a, b):
         return bits(math.copysign(INF, a) * math.copysign(1.0, b))
     return bits(a / b)
 
-
 def expect_lt(a, b):
     if math.isnan(a) or math.isnan(b):
         return 0
     return 1 if a < b else 0
 
-
 def expect_eq(a, b):
     return 0 if (math.isnan(a) or math.isnan(b)) else (1 if a == b else 0)
-
 
 def expect_floor(a, _b):
     if math.isnan(a) or math.isinf(a):
         return bits(a)
     return bits(signed_zero(float(math.floor(a)), a))
 
-
 def expect_ceil(a, _b):
     if math.isnan(a) or math.isinf(a):
         return bits(a)
     return bits(signed_zero(float(math.ceil(a)), a))
-
 
 def signed_zero(x, a):
     # Truncation and the roundings keep the sign of what they started from: trunc of
     # -0.5 is -0.0 and ceil of -0.5 is -0.0, not +0.0.
     return math.copysign(0.0, a) if x == 0.0 else x
 
-
 def expect_trunc(a, _b):
     if math.isnan(a) or math.isinf(a):
         return bits(a)
     return bits(signed_zero(float(math.trunc(a)), a))
-
 
 def expect_round(a, _b):
     # OpenCL's round: nearest, ties away from zero.
@@ -190,7 +172,6 @@ def expect_round(a, _b):
     if abs(a - t) >= 0.5:
         t += math.copysign(1.0, a)
     return bits(signed_zero(t, a))
-
 
 def expect_sqrt(a, _b):
     # IEEE pins the square root exactly, so this is the host's own correctly rounded
@@ -202,13 +183,11 @@ def expect_sqrt(a, _b):
         return bits(a)
     return bits(math.sqrt(a))
 
-
 def expect_from_f32(a, _b):
     # The operand is a binary32 pattern in the low half, so it is the words of the
     # double being reinterpreted, not the double's value.
     fb = struct.unpack("<f", struct.pack("<I", bits(a) & 0xFFFFFFFF))[0]
     return bits(float(fb))
-
 
 def expect_to_f32(a, _b):
     # The operand is the double itself; the result is its binary32 pattern. Above
@@ -218,11 +197,9 @@ def expect_to_f32(a, _b):
     except OverflowError:
         return 0xFF800000 if a < 0 else 0x7F800000
 
-
 def expect_from_u64(a, _b):
     # The operand is the integer in the word, so its value is the bits themselves.
     return bits(float(bits(a)))
-
 
 def expect_to_u64(a, _b):
     # SPIR-V leaves a conversion whose value does not fit undefined, so the cases
@@ -230,7 +207,6 @@ def expect_to_u64(a, _b):
     if math.isnan(a) or math.isinf(a) or a < 0.0 or a >= 2.0 ** 64:
         return None
     return int(math.trunc(a))
-
 
 def _round_f64(fr):
     """Round an exact rational to binary64, nearest even, what float() would do."""
@@ -255,7 +231,6 @@ def _round_f64(fr):
         return sign * INF
     return sign * float(val)
 
-
 def expect_fma(a, b, c):
     if math.isnan(a) or math.isnan(b) or math.isnan(c):
         return 0x7FF8000000000000
@@ -273,22 +248,17 @@ def expect_fma(a, b, c):
         return bits(-0.0) if neg else bits(0.0)
     return bits(_round_f64(exact))
 
-
 def _two(fn):
     return lambda a, b, _c: fn(a, b)
-
 
 def expect_iden(a, _b):
     return bits(a)
 
-
 def expect_isinf(a, _b):
     return 1 if math.isinf(a) else 0
 
-
 def expect_isnan(a, _b):
     return 1 if math.isnan(a) else 0
-
 
 OPS = {
     "iden": ("a", _two(expect_iden)),
@@ -311,7 +281,6 @@ OPS = {
     "fromu64": ("weft_fp64::from_u64(a)", _two(expect_from_u64)),
     "tou64": ("weft_fp64::to_u64(a)", _two(expect_to_u64)),
 }
-
 
 def main():
     want = [w for w in sys.argv[1:] if w in OPS] or list(OPS)
@@ -359,7 +328,6 @@ def main():
             bad += 1
     print("\n%d of %d operations disagree" % (bad, len(want)))
     return 1 if bad else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

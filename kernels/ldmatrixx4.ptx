@@ -1,23 +1,6 @@
-// `ldmatrix.x4` is the multi-matrix form: four 8x8 tiles of halves in one
-// instruction, matrix k's rows addressed by lanes 8k..8k+7. The `.x1` fixture has
-// every tile at offset zero, so a stride of the wrong size, or a peer lane taken
-// from the wrong group, would pass it and fail here.
-//
-// The shared buffer is four tiles of 128 bytes: matrix k starts at 128k, row r is
-// 16 bytes on from that, half c two bytes on from the row. Half h of the buffer
-// (h = 64k + 8r + c) holds the number h, so the value a register carries names the
-// position it came from. Lane l holds row l>>2 and the halves at columns 2(l&3)
-// and one past it of matrix k, so its word is
-//     h0 = 64k + 8 (l>>2) + 2 (l&3),   word = h0 | (h0+1) << 16
-// and the transposed form hands back the transpose, element (r, c) for (c, r),
-// which puts the two halves in two rows at the column this lane owns:
-//     h0 = 64k + 8 (2 (l&3)) + (l>>2), word = h0 | (h0+8) << 16
-//
-// The third load is the register-address form, lane a naming matrix a>>3 at row
-// a&7, which is the buffer at 16a. It is the same word as the named symbol only if
-// the peer lane for matrix k is 8k + (l>>2), so the two forms are a check on each
-// other as well as on the map. check.sh recomputes all three blocks from the two
-// closed forms above, not from what the translator emits.
+// `ldmatrix.x4` is the multi-matrix form: four 8x8 tiles of halves, matrix k's rows
+// addressed by lanes 8k..8k+7. The `.x1` fixture puts every tile at offset zero, so a
+// wrong stride or peer lane would pass it and fail here.
 .version 8.8
 .target sm_100a
 .address_size 64
@@ -36,7 +19,7 @@
     mov.u32 %r1, %tid.x;
     mov.u64 %rd4, tile4;
 
-    // ---- fill: half h holds h, four words a lane ----
+    // fill: half h holds h, four words a lane
     shl.b32 %r2, %r1, 2;                    // first word of this lane
     mov.u32 %r3, 0;
 FILL: setp.ge.u32 %p1, %r3, 4;
@@ -55,17 +38,17 @@ FILL: setp.ge.u32 %p1, %r3, 4;
 FILLED:
     bar.sync 0;
 
-    // ---- four tiles through a named symbol, then the same four transposed ----
+    // four tiles through a named symbol, then the same four transposed
     ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r10, %r11, %r12, %r13}, [tile4];
     ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r14, %r15, %r16, %r17}, [tile4];
 
-    // ---- and once through a per-lane address: lane a names matrix a>>3, row a&7 ----
+    // and once through a per-lane address: lane a names matrix a>>3, row a&7
     shl.b32 %r22, %r1, 4;
     cvt.u64.u32 %rd6, %r22;
     add.s64 %rd7, %rd4, %rd6;
     ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r18, %r19, %r20, %r21}, [%rd7];
 
-    // ---- out: twelve words a lane, four a matrix, three blocks ----
+    // out: twelve words a lane, four a matrix, three blocks
     mul.wide.s32 %rd8, %r1, 16;             // sixteen bytes a lane, four words
     add.s64 %rd9, %rd1, %rd8;
     st.global.b32 [%rd9], %r10;

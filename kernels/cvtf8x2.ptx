@@ -1,19 +1,6 @@
-// Reading two packed narrow values out into two halves: `cvt.rn.f16x2.<packed>`.
-//
-// The last type in the modifier list is the destination, so the pair is the source and
-// the halves are the result. The source container is the narrow type's own width  -- a
-// byte for an fp4 pair, a half-word for the rest  -- and that width is part of the
-// spelling: a word-sized source there is `Arguments mismatch`.
-//
-//   e4m3x2 0x3C38 (1.5, 1.0)      -> 3e003c00  high value in the high half
-//   e2m1x2 0xB2 with .relu        -> 00003c00  -1.5 is zeroed, 1.0 is kept
-//   e2m3x2 0x1F02 (7.5, 0.25)     -> 47803400  MAX_NORM, and a subnormal of M/8
-//   e3m2x2 0x1F01 (28, 0.0625)    -> 4f002c00  MAX_NORM, and the M/16 subnormal
-//   e5m2x2 0x3C3C (1.0, 1.0)      -> 3c003c00
-//   e2m1x2 0x40 (2.0, 0.0)        -> 40000000
-//
-// The other direction and the four-lane arithmetic are in `cvtf8x2dn.ptx`: ptxas takes
-// only two of those rows, so that file carries them and says why.
+// Reading two packed narrow values out into two halves: `cvt.rn.f16x2.<packed>`. The
+// last type in the modifier list is the destination, and the source's own width is part
+// of the spelling.
 .version 8.7
 .target sm_100a
 .address_size 64

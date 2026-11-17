@@ -1,32 +1,6 @@
-// `cp.async.bulk.tensor`, the tensor form of the bulk copy.
-//
-// A linear bulk copy is told its address and its size. The tensor form is told neither:
-// it names a box and the corner that box starts at, and everything else comes from a
-// 128-byte descriptor the kernel is handed. NVIDIA's driver encodes that descriptor and
-// its byte layout is not published, so weft defines one (see `runtime/weft_runtime.hpp`
-// and the same decode in `src/weft_msl.hpp`), and this kernel writes one into a buffer
-// the way a host would.
-//
-// The tensor is three rows by four columns with `src[4 * row + col] = col + 4 * row`:
-//
-//      0  1  2  3
-//      4  5  6  7
-//      8  9 10 11
-//
-// Two copies, one in each direction:
-//
-//   load   a 3x3 box at column 2, row 1. Four of its nine elements hang off the right and
-//          three off the bottom, so the transaction is 36 bytes and the tile it lands is
-//          6, 7, 0, 10, 11, 0, 0, 0, 0: the outside is filled with zero, which is what the
-//          hardware's out-of-bounds fill does.
-//   store  a 2x2 box at column 1, row 1 holding 101, 102, 103, 104. Those land on elements
-//          5, 6, 9 and 10, so the tensor afterwards reads
-//          0, 1, 2, 3, 4, 101, 102, 7, 8, 103, 104, 11, a store that moved the wrong box
-//          leaves a different set.
-//
-// Every number out is one of those, so a copy that read the wrong address, walked a
-// dimension in the wrong order, or wrote past the box instead of zero-filling changes the
-// answer. The tensor is refilled on every run, so a benchmark pass repeats exactly.
+// `cp.async.bulk.tensor`, the tensor form of the bulk copy. A linear copy is told its
+// address and size; this form names a box and its corner, and the rest comes from a
+// 128-byte descriptor.
 .version 8.3
 .target sm_90
 .address_size 64
@@ -49,7 +23,7 @@
     ld.param.u64 %rd2, [tensormap_param_1];
     ld.param.u64 %rd3, [tensormap_param_2];
 
-    // ---- the tensor, filled so the copy has something it did not have to be given ----
+    // the tensor, filled so the copy has something it did not have to be given
     mov.u32 %r7, 0;
 FILL: setp.ge.u32 %p1, %r7, 12;
     @%p1 bra FILLED;
@@ -60,7 +34,7 @@ FILL: setp.ge.u32 %p1, %r7, 12;
     bra FILL;
 FILLED:
 
-    // ---- the map ----
+    // the map
     mov.b64 {%r2, %r3}, %rd2;              // address of element (0, 0)
     st.global.b32 [%rd3], %r2;
     add.s64 %rd4, %rd3, 4;
@@ -96,7 +70,7 @@ FILLED:
     mov.u32 %r13, 0x41544657;
     st.global.b32 [%rd4], %r13;
 
-    // ---- threadgroup memory <- the tensor ----
+    // threadgroup memory <- the tensor
     mbarrier.init.shared.b64 [mbr], 1;
     bar.sync 0;
 
@@ -135,7 +109,7 @@ WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
     add.s64 %rd4, %rd1, 32;
     st.global.b32 [%rd4], %r14;
 
-    // ---- threadgroup memory -> the tensor, and the box that lands ----
+    // threadgroup memory -> the tensor, and the box that lands
     // A host rewrites the box for a second copy, or builds a second map: the box is a
     // field of the descriptor, so a smaller one is asked for here rather than implied.
     add.s64 %rd4, %rd3, 80;
@@ -157,7 +131,7 @@ WAIT: mbarrier.try_wait.parity.shared.b64 %p2, [mbr], 0;
     cp.async.bulk.commit_group;
     cp.async.bulk.wait_group 0;
 
-    // ---- the tensor as the store left it ----
+    // the tensor as the store left it
     mov.u32 %r19, 0;
 COPY: setp.ge.u32 %p3, %r19, 12;
     @%p3 bra COPIED;

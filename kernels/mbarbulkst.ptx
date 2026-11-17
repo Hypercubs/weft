@@ -1,13 +1,4 @@
 // `cp.async.bulk` the other way: threadgroup memory out to the buffer.
-//
-//     tile = { 11, 12, 13, 14 }
-//     cp.async.bulk.global.shared::cta.bulk_group [out], [tile], 16
-//     commit_group; wait_group 0
-//
-// This direction is reported through a bulk group rather than an mbarrier, so there is
-// no descriptor and no transaction count: the size is written in the instruction. Four
-// different words, so a copy that moved the wrong address, or none of them, reads a
-// different set rather than the same one.
 .version 8.0
 .target sm_90
 .address_size 64

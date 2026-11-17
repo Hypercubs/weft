@@ -1,21 +1,5 @@
 // The two instructions that answer a mask of lanes, and the one that picks a lane,
 // where the member mask is a partial warp.
-//
-//     row 0   match.any of (lane & 3)          the lanes sharing that value
-//     row 1   match.any of lane                a single bit, this lane
-//     row 2   match.all of 7, the mask         FFFFFFFF: every lane holds 7
-//     row 3   match.all of 7, the predicate    1
-//     row 4   match.all of lane, the mask      0: the values differ
-//     row 5   match.all of lane, the predicate 0
-//     rows 6..8  the same three over membermask 00FFFFFF, so the mask and the
-//                match are cut to the lanes that participate
-//     row 9   elect.sync over the full mask    d = 0, the lowest lane
-//     row 10  elect.sync over the full mask    p = 1 on lane 0 only
-//     row 11  elect.sync over 00FFFFFC         d = 2, the lowest lane of that mask
-//     row 12  elect.sync over 00FFFFFC         p = 1 on lane 2 only
-//
-// A `match.any` that compared against lane 0's value, an `all` that ignored the member
-// mask, or an election that picked any lane but the lowest would each move one row.
 .version 8.6
 .target sm_100
 .address_size 64

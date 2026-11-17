@@ -1,14 +1,4 @@
-// The vector half atomics. Table 41 keeps them in a table of their own: `.add`, `.min`
-// and `.max` of a half at `.v2`, `.v4` and `.v8`, and of a packed pair at `.v2` and
-// `.v4`. No scalar half carries `.min` at all, so the only way to ask for one is here.
-//
-// The isa says an atomic on a vector is atomic per element and not for the group, so
-// the two halves of the one word this fixture contends are separate values: a
-// translation that wrote the whole word would put the second answer in both halves.
-//
-// Every lane works on the same address. Min and max are idempotent, and the add moves
-// powers of two that stay exact at every step, so the answer after eight lanes is the
-// same whatever order they land in.
+// The vector half atomics.
 .version 8.3
 .target sm_90
 .address_size 64

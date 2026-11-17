@@ -1,23 +1,6 @@
 // The MX converts: fp4 (e2m1) and fp6 (e2m3, e3m2), the formats a Blackwell
-// quantization pass writes with `cvt.rn.satfinite.*`. None of the three has an
-// infinity or a NaN, so `.satfinite`, which the ISA makes mandatory on these
-// converts, is the whole range rule: a NaN answers the positive MAX_NORM, a
-// magnitude past it answers MAX_NORM keeping its sign, and a subnormal rounds
-// onto its own grid.
-//
-//   3.4, 2.7 as e2m1x2      -> 00000055  3.4 -> 3 (0b101) and 2.7 -> 3, first in d[7:4]
-//  -1, -100 with .relu      -> 00000000  relu zeroes both, and it is the converted
-//                                        value it zeroes: without it the word is
-//                                        0xbf, -1 and a saturated -6
-//   NaN, 0.75 as e2m1x2      -> 00000072  a NaN is +MAX_NORM (0111); 0.75 is a tie
-//                                        between 0.5 and 1 and nearest-even takes 1
-//   7.4, 0.2 as e2m3x2       -> 00001f02  7.4 -> 7.5 (11111); 0.2 -> 0.25, a
-//                                        subnormal of the M/8 grid (M=2)
-//   30, 0.07 as e3m2x2       -> 00001f01  30 saturates to 28 (11111); 0.07 -> 1/16
-//   NaN, -inf as e2m3x2      -> 00001f3f  +MAX_NORM, and MAX_NORM with the sign kept
-//
-// Each result is one 16-bit value in a 32-bit word, so a store keeps the fixture
-// off paths that are not themselves under test.
+// quantization pass writes with `cvt.rn.satfinite.*`. None of the three has an infinity
+// or a NaN, so `.satfinite` is the whole range rule.
 .version 8.7
 .target sm_100a
 .address_size 64
@@ -77,18 +60,7 @@
 // splits the random word: bits[12:0] for the low result, bits[28:16] for the high
 // one with a half, and bits[15:0] / [31:16] with a bf16. Every value below sits
 // exactly half an ulp above its lower grid point, so the random bits alone decide:
-//
 //   1+1.5*2^-10, -(1+1.5*2^-10), rbits 0
-//                       -> 3c01c401  no carry: both truncate toward zero, which is
-//                                    one ulp above 1.0 and not 1.0 itself
-//   the same pair with 0x1FFF in both fields
-//                       -> 3c02c402  both carry: one ulp further from zero
-//   bf16 of 1+1.5*2^-8 and +inf, rbits 0xFFFF in the high field, .satfinite
-//                       -> 3f827f7f  the carry takes the bf16 up one, and the
-//                                    infinity clamps to the largest finite bf16
-//   the same value twice with 0x1000, one half of the range, in the high field
-//                       -> 3c023c01  half the random range carries and the empty
-//                                    field does not, so the two halves differ
 .visible .entry cvtrs(
     .param .u64 cvtrs_param_0      // four words
 )

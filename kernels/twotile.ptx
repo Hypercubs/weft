@@ -1,12 +1,4 @@
-// Two threadgroup arrays in one kernel. They are separate objects: `ta` starts at
-// offset 0 of the group's shared window and `tb` at 256, so the second tile must
-// not overwrite the first. The Metal twin of this kernel is `twotile` in
-// basic.metal, and the two must agree byte for byte.
-//
-//   threadgroup float ta[64], tb[64];
-//   ta[i] = in[gid];  tb[i] = in[gid] * 2;
-//   threadgroup_barrier(mem_threadgroup);
-//   out[gid] = ta[(i + 1) & 63] + tb[(i + 3) & 63];
+// Two threadgroup arrays in one kernel.
 .version 7.0
 .target sm_70
 .address_size 64

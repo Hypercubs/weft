@@ -1,0 +1,47 @@
+// A layered 2D surface from PTX: the layer is the first coordinate, `.b` bytes.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.global .surfref srf;
+
+.visible .entry ptxsrflayer(
+    .param .u64 ptxsrflayer_param_0,
+    .param .u64 ptxsrflayer_param_1
+)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [ptxsrflayer_param_0];
+    ld.param.u64 %rd2, [ptxsrflayer_param_1];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;      // gid
+
+    mul.wide.s32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];          // in[gid]
+
+    and.b32 %r5, %r4, 63;               // x
+    shr.u32 %r6, %r4, 6;
+    and.b32 %r6, %r6, 63;               // y
+    shr.u32 %r7, %r4, 12;
+    and.b32 %r7, %r7, 3;                // layer = (gid >> 12) & 3
+    shl.b32 %r9, %r5, 2;                // x as a surface's byte offset
+
+    sust.b.a2d.clamp.b32 [srf, {%r7,%r9,%r6}], {%f1};
+
+    bar.sync 0;
+
+    xor.b32 %r10, %r5, 1;               // the neighbour inside this group
+    shl.b32 %r10, %r10, 2;              // and its byte offset
+    suld.b.a2d.clamp.b32 %r8, [srf, {%r7,%r10,%r6}];
+
+    add.s64 %rd5, %rd2, %rd3;
+    st.global.b32 [%rd5], %r8;          // the texel's bits, as they were stored
+    ret;
+}
