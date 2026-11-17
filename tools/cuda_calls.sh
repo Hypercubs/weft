@@ -108,8 +108,9 @@ else
 fi
 
 if run_case vol kernels/ptx3d.ptx --grid 4096 --buffers 4096 --textures 64x64x8 --bench 1; then
+  # A volume is its depth and no flag: only a 2-D array is designated layered.
   case_rows "texture 3-D, eight slices" "$out/vol.log" \
-    "cuArray3DCreate w=64 h=64 d=8 fmt=0x20 ch=1 flags=0x1" \
+    "cuArray3DCreate w=64 h=64 d=8 fmt=0x20 ch=1 flags=0x0" \
     "depth=8"
 else
   bad "texture 3-D (exit $st)"
@@ -158,8 +159,11 @@ else
 fi
 
 if run_case surf kernels/ptxsrftmix.ptx --grid 4096 --buffers 4096,4096 --textures 64x64,64x64 --bench 1; then
-  grep -qF "'img' is a surface, and the cuda column binds sampled textures" "$out/surf.out" &&
-    ok "surface refused by name" || bad "surface refused by name"
+  # The stand-in driver exports no cuSurfRef entry points, so the column has to say
+  # so rather than answer with numbers it did not compute.
+  grep -qF "no surface reference entry points" "$out/surf.out" &&
+    ok "surface with no driver entry points is reported, not faked" ||
+    bad "surface with no driver entry points is reported, not faked"
   if grep -qF "cuArrayCreate" "$out/surf.log"; then
     bad "surface made no array"
   else
